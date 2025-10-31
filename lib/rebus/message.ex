@@ -74,15 +74,14 @@ defmodule Rebus.Message do
   import Bitwise, only: [bor: 2, band: 2]
 
   @typedoc "Message type"
-  @type message_type :: :invalid | :method_call | :method_return | :error | :signal
+  @type message_type :: :method_call | :method_return | :error | :signal
 
   @typedoc "Message flags"
   @type flag :: :no_reply_expected | :no_auto_start | :allow_interactive_authorization
 
   @typedoc "Header field keys"
   @type header_field ::
-          :invalid
-          | :path
+          :path
           | :interface
           | :member
           | :error_name
@@ -117,7 +116,6 @@ defmodule Rebus.Message do
 
   # Message type constants
   @message_types %{
-    0 => :invalid,
     1 => :method_call,
     2 => :method_return,
     3 => :error,
@@ -137,7 +135,6 @@ defmodule Rebus.Message do
 
   # Header field constants
   @header_fields %{
-    0 => :invalid,
     1 => :path,
     2 => :interface,
     3 => :member,
@@ -380,70 +377,70 @@ defmodule Rebus.Message do
         end
 
       # Decode message type
-      type = Map.get(@message_types, type_byte, :invalid)
+      case type_from_code(type_byte) do
+        {:ok, type} ->
+          # Decode flags
+          flags = decode_flags_byte(flags_byte)
 
-      if type == :invalid do
-        throw({:error, "Invalid message type: #{type_byte}"})
-      end
+          # Decode header fields array
+          case Decoder.decode("a(yv)", rest, endianness) do
+            [header_fields_data] ->
+              # Parse header fields
+              header_fields = decode_header_fields(header_fields_data)
 
-      # Decode flags
-      flags = decode_flags_byte(flags_byte)
+              # Calculate header length from the signature structure
+              # For now, we'll use a simpler approach - calculate from known header size
+              header_fields_size = estimate_header_fields_size(header_fields_data, endianness)
+              # Fixed header (12 bytes) + header fields
+              header_length = 12 + header_fields_size
+              header_padded_length = div(header_length + 7, 8) * 8
 
-      # Decode header fields array
-      case Decoder.decode("a(yv)", rest, endianness) do
-        [header_fields_data] ->
-          # Parse header fields
-          header_fields = decode_header_fields(header_fields_data)
+              # Extract body from the remaining data after padding
+              # Subtract fixed header size
+              body_start = header_padded_length - 12
 
-          # Calculate header length from the signature structure
-          # For now, we'll use a simpler approach - calculate from known header size
-          header_fields_size = estimate_header_fields_size(header_fields_data, endianness)
-          # Fixed header (12 bytes) + header fields
-          header_length = 12 + header_fields_size
-          header_padded_length = div(header_length + 7, 8) * 8
+              if byte_size(rest) >= body_start + body_length do
+                <<_::binary-size(body_start), body_binary::binary-size(body_length), _::binary>> =
+                  rest
 
-          # Extract body from the remaining data after padding
-          # Subtract fixed header size
-          body_start = header_padded_length - 12
+                # Decode body if present
+                signature = Map.get(header_fields, :signature, "")
 
-          if byte_size(rest) >= body_start + body_length do
-            <<_::binary-size(body_start), body_binary::binary-size(body_length), _::binary>> =
-              rest
+                {body, final_signature} =
+                  if signature == "" or body_length == 0 do
+                    {[], ""}
+                  else
+                    try do
+                      {Decoder.decode(signature, body_binary, endianness), signature}
+                    rescue
+                      e -> throw({:error, "Failed to decode body: #{inspect(e)}"})
+                    catch
+                      e -> throw({:error, "Failed to decode body: #{inspect(e)}"})
+                    end
+                  end
 
-            # Decode body if present
-            signature = Map.get(header_fields, :signature, "")
+                message = %__MODULE__{
+                  type: type,
+                  flags: flags,
+                  version: version_byte,
+                  body_length: body_length,
+                  serial: serial,
+                  header_fields: header_fields,
+                  body: body,
+                  signature: final_signature
+                }
 
-            {body, final_signature} =
-              if signature == "" or body_length == 0 do
-                {[], ""}
+                {:ok, message}
               else
-                try do
-                  {Decoder.decode(signature, body_binary, endianness), signature}
-                rescue
-                  e -> throw({:error, "Failed to decode body: #{inspect(e)}"})
-                catch
-                  e -> throw({:error, "Failed to decode body: #{inspect(e)}"})
-                end
+                throw({:error, "Insufficient data for message body"})
               end
 
-            message = %__MODULE__{
-              type: type,
-              flags: flags,
-              version: version_byte,
-              body_length: body_length,
-              serial: serial,
-              header_fields: header_fields,
-              body: body,
-              signature: final_signature
-            }
-
-            {:ok, message}
-          else
-            throw({:error, "Insufficient data for message body"})
+            _ ->
+              throw({:error, "Failed to decode header fields"})
           end
 
-        _ ->
-          throw({:error, "Failed to decode header fields"})
+        {:error, reason} ->
+          throw({:error, reason})
       end
     catch
       {:error, reason} -> {:error, reason}
@@ -484,13 +481,23 @@ defmodule Rebus.Message do
   Gets the message type as an integer code.
   """
   @spec type_code(message_type()) :: non_neg_integer()
-  def type_code(type), do: Map.get(@type_codes, type, 0)
+  def type_code(type) do
+    case Map.get(@type_codes, type) do
+      nil -> raise ArgumentError, "Invalid message type: #{inspect(type)}"
+      code -> code
+    end
+  end
 
   @doc """
   Gets the message type from an integer code.
   """
-  @spec type_from_code(non_neg_integer()) :: message_type()
-  def type_from_code(code), do: Map.get(@message_types, code, :invalid)
+  @spec type_from_code(non_neg_integer()) :: {:ok, message_type()} | {:error, String.t()}
+  def type_from_code(code) do
+    case Map.get(@message_types, code) do
+      nil -> {:error, "Unknown message type code: #{code}"}
+      type -> {:ok, type}
+    end
+  end
 
   # Private helper functions
 
@@ -563,7 +570,7 @@ defmodule Rebus.Message do
   defp infer_array_type([first | _]), do: infer_type(first)
 
   defp extract_header_fields(opts) do
-    field_keys = Map.keys(@field_codes) -- [:invalid]
+    field_keys = Map.keys(@field_codes)
 
     fields =
       for key <- field_keys, Keyword.has_key?(opts, key), into: %{} do
@@ -755,12 +762,9 @@ defmodule Rebus.Message do
   defp decode_header_fields(fields_data) when is_list(fields_data) do
     fields_data
     |> Enum.reduce(%{}, fn [field_code, {_type, value}], acc ->
-      field = Map.get(@header_fields, field_code, :invalid)
-
-      if field != :invalid do
-        Map.put(acc, field, value)
-      else
-        acc
+      case Map.get(@header_fields, field_code) do
+        nil -> acc  # Skip unknown field codes
+        field -> Map.put(acc, field, value)
       end
     end)
   end

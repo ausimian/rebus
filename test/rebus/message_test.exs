@@ -721,16 +721,28 @@ defmodule Rebus.MessageTest do
       assert Message.type_code(:method_return) == 2
       assert Message.type_code(:error) == 3
       assert Message.type_code(:signal) == 4
-      assert Message.type_code(:invalid) == 0
+    end
+
+    test "type_code/1 raises for invalid types" do
+      assert_raise ArgumentError, "Invalid message type: :invalid", fn ->
+        Message.type_code(:invalid)
+      end
+
+      assert_raise ArgumentError, "Invalid message type: :unknown", fn ->
+        Message.type_code(:unknown)
+      end
     end
 
     test "type_from_code/1 returns correct types" do
-      assert Message.type_from_code(1) == :method_call
-      assert Message.type_from_code(2) == :method_return
-      assert Message.type_from_code(3) == :error
-      assert Message.type_from_code(4) == :signal
-      assert Message.type_from_code(0) == :invalid
-      assert Message.type_from_code(99) == :invalid
+      assert Message.type_from_code(1) == {:ok, :method_call}
+      assert Message.type_from_code(2) == {:ok, :method_return}
+      assert Message.type_from_code(3) == {:ok, :error}
+      assert Message.type_from_code(4) == {:ok, :signal}
+    end
+
+    test "type_from_code/1 returns error for unknown codes" do
+      assert Message.type_from_code(0) == {:error, "Unknown message type code: 0"}
+      assert Message.type_from_code(99) == {:error, "Unknown message type code: 99"}
     end
   end
 
