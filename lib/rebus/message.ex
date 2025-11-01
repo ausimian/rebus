@@ -434,7 +434,7 @@ defmodule Rebus.Message do
       iex> Rebus.Message.parse(binary_with_extra)
       {:ok, %Rebus.Message{type: :signal, ...}, <<1, 2, 3, 4>>}
   """
-  @spec parse(binary()) :: {:ok, t(), binary()} | {:error, String.t()} | nil
+  @spec parse(binary()) :: {:ok, t(), binary()} | {:error, any()} | nil
   def parse(binary) when is_binary(binary) do
     # Need at least 12 bytes for the fixed header
     if byte_size(binary) >= 12 do
@@ -447,7 +447,8 @@ defmodule Rebus.Message do
            {:ok, header_fields_length} <- extract_array_length(rest, endianness) do
         # Calculate header fields size: 4 bytes (array length) + alignment + data
         # Array data is aligned to 8-byte boundary (variant alignment)
-        length_plus_alignment = 4 + calculate_padding(4, 8)
+        # 4 bytes alignment padding for 8-byte boundary
+        length_plus_alignment = 8
         header_fields_size = length_plus_alignment + header_fields_length
 
         # Fixed header (12 bytes) + header fields, padded to 8-byte boundary
@@ -830,11 +831,6 @@ defmodule Rebus.Message do
     else
       {:error, :insufficient_data}
     end
-  end
-
-  defp calculate_padding(current_position, target_alignment) do
-    remainder = rem(current_position, target_alignment)
-    if remainder == 0, do: 0, else: target_alignment - remainder
   end
 
   defp estimate_header_fields_size(header_fields_data, endianness) do
