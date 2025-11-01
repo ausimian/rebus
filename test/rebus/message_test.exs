@@ -1154,4 +1154,129 @@ defmodule Rebus.MessageTest do
       assert {:ok, _} = Message.decode(big_binary)
     end
   end
+
+  describe "parse/1" do
+    test "returns nil for insufficient data" do
+      # Empty binary
+      assert Message.parse(<<>>) == nil
+
+      # Less than 12 bytes (fixed header size)
+      assert Message.parse(<<1, 2, 3>>) == nil
+      assert Message.parse(<<1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11>>) == nil
+    end
+
+    test "returns nil for invalid header data" do
+      # Invalid endianness flag
+      invalid_header = <<255, 4, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0>>
+      assert Message.parse(invalid_header) == nil
+    end
+
+    test "returns nil for partial message" do
+      # Create a complete message
+      {:ok, message} =
+        Message.new(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "TestSignal"
+        )
+
+      {:ok, encoded} = Message.encode(message)
+      complete_binary = IO.iodata_to_binary(encoded)
+
+      # Test with partial data (first half)
+      partial_size = div(byte_size(complete_binary), 2)
+      partial_binary = binary_part(complete_binary, 0, partial_size)
+
+      assert Message.parse(partial_binary) == nil
+    end
+
+    test "successfully parses complete message" do
+      # Create a complete message
+      {:ok, original_message} =
+        Message.new(:method_call,
+          path: "/com/example/Object",
+          interface: "com.example.Interface",
+          member: "TestMethod",
+          body: [42, "hello"],
+          signature: "is"
+        )
+
+      {:ok, encoded} = Message.encode(original_message)
+      complete_binary = IO.iodata_to_binary(encoded)
+
+      # Parse should succeed
+      assert {:ok, parsed_message, remaining_data} = Message.parse(complete_binary)
+
+      # Should have no remaining data for exact message
+      assert remaining_data == <<>>
+
+      # Verify the parsed message matches the original
+      assert parsed_message.type == original_message.type
+      assert parsed_message.header_fields == original_message.header_fields
+      assert parsed_message.body == original_message.body
+      assert parsed_message.signature == original_message.signature
+    end
+
+    test "successfully parses message with extra data" do
+      # Create a complete message
+      {:ok, message} =
+        Message.new(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "TestSignal"
+        )
+
+      {:ok, encoded} = Message.encode(message)
+      complete_binary = IO.iodata_to_binary(encoded)
+
+      # Add extra data after the message
+      extra_data = <<1, 2, 3, 4, 5, 6, 7, 8>>
+      binary_with_extra = complete_binary <> extra_data
+
+      # Parse should succeed and return extra data
+      assert {:ok, parsed_message, remaining_data} = Message.parse(binary_with_extra)
+      assert parsed_message.type == :signal
+      assert Map.get(parsed_message.header_fields, :path) == "/test"
+      assert remaining_data == extra_data
+    end
+
+    test "returns error for malformed message with sufficient length" do
+      # Create a binary that has sufficient length but is malformed
+      {:ok, message} =
+        Message.new(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "TestSignal"
+        )
+
+      {:ok, encoded} = Message.encode(message)
+      complete_binary = IO.iodata_to_binary(encoded)
+
+      # Corrupt the message type byte (position 1) to an invalid value
+      <<first, _type, rest::binary>> = complete_binary
+      corrupted_binary = <<first, 99, rest::binary>>
+
+      # Parse should return an error (not nil) since we have sufficient data
+      assert {:error, _reason} = Message.parse(corrupted_binary)
+    end
+
+    test "handles different message types" do
+      message_types = [
+        {:method_call, [path: "/test", member: "TestMethod"]},
+        {:method_return, [reply_serial: 123]},
+        {:error, [error_name: "test.Error", reply_serial: 123]},
+        {:signal, [path: "/test", interface: "test.interface", member: "TestSignal"]}
+      ]
+
+      for {type, opts} <- message_types do
+        {:ok, message} = Message.new(type, opts)
+        {:ok, encoded} = Message.encode(message)
+        complete_binary = IO.iodata_to_binary(encoded)
+
+        assert {:ok, parsed_message, remaining_data} = Message.parse(complete_binary)
+        assert parsed_message.type == type
+        assert remaining_data == <<>>
+      end
+    end
+  end
 end

@@ -432,6 +432,114 @@ defmodule Rebus.Message do
   end
 
   @doc """
+  Parses a complete D-Bus message from a binary if sufficient data is available.
+
+  This function checks if the provided binary contains enough data to parse a complete
+  D-Bus message (both header and body). If it does, it extracts exactly the right
+  amount of data and passes it to `decode/1`. If the binary is too small, returns `nil`.
+
+  This is useful for streaming scenarios where you receive partial data and need to
+  determine when you have a complete message.
+
+  ## Parameters
+
+  - `binary` - The binary data that may contain a D-Bus message
+
+  ## Returns
+
+  - `{:ok, message, remaining_data}` - If a complete message was successfully parsed
+  - `{:error, reason}` - If the binary contains sufficient data but parsing failed
+  - `nil` - If the binary does not contain sufficient data for a complete message
+
+  ## Examples
+
+      # Insufficient data
+      iex> Rebus.Message.parse(<<1, 2, 3>>)
+      nil
+
+      # Complete message data
+      iex> {:ok, message} = Rebus.Message.new(:signal, path: "/", interface: "test", member: "Test")
+      iex> {:ok, encoded} = Rebus.Message.encode(message)
+      iex> binary = IO.iodata_to_binary(encoded)
+      iex> Rebus.Message.parse(binary)
+      {:ok, %Rebus.Message{type: :signal, ...}, <<>>}
+
+      # Message with extra data
+      iex> extra_data = <<1, 2, 3, 4>>
+      iex> binary_with_extra = binary <> extra_data
+      iex> Rebus.Message.parse(binary_with_extra)
+      {:ok, %Rebus.Message{type: :signal, ...}, <<1, 2, 3, 4>>}
+  """
+  @spec parse(binary()) :: {:ok, t(), binary()} | {:error, String.t()} | nil
+  def parse(binary) when is_binary(binary) do
+    # Need at least 12 bytes for the fixed header
+    if byte_size(binary) < 12 do
+      nil
+    else
+      # Parse fixed header to get body length and endianness
+      <<endian_flag, _type_byte, _flags_byte, _version_byte, body_length::32, _serial::32,
+        rest::binary>> = binary
+
+      # Determine endianness
+      endianness =
+        case endian_flag do
+          ?l -> :little
+          ?B -> :big
+          _ -> nil
+        end
+
+      if endianness do
+        # Correct byte order for body length
+        body_length =
+          if endianness == :little do
+            <<body_length::little-32>> = <<body_length::32>>
+            body_length
+          else
+            <<body_length::big-32>> = <<body_length::32>>
+            body_length
+          end
+
+        # Try to decode header fields to determine their size
+        # Instead of fully decoding, just extract the array length from the binary
+        case extract_array_length(rest, endianness) do
+          {:ok, header_fields_length} ->
+            # Calculate header fields size: 4 bytes (array length) + alignment + data
+            # Array data is aligned to 8-byte boundary (variant alignment)
+            length_plus_alignment = 4 + calculate_padding(4, 8)
+            header_fields_size = length_plus_alignment + header_fields_length
+
+            # Fixed header (12 bytes) + header fields, padded to 8-byte boundary
+            header_length = 12 + header_fields_size
+            header_padded_length = div(header_length + 7, 8) * 8
+
+            # Total message size = padded header + body
+            total_message_size = header_padded_length + body_length
+
+            # Check if we have enough data for the complete message
+            if byte_size(binary) >= total_message_size do
+              # Extract exactly the right amount of data and decode it
+              <<message_binary::binary-size(total_message_size), remaining_data::binary>> = binary
+
+              case decode(message_binary) do
+                {:ok, message} -> {:ok, message, remaining_data}
+                {:error, reason} -> {:error, reason}
+              end
+            else
+              nil
+            end
+
+          {:error, _} ->
+            # Cannot extract array length, insufficient data
+            nil
+        end
+      else
+        # Invalid endianness flag
+        nil
+      end
+    end
+  end
+
+  @doc """
   Validates that a message is well-formed according to D-Bus rules.
 
   Checks that:
@@ -763,6 +871,28 @@ defmodule Rebus.Message do
       padding_size = 8 - remainder
       [iodata, <<0::size(padding_size * 8)>>]
     end
+  end
+
+  defp extract_array_length(binary, endianness) do
+    # D-Bus arrays start with a 4-byte length field
+    if byte_size(binary) >= 4 do
+      case endianness do
+        :little ->
+          <<array_length::little-32, _rest::binary>> = binary
+          {:ok, array_length}
+
+        :big ->
+          <<array_length::big-32, _rest::binary>> = binary
+          {:ok, array_length}
+      end
+    else
+      {:error, :insufficient_data}
+    end
+  end
+
+  defp calculate_padding(current_position, target_alignment) do
+    remainder = rem(current_position, target_alignment)
+    if remainder == 0, do: 0, else: target_alignment - remainder
   end
 
   defp estimate_header_fields_size(header_fields_data, endianness) do
