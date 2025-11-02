@@ -290,7 +290,8 @@ defmodule Rebus.Message do
     version_byte = message.version
 
     # Header fields as array - encode at position 12 for proper struct alignment
-    header_fields_encoded = Encoder.encode_at_position("a(yv)", [header_fields_data], endianness, 12)
+    header_fields_encoded =
+      Encoder.encode_at_position("a(yv)", [header_fields_data], endianness, 12)
 
     # Build complete header as iodata
     header_fixed =
