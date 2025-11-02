@@ -119,7 +119,18 @@ defmodule Rebus.Encoder do
   """
   @spec encode(binary(), [any()], endianness()) :: iodata()
   def encode(signature, data, endianness \\ :little) do
-    state = %{endianness: endianness, position: 0, buffer: []}
+    encode_at_position(signature, data, endianness, 0)
+  end
+
+  @doc """
+  Encode data with a specific starting position for alignment calculations.
+
+  This is useful when the encoded data will be inserted at a specific position
+  in a larger message, and alignment must be calculated relative to that position.
+  """
+  @spec encode_at_position(binary(), [any()], endianness(), non_neg_integer()) :: iodata()
+  def encode_at_position(signature, data, endianness, starting_position) do
+    state = %{endianness: endianness, position: starting_position, buffer: []}
 
     signature
     |> parse_signature()
@@ -467,7 +478,16 @@ defmodule Rebus.Encoder do
   defp encode_array_elements(_element_type, [], state), do: state
 
   defp encode_array_elements(element_type, [value | rest], state) do
-    new_state = encode_single(element_type, value, state)
+    # For structs in arrays, each struct must be aligned to 8-byte boundary
+    aligned_state =
+      case element_type do
+        {:struct, _} -> align_to(state, 8)
+        # dict entries are also structs
+        {:dict_entry, _, _} -> align_to(state, 8)
+        _ -> state
+      end
+
+    new_state = encode_single(element_type, value, aligned_state)
     encode_array_elements(element_type, rest, new_state)
   end
 end

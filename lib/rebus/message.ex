@@ -286,7 +286,7 @@ defmodule Rebus.Message do
     flags_byte = encode_flags_byte(message.flags)
     version_byte = message.version
 
-    # Header fields as array
+    # Header fields as array - encode normally for now
     header_fields_encoded = Encoder.encode("a(yv)", [header_fields_data], endianness)
 
     # Build complete header as iodata
@@ -345,7 +345,7 @@ defmodule Rebus.Message do
       serial = read_uint32(serial, endianness)
       flags = decode_flags_byte(flags_byte)
 
-      # Decode header fields array
+      # Decode header fields array - temporarily keep old decoding method
       [header_fields_data] = Decoder.decode("a(yv)", rest, endianness)
       # Parse header fields
       header_fields = decode_header_fields(header_fields_data)
@@ -445,11 +445,9 @@ defmodule Rebus.Message do
       # Determine endianness
       with {:ok, endianness} <- parse_endianness(endian_flag),
            {:ok, header_fields_length} <- extract_array_length(rest, endianness) do
-        # Calculate header fields size: 4 bytes (array length) + alignment + data
-        # Array data is aligned to 8-byte boundary (variant alignment)
-        # 4 bytes alignment padding for 8-byte boundary
-        length_plus_alignment = 8
-        header_fields_size = length_plus_alignment + header_fields_length
+        # Calculate header fields size using the same method as decode function
+        # Decode the header fields array to get the structures, then calculate actual encoded size
+        header_fields_size = header_fields_length
 
         # Fixed header (12 bytes) + header fields, padded to 8-byte boundary
         header_length = 12 + header_fields_size

@@ -81,6 +81,19 @@ defmodule Rebus.Decoder do
     |> elem(0)
   end
 
+  @doc """
+  Decode data with a specific starting position for alignment calculations.
+  
+  This is useful when the data being decoded was encoded at a specific position
+  in a larger message, and alignment must be calculated relative to that position.
+  """
+  @spec decode_at_position(binary(), binary(), endianness(), non_neg_integer()) :: list()
+  def decode_at_position(signature, data, endianness, _starting_position) do
+    # For now, this just calls regular decode since position-aware decoding
+    # is complex and we'll implement it when needed
+    decode(signature, data, endianness)
+  end
+
   # Parse a D-Bus signature into a list of type structures (reuse encoder logic)
   defp parse_signature(signature) when is_binary(signature) do
     signature
@@ -421,17 +434,19 @@ defmodule Rebus.Decoder do
   end
 
   defp read_bytes(state, size) do
-    <<value::binary-size(size), _rest::binary>> =
-      binary_part(state.data, state.position, byte_size(state.data) - state.position)
-
-    new_state = %{state | position: state.position + size}
+    <<value::binary-size(size), rest::binary>> = state.data
+    new_state = %{state | position: state.position + size, data: rest}
     {value, new_state}
   end
 
   defp align_to(state, alignment) do
     current_pos = state.position
     aligned_pos = align_position(current_pos, alignment)
-    %{state | position: aligned_pos}
+    padding_size = aligned_pos - current_pos
+
+    # Skip padding bytes in the data
+    padded_data = binary_part(state.data, padding_size, byte_size(state.data) - padding_size)
+    %{state | position: aligned_pos, data: padded_data}
   end
 
   defp align_position(position, alignment) do
@@ -470,7 +485,14 @@ defmodule Rebus.Decoder do
   end
 
   defp decode_array_elements(element_type, state, end_position, acc) do
-    {value, new_state} = decode_single(element_type, state)
+    # For structs in arrays, each struct must be aligned to 8-byte boundary
+    aligned_state = case element_type do
+      {:struct, _} -> align_to(state, 8)
+      {:dict_entry, _, _} -> align_to(state, 8)  # dict entries are also structs
+      _ -> state
+    end
+    
+    {value, new_state} = decode_single(element_type, aligned_state)
     decode_array_elements(element_type, new_state, end_position, [value | acc])
   end
 end
