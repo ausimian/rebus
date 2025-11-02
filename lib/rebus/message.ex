@@ -286,8 +286,8 @@ defmodule Rebus.Message do
     flags_byte = encode_flags_byte(message.flags)
     version_byte = message.version
 
-    # Header fields as array - encode normally for now
-    header_fields_encoded = Encoder.encode("a(yv)", [header_fields_data], endianness)
+    # Header fields as array - encode at position 12 for proper struct alignment
+    header_fields_encoded = Encoder.encode_at_position("a(yv)", [header_fields_data], endianness, 12)
 
     # Build complete header as iodata
     header_fixed =
@@ -345,8 +345,8 @@ defmodule Rebus.Message do
       serial = read_uint32(serial, endianness)
       flags = decode_flags_byte(flags_byte)
 
-      # Decode header fields array - temporarily keep old decoding method
-      [header_fields_data] = Decoder.decode("a(yv)", rest, endianness)
+      # Decode header fields array - use position-aware decoding for proper struct alignment
+      [header_fields_data] = Decoder.decode_at_position("a(yv)", rest, endianness, 12)
       # Parse header fields
       header_fields = decode_header_fields(header_fields_data)
 

@@ -88,10 +88,15 @@ defmodule Rebus.Decoder do
   in a larger message, and alignment must be calculated relative to that position.
   """
   @spec decode_at_position(binary(), binary(), endianness(), non_neg_integer()) :: list()
-  def decode_at_position(signature, data, endianness, _starting_position) do
-    # For now, this just calls regular decode since position-aware decoding
-    # is complex and we'll implement it when needed
-    decode(signature, data, endianness)
+  def decode_at_position(signature, data, endianness, starting_position) do
+    # Create state with the starting position for proper alignment calculations
+    state = %{endianness: endianness, position: starting_position, data: data}
+
+    signature
+    |> parse_signature()
+    |> decode_types(state)
+    # Return just the values, not the final state
+    |> elem(0)
   end
 
   # Parse a D-Bus signature into a list of type structures (reuse encoder logic)
