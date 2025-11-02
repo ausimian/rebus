@@ -335,19 +335,40 @@ defmodule Rebus.Decoder do
     # Read array length
     {array_length, length_state} = decode_uint32(state)
 
+    # Calculate how much data this array should consume in total
+    # This includes alignment padding + the actual array data
+    alignment_padding = case get_alignment(element_type) do
+      alignment -> 
+        current_pos = length_state.position
+        aligned_pos = align_position(current_pos, alignment)
+        aligned_pos - current_pos
+    end
+    
+    total_array_size = alignment_padding + array_length
+    
+    # Extract exactly the data for this array
+    <<array_binary::binary-size(total_array_size), remaining_data::binary>> = length_state.data
+    
+    # Create a temporary state to decode just this array
+    temp_state = %{length_state | data: array_binary}
+    
     # Align to element type boundary
     element_alignment = get_alignment(element_type)
-    aligned_state = align_to(length_state, element_alignment)
+    aligned_state = align_to(temp_state, element_alignment)
 
-    # Track where array data ends
+    # Track where array data ends within this isolated binary
     array_end_position = aligned_state.position + array_length
 
     # Decode elements until we reach the end
-    {elements, _final_state} =
+    {elements, _final_temp_state} =
       decode_array_elements(element_type, aligned_state, array_end_position, [])
 
-    # Update state position to end of array
-    final_state = %{aligned_state | position: array_end_position}
+    # Return with the remaining data and updated position
+    final_state = %{
+      length_state | 
+      data: remaining_data, 
+      position: length_state.position + total_array_size
+    }
 
     {elements, final_state}
   end
