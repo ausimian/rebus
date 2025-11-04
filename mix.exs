@@ -14,7 +14,14 @@ defmodule Rebus.MixProject do
       package: package(),
       source_url: @source_url,
       elixirc_paths: elixirc_paths(Mix.env()),
-      test_coverage: [ignore_modules: [Rebus.TestServer]]
+      test_coverage: [tool: ExCoveralls, ignore_modules: [Rebus.TestServer]],
+      preferred_cli_env: [
+        coveralls: :test,
+        "coveralls.detail": :test,
+        "coveralls.post": :test,
+        "coveralls.html": :test,
+        "coveralls.json": :test
+      ]
     ]
   end
 
@@ -35,6 +42,7 @@ defmodule Rebus.MixProject do
     [
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
+      {:excoveralls, "~> 0.18", only: :test},
       {:typedstruct, "~> 0.5.0", runtime: false}
     ]
   end

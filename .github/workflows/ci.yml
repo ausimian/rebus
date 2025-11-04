@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ main, github ]
+    branches: [ main, github, codecov ]
   pull_request:
     branches: [ main ]
 
@@ -67,6 +67,26 @@ jobs:
 
     - name: Run tests with coverage
       run: mix test --cover
+      if: matrix.elixir-version == '1.18.2' && matrix.otp-version == '27.1'
+
+    - name: Generate coverage report
+      run: mix coveralls.json
+      if: matrix.elixir-version == '1.18.2' && matrix.otp-version == '27.1'
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./cover/excoveralls.json
+        flags: unittests
+        name: codecov-umbrella
+      if: matrix.elixir-version == '1.18.2' && matrix.otp-version == '27.1'
+
+    - name: Coverage Summary
+      run: |
+        # Extract coverage percentage from the console output
+        COVERAGE=$(mix coveralls.json 2>&1 | grep -o '\[TOTAL\]  [0-9.]*%' | grep -o '[0-9.]*')
+        echo "📊 Test Coverage: ${COVERAGE}%"
+        echo "COVERAGE=${COVERAGE}" >> $GITHUB_ENV
       if: matrix.elixir-version == '1.18.2' && matrix.otp-version == '27.1'
 
   dialyzer:
