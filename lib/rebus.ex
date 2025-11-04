@@ -20,7 +20,8 @@ defmodule Rebus do
   ## Quick Start
 
       # Connect to the session bus
-      {:ok, conn} = Rebus.connect(:session)
+      session = System.get_env("DBUS_SESSION_BUS_ADDRESS")
+      {:ok, conn} = Rebus.connect(%{family: :local, path: session})
 
       # Add a signal handler to receive all signals
       ref = Rebus.add_signal_handler(conn)
@@ -32,7 +33,6 @@ defmodule Rebus do
 
   Rebus supports connecting to different types of D-Bus endpoints:
 
-  - `:session` - The user's session bus (most common for desktop applications)
   - `%{family: :inet, addr: {ip, port}}` - TCP/IP connection to a remote D-Bus daemon
   - `%{family: :local, path: path}` - Unix domain socket connection to a local D-Bus daemon
 
@@ -52,13 +52,11 @@ defmodule Rebus do
   ## Examples
 
       # Connect to session bus with default options
-      {:ok, conn} = Rebus.connect(:session)
+      session = System.get_env("DBUS_SESSION_BUS_ADDRESS")
+      {:ok, conn} = Rebus.connect(%{family: :local, path: session})
 
       # Connect to a Unix domain socket
       {:ok, conn} = Rebus.connect(%{family: :local, path: "/tmp/dbus-socket"})
-
-      # Connect with custom options
-      {:ok, conn} = Rebus.connect(:session, timeout: 5000, name: :my_dbus_conn)
 
   For more advanced usage, see the documentation for `Rebus.Message` and other
   modules in this package.
@@ -100,11 +98,9 @@ defmodule Rebus do
 
   ## Notes
 
-  The returned PID is for the transport process, which is the main interface for
+  The returned PID is for the connection process, which is the main interface for
   sending and receiving D-Bus messages.
 
-  The `:session` address is a convenience that automatically resolves to the
-  user's session bus socket path from the environment.
   """
   @spec connect(address(), keyword()) :: DynamicSupervisor.on_start_child()
   def connect(address, opts \\ [])
