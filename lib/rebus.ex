@@ -60,8 +60,8 @@ defmodule Rebus do
       # Connect with custom options
       {:ok, conn} = Rebus.connect(:session, timeout: 5000, name: :my_dbus_conn)
 
-  For more advanced usage, see the documentation for `Rebus.Message`, `Rebus.Transport`,
-  and other modules in this package.
+  For more advanced usage, see the documentation for `Rebus.Message` and other
+  modules in this package.
   """
 
   @type address :: :session | :socket.sockaddr_in() | :socket.sockaddr_un()
@@ -76,7 +76,6 @@ defmodule Rebus do
   ## Parameters
 
   - `address` - The D-Bus endpoint to connect to:
-    - `:session` - Connect to the user's session bus (most common)
     - `%{family: :inet, addr: {ip, port}}` - TCP/IP connection
     - `%{family: :local, path: path}` - Unix domain socket connection
 
@@ -91,12 +90,6 @@ defmodule Rebus do
   - `{:error, reason}` - Connection failed due to the specified reason
 
   ## Examples
-
-      # Connect to the session bus
-      {:ok, conn} = Rebus.connect(:session)
-
-      # Connect with a timeout
-      {:ok, conn} = Rebus.connect(:session, timeout: 10_000)
 
       # Connect to a custom Unix socket
       {:ok, conn} = Rebus.connect(%{family: :local, path: "/tmp/my-dbus"})
@@ -202,11 +195,11 @@ defmodule Rebus do
       # ... handle signals ...
 
       # Remove the handler when done
-      :ok = Rebus.remove_signal_handler(conn, ref)
+      :ok = Rebus.delete_signal_handler(conn, ref)
 
   ## Notes
 
-  After removing a signal handler, the calling process will no longer receive
+  After deleting a signal handler, the calling process will no longer receive
   signal messages for that handler. Other signal handlers on the same connection
   (if any) will continue to receive signals normally.
 
