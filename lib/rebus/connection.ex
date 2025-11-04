@@ -67,6 +67,14 @@ defmodule Rebus.Connection do
     {:noreply, state}
   end
 
+  def handle_info({:gen_event_EXIT, {SignalHandler, ref}, _reason}, %__MODULE__{} = state) do
+    # Because handlers are addede via :gen_event.add_sup_handler/3, we receive
+    # `:gen_event_EXIT` messages when they are removed. We can use this to clean
+    # up the monitor
+    Process.demonitor(ref, [:flush])
+    {:noreply, state}
+  end
+
   @impl true
 
   def handle_continue(:hello, %__MODULE__{} = state) do
@@ -139,7 +147,7 @@ defmodule Rebus.Connection do
 
   def handle_call({:add_signal_handler, pid}, _from, %__MODULE__{} = state) do
     ref = Process.monitor(pid)
-    :ok = :gen_event.add_handler(SignalHandler, {SignalHandler, ref}, {self(), pid, ref})
+    :ok = :gen_event.add_sup_handler(SignalHandler, {SignalHandler, ref}, {self(), pid, ref})
     {:reply, ref, state}
   end
 
