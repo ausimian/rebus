@@ -24,14 +24,29 @@ defmodule Rebus.TestServer do
     field :prev, binary(), default: <<>>
     field :tap, pid()
     field :serial, non_neg_integer(), default: 1
+    field :family, :inet | :local, default: :inet
+    field :path, String.t() | nil, default: nil
   end
 
   @impl true
   def init(opts) do
-    {:ok, sock} = :socket.open(:inet, :stream, :default)
-    :ok = :socket.bind(sock, %{family: :inet, addr: :loopback, port: 0})
-    :ok = :socket.listen(sock, 5)
-    {:ok, %__MODULE__{svr_sock: sock, tap: opts[:tap]}, {:continue, :accept}}
+    family = opts[:family] || :inet
+    path = opts[:path]
+    
+    case family do
+      :inet ->
+        {:ok, sock} = :socket.open(:inet, :stream, :default)
+        :ok = :socket.bind(sock, %{family: :inet, addr: :loopback, port: 0})
+        :ok = :socket.listen(sock, 5)
+        {:ok, %__MODULE__{svr_sock: sock, tap: opts[:tap], family: family}, {:continue, :accept}}
+        
+      :local ->
+        {:ok, sock} = :socket.open(:local, :stream, :default)
+        # For Unix sockets, the path should be passed as binary
+        :ok = :socket.bind(sock, %{family: :local, path: path})
+        :ok = :socket.listen(sock, 5)
+        {:ok, %__MODULE__{svr_sock: sock, tap: opts[:tap], family: family, path: path}, {:continue, :accept}}
+    end
   end
 
   @impl true
@@ -83,6 +98,15 @@ defmodule Rebus.TestServer do
     :ok = :socket.send(state.cli_sock, bin)
     {:noreply, %{state | serial: state.serial + 1}}
   end
+
+  @impl true
+  def terminate(_reason, %__MODULE__{family: :local, path: path} = _state) when is_binary(path) do
+    # Clean up Unix socket file
+    File.rm(path)
+    :ok
+  end
+
+  def terminate(_reason, _state), do: :ok
 
   defp parse(data, %__MODULE__{} = state) do
     case Message.parse(data) do

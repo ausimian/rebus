@@ -17,8 +17,7 @@ Rebus provides a clean, Elixir-native interface for communicating over D-Bus, th
 
 ```elixir
 # Connect to a D-Bus endpoint
-address = %{family: :inet, addr: {{127, 0, 0, 1}, port: 12345}}
-{:ok, conn} = Rebus.connect(address)
+{:ok, conn} = Rebus.connect(:session)
 
 # Add a signal handler to receive D-Bus signals
 ref = Rebus.add_signal_handler(conn)

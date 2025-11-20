@@ -20,8 +20,7 @@ defmodule Rebus do
   ## Quick Start
 
       # Connect to the session bus
-      session = System.get_env("DBUS_SESSION_BUS_ADDRESS")
-      {:ok, conn} = Rebus.connect(%{family: :local, path: session})
+      {:ok, conn} = Rebus.connect(:session)
 
       # Add a signal handler to receive all signals
       ref = Rebus.add_signal_handler(conn)
@@ -33,8 +32,18 @@ defmodule Rebus do
 
   Rebus supports connecting to different types of D-Bus endpoints:
 
-  - `%{family: :inet, addr: {ip, port}}` - TCP/IP connection to a remote D-Bus daemon
+  - `:system` - Connects to the system bus using the address specified in
+     application config (see below) or the `/run/dbus/system_bus_socket` by default.
+  - `:session` - Connects to the session bus using the address specified in
+     the `DBUS_SESSION_BUS_ADDRESS` environment variable.
   - `%{family: :local, path: path}` - Unix domain socket connection to a local D-Bus daemon
+  - `%{family: :inet, addr: {ip, port}}` - TCP/IP connection to a remote D-Bus daemon
+
+  ## Configuration
+
+  You can configure the system bus address in your application's config:
+
+      config :rebus, :system_bus_address, "unix:path=/run/dbus/system_bus_socket"
 
   ## Architecture
 
@@ -52,8 +61,7 @@ defmodule Rebus do
   ## Examples
 
       # Connect to session bus with default options
-      session = System.get_env("DBUS_SESSION_BUS_ADDRESS")
-      {:ok, conn} = Rebus.connect(%{family: :local, path: session})
+      {:ok, conn} = Rebus.connect(:session)
 
       # Connect to a Unix domain socket
       {:ok, conn} = Rebus.connect(%{family: :local, path: "/tmp/dbus-socket"})
@@ -62,7 +70,9 @@ defmodule Rebus do
   modules in this package.
   """
 
-  @type address :: :session | :socket.sockaddr_in() | :socket.sockaddr_un()
+  @type address :: :system | :session | :socket.sockaddr_in() | :socket.sockaddr_un()
+
+  @default_system_bus_address "unix:path=/run/dbus/system_bus_socket"
 
   @doc """
   Establishes a connection to a D-Bus message bus.
@@ -74,8 +84,12 @@ defmodule Rebus do
   ## Parameters
 
   - `address` - The D-Bus endpoint to connect to:
-    - `%{family: :inet, addr: {ip, port}}` - TCP/IP connection
-    - `%{family: :local, path: path}` - Unix domain socket connection
+    - `:system` - Connects to the system bus using the address specified in
+       application config (see below) or the `/run/dbus/system_bus_socket` by default.
+    - `:session` - Connects to the session bus using the address specified in
+       the `DBUS_SESSION_BUS_ADDRESS` environment variable.
+    - `%{family: :local, path: path}` - Unix domain socket connection to a local D-Bus daemon
+    - `%{family: :inet, addr: {ip, port}}` - TCP/IP connection to a remote D-Bus daemon
 
   - `opts` - Optional keyword list of connection options:
     - `:timeout` - Connection timeout in milliseconds (default: 5000)
@@ -105,6 +119,26 @@ defmodule Rebus do
   @spec connect(address(), keyword()) :: DynamicSupervisor.on_start_child()
   def connect(address, opts \\ [])
 
+  def connect(:system, opts) do
+    case Application.get_env(:rebus, :system_bus_address, @default_system_bus_address) do
+      nil ->
+        {:error, :no_system_bus_address}
+
+      "unix:path=" <> address ->
+        connect(%{family: :local, path: address}, opts)
+    end
+  end
+
+  def connect(:session, opts) do
+    case System.get_env("DBUS_SESSION_BUS_ADDRESS") do
+      nil ->
+        {:error, :no_session_bus_address}
+
+      "unix:path=" <> address ->
+        connect(%{family: :local, path: address}, opts)
+    end
+  end
+
   def connect(%{family: family} = addr, opts) when family in [:inet, :local] do
     args =
       opts
@@ -112,6 +146,17 @@ defmodule Rebus do
 
     child_spec = {Rebus.Connection, args}
     DynamicSupervisor.start_child(Rebus.ConnectionSupervisor, child_spec)
+  end
+
+  @doc """
+  Same as `connect/2`, but raises an exception on failure.
+  """
+  @spec connect!(address(), keyword()) :: pid()
+  def connect!(address, opts \\ []) do
+    case connect(address, opts) do
+      {:ok, pid} -> pid
+      {:error, reason} -> raise "Failed to connect to D-Bus: #{inspect(reason)}"
+    end
   end
 
   @doc """
