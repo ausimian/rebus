@@ -21,3 +21,6 @@ rebus-*.tar
 
 # Temporary files, for example, from tests.
 /tmp/
+
+# Erlang/Elixir shell history file.
+/.erl.history/
