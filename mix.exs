@@ -15,7 +15,10 @@ defmodule Rebus.MixProject do
       source_url: @source_url,
       elixirc_paths: elixirc_paths(Mix.env()),
       test_coverage: [ignore_modules: [Rebus.TestServer]],
-      dialyzer: [plt_core_path: "priv/plts", plt_file: {:no_warn, "priv/plts/dialyzer.plt"}]
+      dialyzer: [
+        plt_core_path: "priv/plts",
+        plt_file: {:no_warn, "priv/plts/dialyzer-#{Mix.env()}.plt"}
+      ]
     ]
   end
 
