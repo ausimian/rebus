@@ -36,8 +36,10 @@ defmodule RebusTest do
     test "can be established with unix socket" do
       # Use a short path to avoid Unix socket path length limit (108 bytes)
       socket_path = "/tmp/rebus_test_#{:erlang.unique_integer([:positive])}.sock"
-      {:ok, svr} = start_supervised({Rebus.TestServer, tap: self(), family: :local, path: socket_path})
-      
+
+      {:ok, svr} =
+        start_supervised({Rebus.TestServer, tap: self(), family: :local, path: socket_path})
+
       {:ok, _cli} = Rebus.connect(%{family: :local, path: socket_path})
 
       assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
@@ -47,15 +49,19 @@ defmodule RebusTest do
   describe "Connection address parsing" do
     test ":system parses unix:path= format" do
       # Test with a non-existent path to verify parsing works
-      Application.put_env(:rebus, :system_bus_address, "unix:path=/tmp/nonexistent-test-system-bus")
-      
+      Application.put_env(
+        :rebus,
+        :system_bus_address,
+        "unix:path=/tmp/nonexistent-test-system-bus"
+      )
+
       # This will fail to connect but tests address parsing
       result = Rebus.connect(:system)
-      
+
       # Should get a connection error, not a parsing error
       assert {:error, reason} = result
       assert reason != :no_system_bus_address
-      
+
       # Clean up
       Application.delete_env(:rebus, :system_bus_address)
     end
@@ -63,9 +69,9 @@ defmodule RebusTest do
     test ":system returns error when address is nil" do
       # Temporarily set address to nil
       Application.put_env(:rebus, :system_bus_address, nil)
-      
+
       assert {:error, :no_system_bus_address} = Rebus.connect(:system)
-      
+
       # Clean up
       Application.delete_env(:rebus, :system_bus_address)
     end
@@ -73,14 +79,14 @@ defmodule RebusTest do
     test ":session parses unix:path= format" do
       # Test with a non-existent path to verify parsing works
       System.put_env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/nonexistent-test-session-bus")
-      
+
       # This will fail to connect but tests address parsing
       result = Rebus.connect(:session)
-      
+
       # Should get a connection error, not a parsing error
       assert {:error, reason} = result
       assert reason != :no_session_bus_address
-      
+
       # Clean up
       System.delete_env("DBUS_SESSION_BUS_ADDRESS")
     end
@@ -89,9 +95,9 @@ defmodule RebusTest do
       # Ensure the environment variable is not set
       original_value = System.get_env("DBUS_SESSION_BUS_ADDRESS")
       System.delete_env("DBUS_SESSION_BUS_ADDRESS")
-      
+
       assert {:error, :no_session_bus_address} = Rebus.connect(:session)
-      
+
       # Restore original value if it existed
       if original_value do
         System.put_env("DBUS_SESSION_BUS_ADDRESS", original_value)

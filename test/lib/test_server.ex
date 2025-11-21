@@ -32,20 +32,22 @@ defmodule Rebus.TestServer do
   def init(opts) do
     family = opts[:family] || :inet
     path = opts[:path]
-    
+
     case family do
       :inet ->
         {:ok, sock} = :socket.open(:inet, :stream, :default)
         :ok = :socket.bind(sock, %{family: :inet, addr: :loopback, port: 0})
         :ok = :socket.listen(sock, 5)
         {:ok, %__MODULE__{svr_sock: sock, tap: opts[:tap], family: family}, {:continue, :accept}}
-        
+
       :local ->
         {:ok, sock} = :socket.open(:local, :stream, :default)
         # For Unix sockets, the path should be passed as binary
         :ok = :socket.bind(sock, %{family: :local, path: path})
         :ok = :socket.listen(sock, 5)
-        {:ok, %__MODULE__{svr_sock: sock, tap: opts[:tap], family: family, path: path}, {:continue, :accept}}
+
+        {:ok, %__MODULE__{svr_sock: sock, tap: opts[:tap], family: family, path: path},
+         {:continue, :accept}}
     end
   end
 
