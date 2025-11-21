@@ -29,8 +29,10 @@ defmodule Rebus.Message do
   - `:reply_serial` - Serial of message being replied to (required for ERROR and METHOD_RETURN)
   - `:destination` - Target connection name (optional)
   - `:sender` - Sending connection name (optional, usually set by message bus)
-  - `:signature` - Signature of message body (optional, defaults to empty)
+  - `:signature` - Signature of message body (optional, defaults to empty, automatically added to header_fields when body is present)
   - `:unix_fds` - Number of Unix file descriptors (optional)
+
+  Note: The signature is stored in `header_fields[:signature]` and can be accessed using `Rebus.Message.signature/1`.
 
   ## Message Flags
 
@@ -99,8 +101,7 @@ defmodule Rebus.Message do
           body_length: non_neg_integer(),
           serial: non_neg_integer(),
           header_fields: %{optional(header_field()) => term()},
-          body: [term()],
-          signature: String.t()
+          body: [term()]
         }
 
   defstruct [
@@ -110,8 +111,7 @@ defmodule Rebus.Message do
     :body_length,
     :serial,
     :header_fields,
-    :body,
-    :signature
+    :body
   ]
 
   # Message type constants
@@ -213,6 +213,12 @@ defmodule Rebus.Message do
          {:ok, header_fields} <- extract_header_fields(opts),
          {:ok, validated_fields} <- validate_header_fields(header_fields),
          :ok <- validate_required_fields(validated_type, header_fields) do
+      # Add signature to header_fields if body is present
+      validated_fields =
+        if signature != "",
+          do: Map.put(validated_fields, :signature, signature),
+          else: validated_fields
+
       body_length = if body == [], do: 0, else: calculate_body_length(body, signature)
 
       message = %__MODULE__{
@@ -222,8 +228,7 @@ defmodule Rebus.Message do
         body_length: body_length,
         serial: 0,
         header_fields: validated_fields,
-        body: body,
-        signature: signature
+        body: body
       }
 
       {:ok, message}
@@ -277,7 +282,8 @@ defmodule Rebus.Message do
       if message.body == [] do
         []
       else
-        Encoder.encode(message.signature, message.body, endianness)
+        signature = Map.get(message.header_fields, :signature, "")
+        Encoder.encode(signature, message.body, endianness)
       end
 
     # Calculate actual body length
@@ -372,11 +378,11 @@ defmodule Rebus.Message do
         # Decode body if present
         signature = Map.get(header_fields, :signature, "")
 
-        {body, final_signature} =
+        body =
           if signature == "" or body_length == 0 do
-            {[], ""}
+            []
           else
-            {Decoder.decode(signature, body_binary, endianness), signature}
+            Decoder.decode(signature, body_binary, endianness)
           end
 
         message = %__MODULE__{
@@ -386,8 +392,7 @@ defmodule Rebus.Message do
           body_length: body_length,
           serial: serial,
           header_fields: header_fields,
-          body: body,
-          signature: final_signature
+          body: body
         }
 
         {:ok, message}
@@ -496,10 +501,12 @@ defmodule Rebus.Message do
   """
   @spec validate(t()) :: :ok | {:error, String.t()}
   def validate(%__MODULE__{} = message) do
+    signature = Map.get(message.header_fields, :signature, "")
+
     with :ok <- validate_message_type(message.type),
          :ok <- validate_required_fields(message.type, message.header_fields),
          :ok <- validate_header_field_types(message.header_fields),
-         :ok <- validate_signature_format(message.signature) do
+         :ok <- validate_signature_format(signature) do
       :ok
     end
   end
@@ -525,6 +532,26 @@ defmodule Rebus.Message do
       nil -> {:error, :invalid_message_type}
       type -> {:ok, type}
     end
+  end
+
+  @doc """
+  Gets the signature from the message header fields.
+
+  Returns the signature string if present, or an empty string if not.
+
+  ## Examples
+
+      iex> message = Rebus.Message.new!(:signal, path: "/", interface: "test", member: "Test", body: [42], signature: "i")
+      iex> Rebus.Message.signature(message)
+      "i"
+
+      iex> message = Rebus.Message.new!(:signal, path: "/", interface: "test", member: "Test")
+      iex> Rebus.Message.signature(message)
+      ""
+  """
+  @spec signature(t()) :: String.t()
+  def signature(%__MODULE__{} = message) do
+    Map.get(message.header_fields, :signature, "")
   end
 
   # Private helper functions
