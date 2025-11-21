@@ -28,7 +28,7 @@ defmodule Rebus.MessageTest do
       assert message.header_fields.member == "TestMethod"
       assert message.header_fields.destination == "com.example.Service"
       assert message.body == [42, "hello"]
-      assert message.signature == "is"
+      assert Message.signature(message) == "is"
       assert message.version == 1
       assert message.flags == []
     end
@@ -48,7 +48,7 @@ defmodule Rebus.MessageTest do
       assert message.header_fields.interface == "com.example.Interface"
       assert message.header_fields.member == "TestSignal"
       assert message.body == ["signal_value"]
-      assert message.signature == "s"
+      assert Message.signature(message) == "s"
     end
 
     test "creates a valid error message" do
@@ -64,7 +64,7 @@ defmodule Rebus.MessageTest do
       assert message.header_fields.error_name == "com.example.Error.TestError"
       assert message.header_fields.reply_serial == 123
       assert message.body == ["Error message"]
-      assert message.signature == "s"
+      assert Message.signature(message) == "s"
     end
 
     test "creates a valid method return message" do
@@ -78,7 +78,7 @@ defmodule Rebus.MessageTest do
       assert message.type == :method_return
       assert message.header_fields.reply_serial == 456
       assert message.body == [789]
-      assert message.signature == "i"
+      assert Message.signature(message) == "i"
     end
 
     test "supports message flags" do
@@ -103,7 +103,7 @@ defmodule Rebus.MessageTest do
                )
 
       # Should auto-generate a signature for int, string, boolean
-      assert message.signature == "isb"
+      assert Message.signature(message) == "isb"
     end
 
     test "uses empty signature for empty body" do
@@ -114,7 +114,7 @@ defmodule Rebus.MessageTest do
                  member: "Test"
                )
 
-      assert message.signature == ""
+      assert Message.signature(message) == ""
       assert message.body == []
       assert message.body_length == 0
     end
@@ -245,7 +245,7 @@ defmodule Rebus.MessageTest do
       assert decoded.version == original.version
       assert decoded.serial == original.serial
       assert decoded.body == original.body
-      assert decoded.signature == original.signature
+      assert Message.signature(decoded) == Message.signature(original)
 
       # Check header fields
       assert decoded.header_fields.path == original.header_fields.path
@@ -268,7 +268,7 @@ defmodule Rebus.MessageTest do
       assert decoded.type == original.type
       assert decoded.serial == original.serial
       assert decoded.body == []
-      assert decoded.signature == ""
+      assert Message.signature(decoded) == ""
       assert decoded.body_length == 0
     end
 
@@ -343,7 +343,7 @@ defmodule Rebus.MessageTest do
       assert {:ok, decoded} = Message.decode(encoded)
 
       assert decoded.body == original.body
-      assert decoded.signature == original.signature
+      assert Message.signature(decoded) == Message.signature(original)
     end
   end
 
@@ -364,7 +364,6 @@ defmodule Rebus.MessageTest do
         type: :method_call,
         header_fields: %{member: "Test"},
         body: [],
-        signature: "",
         flags: [],
         version: 1,
         serial: 1,
@@ -381,10 +380,10 @@ defmodule Rebus.MessageTest do
         header_fields: %{
           path: "/test",
           interface: "test.interface",
-          member: "Test"
+          member: "Test",
+          signature: "invalid!@#$%"
         },
         body: [],
-        signature: "invalid!@#$%",
         flags: [],
         version: 1,
         serial: 1,
@@ -896,7 +895,7 @@ defmodule Rebus.MessageTest do
           body: []
         )
 
-      assert message.signature == ""
+      assert Message.signature(message) == ""
 
       # Test with byte (0-255) - but auto-generated signature is 'i' for int32
       {:ok, message} =
@@ -908,7 +907,7 @@ defmodule Rebus.MessageTest do
         )
 
       # Auto-generated signature treats integers as int32 ('i') due to clause order
-      assert message.signature == "i"
+      assert Message.signature(message) == "i"
 
       # Test with larger integer (outside int32 range)
       {:ok, message} =
@@ -919,7 +918,7 @@ defmodule Rebus.MessageTest do
           body: [3_000_000_000]
         )
 
-      assert message.signature == "x"
+      assert Message.signature(message) == "x"
 
       # Test with string
       {:ok, message} =
@@ -930,7 +929,7 @@ defmodule Rebus.MessageTest do
           body: ["hello"]
         )
 
-      assert message.signature == "s"
+      assert Message.signature(message) == "s"
 
       # Test with boolean
       {:ok, message} =
@@ -941,7 +940,7 @@ defmodule Rebus.MessageTest do
           body: [true]
         )
 
-      assert message.signature == "b"
+      assert Message.signature(message) == "b"
 
       # Test with float
       {:ok, message} =
@@ -952,7 +951,7 @@ defmodule Rebus.MessageTest do
           body: [3.14]
         )
 
-      assert message.signature == "d"
+      assert Message.signature(message) == "d"
 
       # Test with array
       {:ok, message} =
@@ -963,7 +962,7 @@ defmodule Rebus.MessageTest do
           body: [["hello", "world"]]
         )
 
-      assert message.signature == "as"
+      assert Message.signature(message) == "as"
 
       # Test with empty array
       {:ok, message} =
@@ -974,7 +973,7 @@ defmodule Rebus.MessageTest do
           body: [[]]
         )
 
-      assert message.signature == "as"
+      assert Message.signature(message) == "as"
 
       # Test with mixed types (integer, string, boolean)
       {:ok, message} =
@@ -986,7 +985,7 @@ defmodule Rebus.MessageTest do
         )
 
       # int32, string, boolean
-      assert message.signature == "isb"
+      assert Message.signature(message) == "isb"
 
       # Test with variant (unsupported type)
       {:ok, message} =
@@ -997,7 +996,7 @@ defmodule Rebus.MessageTest do
           body: [%{key: "value"}]
         )
 
-      assert message.signature == "v"
+      assert Message.signature(message) == "v"
     end
   end
 
@@ -1099,8 +1098,7 @@ defmodule Rebus.MessageTest do
           member: "Test",
           signature: "invalid_signature!"
         },
-        body: ["test"],
-        signature: "invalid_signature!"
+        body: ["test"]
       }
 
       # The validation should catch the invalid signature
@@ -1144,7 +1142,7 @@ defmodule Rebus.MessageTest do
             body: [value]
           )
 
-        assert message.signature == expected_sig
+        assert Message.signature(message) == expected_sig
       end
     end
 
@@ -1193,8 +1191,7 @@ defmodule Rebus.MessageTest do
           member: "Test",
           signature: "s"
         },
-        body: [],
-        signature: "s"
+        body: []
       }
 
       # This should still validate the basic structure
@@ -1269,8 +1266,7 @@ defmodule Rebus.MessageTest do
           interface: "test.interface",
           member: "Test"
         },
-        body: [],
-        signature: ""
+        body: []
       }
 
       # This should still encode successfully due to error handling
@@ -1351,7 +1347,7 @@ defmodule Rebus.MessageTest do
       assert parsed_message.type == original_message.type
       assert parsed_message.header_fields == original_message.header_fields
       assert parsed_message.body == original_message.body
-      assert parsed_message.signature == original_message.signature
+      assert Message.signature(parsed_message) == Message.signature(original_message)
     end
 
     test "successfully parses message with extra data" do
