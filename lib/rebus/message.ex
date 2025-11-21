@@ -70,6 +70,8 @@ defmodule Rebus.Message do
       ...> )
   """
 
+  use TypedStruct
+
   alias Rebus.Encoder
   alias Rebus.Decoder
 
@@ -93,26 +95,16 @@ defmodule Rebus.Message do
           | :signature
           | :unix_fds
 
-  @typedoc "Message structure"
-  @type t :: %__MODULE__{
-          type: message_type(),
-          flags: [flag()],
-          version: non_neg_integer(),
-          body_length: non_neg_integer(),
-          serial: non_neg_integer(),
-          header_fields: %{optional(header_field()) => term()},
-          body: [term()]
-        }
-
-  defstruct [
-    :type,
-    :flags,
-    :version,
-    :body_length,
-    :serial,
-    :header_fields,
-    :body
-  ]
+  typedstruct enforce: true do
+    @typedoc "D-Bus message structure"
+    field :type, message_type()
+    field :flags, [flag()]
+    field :version, non_neg_integer()
+    field :body_length, non_neg_integer()
+    field :serial, non_neg_integer()
+    field :header_fields, %{optional(header_field()) => term()}
+    field :body, [term()]
+  end
 
   # Message type constants
   @message_types %{
