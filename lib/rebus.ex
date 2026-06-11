@@ -270,15 +270,23 @@ defmodule Rebus do
   """
   @spec reply(pid(), Rebus.Message.t(), [term()], String.t() | nil) :: :ok | {:error, term()}
   def reply(conn, %Rebus.Message{} = request, body \\ [], signature \\ nil) do
-    opts = [
-      reply_serial: request.serial,
-      destination: request.header_fields[:sender],
-      body: body,
-      flags: [:no_reply_expected]
-    ]
+    if no_reply_expected?(request) do
+      # The caller flagged the method call NO_REPLY_EXPECTED (e.g. org.bluez
+      # AdvertisementMonitor1.DeviceFound). Sending a method_return anyway is an
+      # unsolicited reply the bus policy rejects ("Rejected send message ...
+      # requested_reply=0"), so skip it.
+      :ok
+    else
+      opts = [
+        reply_serial: request.serial,
+        destination: request.header_fields[:sender],
+        body: body,
+        flags: [:no_reply_expected]
+      ]
 
-    opts = if signature, do: Keyword.put(opts, :signature, signature), else: opts
-    Rebus.Connection.send(conn, Rebus.Message.new!(:method_return, opts))
+      opts = if signature, do: Keyword.put(opts, :signature, signature), else: opts
+      Rebus.Connection.send(conn, Rebus.Message.new!(:method_return, opts))
+    end
   end
 
   @doc """
@@ -287,16 +295,24 @@ defmodule Rebus do
   """
   @spec reply_error(pid(), Rebus.Message.t(), String.t(), String.t()) :: :ok | {:error, term()}
   def reply_error(conn, %Rebus.Message{} = request, error_name, message) do
-    Rebus.Connection.send(
-      conn,
-      Rebus.Message.new!(:error,
-        error_name: error_name,
-        reply_serial: request.serial,
-        destination: request.header_fields[:sender],
-        body: [message],
-        signature: "s",
-        flags: [:no_reply_expected]
+    if no_reply_expected?(request) do
+      :ok
+    else
+      Rebus.Connection.send(
+        conn,
+        Rebus.Message.new!(:error,
+          error_name: error_name,
+          reply_serial: request.serial,
+          destination: request.header_fields[:sender],
+          body: [message],
+          signature: "s",
+          flags: [:no_reply_expected]
+        )
       )
-    )
+    end
+  end
+
+  defp no_reply_expected?(%Rebus.Message{flags: flags}) do
+    is_list(flags) and :no_reply_expected in flags
   end
 end
