@@ -248,4 +248,55 @@ defmodule Rebus do
   subsequent calls will simply return `:ok` without error.
   """
   defdelegate delete_signal_handler(conn, ref), to: Rebus.Connection
+
+  # ── Service-side API (fork addition: bbangert/rebus, branch dbus-service) ──
+  #
+  # Upstream rebus is a pure client. These let a process act as a D-Bus
+  # *service* — receive inbound method calls and reply — which is required to
+  # export objects (e.g. an org.bluez AdvertisementMonitor for passive BLE
+  # scanning).
+
+  @doc """
+  Register `handler` to receive inbound method calls on `conn` as
+  `{:dbus_call, %Rebus.Message{type: :method_call}}` messages. The handler
+  replies with `reply/4` or `reply_error/4`.
+  """
+  defdelegate set_method_handler(conn, handler), to: Rebus.Connection
+
+  @doc """
+  Reply to an inbound method call `request` with a `:method_return`. `body` is
+  the reply arguments (default none); pass `signature` when the body is
+  non-empty (e.g. `"a{sv}"`).
+  """
+  @spec reply(pid(), Rebus.Message.t(), [term()], String.t() | nil) :: :ok | {:error, term()}
+  def reply(conn, %Rebus.Message{} = request, body \\ [], signature \\ nil) do
+    opts = [
+      reply_serial: request.serial,
+      destination: request.header_fields[:sender],
+      body: body,
+      flags: [:no_reply_expected]
+    ]
+
+    opts = if signature, do: Keyword.put(opts, :signature, signature), else: opts
+    Rebus.Connection.send(conn, Rebus.Message.new!(:method_return, opts))
+  end
+
+  @doc """
+  Reply to an inbound method call `request` with a D-Bus error
+  (e.g. `"org.freedesktop.DBus.Error.UnknownMethod"`).
+  """
+  @spec reply_error(pid(), Rebus.Message.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def reply_error(conn, %Rebus.Message{} = request, error_name, message) do
+    Rebus.Connection.send(
+      conn,
+      Rebus.Message.new!(:error,
+        error_name: error_name,
+        reply_serial: request.serial,
+        destination: request.header_fields[:sender],
+        body: [message],
+        signature: "s",
+        flags: [:no_reply_expected]
+      )
+    )
+  end
 end
