@@ -170,6 +170,36 @@ defmodule RebusTest do
 
       assert_receive {^ref, %Message{body: ["foobar"]}}
     end
+
+    test "emit_signal/2 emits a fire-and-forget signal", %{cli: cli, svr: svr} do
+      # A realistic GATT notification body (PropertiesChanged with an `ay` Value).
+      # emit_signal returns :ok synchronously: if the :signal were treated like a
+      # method_call it would land in the pending-reply table and block until a
+      # reply that never comes. Returning :ok proves it skips that table.
+      assert :ok =
+               Rebus.emit_signal(cli,
+                 path: "/up/improv/service0/char0",
+                 interface: "org.freedesktop.DBus.Properties",
+                 member: "PropertiesChanged",
+                 signature: "sa{sv}as",
+                 body: [
+                   "org.bluez.GattCharacteristic1",
+                   [{"Value", {"ay", [1, 2, 3]}}],
+                   []
+                 ]
+               )
+
+      assert_receive {^svr, %Message{type: :signal} = rcvd}
+      assert rcvd.header_fields[:path] == "/up/improv/service0/char0"
+      assert rcvd.header_fields[:interface] == "org.freedesktop.DBus.Properties"
+      assert rcvd.header_fields[:member] == "PropertiesChanged"
+
+      assert [
+               "org.bluez.GattCharacteristic1",
+               [{"Value", {"ay", [1, 2, 3]}}],
+               []
+             ] = rcvd.body
+    end
   end
 
   defp server_setup(_) do

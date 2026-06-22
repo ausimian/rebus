@@ -1,6 +1,7 @@
 defmodule Rebus.EncoderTest do
   use ExUnit.Case, async: true
 
+  alias Rebus.Decoder
   alias Rebus.Encoder
 
   describe "basic types" do
@@ -169,6 +170,31 @@ defmodule Rebus.EncoderTest do
       assert rest8 == <<>>
       # Just verify we got some reasonable length
       assert array_length > 0
+    end
+
+    # Regression: a GATT Properties.GetAll can legitimately return an empty
+    # `a{sv}`, and a notification body carries an empty trailing `as`. The
+    # existing client never emits an empty container, so guard the length +
+    # alignment accounting here. (Spec: array = UINT32 length of element data
+    # only, then padding to the element's alignment boundary even when empty.)
+    test "encodes empty a{sv} as zero-length with 8-byte alignment padding" do
+      binary = "a{sv}" |> then(&Encoder.encode(&1, [[]])) |> IO.iodata_to_binary()
+
+      # length field = 0 (no element bytes), then 4 bytes padding to the
+      # dict-entry 8-byte boundary. Length must NOT count the padding.
+      assert binary == <<0, 0, 0, 0, 0, 0, 0, 0>>
+      assert Decoder.decode("a{sv}", binary) == [[]]
+    end
+
+    test "encodes empty as / ay as a bare zero-length field" do
+      # string/byte elements align to 4/1, so an empty array is just the length.
+      as = "as" |> then(&Encoder.encode(&1, [[]])) |> IO.iodata_to_binary()
+      ay = "ay" |> then(&Encoder.encode(&1, [[]])) |> IO.iodata_to_binary()
+
+      assert as == <<0, 0, 0, 0>>
+      assert ay == <<0, 0, 0, 0>>
+      assert Decoder.decode("as", as) == [[]]
+      assert Decoder.decode("ay", ay) == [[]]
     end
   end
 

@@ -315,4 +315,22 @@ defmodule Rebus do
   defp no_reply_expected?(%Rebus.Message{flags: flags}) do
     is_list(flags) and :no_reply_expected in flags
   end
+
+  @doc """
+  Emit a D-Bus `:signal` on `conn`.
+
+  `opts` are forwarded to `Rebus.Message.new!/2` and must include `:path`,
+  `:interface`, and `:member`. Pass `:body` and `:signature` when the signal
+  carries arguments, and an optional `:destination` to direct it at one peer.
+
+  Unlike `reply/4`, a signal is fire-and-forget: the transport skips the
+  pending-reply table, so there is nothing to await — this returns `:ok` as
+  soon as the frame is written. Used to push GATT notifications, e.g. a
+  `org.freedesktop.DBus.Properties.PropertiesChanged` on an exported
+  characteristic object.
+  """
+  @spec emit_signal(pid(), keyword()) :: :ok | {:error, term()}
+  def emit_signal(conn, opts) when is_pid(conn) and is_list(opts) do
+    Rebus.Connection.send(conn, Rebus.Message.new!(:signal, opts))
+  end
 end
