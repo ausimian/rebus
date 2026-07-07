@@ -248,4 +248,89 @@ defmodule Rebus do
   subsequent calls will simply return `:ok` without error.
   """
   defdelegate delete_signal_handler(conn, ref), to: Rebus.Connection
+
+  # ── Service-side API (fork addition: bbangert/rebus, branch dbus-service) ──
+  #
+  # Upstream rebus is a pure client. These let a process act as a D-Bus
+  # *service* — receive inbound method calls and reply — which is required to
+  # export objects (e.g. an org.bluez AdvertisementMonitor for passive BLE
+  # scanning).
+
+  @doc """
+  Register `handler` to receive inbound method calls on `conn` as
+  `{:dbus_call, %Rebus.Message{type: :method_call}}` messages. The handler
+  replies with `reply/4` or `reply_error/4`.
+  """
+  defdelegate set_method_handler(conn, handler), to: Rebus.Connection
+
+  @doc """
+  Reply to an inbound method call `request` with a `:method_return`. `body` is
+  the reply arguments (default none); pass `signature` when the body is
+  non-empty (e.g. `"a{sv}"`).
+  """
+  @spec reply(pid(), Rebus.Message.t(), [term()], String.t() | nil) :: :ok | {:error, term()}
+  def reply(conn, %Rebus.Message{} = request, body \\ [], signature \\ nil) do
+    if no_reply_expected?(request) do
+      # The caller flagged the method call NO_REPLY_EXPECTED (e.g. org.bluez
+      # AdvertisementMonitor1.DeviceFound). Sending a method_return anyway is an
+      # unsolicited reply the bus policy rejects ("Rejected send message ...
+      # requested_reply=0"), so skip it.
+      :ok
+    else
+      opts = [
+        reply_serial: request.serial,
+        destination: request.header_fields[:sender],
+        body: body,
+        flags: [:no_reply_expected]
+      ]
+
+      opts = if signature, do: Keyword.put(opts, :signature, signature), else: opts
+      Rebus.Connection.send(conn, Rebus.Message.new!(:method_return, opts))
+    end
+  end
+
+  @doc """
+  Reply to an inbound method call `request` with a D-Bus error
+  (e.g. `"org.freedesktop.DBus.Error.UnknownMethod"`).
+  """
+  @spec reply_error(pid(), Rebus.Message.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def reply_error(conn, %Rebus.Message{} = request, error_name, message) do
+    if no_reply_expected?(request) do
+      :ok
+    else
+      Rebus.Connection.send(
+        conn,
+        Rebus.Message.new!(:error,
+          error_name: error_name,
+          reply_serial: request.serial,
+          destination: request.header_fields[:sender],
+          body: [message],
+          signature: "s",
+          flags: [:no_reply_expected]
+        )
+      )
+    end
+  end
+
+  defp no_reply_expected?(%Rebus.Message{flags: flags}) do
+    is_list(flags) and :no_reply_expected in flags
+  end
+
+  @doc """
+  Emit a D-Bus `:signal` on `conn`.
+
+  `opts` are forwarded to `Rebus.Message.new!/2` and must include `:path`,
+  `:interface`, and `:member`. Pass `:body` and `:signature` when the signal
+  carries arguments, and an optional `:destination` to direct it at one peer.
+
+  Unlike `reply/4`, a signal is fire-and-forget: the transport skips the
+  pending-reply table, so there is nothing to await — this returns `:ok` as
+  soon as the frame is written. Used to push GATT notifications, e.g. a
+  `org.freedesktop.DBus.Properties.PropertiesChanged` on an exported
+  characteristic object.
+  """
+  @spec emit_signal(pid(), keyword()) :: :ok | {:error, term()}
+  def emit_signal(conn, opts) when is_pid(conn) and is_list(opts) do
+    Rebus.Connection.send(conn, Rebus.Message.new!(:signal, opts))
+  end
 end

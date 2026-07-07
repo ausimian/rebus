@@ -20,6 +20,16 @@ defmodule Rebus.Connection do
     GenServer.call(conn, {:delete_signal_handler, ref})
   end
 
+  @doc """
+  Register a process to receive inbound method calls (fork addition). The
+  process receives `{:dbus_call, %Rebus.Message{type: :method_call}}` messages
+  and should reply via `Rebus.reply/4` / `Rebus.reply_error/4`.
+  """
+  @spec set_method_handler(pid(), pid()) :: :ok
+  def set_method_handler(conn, handler) when is_pid(conn) and is_pid(handler) do
+    GenServer.call(conn, {:set_method_handler, handler})
+  end
+
   @spec start_link(keyword()) :: :ignore | {:error, any()} | {:ok, pid()}
   def start_link(args) do
     GenServer.start_link(__MODULE__, args)
@@ -33,6 +43,12 @@ defmodule Rebus.Connection do
     field :name, binary() | nil, default: nil
     field :serial, non_neg_integer(), default: 1
     field :pending, %{non_neg_integer() => :gen_statem.from()}, default: %{}
+    # Downstream fork addition (bbangert/rebus, branch dbus-service): a process
+    # that receives inbound method calls as `{:dbus_call, %Message{}}` so this
+    # connection can act as a D-Bus *service* (needed to export an org.bluez
+    # AdvertisementMonitor for passive scanning). Upstream rebus is client-only
+    # and would crash on an inbound method call.
+    field :method_handler, pid() | nil, default: nil
   end
 
   @impl true
@@ -157,6 +173,10 @@ defmodule Rebus.Connection do
     {:reply, :ok, state}
   end
 
+  def handle_call({:set_method_handler, handler}, _from, %__MODULE__{} = state) do
+    {:reply, :ok, %{state | method_handler: handler}}
+  end
+
   defp parse(data, %__MODULE__{} = state) do
     case Message.parse(data) do
       {:ok, %Message{header_fields: %{reply_serial: 1}} = msg, rest} when is_nil(state.name) ->
@@ -168,6 +188,9 @@ defmodule Rebus.Connection do
       {:ok, %Message{type: :signal} = msg, rest} ->
         parse(rest, notify(msg, state))
 
+      {:ok, %Message{type: :method_call} = msg, rest} ->
+        parse(rest, dispatch_call(msg, state))
+
       nil ->
         # Incomplete message, store data for next recv
         {:noreply, %{state | prev: data}, {:continue, :recv}}
@@ -176,6 +199,19 @@ defmodule Rebus.Connection do
         {:stop, reason}
     end
   end
+
+  # Fork addition: deliver an inbound method call to the registered handler.
+  # With no handler set, drop it (the service registers its handler before it
+  # exposes any object, so org.bluez never calls us unhandled).
+  defp dispatch_call(%Message{} = msg, %__MODULE__{method_handler: pid} = state)
+       when is_pid(pid) do
+    # Kernel.send/2 explicitly: this module defines a local send/2 (the
+    # client-side method-call sender), which would otherwise shadow it.
+    Kernel.send(pid, {:dbus_call, msg})
+    state
+  end
+
+  defp dispatch_call(%Message{}, %__MODULE__{} = state), do: state
 
   defp notify(%Message{} = msg, %__MODULE__{name: name} = state) do
     case msg do
