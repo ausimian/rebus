@@ -1,7 +1,30 @@
 defmodule Rebus.DecoderTest do
   use ExUnit.Case, async: true
 
-  alias Rebus.{Encoder, Decoder}
+  alias Rebus.{Decoder, Encoder, Message}
+
+  defp nested_array_signature(depth), do: String.duplicate("a", depth) <> "i"
+
+  defp nested_array_value(0), do: 42
+  defp nested_array_value(depth), do: [nested_array_value(depth - 1)]
+
+  defp nested_struct_signature(0), do: "i"
+  defp nested_struct_signature(depth), do: "(" <> nested_struct_signature(depth - 1) <> ")"
+
+  defp nested_struct_value(0), do: 42
+  defp nested_struct_value(depth), do: [nested_struct_value(depth - 1)]
+
+  defp interleaved_array_struct_signature(0), do: "i"
+
+  defp interleaved_array_struct_signature(depth) do
+    "a(" <> interleaved_array_struct_signature(depth - 1) <> ")"
+  end
+
+  defp interleaved_array_struct_value(0), do: 42
+  defp interleaved_array_struct_value(depth), do: [[interleaved_array_struct_value(depth - 1)]]
+
+  defp nested_variant(0), do: {"i", 42}
+  defp nested_variant(depth), do: {"v", nested_variant(depth - 1)}
 
   describe "basic types" do
     test "decodes byte" do
@@ -246,6 +269,12 @@ defmodule Rebus.DecoderTest do
       assert result == [[]]
     end
 
+    test "rejects a nonempty array of zero-width structs" do
+      assert_raise ArgumentError, "D-Bus array element did not consume input", fn ->
+        Decoder.decode("a()", <<1::little-32, 0::size(5 * 8)>>)
+      end
+    end
+
     test "round-trips variants with 8-byte-aligned payloads" do
       values = [
         {"x", 5},
@@ -316,6 +345,73 @@ defmodule Rebus.DecoderTest do
 
       result = Decoder.decode("h", data)
       assert result == [42]
+    end
+  end
+
+  describe "D-Bus type nesting limits" do
+    test "accepts the maximum array nesting depth" do
+      signature = nested_array_signature(32)
+      value = nested_array_value(32)
+      encoded = Encoder.encode(signature, [value])
+
+      assert Decoder.decode(signature, IO.iodata_to_binary(encoded)) == [value]
+    end
+
+    test "rejects array nesting beyond the D-Bus limit before decoding" do
+      signature = nested_array_signature(33)
+      value = nested_array_value(33)
+      encoded = Encoder.encode(signature, [value])
+
+      assert_raise ArgumentError, "D-Bus nesting limit exceeded", fn ->
+        Decoder.decode(signature, IO.iodata_to_binary(encoded))
+      end
+    end
+
+    test "enforces the same boundary for nested structs" do
+      maximum_signature = nested_struct_signature(32)
+      maximum_value = nested_struct_value(32)
+      over_limit_signature = nested_struct_signature(33)
+      over_limit_value = nested_struct_value(33)
+
+      maximum_data = Encoder.encode(maximum_signature, [maximum_value])
+      over_limit_data = Encoder.encode(over_limit_signature, [over_limit_value])
+
+      assert Decoder.decode(maximum_signature, IO.iodata_to_binary(maximum_data)) == [
+               maximum_value
+             ]
+
+      assert_raise ArgumentError, "D-Bus nesting limit exceeded", fn ->
+        Decoder.decode(over_limit_signature, IO.iodata_to_binary(over_limit_data))
+      end
+    end
+
+    test "accepts independently bounded interleaved array and struct nesting" do
+      signature = interleaved_array_struct_signature(17)
+      value = interleaved_array_struct_value(17)
+      encoded = Encoder.encode(signature, [value])
+
+      assert Decoder.decode(signature, IO.iodata_to_binary(encoded)) == [value]
+    end
+
+    test "rejects a nested variant body that exceeds total nesting depth" do
+      maximum = nested_variant(63)
+      over_limit = nested_variant(64)
+
+      maximum_data = Encoder.encode("v", [maximum])
+
+      assert Decoder.decode("v", IO.iodata_to_binary(maximum_data)) == [maximum]
+
+      message =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "NestedVariant",
+          signature: "v",
+          body: [over_limit]
+        )
+
+      assert {:ok, encoded_message} = Message.encode(message)
+      assert {:error, :invalid_message} = Message.decode(IO.iodata_to_binary(encoded_message))
     end
   end
 

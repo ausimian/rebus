@@ -8,6 +8,11 @@ defmodule Rebus.Connection do
   require Logger
 
   @default_write_timeout 5_000
+  @default_read_timeout 5_000
+  @max_auth_line_size 1_024
+  @max_read_chunk 65_536
+  @max_read_attempts 1
+  @max_inbound_segments 64
   @max_serial 4_294_967_295
 
   @spec call(pid(), Message.t(), non_neg_integer()) :: Message.t() | {:error, term()}
@@ -72,11 +77,16 @@ defmodule Rebus.Connection do
   typedstruct enforce: true do
     field :sock, :socket.socket()
     field :guid, binary() | nil, default: nil
-    field :rref, reference() | nil, default: nil
-    field :prev, binary(), default: <<>>
+    field :rref, term() | nil, default: nil
+    field :inbound_segments, [{pos_integer(), binary()}], default: []
+    field :inbound_size, non_neg_integer(), default: 0
+    field :inbound_expected_size, pos_integer() | nil, default: nil
+    field :inbound_flatten_count, non_neg_integer(), default: 0
     field :name, binary() | nil, default: nil
     field :serial, non_neg_integer(), default: 1
     field :write_timeout, pos_integer(), default: @default_write_timeout
+    field :read_timeout, pos_integer(), default: @default_read_timeout
+    field :partial_frame_timer, {reference(), reference()} | nil, default: nil
 
     field :pending,
           %{
@@ -99,19 +109,30 @@ defmodule Rebus.Connection do
   def init(args) do
     %{family: family} = addr = Keyword.fetch!(args, :addr)
     write_timeout = Keyword.get(args, :write_timeout, @default_write_timeout)
+    read_timeout = Keyword.get(args, :read_timeout, @default_read_timeout)
 
-    if is_integer(write_timeout) and write_timeout > 0 do
-      case :socket.open(family, :stream, :default) do
-        {:ok, sock} -> initialize(sock, addr, write_timeout)
-        {:error, reason} -> {:stop, normalize_socket_error(reason)}
-      end
-    else
-      {:stop, :invalid_write_timeout}
+    cond do
+      not (is_integer(write_timeout) and write_timeout > 0) ->
+        {:stop, :invalid_write_timeout}
+
+      not (is_integer(read_timeout) and read_timeout > 0) ->
+        {:stop, :invalid_read_timeout}
+
+      true ->
+        case :socket.open(family, :stream, :default) do
+          {:ok, sock} ->
+            _ = configure_receive_buffer(sock)
+            initialize(sock, addr, write_timeout, read_timeout)
+
+          {:error, reason} ->
+            {:stop, normalize_socket_error(reason)}
+        end
     end
   end
 
   @impl true
-  def terminate(_reason, %__MODULE__{sock: sock}) do
+  def terminate(_reason, %__MODULE__{sock: sock, partial_frame_timer: timer_ref}) do
+    cancel_partial_frame_timer(timer_ref)
     _ = :socket.close(sock)
     :ok
   end
@@ -141,8 +162,22 @@ defmodule Rebus.Connection do
   end
 
   def handle_info(
+        {:"$socket", s, :completion, {h, result}},
+        %__MODULE__{sock: s, rref: {:completion, h}} = state
+      ) do
+    handle_read_completion(result, %{state | rref: nil})
+  end
+
+  def handle_info(
         {:"$socket", s, :abort, {h, reason}},
         %__MODULE__{sock: s, rref: h} = state
+      ) do
+    stop_for_transport_error(reason, state)
+  end
+
+  def handle_info(
+        {:"$socket", s, :abort, {h, reason}},
+        %__MODULE__{sock: s, rref: {:completion, h}} = state
       ) do
     stop_for_transport_error(reason, state)
   end
@@ -194,6 +229,15 @@ defmodule Rebus.Connection do
       _ ->
         {:noreply, state}
     end
+  end
+
+  def handle_info(
+        {:partial_frame_timeout, token},
+        %__MODULE__{
+          partial_frame_timer: {_timer_ref, token}
+        } = state
+      ) do
+    stop_for_protocol_error(:read_timeout, %{state | partial_frame_timer: nil})
   end
 
   def handle_info(
@@ -253,34 +297,115 @@ defmodule Rebus.Connection do
 
   def handle_continue(:hello_reply_buffer, %__MODULE__{} = state) do
     # Authentication may have read D-Bus bytes along with its final response.
-    parse_hello_reply(state.prev, state)
+    process_inbound(state, {:hello_reply, read_deadline(state.read_timeout)})
   end
 
   def handle_continue(:hello_reply, %__MODULE__{} = state) do
-    # Wait for the Hello reply
-    case :socket.recv(state.sock, 0, [], 5_000) do
-      {:ok, data} ->
-        parse_hello_reply(state.prev <> data, state)
+    receive_hello_reply(state, read_deadline(state.read_timeout))
+  end
 
-      {:error, reason} ->
-        stop_for_transport_error(reason, state)
-    end
+  def handle_continue({:hello_reply, deadline}, %__MODULE__{} = state) do
+    receive_hello_reply(state, deadline)
   end
 
   def handle_continue(:recv, %__MODULE__{rref: nil} = state) do
-    case :socket.recv(state.sock, 0, [], :nowait) do
-      {:ok, data} ->
-        parse(state.prev <> data, %__MODULE__{state | prev: <<>>})
+    handle_receive_result(:socket.recv(state.sock, 0, [], :nowait), state)
+  end
 
-      {:select, {:select_info, :recv, handle}} ->
-        {:noreply, %{state | rref: handle}}
+  # A pending socket operation owns the receive continuation. Keeping this
+  # catch-all prevents a stale continuation from crashing and exposing state.
+  def handle_continue(:recv, %__MODULE__{} = state), do: {:noreply, state}
+
+  def handle_continue(:write, %__MODULE__{} = state), do: advance_writes(state)
+
+  @doc false
+  def handle_receive_result({:ok, data}, %__MODULE__{} = state) when is_binary(data) do
+    append_inbound(data, state, :recv)
+  end
+
+  def handle_receive_result(
+        {:select, {:select_info, :recv, handle}},
+        %__MODULE__{} = state
+      ) do
+    {:noreply, %{state | rref: handle}}
+  end
+
+  def handle_receive_result(
+        {:select, {{:select_info, :recv, handle}, data}},
+        %__MODULE__{} = state
+      )
+      when is_binary(data) do
+    append_inbound(data, %{state | rref: handle}, :recv)
+  end
+
+  def handle_receive_result(
+        {:completion, {:completion_info, :recv, handle}},
+        %__MODULE__{} = state
+      ) do
+    {:noreply, %{state | rref: {:completion, handle}}}
+  end
+
+  def handle_receive_result({:error, reason}, %__MODULE__{} = state) do
+    stop_for_transport_error(reason, state)
+  end
+
+  def handle_receive_result(_result, %__MODULE__{} = state) do
+    stop_for_transport_error(:receive_failed, state)
+  end
+
+  defp receive_hello_reply(%__MODULE__{} = state, deadline) do
+    case remaining_timeout(deadline, state.read_timeout) do
+      :expired ->
+        stop_for_protocol_error(:read_timeout, state)
+
+      {:ok, timeout} ->
+        receive_hello_reply(state, deadline, timeout)
+    end
+  end
+
+  defp receive_hello_reply(%__MODULE__{} = state, deadline, timeout) do
+    case :socket.recv(state.sock, 0, [], timeout) do
+      {:ok, data} ->
+        continue_hello_reply(data, state, deadline)
+
+      {:error, {:timeout, data}} when is_binary(data) and byte_size(data) > 0 ->
+        continue_hello_reply(data, state, deadline)
+
+      {:error, :timeout} ->
+        stop_for_protocol_error(:read_timeout, state)
+
+      {:error, {:timeout, _data}} ->
+        stop_for_protocol_error(:read_timeout, state)
 
       {:error, reason} ->
         stop_for_transport_error(reason, state)
     end
   end
 
-  def handle_continue(:write, %__MODULE__{} = state), do: advance_writes(state)
+  defp continue_hello_reply(data, %__MODULE__{} = state, deadline) do
+    case append_inbound(data, state, {:hello_reply, deadline}) do
+      {:noreply, %__MODULE__{} = state, {:continue, {:hello_reply, _deadline}}} ->
+        receive_hello_reply(state, deadline)
+
+      result ->
+        result
+    end
+  end
+
+  defp handle_read_completion({:ok, data}, %__MODULE__{} = state) when is_binary(data) do
+    append_inbound(data, state, :recv)
+  end
+
+  defp handle_read_completion({:error, reason}, %__MODULE__{} = state) do
+    stop_for_transport_error(reason, state)
+  end
+
+  # Completion-based socket backends may use a result shape that differs from
+  # the readiness backend. Treat an unknown result as a clean transport stop
+  # rather than raising and allowing GenServer to log buffered peer data.
+  defp handle_read_completion(_result, %__MODULE__{} = state) do
+    stop_for_transport_error(:receive_failed, state)
+  end
 
   @impl true
   def handle_call({:call, %Message{} = msg, deadline, request_ref}, from, %__MODULE__{} = state) do
@@ -379,50 +504,72 @@ defmodule Rebus.Connection do
     end
   end
 
-  defp parse(data, %__MODULE__{} = state) do
+  defp parse_complete_message(data, %__MODULE__{} = state, continuation) do
+    parse_flat_messages(data, state, continuation, data)
+  end
+
+  # `data` is already flat when a complete frame is available. Parse every
+  # coalesced frame directly from its sub-binary remainder, retaining only the
+  # final incomplete tail. This avoids re-flattening a receive buffer per frame.
+  defp parse_flat_messages(<<>>, %__MODULE__{} = state, continuation, _source) do
+    process_inbound(state, continuation)
+  end
+
+  defp parse_flat_messages(data, %__MODULE__{} = state, continuation, source) do
     case Message.parse(data) do
-      {:ok, %Message{type: type, header_fields: %{reply_serial: 1}} = msg, rest}
-      when is_nil(state.name) and type in [:method_return, :error] ->
+      {:ok, %Message{} = msg, rest} when is_nil(state.name) ->
+        state = finish_frame(state)
+
         case hello_reply_result(msg) do
-          {:ok, name} -> parse(rest, %{state | name: name})
+          {:ok, name} -> parse_flat_messages(rest, %{state | name: name}, :recv, source)
           {:error, reason} -> stop_for_protocol_error(reason, state)
         end
 
       {:ok, %Message{type: type} = msg, rest} when type in [:method_return, :error] ->
+        state = finish_frame(state)
+
         case reply(msg, state) do
-          {:ok, state} -> parse(rest, state)
+          {:ok, state} -> parse_flat_messages(rest, state, continuation, source)
           {:error, reason} -> stop_for_protocol_error(reason, state)
         end
 
       {:ok, %Message{type: :signal} = msg, rest} ->
-        parse(rest, notify(msg, state))
+        state = finish_frame(state)
+        parse_flat_messages(rest, notify(msg, state), continuation, source)
 
       {:ok, %Message{type: :method_call}, rest} ->
-        parse(rest, state)
+        parse_flat_messages(rest, finish_frame(state), continuation, source)
 
       {:ok, %Message{}, rest} ->
-        parse(rest, state)
+        parse_flat_messages(rest, finish_frame(state), continuation, source)
 
       nil ->
-        # Incomplete message, store data for next recv
-        {:noreply, %{state | prev: data}, {:continue, :recv}}
+        append_inbound(retain_remainder(data, source), state, continuation)
 
       {:error, reason} ->
         stop_for_protocol_error(reason, state)
     end
   end
 
-  defp initialize(sock, addr, write_timeout) do
+  defp initialize(sock, addr, write_timeout, read_timeout) do
     auth = "AUTH EXTERNAL #{get_auth_id()}\r\n"
 
-    with :ok <- :socket.connect(sock, addr),
+    with :ok <- connect_socket(sock, addr, read_timeout),
          :ok <- handshake_send(sock, [0, auth], write_timeout),
-         {:ok, <<"OK ", guid::binary-size(32), "\r\n", rest::binary>>} <- :socket.recv(sock, 0),
+         {:ok, <<"OK ", guid::binary-size(32)>>, rest} <-
+           handshake_recv(sock, read_timeout),
          :ok <- handshake_send(sock, "BEGIN \r\n", write_timeout) do
-      {:ok, %__MODULE__{sock: sock, guid: guid, prev: rest, write_timeout: write_timeout},
-       {:continue, :hello}}
+      {:ok,
+       %__MODULE__{
+         sock: sock,
+         guid: guid,
+         inbound_segments: if(rest == <<>>, do: [], else: [{byte_size(rest), rest}]),
+         inbound_size: byte_size(rest),
+         write_timeout: write_timeout,
+         read_timeout: read_timeout
+       }, {:continue, :hello}}
     else
-      {:ok, _} -> stop_and_close(sock, :auth_failed)
+      {:ok, _, _} -> stop_and_close(sock, :auth_failed)
       {:error, reason} -> stop_and_close(sock, reason)
     end
   end
@@ -430,6 +577,100 @@ defmodule Rebus.Connection do
   defp stop_and_close(sock, reason) do
     _ = :socket.close(sock)
     {:stop, normalize_socket_error(reason)}
+  end
+
+  defp connect_socket(sock, addr, timeout) do
+    case :socket.connect(sock, addr, timeout) do
+      :ok -> :ok
+      {:error, :timeout} -> {:error, :read_timeout}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc false
+  def configure_receive_buffer(
+        sock,
+        setopt_fun \\ &:socket.setopt/3,
+        warning_fun \\ fn message -> Logger.warning(message) end
+      ) do
+    # A zero-length receive returns the bytes currently available on every
+    # supported OTP release. Keep the backing allocation independent of a
+    # peer-declared D-Bus frame length. Some backends only accept the scalar
+    # form, so failure to tune this hint must never make connections unavailable.
+    case setopt_fun.(sock, {:otp, :rcvbuf}, {@max_read_attempts, @max_read_chunk}) do
+      :ok ->
+        :tuple
+
+      {:error, _reason} ->
+        case setopt_fun.(sock, {:otp, :rcvbuf}, @max_read_chunk) do
+          :ok ->
+            :scalar
+
+          {:error, _reason} ->
+            default_receive_buffer(warning_fun)
+
+          _other ->
+            default_receive_buffer(warning_fun)
+        end
+
+      _other ->
+        default_receive_buffer(warning_fun)
+    end
+  end
+
+  defp default_receive_buffer(warning_fun) do
+    warning_fun.("D-Bus connection is using OTP's default receive buffer")
+    :default
+  end
+
+  defp handshake_recv(sock, timeout) do
+    receive_auth_line(sock, <<>>, read_deadline(timeout), timeout)
+  end
+
+  defp receive_auth_line(sock, buffer, deadline, timeout) do
+    case remaining_timeout(deadline, timeout) do
+      :expired ->
+        {:error, :read_timeout}
+
+      {:ok, receive_timeout} ->
+        case :socket.recv(sock, 0, [], receive_timeout) do
+          {:ok, data} ->
+            consume_auth_data(sock, buffer, data, deadline, timeout)
+
+          {:error, {:timeout, data}} when is_binary(data) and byte_size(data) > 0 ->
+            consume_auth_data(sock, buffer, data, deadline, timeout)
+
+          {:error, :timeout} ->
+            {:error, :read_timeout}
+
+          {:error, {:timeout, _data}} ->
+            {:error, :read_timeout}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
+  defp consume_auth_data(sock, buffer, data, deadline, timeout) do
+    buffer = buffer <> data
+
+    case :binary.match(buffer, "\r\n") do
+      {line_size, 2} when line_size <= @max_auth_line_size ->
+        line = binary_part(buffer, 0, line_size)
+        rest_size = byte_size(buffer) - line_size - 2
+        rest = binary_part(buffer, line_size + 2, rest_size)
+        {:ok, line, rest}
+
+      {_, 2} ->
+        {:error, :auth_failed}
+
+      :nomatch when byte_size(buffer) > @max_auth_line_size ->
+        {:error, :auth_failed}
+
+      :nomatch ->
+        receive_auth_line(sock, buffer, deadline, timeout)
+    end
   end
 
   defp handshake_send(sock, data, timeout) do
@@ -460,29 +701,174 @@ defmodule Rebus.Connection do
     {:stop, {:shutdown, reason}, fail_pending(state)}
   end
 
-  defp handle_hello_reply(
-         %Message{} = msg,
-         rest,
-         %__MODULE__{} = state
-       ) do
-    case hello_reply_result(msg) do
-      {:ok, name} -> parse(rest, %{state | name: name, prev: <<>>})
-      {:error, reason} -> stop_for_protocol_error(reason, state)
+  # Each zero-length receive returns data already available through the fixed
+  # OTP buffer. Fixed-header validation still happens as soon as 16 bytes are
+  # retained, without making allocation depend on a peer-declared frame length.
+  @doc false
+  @spec append_inbound_fragment(binary(), t(), term()) ::
+          {:noreply, t()} | {:noreply, t(), {:continue, term()}} | {:stop, term(), t()}
+  def append_inbound_fragment(data, %__MODULE__{} = state, continuation)
+      when is_binary(data) do
+    append_inbound(data, state, continuation)
+  end
+
+  defp append_inbound(<<>>, %__MODULE__{} = state, continuation),
+    do: process_inbound(state, continuation)
+
+  defp append_inbound(data, %__MODULE__{} = state, continuation) do
+    segments = append_segment(data, state.inbound_segments)
+
+    if length(segments) <= @max_inbound_segments do
+      state = %{
+        state
+        | inbound_segments: segments,
+          inbound_size: state.inbound_size + byte_size(data)
+      }
+
+      process_inbound(state, continuation)
+    else
+      # Segment metadata is part of the retained inbound budget. A peer that
+      # defeats rope merging with pathological fragment sizes is rejected
+      # before its BEAM-term overhead becomes unbounded.
+      stop_for_protocol_error(:message_too_large, state)
     end
   end
 
-  defp parse_hello_reply(data, %__MODULE__{} = state) do
-    case Message.parse(data) do
-      {:ok, %Message{} = msg, rest} ->
-        handle_hello_reply(msg, rest, state)
+  defp process_inbound(%__MODULE__{inbound_size: 0} = state, continuation),
+    do: buffer_incomplete_message(state, continuation)
+
+  defp process_inbound(%__MODULE__{inbound_expected_size: nil} = state, continuation) do
+    case Message.expected_size(inbound_prefix(state, min(state.inbound_size, 16))) do
+      {:ok, expected_size} ->
+        process_inbound(%{state | inbound_expected_size: expected_size}, continuation)
 
       nil ->
-        # Incomplete message, store data for the next Hello reply receive.
-        {:noreply, %{state | prev: data}, {:continue, :hello_reply}}
+        buffer_incomplete_message(state, continuation)
 
       {:error, reason} ->
         stop_for_protocol_error(reason, state)
     end
+  end
+
+  defp process_inbound(%__MODULE__{} = state, continuation) do
+    if state.inbound_size >= state.inbound_expected_size do
+      data = inbound_binary(state)
+
+      parse_complete_message(
+        data,
+        clear_inbound_frame(%{state | inbound_flatten_count: state.inbound_flatten_count + 1}),
+        continuation
+      )
+    else
+      buffer_incomplete_message(state, continuation)
+    end
+  end
+
+  @doc false
+  @spec inbound_receive_buffer_size() :: pos_integer()
+  def inbound_receive_buffer_size, do: @max_read_chunk
+
+  defp inbound_prefix(%__MODULE__{} = state, size) do
+    state.inbound_segments
+    |> Enum.reverse()
+    |> Enum.map(&elem(&1, 1))
+    |> take_prefix(size, [])
+    |> IO.iodata_to_binary()
+  end
+
+  defp take_prefix(_segments, 0, acc), do: Enum.reverse(acc)
+  defp take_prefix([], _size, acc), do: Enum.reverse(acc)
+
+  defp take_prefix([segment | segments], size, acc) when byte_size(segment) <= size do
+    take_prefix(segments, size - byte_size(segment), [segment | acc])
+  end
+
+  defp take_prefix([segment | _segments], size, acc) do
+    Enum.reverse([binary_part(segment, 0, size) | acc])
+  end
+
+  defp inbound_binary(%__MODULE__{} = state) do
+    state.inbound_segments
+    |> Enum.reverse()
+    |> Enum.map(&elem(&1, 1))
+    |> IO.iodata_to_binary()
+  end
+
+  # Segments are newest first. Merging a segment only with smaller or equal
+  # predecessors keeps common small-fragment traffic logarithmic while
+  # preserving byte order. The explicit segment limit protects pathological
+  # decreasing fragment sizes without flattening an ever-growing buffer.
+  defp append_segment(data, segments) do
+    merge_segment(byte_size(data), data, segments)
+  end
+
+  defp merge_segment(size, data, [{previous_size, previous} | segments])
+       when previous_size <= size do
+    merge_segment(previous_size + size, previous <> data, segments)
+  end
+
+  defp merge_segment(size, data, segments), do: [{size, data} | segments]
+
+  defp retain_remainder(remainder, source) do
+    if byte_size(remainder) * 4 < byte_size(source) do
+      :binary.copy(remainder)
+    else
+      remainder
+    end
+  end
+
+  defp clear_inbound_frame(%__MODULE__{} = state),
+    do: %{state | inbound_segments: [], inbound_size: 0, inbound_expected_size: nil}
+
+  # A timer exists only while a nonempty frame is incomplete. Each retained
+  # fragment replaces it, so a peer that is making progress remains connected
+  # while a peer that stops or dribbles too slowly cannot pin retained data.
+  defp buffer_incomplete_message(%__MODULE__{inbound_size: 0, rref: rref} = state, _continuation)
+       when not is_nil(rref) do
+    {:noreply, clear_partial_frame(state)}
+  end
+
+  defp buffer_incomplete_message(%__MODULE__{inbound_size: 0} = state, continuation) do
+    {:noreply, clear_partial_frame(state), {:continue, continuation}}
+  end
+
+  defp buffer_incomplete_message(%__MODULE__{rref: rref} = state, _continuation)
+       when not is_nil(rref) do
+    timer_ref = restart_partial_frame_timer(state)
+    {:noreply, %{state | partial_frame_timer: timer_ref}}
+  end
+
+  defp buffer_incomplete_message(%__MODULE__{} = state, continuation) do
+    timer_ref = restart_partial_frame_timer(state)
+    {:noreply, %{state | partial_frame_timer: timer_ref}, {:continue, continuation}}
+  end
+
+  defp clear_partial_frame(%__MODULE__{} = state) do
+    %{
+      state
+      | inbound_segments: [],
+        inbound_size: 0,
+        inbound_expected_size: nil,
+        partial_frame_timer: cancel_partial_frame_timer(state.partial_frame_timer)
+    }
+  end
+
+  defp finish_frame(%__MODULE__{} = state) do
+    %{state | partial_frame_timer: cancel_partial_frame_timer(state.partial_frame_timer)}
+  end
+
+  defp restart_partial_frame_timer(%__MODULE__{} = state) do
+    cancel_partial_frame_timer(state.partial_frame_timer)
+    token = make_ref()
+    timer_ref = Process.send_after(self(), {:partial_frame_timeout, token}, state.read_timeout)
+    {timer_ref, token}
+  end
+
+  defp cancel_partial_frame_timer(nil), do: nil
+
+  defp cancel_partial_frame_timer({timer_ref, _token}) do
+    _ = Process.cancel_timer(timer_ref)
+    nil
   end
 
   defp hello_reply_result(%Message{
@@ -522,6 +908,9 @@ defmodule Rebus.Connection do
           | :invalid_endianness
           | :invalid_message
           | :invalid_message_type
+          | :message_too_large
+          | :read_timeout
+          | :unsupported_protocol_version
           | :protocol_error
           | {:hello_failed,
              binary() | :invalid_error_name | :missing_error_name | :missing_unique_name}
@@ -552,7 +941,10 @@ defmodule Rebus.Connection do
              :insufficient_data,
              :invalid_endianness,
              :invalid_message,
-             :invalid_message_type
+             :invalid_message_type,
+             :message_too_large,
+             :read_timeout,
+             :unsupported_protocol_version
            ] ->
         reason
 
@@ -661,6 +1053,17 @@ defmodule Rebus.Connection do
     case deadline - System.monotonic_time(:millisecond) do
       remaining when remaining > 0 -> {:ok, remaining}
       _ -> {:error, :timeout}
+    end
+  end
+
+  defp read_deadline(timeout) when is_integer(timeout) and timeout > 0 do
+    System.monotonic_time(:millisecond) + timeout
+  end
+
+  defp remaining_timeout(deadline, maximum) when is_integer(deadline) and maximum > 0 do
+    case deadline - System.monotonic_time(:millisecond) do
+      remaining when remaining > 0 -> {:ok, min(remaining, maximum)}
+      _ -> :expired
     end
   end
 

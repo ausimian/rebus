@@ -77,6 +77,9 @@ defmodule Rebus.Message do
 
   import Bitwise, only: [bor: 2, band: 2]
 
+  @max_message_size 134_217_728
+  @max_array_size 67_108_864
+
   @typedoc "Message type"
   @type message_type :: :method_call | :method_return | :error | :signal
 
@@ -160,6 +163,15 @@ defmodule Rebus.Message do
     error: [:error_name, :reply_serial],
     signal: [:path, :interface, :member]
   }
+
+  @doc """
+  The largest complete D-Bus message accepted from the wire, in bytes.
+
+  This is the D-Bus protocol limit of 2^27 bytes and includes the fixed header,
+  header fields, alignment padding, and body.
+  """
+  @spec max_message_size() :: pos_integer()
+  def max_message_size, do: @max_message_size
 
   @doc """
   Creates a new D-Bus message.
@@ -335,6 +347,10 @@ defmodule Rebus.Message do
   `{:ok, message}` on success, `{:error, reason}` on failure.
   """
   @spec decode(binary()) :: {:ok, t()} | {:error, any()}
+  def decode(binary) when is_binary(binary) and byte_size(binary) > @max_message_size do
+    {:error, :message_too_large}
+  end
+
   def decode(binary) when is_binary(binary) do
     # Parse fixed header
     <<endian_flag, type_byte, flags_byte, version_byte, body_length::binary-size(4),
@@ -342,7 +358,9 @@ defmodule Rebus.Message do
 
     # Determine endianness
     with {:ok, endianness} <- parse_endianness(endian_flag),
-         {:ok, type} <- type_from_code(type_byte) do
+         {:ok, type} <- type_from_code(type_byte),
+         :ok <- validate_protocol_version(version_byte),
+         :ok <- validate_declared_message_size(rest, body_length, endianness) do
       body_length = read_uint32(body_length, endianness)
       serial = read_uint32(serial, endianness)
       flags = decode_flags_byte(flags_byte)
@@ -413,7 +431,11 @@ defmodule Rebus.Message do
   ## Returns
 
   - `{:ok, message, remaining_data}` - If a complete message was successfully parsed
-  - `{:error, reason}` - If the binary contains sufficient data but parsing failed
+  - `{:error, reason}` - If the binary contains sufficient data but parsing failed.
+    Invalid endianness, message type, and protocol version are rejected as soon
+    as the 12-byte fixed header is available. `:message_too_large` is returned
+    as soon as the header-fields length is available and the declared complete
+    message would exceed `max_message_size/0`.
   - `nil` - If the binary does not contain sufficient data for a complete message
 
   ## Examples
@@ -437,45 +459,44 @@ defmodule Rebus.Message do
   """
   @spec parse(binary()) :: {:ok, t(), binary()} | {:error, any()} | nil
   def parse(binary) when is_binary(binary) do
-    # Need at least 12 bytes for the fixed header
-    if byte_size(binary) >= 12 do
-      # Parse fixed header to get body length and endianness
-      <<endian_flag, _type_byte, _flags_byte, _version_byte, body_length::binary-size(4),
-        _serial::binary-size(4), rest::binary>> = binary
+    case expected_size(binary) do
+      {:ok, total_message_size} when byte_size(binary) >= total_message_size ->
+        <<message_binary::binary-size(total_message_size), remaining_data::binary>> = binary
 
-      # Determine endianness
-      with {:ok, endianness} <- parse_endianness(endian_flag) do
-        case extract_array_length(rest, endianness) do
-          {:ok, header_fields_length} ->
-            # Calculate header fields size: array length field (4 bytes) + array data
-            header_fields_size = 4 + header_fields_length
-
-            # Fixed header (12 bytes) + header fields, padded to 8-byte boundary
-            header_length = 12 + header_fields_size
-            header_padded_length = div(header_length + 7, 8) * 8
-
-            # Correct byte order for body length
-            body_length = read_uint32(body_length, endianness)
-            # Total message size = padded header + body
-            total_message_size = header_padded_length + body_length
-
-            # Check if we have enough data for the complete message
-            if byte_size(binary) >= total_message_size do
-              # Extract exactly the right amount of data and decode it
-              <<message_binary::binary-size(total_message_size), remaining_data::binary>> =
-                binary
-
-              with {:ok, message} <- decode(message_binary) do
-                {:ok, message, remaining_data}
-              end
-            end
-
-          {:error, :insufficient_data} ->
-            nil
+        with {:ok, message} <- decode(message_binary) do
+          {:ok, message, remaining_data}
         end
+
+      {:ok, _total_message_size} ->
+        nil
+
+      {:error, _reason} = error ->
+        error
+
+      nil ->
+        nil
+    end
+  end
+
+  @doc false
+  @spec expected_size(binary()) :: {:ok, pos_integer()} | {:error, atom()} | nil
+  def expected_size(binary) when is_binary(binary) and byte_size(binary) >= 12 do
+    <<endian_flag, type_byte, _flags_byte, version_byte, body_length::binary-size(4),
+      _serial::binary-size(4), rest::binary>> = binary
+
+    with {:ok, endianness} <- parse_endianness(endian_flag),
+         {:ok, _type} <- type_from_code(type_byte),
+         :ok <- validate_protocol_version(version_byte) do
+      body_length = read_uint32(body_length, endianness)
+
+      case declared_message_size(rest, body_length, endianness) do
+        {:error, :insufficient_data} -> nil
+        result -> result
       end
     end
   end
+
+  def expected_size(_binary), do: nil
 
   @doc """
   Validates that a message is well-formed according to D-Bus rules.
@@ -835,6 +856,36 @@ defmodule Rebus.Message do
   defp parse_endianness(?l), do: {:ok, :little}
   defp parse_endianness(?B), do: {:ok, :big}
   defp parse_endianness(_), do: {:error, :invalid_endianness}
+
+  defp validate_protocol_version(1), do: :ok
+  defp validate_protocol_version(_), do: {:error, :unsupported_protocol_version}
+
+  defp validate_declared_message_size(rest, body_length, endianness) do
+    case declared_message_size(rest, read_uint32(body_length, endianness), endianness) do
+      {:error, :message_too_large} -> {:error, :message_too_large}
+      _ -> :ok
+    end
+  end
+
+  defp declared_message_size(rest, body_length, endianness) do
+    with {:ok, header_fields_length} <- extract_array_length(rest, endianness) do
+      if header_fields_length <= @max_array_size do
+        header_padded_length =
+          (12 + 4 + header_fields_length)
+          |> then(&(div(&1 + 7, 8) * 8))
+
+        total_message_size = header_padded_length + body_length
+
+        if total_message_size <= @max_message_size do
+          {:ok, total_message_size}
+        else
+          {:error, :message_too_large}
+        end
+      else
+        {:error, :message_too_large}
+      end
+    end
+  end
 
   defp extract_array_length(binary, endianness) do
     # D-Bus arrays start with a 4-byte length field

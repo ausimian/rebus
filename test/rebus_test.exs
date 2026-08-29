@@ -31,6 +31,11 @@ defmodule RebusTest do
       assert {:error, :invalid_write_timeout} = Rebus.connect(addr, write_timeout: -1)
     end
 
+    test "rejects an invalid read timeout", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      assert {:error, :invalid_read_timeout} = Rebus.connect(addr, read_timeout: 0)
+    end
+
     test "connect! raises on failure" do
       # Try to connect to non-existent socket
       assert_raise RuntimeError, ~r/Failed to connect to D-Bus/, fn ->
@@ -58,6 +63,166 @@ defmodule RebusTest do
       assert_receive {^rejecting_svr, :client_closed}, 1_000
     end
 
+    test "returns a read timeout for a silent authentication peer", %{svr: svr} do
+      {:ok, silent_svr} =
+        start_supervised(
+          {Rebus.TestServer, tap: self(), silent_auth: true},
+          id: :silent_auth_server
+        )
+
+      {:ok, silent_addr} = TestServer.get_listen_addr(silent_svr)
+
+      assert {:error, :read_timeout} = Rebus.connect(silent_addr, read_timeout: 300)
+      assert_receive {^silent_svr, :auth_received}, 1_000
+
+      {:ok, working_addr} = TestServer.get_listen_addr(svr)
+      assert {:ok, _cli} = Rebus.connect(working_addr, read_timeout: 500)
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+    end
+
+    test "stops after an unanswered Hello reply timeout", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      assert {:ok, cli} = Rebus.connect(addr, read_timeout: 300)
+      ref = Process.monitor(cli)
+
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :read_timeout}}, 1_000
+    end
+
+    test "continues a fragmented authentication response" do
+      auth_response = "OK 30313233343536373839414243444546\r\n"
+
+      {:ok, auth_svr} =
+        start_supervised(
+          {Rebus.TestServer,
+           tap: self(),
+           auth_response: auth_response,
+           auth_response_fragments: [
+             binary_part(auth_response, 0, 8),
+             binary_part(auth_response, 8, byte_size(auth_response) - 8)
+           ],
+           auth_fragment_delay: 50},
+          id: :fragmented_auth_server
+        )
+
+      {:ok, addr} = TestServer.get_listen_addr(auth_svr)
+      assert {:ok, _cli} = Rebus.connect(addr, read_timeout: 300)
+      assert_receive {^auth_svr, %Message{header_fields: %{member: "Hello"}}}
+    end
+
+    test "does not extend authentication setup past its total read timeout" do
+      auth_response = "OK 30313233343536373839414243444546\r\n"
+
+      {:ok, auth_svr} =
+        start_supervised(
+          {Rebus.TestServer,
+           tap: self(),
+           auth_response: auth_response,
+           auth_response_fragments: [
+             binary_part(auth_response, 0, 1),
+             binary_part(auth_response, 1, 1),
+             binary_part(auth_response, 2, byte_size(auth_response) - 2)
+           ],
+           auth_fragment_delay: 300},
+          id: :dribbling_auth_server
+        )
+
+      {:ok, addr} = TestServer.get_listen_addr(auth_svr)
+      assert {:error, :read_timeout} = Rebus.connect(addr, read_timeout: 500)
+      assert_receive {^auth_svr, :client_closed}, 1_500
+    end
+
+    test "times out after a partial authentication response" do
+      {:ok, auth_svr} =
+        start_supervised(
+          {Rebus.TestServer, tap: self(), partial_auth: "OK 303132333435"},
+          id: :partial_auth_server
+        )
+
+      {:ok, addr} = TestServer.get_listen_addr(auth_svr)
+      assert {:error, :read_timeout} = Rebus.connect(addr, read_timeout: 150)
+      assert_receive {^auth_svr, :auth_received}
+    end
+
+    test "rejects an overlong authentication response" do
+      auth_response = "OK " <> String.duplicate("a", 1_024) <> "\r\n"
+
+      {:ok, auth_svr} =
+        start_supervised(
+          {Rebus.TestServer, tap: self(), auth_response: auth_response},
+          id: :overlong_auth_server
+        )
+
+      {:ok, addr} = TestServer.get_listen_addr(auth_svr)
+      assert {:error, :auth_failed} = Rebus.connect(addr)
+    end
+
+    test "times out after partial Hello reply progress with a protocol reason", %{svr: svr} do
+      log =
+        capture_log(fn ->
+          {cli, hello} = connect_until_hello(svr, read_timeout: 100)
+
+          reply =
+            Message.new!(:method_return,
+              reply_serial: hello.serial,
+              signature: "s",
+              body: [":1.100"]
+            )
+
+          {:ok, encoded} = Message.encode(reply)
+          encoded = IO.iodata_to_binary(encoded)
+          first = binary_part(encoded, 0, 20)
+          ref = Process.monitor(cli)
+
+          :ok = TestServer.push_raw(svr, first)
+
+          assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :read_timeout}}, 500
+        end)
+
+      assert log =~ "D-Bus connection protocol stopped: :read_timeout"
+      refute log =~ "D-Bus connection transport stopped"
+      refute log =~ "%Rebus.Connection"
+    end
+
+    test "accepts Hello reply fragments within the total read timeout", %{svr: svr} do
+      {cli, hello} = connect_until_hello(svr, read_timeout: 500)
+
+      reply =
+        Message.new!(:method_return, reply_serial: hello.serial, signature: "s", body: [":1.100"])
+
+      {:ok, encoded} = Message.encode(reply)
+      encoded = IO.iodata_to_binary(encoded)
+      first = binary_part(encoded, 0, 20)
+      rest = binary_part(encoded, 20, byte_size(encoded) - 20)
+
+      task = Task.async(fn -> TestServer.push_raw_delayed_fragments(svr, [first, rest], 200) end)
+
+      assert wait_until(fn -> :sys.get_state(cli).name == ":1.100" end, 100)
+      assert :ok = Task.await(task)
+      assert :sys.get_state(cli).partial_frame_timer == nil
+      assert Process.alive?(cli)
+    end
+
+    test "does not extend the Hello setup deadline when a peer dribbles bytes", %{svr: svr} do
+      {cli, hello} = connect_until_hello(svr, read_timeout: 500)
+
+      reply =
+        Message.new!(:method_return, reply_serial: hello.serial, signature: "s", body: [":1.100"])
+
+      {:ok, encoded} = Message.encode(reply)
+
+      <<first::binary-size(20), second::binary-size(1), _rest::binary>> =
+        IO.iodata_to_binary(encoded)
+
+      ref = Process.monitor(cli)
+
+      task =
+        Task.async(fn -> TestServer.push_raw_delayed_fragments(svr, [first, second], 300) end)
+
+      assert :ok = Task.await(task)
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :read_timeout}}, 700
+    end
+
     test "stops with the parse error reason", %{svr: svr} do
       log =
         capture_log(fn ->
@@ -70,6 +235,178 @@ defmodule RebusTest do
 
       assert log =~ "D-Bus connection protocol stopped: :invalid_endianness"
       refute log =~ "%Rebus.Connection"
+    end
+
+    test "stops on a nonempty array of zero-width structs", %{svr: svr} do
+      log =
+        capture_log(fn ->
+          cli = connect_until_ready(svr)
+          ref = Process.monitor(cli)
+
+          :ok = TestServer.push_raw(svr, malformed_empty_struct_array_message())
+
+          assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :invalid_message}}, 1_000
+        end)
+
+      assert log =~ "D-Bus connection protocol stopped: :invalid_message"
+    end
+
+    test "rejects a fragmented oversized inbound frame before buffering its body", %{svr: svr} do
+      log =
+        capture_log(fn ->
+          cli = connect_until_ready(svr)
+          ref = Process.monitor(cli)
+          body_length = Message.max_message_size() - 16 + 1
+
+          fixed_header =
+            <<?l, 4, 0, 1, body_length::little-32, 1::little-32, 0::little-32>>
+
+          assert {:error, :message_too_large} = Message.expected_size(fixed_header)
+
+          # Only the complete fixed header is sent; no message body is ever
+          # placed on the socket before the declared size is rejected.
+          :ok = TestServer.push_raw(svr, fixed_header)
+
+          assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :message_too_large}}, 1_000
+        end)
+
+      assert log =~ "D-Bus connection protocol stopped: :message_too_large"
+      refute log =~ "%Rebus.Connection"
+    end
+
+    test "bounds retained segments for many small incomplete fragments", %{svr: svr} do
+      cli = connect_until_ready(svr, read_timeout: 10_000)
+      body_length = 1_000_000
+      fixed_header = <<?l, 4, 0, 1, body_length::little-32, 1::little-32, 0::little-32>>
+
+      :ok = TestServer.push_raw(svr, fixed_header)
+      assert wait_until(fn -> :sys.get_state(cli).inbound_expected_size != nil end)
+
+      assert :ok = TestServer.push_raw_fragments(svr, :binary.copy(<<0>>, 256))
+
+      assert wait_until(fn ->
+               :sys.get_state(cli).inbound_size == byte_size(fixed_header) + 256
+             end)
+
+      state = :sys.get_state(cli)
+
+      assert state.inbound_size <= byte_size(fixed_header) + 256
+      assert state.inbound_expected_size == byte_size(fixed_header) + body_length
+      assert length(state.inbound_segments) <= 10
+      assert binary_part(inbound_data(state), 0, byte_size(fixed_header)) == fixed_header
+    end
+
+    test "caps each inbound receive allocation below the maximum frame size", %{svr: svr} do
+      cli = connect_until_ready(svr)
+
+      assert Connection.inbound_receive_buffer_size() == 65_536
+
+      assert {:ok, receive_buffer} = :socket.getopt(:sys.get_state(cli).sock, {:otp, :rcvbuf})
+
+      buffer_size =
+        case receive_buffer do
+          {1, size} -> size
+          size when is_integer(size) -> size
+        end
+
+      assert buffer_size == Connection.inbound_receive_buffer_size()
+      assert buffer_size < Message.max_message_size()
+    end
+
+    test "decodes a one-byte fragmented inbound frame", %{svr: svr} do
+      cli = connect_until_ready(svr)
+      ref = Rebus.add_signal_handler(cli)
+
+      message =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "Fragmented",
+          signature: "s",
+          body: ["delivered one byte at a time"]
+        )
+
+      {:ok, encoded} = Message.encode(message)
+      assert :ok = TestServer.push_raw_fragments(svr, IO.iodata_to_binary(encoded))
+
+      assert_receive {^ref,
+                      %Message{
+                        header_fields: %{member: "Fragmented"},
+                        body: ["delivered one byte at a time"]
+                      }},
+                     1_000
+
+      assert wait_until(fn -> :sys.get_state(cli).inbound_size == 0 end)
+      assert :sys.get_state(cli).partial_frame_timer == nil
+    end
+
+    test "keeps an idle connection alive without an incomplete frame", %{svr: svr} do
+      cli = connect_until_ready(svr, read_timeout: 500)
+
+      Process.sleep(600)
+
+      assert Process.alive?(cli)
+      assert :sys.get_state(cli).partial_frame_timer == nil
+    end
+
+    test "stops a stalled fragmented inbound frame after the read timeout", %{svr: svr} do
+      log =
+        capture_log(fn ->
+          cli = connect_until_ready(svr, read_timeout: 500)
+          ref = Process.monitor(cli)
+          partial_header = <<?l, 4, 0, 1, 0::little-32, 1::little-32>>
+
+          :ok = TestServer.push_raw(svr, partial_header)
+
+          assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :read_timeout}}, 1_000
+        end)
+
+      assert log =~ "D-Bus connection protocol stopped: :read_timeout"
+      refute log =~ "%Rebus.Connection"
+    end
+
+    test "resets the partial-frame deadline when a peer makes progress", %{svr: svr} do
+      cli = connect_until_ready(svr, read_timeout: 1_000)
+
+      message =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "Fragmented"
+        )
+
+      {:ok, encoded} = Message.encode(message)
+      binary = IO.iodata_to_binary(encoded)
+      <<first::binary-size(12), second::binary-size(1), rest::binary>> = binary
+
+      assert :ok = TestServer.push_raw(svr, first)
+
+      assert wait_until(fn ->
+               %Connection{inbound_size: size, partial_frame_timer: timer} = :sys.get_state(cli)
+               size == byte_size(first) and timer != nil
+             end)
+
+      first_timer = :sys.get_state(cli).partial_frame_timer
+
+      assert :ok = TestServer.push_raw(svr, second)
+
+      assert wait_until(fn ->
+               %Connection{inbound_size: size, partial_frame_timer: timer} = :sys.get_state(cli)
+
+               size == byte_size(first) + byte_size(second) and timer != nil and
+                 timer != first_timer
+             end)
+
+      second_timer = :sys.get_state(cli).partial_frame_timer
+      {_timer_ref, stale_token} = first_timer
+      send(cli, {:partial_frame_timeout, stale_token})
+
+      assert wait_until(fn -> :sys.get_state(cli).partial_frame_timer == second_timer end)
+      assert Process.alive?(cli)
+
+      assert :ok = TestServer.push_raw(svr, rest)
+      assert wait_until(fn -> :sys.get_state(cli).inbound_size == 0 end)
+      assert :sys.get_state(cli).partial_frame_timer == nil
     end
   end
 
@@ -133,6 +470,176 @@ defmodule RebusTest do
                Connection.socket_send_args("rest", {:continue, continuation})
     end
 
+    test "falls back safely when configuring the OTP receive buffer" do
+      parent = self()
+      tuple_value = {1, Connection.inbound_receive_buffer_size()}
+
+      assert :tuple =
+               Connection.configure_receive_buffer(
+                 :test_socket,
+                 fn _sock, _option, value ->
+                   send(parent, {:setopt, value})
+                   :ok
+                 end,
+                 fn warning -> send(parent, {:warning, warning}) end
+               )
+
+      assert_receive {:setopt, ^tuple_value}
+      refute_receive {:warning, _}
+
+      assert :scalar =
+               Connection.configure_receive_buffer(
+                 :test_socket,
+                 fn _sock, _option, value ->
+                   send(parent, {:setopt, value})
+                   if is_tuple(value), do: {:error, :invalid}, else: :ok
+                 end,
+                 fn warning -> send(parent, {:warning, warning}) end
+               )
+
+      assert_receive {:setopt, ^tuple_value}
+      assert_receive {:setopt, 65_536}
+      refute_receive {:warning, _}
+
+      assert :default =
+               Connection.configure_receive_buffer(
+                 :test_socket,
+                 fn _sock, _option, value ->
+                   send(parent, {:setopt, value})
+                   {:error, :invalid}
+                 end,
+                 fn warning -> send(parent, {:warning, warning}) end
+               )
+
+      assert_receive {:setopt, ^tuple_value}
+      assert_receive {:setopt, 65_536}
+      assert_receive {:warning, "D-Bus connection is using OTP's default receive buffer"}
+
+      assert :default =
+               Connection.configure_receive_buffer(
+                 :test_socket,
+                 fn _sock, _option, value ->
+                   send(parent, {:setopt, value})
+                   :unexpected
+                 end,
+                 fn warning -> send(parent, {:warning, warning}) end
+               )
+
+      assert_receive {:setopt, ^tuple_value}
+      refute_receive {:setopt, 65_536}
+      assert_receive {:warning, "D-Bus connection is using OTP's default receive buffer"}
+
+      assert :default =
+               Connection.configure_receive_buffer(
+                 :test_socket,
+                 fn _sock, _option, value ->
+                   send(parent, {:setopt, value})
+                   if is_tuple(value), do: {:error, :invalid}, else: :unexpected
+                 end,
+                 fn warning -> send(parent, {:warning, warning}) end
+               )
+
+      assert_receive {:setopt, ^tuple_value}
+      assert_receive {:setopt, 65_536}
+      assert_receive {:warning, "D-Bus connection is using OTP's default receive buffer"}
+    end
+
+    test "uses the production warning callback for receive-buffer fallback" do
+      log =
+        capture_log(fn ->
+          assert :default =
+                   Connection.configure_receive_buffer(:test_socket, fn _sock, _option, _value ->
+                     {:error, :invalid}
+                   end)
+        end)
+
+      assert log =~ "D-Bus connection is using OTP's default receive buffer"
+      refute log =~ "test_socket"
+    end
+
+    test "rejects a pathological inbound segment count without logging data" do
+      {:ok, sock} = :socket.open(:inet, :stream, :default)
+
+      segments =
+        Enum.map(64..1//-1, fn size ->
+          {size, :binary.copy(<<0>>, size)}
+        end)
+
+      state = %Connection{
+        sock: sock,
+        inbound_segments: segments,
+        inbound_size: Enum.sum(Enum.map(segments, &elem(&1, 0)))
+      }
+
+      log =
+        capture_log(fn ->
+          assert {:stop, {:shutdown, :message_too_large}, ^state} =
+                   Connection.append_inbound_fragment("sensitive peer payload", state, :recv)
+        end)
+
+      assert log =~ "D-Bus connection protocol stopped: :message_too_large"
+      refute log =~ "sensitive peer payload"
+      refute log =~ "%Rebus.Connection"
+      _ = :socket.close(sock)
+    end
+
+    test "waits for a select after handling its attached receive data" do
+      {:ok, sock} = :socket.open(:inet, :stream, :default)
+
+      message =
+        Message.new!(:method_call, path: "/", interface: "org.example.Test", member: "Select")
+
+      {:ok, encoded} = Message.encode(message)
+      data = IO.iodata_to_binary(encoded)
+      select_info = {:select_info, :recv, make_ref()}
+      {:select_info, :recv, handle} = select_info
+      state = %Connection{sock: sock, name: ":1.100"}
+
+      assert {:noreply,
+              %Connection{rref: ^handle, inbound_size: 0, partial_frame_timer: nil} = state} =
+               Connection.handle_receive_result({:select, {select_info, data}}, state)
+
+      assert {:noreply, ^state} = Connection.handle_continue(:recv, state)
+      Connection.terminate(:normal, state)
+    end
+
+    test "parses coalesced frames with one materialization per receive" do
+      {:ok, sock} = :socket.open(:inet, :stream, :default)
+
+      message =
+        Message.new!(:method_call, path: "/", interface: "org.example.Test", member: "Coalesced")
+
+      {:ok, encoded} = Message.encode(message)
+      data = :binary.copy(IO.iodata_to_binary(encoded), 1_000)
+      handle = make_ref()
+
+      state = %Connection{
+        sock: sock,
+        name: ":1.100",
+        rref: {:completion, handle}
+      }
+
+      assert {:noreply, %Connection{inbound_size: 0, inbound_flatten_count: 1},
+              {:continue, :recv}} =
+               Connection.handle_info(
+                 {:"$socket", sock, :completion, {handle, {:ok, data}}},
+                 state
+               )
+
+      _ = :socket.close(sock)
+    end
+
+    test "ignores stale partial-frame timeout tokens" do
+      {:ok, sock} = :socket.open(:inet, :stream, :default)
+      current_token = make_ref()
+      state = %Connection{sock: sock, partial_frame_timer: {make_ref(), current_token}}
+
+      assert {:noreply, ^state} =
+               Connection.handle_info({:partial_frame_timeout, make_ref()}, state)
+
+      _ = :socket.close(sock)
+    end
+
     test "normalizes only partial socket errors" do
       assert :closed == Connection.normalize_socket_error({:closed, "partial peer data"})
       assert :closed == Connection.normalize_socket_error({:closed, ["partial", ?\n]})
@@ -171,6 +678,79 @@ defmodule RebusTest do
 
       refute log =~ "sensitive partial data"
       assert log =~ "D-Bus connection transport stopped: :closed"
+      _ = :socket.close(sock)
+    end
+
+    test "handles completion-based reads without leaking buffered state" do
+      {:ok, sock} = :socket.open(:inet, :stream, :default)
+
+      message =
+        Message.new!(:method_call, path: "/", interface: "org.example.Test", member: "Read")
+
+      {:ok, encoded} = Message.encode(message)
+      data = IO.iodata_to_binary(encoded)
+      complete_handle = make_ref()
+
+      complete_state = %Connection{
+        sock: sock,
+        name: ":1.100",
+        rref: {:completion, complete_handle}
+      }
+
+      assert {:noreply, %Connection{rref: nil, inbound_size: 0}, {:continue, :recv}} =
+               Connection.handle_info(
+                 {:"$socket", sock, :completion, {complete_handle, {:ok, data}}},
+                 complete_state
+               )
+
+      partial_handle = make_ref()
+      partial_state = %Connection{sock: sock, rref: {:completion, partial_handle}}
+
+      assert {:noreply, %Connection{rref: nil, inbound_size: 15} = buffered, {:continue, :recv}} =
+               Connection.handle_info(
+                 {:"$socket", sock, :completion,
+                  {partial_handle, {:ok, binary_part(data, 0, 15)}}},
+                 partial_state
+               )
+
+      assert buffered.partial_frame_timer != nil
+      Connection.terminate(:normal, buffered)
+    end
+
+    test "stops cleanly for completion read errors and aborts" do
+      {:ok, sock} = :socket.open(:inet, :stream, :default)
+      error_handle = make_ref()
+      error_state = %Connection{sock: sock, rref: {:completion, error_handle}}
+
+      error_log =
+        capture_log(fn ->
+          assert {:stop, {:shutdown, :closed}, %Connection{rref: nil}} =
+                   Connection.handle_info(
+                     {:"$socket", sock, :completion,
+                      {error_handle, {:error, {:closed, "sensitive partial data"}}}},
+                     error_state
+                   )
+        end)
+
+      refute error_log =~ "sensitive partial data"
+      refute error_log =~ "%Rebus.Connection"
+
+      abort_handle = make_ref()
+      abort_state = %Connection{sock: sock, rref: {:completion, abort_handle}}
+
+      abort_log =
+        capture_log(fn ->
+          assert {:stop, {:shutdown, :closed}, ^abort_state} =
+                   Connection.handle_info(
+                     {:"$socket", sock, :abort,
+                      {abort_handle, {:closed, "sensitive partial data"}}},
+                     abort_state
+                   )
+        end)
+
+      refute abort_log =~ "sensitive partial data"
+      refute abort_log =~ "%Rebus.Connection"
+
       _ = :socket.close(sock)
     end
 
@@ -234,15 +814,14 @@ defmodule RebusTest do
       {sock, server} = start_fragmented_socket_server(first)
       state = %Connection{sock: sock}
 
-      assert {:noreply, %{prev: ^first} = state, {:continue, :hello_reply}} =
-               Connection.handle_continue(:hello_reply, state)
-
-      send(server.pid, {:send_remainder, second})
-
       log =
         capture_log(fn ->
-          assert {:stop, {:shutdown, {:hello_failed, "org.example.SecretError"}}, ^state} =
-                   Connection.handle_continue(:hello_reply, state)
+          task = Task.async(fn -> Connection.handle_continue(:hello_reply, state) end)
+          send(server.pid, {:send_remainder, second})
+
+          assert {:stop, {:shutdown, {:hello_failed, "org.example.SecretError"}},
+                  %Connection{inbound_size: 0, inbound_segments: [], partial_frame_timer: nil}} =
+                   Task.await(task)
         end)
 
       refute log =~ sensitive_prefix
@@ -266,9 +845,15 @@ defmodule RebusTest do
       {:ok, encoded} = Message.encode(hello_reply)
       {:ok, sock} = :socket.open(:inet, :stream, :default)
       :ok = :socket.close(sock)
-      state = %Connection{sock: sock, prev: IO.iodata_to_binary(encoded)}
+      data = IO.iodata_to_binary(encoded)
 
-      assert {:noreply, %Connection{name: ":1.100", prev: <<>>}, {:continue, :recv}} =
+      state = %Connection{
+        sock: sock,
+        inbound_segments: [{byte_size(data), data}],
+        inbound_size: byte_size(data)
+      }
+
+      assert {:noreply, %Connection{name: ":1.100", inbound_size: 0}, {:continue, :recv}} =
                Connection.handle_continue(:hello_reply_buffer, state)
     end
   end
@@ -376,6 +961,32 @@ defmodule RebusTest do
                      1_000
     end
 
+    test "rejects a signal before the Hello reply", %{svr: svr} do
+      {cli, _hello} = connect_until_hello(svr)
+
+      signal =
+        Message.new!(:signal,
+          path: "/org/freedesktop/DBus",
+          interface: "org.freedesktop.DBus",
+          member: "BeforeHello"
+        )
+
+      assert_unexpected_handshake_message(svr, cli, signal, :signal)
+    end
+
+    test "rejects a method call before the Hello reply", %{svr: svr} do
+      {cli, _hello} = connect_until_hello(svr)
+
+      method_call =
+        Message.new!(:method_call,
+          path: "/org/freedesktop/DBus",
+          interface: "org.freedesktop.DBus",
+          member: "BeforeHello"
+        )
+
+      assert_unexpected_handshake_message(svr, cli, method_call, :method_call)
+    end
+
     test "drains a coalesced method call and signal after a Hello reply", %{svr: svr} do
       {cli, hello} = connect_until_hello(svr)
       ref = make_ref()
@@ -426,7 +1037,50 @@ defmodule RebusTest do
                      1_000
 
       assert wait_until(fn -> :sys.get_state(cli).name == ":1.100" end)
-      assert <<>> == :sys.get_state(cli).prev
+      assert 0 == :sys.get_state(cli).inbound_size
+    end
+
+    test "drains a large coalesced signal burst before a partial tail", %{svr: svr} do
+      cli = connect_until_ready(svr)
+      ref = Rebus.add_signal_handler(cli)
+
+      messages =
+        for index <- 1..101 do
+          Message.new!(:signal,
+            path: "/test",
+            interface: "test.interface",
+            member: "Burst",
+            signature: "u",
+            body: [index]
+          )
+        end
+
+      encoded =
+        Enum.map(messages, fn message ->
+          {:ok, data} = Message.encode(message)
+          IO.iodata_to_binary(data)
+        end)
+
+      {complete, [tail]} = Enum.split(encoded, 100)
+      split_at = byte_size(tail) - 3
+      partial_tail = binary_part(tail, 0, split_at)
+      remainder = binary_part(tail, split_at, byte_size(tail) - split_at)
+
+      :ok = TestServer.push_raw(svr, IO.iodata_to_binary([complete, partial_tail]))
+
+      for index <- 1..100 do
+        assert_receive {^ref, %Message{header_fields: %{member: "Burst"}, body: [^index]}},
+                       1_000
+      end
+
+      state = :sys.get_state(cli)
+      assert state.inbound_size < state.inbound_expected_size
+      assert length(state.inbound_segments) <= 10
+
+      :ok = TestServer.push_raw(svr, remainder)
+
+      assert_receive {^ref, %Message{header_fields: %{member: "Burst"}, body: [101]}},
+                     1_000
     end
   end
 
@@ -469,7 +1123,7 @@ defmodule RebusTest do
     end
 
     test "does not set a name from an empty steady reply", %{svr: svr} do
-      cli = connect_until_ready(svr)
+      cli = connect_until_ready(svr, send_name_acquired?: false)
       :ok = :sys.suspend(cli)
       _ = :sys.replace_state(cli, fn state -> %{state | name: nil} end)
       :ok = :sys.resume(cli)
@@ -1205,7 +1859,7 @@ defmodule RebusTest do
     %{cli: cli}
   end
 
-  defp handle_hello(%Message{} = msg, svr) do
+  defp handle_hello(%Message{} = msg, svr, opts \\ []) do
     reply =
       Rebus.Message.new!(
         :method_return,
@@ -1217,33 +1871,42 @@ defmodule RebusTest do
 
     :ok = TestServer.push(svr, reply)
 
-    signal =
-      Rebus.Message.new!(
-        :signal,
-        path: "/org/freedesktop/DBus",
-        interface: "org.freedesktop.DBus",
-        member: "NameAcquired",
-        destination: ":1.100",
-        signature: "s",
-        flags: [],
-        body: [":1.100"]
-      )
+    if Keyword.get(opts, :send_name_acquired?, true) do
+      signal =
+        Rebus.Message.new!(
+          :signal,
+          path: "/org/freedesktop/DBus",
+          interface: "org.freedesktop.DBus",
+          member: "NameAcquired",
+          destination: ":1.100",
+          signature: "s",
+          flags: [],
+          body: [":1.100"]
+        )
 
-    :ok = TestServer.push(svr, signal)
+      :ok = TestServer.push(svr, signal)
+    end
   end
 
-  defp connect_until_hello(svr) do
+  defp connect_until_hello(svr, opts \\ []) do
+    {_fixture_opts, connect_opts} = split_fixture_options(opts)
     {:ok, addr} = TestServer.get_listen_addr(svr)
-    {:ok, cli} = Rebus.connect(addr)
+    {:ok, cli} = Rebus.connect(addr, connect_opts)
     assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
     {cli, hello}
   end
 
-  defp connect_until_ready(svr) do
-    {cli, hello} = connect_until_hello(svr)
-    handle_hello(hello, svr)
+  defp connect_until_ready(svr, opts \\ []) do
+    {fixture_opts, connect_opts} = split_fixture_options(opts)
+    {cli, hello} = connect_until_hello(svr, connect_opts)
+    handle_hello(hello, svr, fixture_opts)
     assert wait_until(fn -> :sys.get_state(cli).name == ":1.100" end)
     cli
+  end
+
+  defp split_fixture_options(opts) do
+    # Test-only controls must never be passed to Rebus.connect/2.
+    Keyword.split(opts, [:send_name_acquired?])
   end
 
   defp assert_hello_error_reason(svr, expected_reason, build_reply) do
@@ -1259,6 +1922,15 @@ defmodule RebusTest do
                       {:shutdown, {:hello_failed, ^expected_reason}}},
                      1_000
     end)
+  end
+
+  defp assert_unexpected_handshake_message(svr, cli, message, type) do
+    ref = Process.monitor(cli)
+    :ok = TestServer.push(svr, message)
+
+    assert_receive {:DOWN, ^ref, :process, ^cli,
+                    {:shutdown, {:unexpected_handshake_message, ^type}}},
+                   1_000
   end
 
   defp assert_missing_reply_serial(svr, type) do
@@ -1281,6 +1953,23 @@ defmodule RebusTest do
 
   defp raw_error_reply(reply_serial, header_fields) do
     raw_reply(:error, Map.put(header_fields, :reply_serial, reply_serial))
+  end
+
+  defp malformed_empty_struct_array_message do
+    message =
+      Message.new!(:signal,
+        path: "/test",
+        interface: "test.interface",
+        member: "ZeroWidth",
+        signature: "a()",
+        body: [[]]
+      )
+
+    {:ok, encoded} = Message.encode(message)
+    encoded = IO.iodata_to_binary(encoded)
+    header_size = byte_size(encoded) - message.body_length
+    <<header::binary-size(header_size), _body::binary>> = encoded
+    header <> <<1::little-32, 0::size(4 * 8)>>
   end
 
   defp raw_reply(type, header_fields) do
@@ -1330,6 +2019,13 @@ defmodule RebusTest do
 
   defp protocol_stop_log_count(log) do
     length(String.split(log, "D-Bus connection protocol stopped:")) - 1
+  end
+
+  defp inbound_data(%Connection{} = state) do
+    state.inbound_segments
+    |> Enum.reverse()
+    |> Enum.map(&elem(&1, 1))
+    |> IO.iodata_to_binary()
   end
 
   defp wait_until(predicate, attempts \\ 100)

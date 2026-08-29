@@ -19,6 +19,8 @@ jobs:
             otp-version: '26.2'
           - elixir-version: '1.19.1'
             otp-version: '27.1'
+          - elixir-version: '1.19.5'
+            otp-version: '28.3'
 
     steps:
     - name: Checkout code
@@ -71,21 +73,22 @@ jobs:
 
     - name: Run tests with coverage
       run: mix test --cover
-      if: matrix.elixir-version == '1.18.2' && matrix.otp-version == '27.1'
+      if: matrix.elixir-version == '1.19.5' && matrix.otp-version == '28.3'
 
   dialyzer:
     name: Dialyzer
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        elixir-version: ['1.18.2']
-        otp-version: ['27.1']
+        elixir-version: ['1.19.5']
+        otp-version: ['28.3']
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
     - name: Set up Elixir
+      id: beam
       uses: erlef/setup-beam@v1
       with:
         elixir-version: ${{ matrix.elixir-version }}
@@ -123,7 +126,7 @@ jobs:
         key: |
           plt-${{ runner.os }}-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('**/mix.lock') }}
         path: |
-          priv/plts
+          _build/plts
 
     - name: Install dependencies
       if: steps.cache-deps.outputs.cache-hit != 'true'
@@ -143,12 +146,12 @@ jobs:
     - name: Save PLT cache
       id: plt_cache_save
       uses: actions/cache/save@v3
-      if: steps.plt_cache.outputs.cache-hit != 'true'
+      if: steps.cache-plt.outputs.cache-hit != 'true'
       with:
         key: |
           plt-${{ runner.os }}-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('**/mix.lock') }}
         path: |
-          priv/plts
+          _build/plts
 
     - name: Run dialyzer
       # Two formats are included for ease of debugging and it is lightly recommended to use both, see https://github.com/jeremyjh/dialyxir/issues/530 for reasoning

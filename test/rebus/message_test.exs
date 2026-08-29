@@ -10,6 +10,20 @@ defmodule Rebus.MessageTest do
     end
   end
 
+  defp fixed_header(endianness, type, version, body_length, header_fields_length) do
+    {endian_flag, body_length, serial, header_fields_length} =
+      case endianness do
+        :little ->
+          {?l, <<body_length::little-32>>, <<1::little-32>>, <<header_fields_length::little-32>>}
+
+        :big ->
+          {?B, <<body_length::big-32>>, <<1::big-32>>, <<header_fields_length::big-32>>}
+      end
+
+    <<endian_flag, type, 0, version, body_length::binary, serial::binary,
+      header_fields_length::binary>>
+  end
+
   describe "new/2" do
     test "creates a valid method call message" do
       assert {:ok, message} =
@@ -580,6 +594,24 @@ defmodule Rebus.MessageTest do
 
       # This should be different size
       assert byte_size(truncated) < byte_size(encoded)
+    end
+
+    test "rejects a nonempty array of zero-width structs" do
+      message =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "ZeroWidth",
+          signature: "a()",
+          body: [[]]
+        )
+
+      {:ok, encoded} = encode_to_binary(message)
+      header_size = byte_size(encoded) - message.body_length
+      <<header::binary-size(header_size), _body::binary>> = encoded
+      malformed_body = <<1::little-32, 0::size(4 * 8)>>
+
+      assert {:error, :invalid_message} = Message.decode(header <> malformed_body)
     end
 
     test "rejects invalid message type in binary" do
@@ -1325,6 +1357,50 @@ defmodule Rebus.MessageTest do
         invalid_header = <<255, 0::size((size - 1) * 8)>>
 
         assert {:error, :invalid_endianness} = Message.parse(invalid_header)
+      end
+    end
+
+    test "validates the message type and protocol version at the fixed-header boundary" do
+      invalid_type = fixed_header(:little, 0, 1, 0, 0)
+      unsupported_version = fixed_header(:big, 4, 2, 0, 0)
+
+      assert {:error, :invalid_message_type} = Message.parse(binary_part(invalid_type, 0, 12))
+
+      assert {:error, :unsupported_protocol_version} =
+               Message.parse(binary_part(unsupported_version, 0, 12))
+    end
+
+    test "rejects hostile declared body and header-field lengths before the body arrives" do
+      for endianness <- [:little, :big] do
+        too_large_body = Message.max_message_size() - 16 + 1
+        body_length_header = fixed_header(endianness, 4, 1, too_large_body, 0)
+
+        assert {:error, :message_too_large} = Message.parse(body_length_header)
+        assert {:error, :message_too_large} = Message.decode(body_length_header)
+
+        too_large_header_fields = 67_108_864 + 1
+        header_fields_length_header = fixed_header(endianness, 4, 1, 0, too_large_header_fields)
+
+        assert {:error, :message_too_large} = Message.parse(header_fields_length_header)
+        assert {:error, :message_too_large} = Message.decode(header_fields_length_header)
+      end
+    end
+
+    test "enforces the D-Bus 2^26 header-fields array limit" do
+      for endianness <- [:little, :big] do
+        maximum_array = fixed_header(endianness, 4, 1, 0, 67_108_864)
+        oversized_array = fixed_header(endianness, 4, 1, 0, 67_108_864 + 1)
+
+        assert nil == Message.parse(maximum_array)
+        assert {:error, :message_too_large} = Message.parse(oversized_array)
+      end
+    end
+
+    test "allows a maximum-size message to remain incomplete" do
+      for endianness <- [:little, :big] do
+        maximum_body = Message.max_message_size() - 16
+
+        assert nil == Message.parse(fixed_header(endianness, 4, 1, maximum_body, 0))
       end
     end
 

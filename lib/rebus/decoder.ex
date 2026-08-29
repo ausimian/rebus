@@ -27,11 +27,18 @@ defmodule Rebus.Decoder do
   @type_dict_end 125
   @type_unix_fd 104
 
+  @max_array_depth 32
+  @max_struct_depth 32
+  @max_total_depth 64
+
   @type endianness :: :little | :big
   @type decoding_state :: %{
           endianness: endianness(),
           position: non_neg_integer(),
-          data: binary()
+          data: binary(),
+          array_depth: non_neg_integer(),
+          struct_depth: non_neg_integer(),
+          total_depth: non_neg_integer()
         }
 
   @doc """
@@ -50,6 +57,11 @@ defmodule Rebus.Decoder do
   ## Returns
 
   Returns the decoded Elixir data structure. Multiple values are returned as a list.
+
+  ## Raises
+
+  Raises `ArgumentError` when D-Bus container nesting exceeds the protocol limit
+  of 32 array levels, 32 struct levels, or 64 total levels.
 
   ## Examples
 
@@ -72,10 +84,11 @@ defmodule Rebus.Decoder do
   """
   @spec decode(binary(), binary(), endianness()) :: [any()]
   def decode(signature, data, endianness \\ :little) do
-    state = %{endianness: endianness, position: 0, data: data}
+    state = new_state(endianness, 0, data)
+    types = parse_signature(signature)
+    validate_type_nesting(types, state)
 
-    signature
-    |> parse_signature()
+    types
     |> decode_types(state)
     # Return just the values, not the final state
     |> elem(0)
@@ -90,10 +103,11 @@ defmodule Rebus.Decoder do
   @spec decode_at_position(binary(), binary(), endianness(), non_neg_integer()) :: list()
   def decode_at_position(signature, data, endianness, starting_position) do
     # Create state with the starting position for proper alignment calculations
-    state = %{endianness: endianness, position: starting_position, data: data}
+    state = new_state(endianness, starting_position, data)
+    types = parse_signature(signature)
+    validate_type_nesting(types, state)
 
-    signature
-    |> parse_signature()
+    types
     |> decode_types(state)
     # Return just the values, not the final state
     |> elem(0)
@@ -325,10 +339,11 @@ defmodule Rebus.Decoder do
 
   defp decode_single({:struct, field_types}, state) do
     # Structs are aligned to 8-byte boundary
-    aligned_state = align_to(state, 8)
+    nested_state = enter_container(state, :struct)
+    aligned_state = align_to(nested_state, 8)
     {values, final_state} = decode_types(field_types, aligned_state)
     # Return struct as list
-    {values, final_state}
+    {values, leave_container(final_state, state)}
   end
 
   defp decode_single({:array, element_type}, state) do
@@ -352,10 +367,11 @@ defmodule Rebus.Decoder do
 
     # Create a temporary state to decode just this array
     temp_state = %{length_state | data: array_binary}
+    nested_state = enter_container(temp_state, :array)
 
     # Align to element type boundary
     element_alignment = get_alignment(element_type)
-    aligned_state = align_to(temp_state, element_alignment)
+    aligned_state = align_to(nested_state, element_alignment)
 
     # Track where array data ends within this isolated binary
     array_end_position = aligned_state.position + array_length
@@ -380,9 +396,11 @@ defmodule Rebus.Decoder do
 
     # Parse signature and decode value
     [parsed_type] = parse_signature(signature)
-    {value, final_state} = decode_single(parsed_type, signature_state)
+    nested_state = enter_container(signature_state, :variant)
+    validate_type_nesting([parsed_type], nested_state)
+    {value, final_state} = decode_single(parsed_type, nested_state)
 
-    {{signature, value}, final_state}
+    {{signature, value}, leave_container(final_state, state)}
   end
 
   defp decode_single({:unix_fd, _}, state) do
@@ -391,13 +409,102 @@ defmodule Rebus.Decoder do
 
   defp decode_single({:dict_entry, key_type, value_type}, state) do
     # Dictionary entries are like structs with key and value
-    aligned_state = align_to(state, 8)
+    nested_state = enter_container(state, :dict_entry)
+    aligned_state = align_to(nested_state, 8)
     {key, key_state} = decode_single(key_type, aligned_state)
     {value, final_state} = decode_single(value_type, key_state)
-    {{key, value}, final_state}
+    {{key, value}, leave_container(final_state, state)}
   end
 
   # Helper functions
+
+  defp new_state(endianness, position, data) do
+    %{
+      endianness: endianness,
+      position: position,
+      data: data,
+      array_depth: 0,
+      struct_depth: 0,
+      total_depth: 0
+    }
+  end
+
+  defp validate_type_nesting(types, state) when is_list(types) do
+    Enum.each(types, &validate_type_nesting(&1, state))
+  end
+
+  defp validate_type_nesting({:array, element_type}, state) do
+    state |> enter_container(:array) |> then(&validate_type_nesting(element_type, &1))
+  end
+
+  defp validate_type_nesting({:struct, field_types}, state) do
+    nested_state = enter_container(state, :struct)
+    validate_type_nesting(field_types, nested_state)
+  end
+
+  defp validate_type_nesting({:dict_entry, key_type, value_type}, state) do
+    nested_state = enter_container(state, :dict_entry)
+    validate_type_nesting([key_type, value_type], nested_state)
+  end
+
+  defp validate_type_nesting({:variant, _}, state) do
+    _ = enter_container(state, :variant)
+    :ok
+  end
+
+  defp validate_type_nesting(_type, _state), do: :ok
+
+  defp enter_container(state, :variant) do
+    ensure_total_depth!(state)
+    %{state | total_depth: state.total_depth + 1}
+  end
+
+  defp enter_container(state, :array) do
+    ensure_array_depth!(state)
+    ensure_total_depth!(state)
+
+    %{
+      state
+      | array_depth: state.array_depth + 1,
+        total_depth: state.total_depth + 1
+    }
+  end
+
+  defp enter_container(state, _struct_or_dict_entry) do
+    ensure_struct_depth!(state)
+    ensure_total_depth!(state)
+
+    %{
+      state
+      | struct_depth: state.struct_depth + 1,
+        total_depth: state.total_depth + 1
+    }
+  end
+
+  defp leave_container(state, parent_state) do
+    %{
+      state
+      | array_depth: parent_state.array_depth,
+        struct_depth: parent_state.struct_depth,
+        total_depth: parent_state.total_depth
+    }
+  end
+
+  defp ensure_array_depth!(%{array_depth: depth}) when depth < @max_array_depth,
+    do: :ok
+
+  defp ensure_array_depth!(_state),
+    do: raise(ArgumentError, "D-Bus nesting limit exceeded")
+
+  defp ensure_struct_depth!(%{struct_depth: depth}) when depth < @max_struct_depth,
+    do: :ok
+
+  defp ensure_struct_depth!(_state),
+    do: raise(ArgumentError, "D-Bus nesting limit exceeded")
+
+  defp ensure_total_depth!(%{total_depth: depth}) when depth < @max_total_depth, do: :ok
+
+  defp ensure_total_depth!(_state), do: raise(ArgumentError, "D-Bus nesting limit exceeded")
 
   defp decode_int32(state) do
     {value, new_state} = read_aligned_bytes(state, 4, 4)
@@ -522,6 +629,11 @@ defmodule Rebus.Decoder do
       end
 
     {value, new_state} = decode_single(element_type, aligned_state)
+
+    if new_state.position <= aligned_state.position do
+      raise ArgumentError, "D-Bus array element did not consume input"
+    end
+
     decode_array_elements(element_type, new_state, end_position, [value | acc])
   end
 end

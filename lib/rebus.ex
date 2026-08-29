@@ -117,6 +117,17 @@ defmodule Rebus do
       await socket readiness. If no bytes were accepted, only that caller times
       out; after a partial frame, the temporary connection is terminated and
       inflight callers receive `{:error, :disconnected}` (it does not restart).
+    - `:read_timeout` - Positive maximum time in milliseconds to establish the
+      socket or receive the complete, line-framed authentication response
+      before `connect/2` returns (default: 5000). Each setup operation has one
+      total budget, so peer progress cannot extend an authentication response
+      indefinitely. Expiry makes `connect/2` return
+      `{:error, :read_timeout}`. After `connect/2` returns `{:ok, pid}`, it
+      bounds the complete initial Hello reply from the time it is sent; peer
+      progress cannot extend that setup budget. Once established, it bounds
+      gaps between inbound fragments, is reset whenever a peer makes progress,
+      and is inactive while no frame is buffered. Expiry then terminates the
+      temporary connection; inflight callers receive `{:error, :disconnected}`.
 
   ## Return Values
 
