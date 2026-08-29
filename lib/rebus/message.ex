@@ -444,29 +444,34 @@ defmodule Rebus.Message do
         _serial::binary-size(4), rest::binary>> = binary
 
       # Determine endianness
-      with {:ok, endianness} <- parse_endianness(endian_flag),
-           {:ok, header_fields_length} <- extract_array_length(rest, endianness) do
-        # Calculate header fields size: array length field (4 bytes) + array data
-        header_fields_size = 4 + header_fields_length
+      with {:ok, endianness} <- parse_endianness(endian_flag) do
+        case extract_array_length(rest, endianness) do
+          {:ok, header_fields_length} ->
+            # Calculate header fields size: array length field (4 bytes) + array data
+            header_fields_size = 4 + header_fields_length
 
-        # Fixed header (12 bytes) + header fields, padded to 8-byte boundary
-        header_length = 12 + header_fields_size
-        header_padded_length = div(header_length + 7, 8) * 8
+            # Fixed header (12 bytes) + header fields, padded to 8-byte boundary
+            header_length = 12 + header_fields_size
+            header_padded_length = div(header_length + 7, 8) * 8
 
-        # Correct byte order for body length
-        body_length = read_uint32(body_length, endianness)
-        # Total message size = padded header + body
-        total_message_size = header_padded_length + body_length
+            # Correct byte order for body length
+            body_length = read_uint32(body_length, endianness)
+            # Total message size = padded header + body
+            total_message_size = header_padded_length + body_length
 
-        # Check if we have enough data for the complete message
-        if byte_size(binary) >= total_message_size do
-          # Extract exactly the right amount of data and decode it
-          <<message_binary::binary-size(total_message_size), remaining_data::binary>> =
-            binary
+            # Check if we have enough data for the complete message
+            if byte_size(binary) >= total_message_size do
+              # Extract exactly the right amount of data and decode it
+              <<message_binary::binary-size(total_message_size), remaining_data::binary>> =
+                binary
 
-          with {:ok, message} <- decode(message_binary) do
-            {:ok, message, remaining_data}
-          end
+              with {:ok, message} <- decode(message_binary) do
+                {:ok, message, remaining_data}
+              end
+            end
+
+          {:error, :insufficient_data} ->
+            nil
         end
       end
     end

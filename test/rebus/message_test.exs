@@ -1320,29 +1320,63 @@ defmodule Rebus.MessageTest do
       assert Message.parse(<<1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11>>) == nil
     end
 
-    test "returns nil for invalid header data" do
-      # Invalid endianness flag
-      invalid_header = <<255, 4, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0>>
-      assert {:error, :invalid_endianness} = Message.parse(invalid_header)
+    test "returns an error for invalid endianness after every fixed-header boundary" do
+      for size <- 12..16 do
+        invalid_header = <<255, 0::size((size - 1) * 8)>>
+
+        assert {:error, :invalid_endianness} = Message.parse(invalid_header)
+      end
     end
 
-    test "returns nil for partial message" do
-      # Create a complete message
-      {:ok, message} =
-        Message.new(:signal,
+    test "handles complete, truncated, and concatenated messages in both byte orders" do
+      body = [42, "payload"]
+      signature = "is"
+
+      message =
+        Message.new!(:signal,
           path: "/test",
           interface: "test.interface",
-          member: "TestSignal"
+          member: "TestSignal",
+          body: body,
+          signature: signature
         )
 
-      {:ok, encoded} = Message.encode(message)
-      complete_binary = IO.iodata_to_binary(encoded)
+      next_message =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "NextSignal",
+          body: [7],
+          signature: "i"
+        )
 
-      # Test with partial data (first half)
-      partial_size = div(byte_size(complete_binary), 2)
-      partial_binary = binary_part(complete_binary, 0, partial_size)
+      for endianness <- [:little, :big] do
+        {:ok, encoded} = Message.encode(message, endianness)
+        complete_binary = IO.iodata_to_binary(encoded)
 
-      assert Message.parse(partial_binary) == nil
+        assert {:ok, decoded_message, <<>>} = Message.parse(complete_binary)
+        assert decoded_message.body == body
+        assert Message.signature(decoded_message) == signature
+
+        for size <- 0..(byte_size(complete_binary) - 1) do
+          assert Message.parse(binary_part(complete_binary, 0, size)) == nil
+        end
+
+        {:ok, next_encoded} = Message.encode(next_message, endianness)
+        next_binary = IO.iodata_to_binary(next_encoded)
+        stream = complete_binary <> next_binary
+        complete_size = byte_size(complete_binary)
+
+        for size <- 0..byte_size(next_binary) do
+          next_prefix = binary_part(next_binary, 0, size)
+
+          assert {:ok, parsed_message, ^next_prefix} =
+                   Message.parse(binary_part(stream, 0, complete_size + size))
+
+          assert parsed_message.body == body
+          assert Message.signature(parsed_message) == signature
+        end
+      end
     end
 
     test "successfully parses complete message" do
