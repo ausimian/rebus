@@ -93,6 +93,11 @@ Rebus implements the D-Bus specification including:
 - Proper 8-byte struct alignment in arrays
 - Header field encoding at correct positions
 - Message size calculations with alignment padding
+- The 128 MiB (2^27 byte) inbound message limit and 64 MiB (2^26 byte)
+  header-fields array limit, with early fixed-header validation and a
+  progress-aware deadline and bounded retained storage for incomplete frames
+- D-Bus container nesting limits: 32 array levels, 32 struct levels, and 64
+  total levels
 - Array boundary tracking for consecutive arrays
 - Position-aware encoding and decoding
 

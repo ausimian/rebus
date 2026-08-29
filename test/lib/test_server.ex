@@ -17,6 +17,15 @@ defmodule Rebus.TestServer do
     GenServer.cast(svr, {:push_raw, data})
   end
 
+  def push_raw_fragments(svr, data) when is_binary(data) do
+    GenServer.call(svr, {:push_raw_fragments, data})
+  end
+
+  def push_raw_delayed_fragments(svr, fragments, delay)
+      when is_list(fragments) and is_integer(delay) and delay >= 0 do
+    GenServer.call(svr, {:push_raw_delayed_fragments, fragments, delay})
+  end
+
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts)
   end
@@ -31,7 +40,11 @@ defmodule Rebus.TestServer do
     field :family, :inet | :local, default: :inet
     field :path, String.t() | nil, default: nil
     field :auth_response, binary(), default: "OK 30313233343536373839414243444546\r\n"
+    field :auth_response_fragments, [binary()] | nil, default: nil
+    field :auth_fragment_delay, non_neg_integer(), default: 0
+    field :partial_auth, binary() | nil, default: nil
     field :close_after_begin, boolean(), default: false
+    field :silent_auth, boolean(), default: false
   end
 
   @impl true
@@ -51,7 +64,11 @@ defmodule Rebus.TestServer do
            tap: opts[:tap],
            family: family,
            auth_response: opts[:auth_response] || "OK 30313233343536373839414243444546\r\n",
-           close_after_begin: opts[:close_after_begin] || false
+           auth_response_fragments: opts[:auth_response_fragments],
+           auth_fragment_delay: opts[:auth_fragment_delay] || 0,
+           partial_auth: opts[:partial_auth],
+           close_after_begin: opts[:close_after_begin] || false,
+           silent_auth: opts[:silent_auth] || false
          }, {:continue, :accept}}
 
       :local ->
@@ -67,7 +84,11 @@ defmodule Rebus.TestServer do
            family: family,
            path: path,
            auth_response: opts[:auth_response] || "OK 30313233343536373839414243444546\r\n",
-           close_after_begin: opts[:close_after_begin] || false
+           auth_response_fragments: opts[:auth_response_fragments],
+           auth_fragment_delay: opts[:auth_fragment_delay] || 0,
+           partial_auth: opts[:partial_auth],
+           close_after_begin: opts[:close_after_begin] || false,
+           silent_auth: opts[:silent_auth] || false
          }, {:continue, :accept}}
     end
   end
@@ -77,21 +98,42 @@ defmodule Rebus.TestServer do
     case :socket.accept(state.svr_sock, :nowait) do
       {:ok, cli} ->
         {:ok, "\0AUTH " <> _} = :socket.recv(cli)
-        :ok = :socket.send(cli, state.auth_response)
 
-        case state.auth_response do
-          <<"OK ", _::binary>> ->
-            {:ok, "BEGIN \r\n"} = :socket.recv(cli, 8)
+        cond do
+          state.silent_auth ->
+            send(state.tap, {self(), :auth_received})
+            {:noreply, %{state | cli_sock: cli}}
 
-            if state.close_after_begin do
-              :ok = :socket.close(cli)
-              {:noreply, %{state | cli_sock: nil}, {:continue, :accept}}
-            else
-              {:noreply, %{state | cli_sock: cli}, {:continue, :recv}}
+          is_binary(state.partial_auth) ->
+            :ok = :socket.send(cli, state.partial_auth)
+            send(state.tap, {self(), :auth_received})
+            {:noreply, %{state | cli_sock: cli}}
+
+          true ->
+            send_auth_response(cli, state)
+
+            case state.auth_response do
+              <<"OK ", _::binary>> ->
+                case :socket.recv(cli, 8) do
+                  {:ok, "BEGIN \r\n"} ->
+                    if state.close_after_begin do
+                      :ok = :socket.close(cli)
+                      {:noreply, %{state | cli_sock: nil}, {:continue, :accept}}
+                    else
+                      {:noreply, %{state | cli_sock: cli}, {:continue, :recv}}
+                    end
+
+                  {:error, :closed} ->
+                    send(state.tap, {self(), :client_closed})
+                    {:noreply, %{state | cli_sock: nil}, {:continue, :accept}}
+
+                  _ ->
+                    observe_client_close(cli, state)
+                end
+
+              _ ->
+                observe_client_close(cli, state)
             end
-
-          _ ->
-            observe_client_close(cli, state)
         end
 
       {:select, {:select_info, :accept, handle}} ->
@@ -130,6 +172,32 @@ defmodule Rebus.TestServer do
     {:reply, :socket.sockname(state.svr_sock), state}
   end
 
+  def handle_call({:push_raw_fragments, data}, _from, %__MODULE__{} = state) do
+    for <<byte <- data>> do
+      :ok = :socket.send(state.cli_sock, <<byte>>)
+    end
+
+    {:reply, :ok, state}
+  end
+
+  def handle_call(
+        {:push_raw_delayed_fragments, fragments, delay},
+        _from,
+        %__MODULE__{} = state
+      ) do
+    fragments
+    |> Enum.with_index()
+    |> Enum.each(fn {fragment, index} ->
+      :ok = :socket.send(state.cli_sock, fragment)
+
+      if index < length(fragments) - 1 and delay > 0 do
+        Process.sleep(delay)
+      end
+    end)
+
+    {:reply, :ok, state}
+  end
+
   @impl true
   def handle_cast({:push, %Message{} = msg}, %__MODULE__{} = state) do
     {:ok, bin} = Rebus.Message.encode(%{msg | serial: state.serial})
@@ -161,6 +229,20 @@ defmodule Rebus.TestServer do
     _ = :socket.close(cli)
     send(state.tap, {self(), outcome})
     {:noreply, %{state | cli_sock: nil, handle: nil, prev: <<>>}, {:continue, :accept}}
+  end
+
+  defp send_auth_response(cli, %__MODULE__{} = state) do
+    fragments = state.auth_response_fragments || [state.auth_response]
+
+    fragments
+    |> Enum.with_index()
+    |> Enum.each(fn {fragment, index} ->
+      :ok = :socket.send(cli, fragment)
+
+      if index < length(fragments) - 1 and state.auth_fragment_delay > 0 do
+        Process.sleep(state.auth_fragment_delay)
+      end
+    end)
   end
 
   defp parse(data, %__MODULE__{} = state) do
