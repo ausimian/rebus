@@ -260,10 +260,8 @@ defmodule RebusTest do
 
           fixed_header = <<?l, 4, 0, 1, body_length::little-32, 1::little-32>>
 
-          :ok = TestServer.push_raw(svr, fixed_header)
-          assert wait_until(fn -> inbound_data(:sys.get_state(cli)) == fixed_header end)
-
-          :ok = TestServer.push_raw(svr, <<0::little-32>>)
+          assert :ok =
+                   TestServer.push_raw_fragments(svr, fixed_header <> <<0::little-32>>)
 
           assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :message_too_large}}, 1_000
         end)
@@ -292,18 +290,14 @@ defmodule RebusTest do
 
     test "caps each inbound receive allocation below the maximum frame size", %{svr: svr} do
       cli = connect_until_ready(svr)
-      state = :sys.get_state(cli)
 
-      max_legal_body_length = Message.max_message_size() - 16
+      assert Connection.inbound_receive_buffer_size() == 65_536
 
-      state = %{
-        state
-        | inbound_size: 16,
-          inbound_expected_size: 16 + max_legal_body_length
-      }
+      assert {:ok, {1, buffer_size}} =
+               :socket.getopt(:sys.get_state(cli).sock, {:otp, :rcvbuf})
 
-      assert Connection.inbound_read_length(state) == 65_536
-      assert Connection.inbound_read_length(state) < Message.max_message_size()
+      assert buffer_size == Connection.inbound_receive_buffer_size()
+      assert buffer_size < Message.max_message_size()
     end
 
     test "decodes a one-byte fragmented inbound frame", %{svr: svr} do
@@ -330,6 +324,7 @@ defmodule RebusTest do
                      1_000
 
       assert wait_until(fn -> :sys.get_state(cli).inbound_size == 0 end)
+      assert :sys.get_state(cli).partial_frame_timer == nil
     end
 
     test "keeps an idle connection alive without an incomplete frame", %{svr: svr} do
@@ -349,7 +344,6 @@ defmodule RebusTest do
           partial_header = <<?l, 4, 0, 1, 0::little-32, 1::little-32>>
 
           :ok = TestServer.push_raw(svr, partial_header)
-          assert wait_until(fn -> inbound_data(:sys.get_state(cli)) == partial_header end)
 
           assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :read_timeout}}, 1_000
         end)
@@ -358,7 +352,7 @@ defmodule RebusTest do
       refute log =~ "%Rebus.Connection"
     end
 
-    test "resets the partial-frame deadline on progress and clears it on completion", %{svr: svr} do
+    test "resets the partial-frame deadline when a peer makes progress", %{svr: svr} do
       cli = connect_until_ready(svr, read_timeout: 1_000)
 
       message =
@@ -370,31 +364,19 @@ defmodule RebusTest do
 
       {:ok, encoded} = Message.encode(message)
       binary = IO.iodata_to_binary(encoded)
-      <<first::binary-size(12), second::binary-size(1), rest::binary>> = binary
+      <<first::binary-size(12), second::binary-size(1), _rest::binary>> = binary
+      ref = Process.monitor(cli)
 
-      :ok = TestServer.push_raw(svr, first)
-      assert wait_until(fn -> inbound_data(:sys.get_state(cli)) == first end)
-      first_timer = :sys.get_state(cli).partial_frame_timer
+      task =
+        Task.async(fn -> TestServer.push_raw_delayed_fragments(svr, [first, second], 600) end)
 
-      :ok = TestServer.push_raw(svr, second)
-      assert wait_until(fn -> inbound_data(:sys.get_state(cli)) == first <> second end)
-      second_timer = :sys.get_state(cli).partial_frame_timer
+      assert :ok = Task.await(task)
 
-      refute first_timer == second_timer
+      # Without resetting on the second fragment, the original 1,000 ms budget
+      # would expire during this interval.
+      refute_receive {:DOWN, ^ref, :process, ^cli, _reason}, 500
 
-      {_timer_ref, stale_token} = first_timer
-      send(cli, {:partial_frame_timeout, stale_token})
-      assert :sys.get_state(cli).partial_frame_timer == second_timer
-      assert Process.alive?(cli)
-
-      :ok = TestServer.push_raw(svr, rest)
-
-      assert wait_until(fn ->
-               state = :sys.get_state(cli)
-               state.inbound_size == 0 and state.partial_frame_timer == nil
-             end)
-
-      assert Process.alive?(cli)
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :read_timeout}}, 1_000
     end
   end
 

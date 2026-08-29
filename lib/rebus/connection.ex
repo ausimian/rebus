@@ -11,6 +11,7 @@ defmodule Rebus.Connection do
   @default_read_timeout 5_000
   @max_auth_line_size 1_024
   @max_read_chunk 65_536
+  @max_read_attempts 1
   @max_inbound_segments 64
   @max_serial 4_294_967_295
 
@@ -118,8 +119,14 @@ defmodule Rebus.Connection do
 
       true ->
         case :socket.open(family, :stream, :default) do
-          {:ok, sock} -> initialize(sock, addr, write_timeout, read_timeout)
-          {:error, reason} -> {:stop, normalize_socket_error(reason)}
+          {:ok, sock} ->
+            case configure_receive_buffer(sock) do
+              :ok -> initialize(sock, addr, write_timeout, read_timeout)
+              {:error, reason} -> stop_and_close(sock, reason)
+            end
+
+          {:error, reason} ->
+            {:stop, normalize_socket_error(reason)}
         end
     end
   end
@@ -303,7 +310,7 @@ defmodule Rebus.Connection do
   end
 
   def handle_continue(:recv, %__MODULE__{rref: nil} = state) do
-    case :socket.recv(state.sock, inbound_read_length(state), [], :nowait) do
+    case :socket.recv(state.sock, 0, [], :nowait) do
       {:ok, data} ->
         append_inbound(data, state, :recv)
 
@@ -334,7 +341,7 @@ defmodule Rebus.Connection do
   end
 
   defp receive_hello_reply(%__MODULE__{} = state, deadline, timeout) do
-    case :socket.recv(state.sock, inbound_read_length(state), [], timeout) do
+    case :socket.recv(state.sock, 0, [], timeout) do
       {:ok, data} ->
         continue_hello_reply(data, state, deadline)
 
@@ -547,6 +554,16 @@ defmodule Rebus.Connection do
     end
   end
 
+  defp configure_receive_buffer(sock) do
+    # A zero-length receive returns the bytes currently available on every
+    # supported OTP release. Keep the backing allocation independent of a
+    # peer-declared D-Bus frame length and make one OS read per receive call.
+    case :socket.setopt(sock, {:otp, :rcvbuf}, {@max_read_attempts, @max_read_chunk}) do
+      :ok -> :ok
+      {:error, reason} -> {:error, normalize_socket_error(reason)}
+    end
+  end
+
   defp handshake_recv(sock, timeout) do
     receive_auth_line(sock, <<>>, read_deadline(timeout), timeout)
   end
@@ -625,9 +642,9 @@ defmodule Rebus.Connection do
     {:stop, {:shutdown, reason}, fail_pending(state)}
   end
 
-  # Receive the fixed header first, then stay within its declared frame boundary.
-  # A fixed ceiling keeps esock's receive-buffer allocation independent of any
-  # peer-declared message length.
+  # Each zero-length receive returns data already available through the fixed
+  # OTP buffer. Fixed-header validation still happens as soon as 16 bytes are
+  # retained, without making allocation depend on a peer-declared frame length.
   defp append_inbound(<<>>, %__MODULE__{} = state, continuation),
     do: process_inbound(state, continuation)
 
@@ -683,14 +700,8 @@ defmodule Rebus.Connection do
   end
 
   @doc false
-  @spec inbound_read_length(t()) :: pos_integer()
-  def inbound_read_length(%__MODULE__{inbound_expected_size: nil, inbound_size: size}) do
-    min(max(16 - size, 1), @max_read_chunk)
-  end
-
-  def inbound_read_length(%__MODULE__{} = state) do
-    min(state.inbound_expected_size - state.inbound_size, @max_read_chunk)
-  end
+  @spec inbound_receive_buffer_size() :: pos_integer()
+  def inbound_receive_buffer_size, do: @max_read_chunk
 
   defp inbound_prefix(%__MODULE__{} = state, size) do
     state.inbound_segments
