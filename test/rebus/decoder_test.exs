@@ -245,6 +245,52 @@ defmodule Rebus.DecoderTest do
       result = Decoder.decode("ai", data)
       assert result == [[]]
     end
+
+    test "round-trips variants with 8-byte-aligned payloads" do
+      values = [
+        {"x", 5},
+        {"t", 0x1234_5678_9ABC_DEF0},
+        {"d", 3.25}
+      ]
+
+      for endianness <- [:little, :big] do
+        encoded = Encoder.encode("av", [values], endianness)
+        data = IO.iodata_to_binary(encoded)
+
+        assert Decoder.decode("av", data, endianness) == [values]
+      end
+    end
+
+    test "round-trips nested arrays with 8-byte-aligned payloads" do
+      for {signature, values} <- [
+            {"aax", [[[5]]]},
+            {"aad", [[[3.25]]]},
+            {"aav", [[[{"x", 5}]]]}
+          ],
+          endianness <- [:little, :big] do
+        encoded = Encoder.encode(signature, values, endianness)
+        data = IO.iodata_to_binary(encoded)
+
+        assert Decoder.decode(signature, data, endianness) == values
+      end
+    end
+
+    test "round-trips arrays encoded at nonzero stream positions" do
+      for {signature, values, starting_position} <- [
+            {"av", [[{"x", 5}]], 1},
+            {"aax", [[[5]]], 2},
+            {"av", [[{"x", 5}]], 4},
+            {"ai", [[1, 2]], 12}
+          ],
+          endianness <- [:little, :big] do
+        data =
+          Encoder.encode_at_position(signature, values, endianness, starting_position)
+          |> IO.iodata_to_binary()
+
+        assert Decoder.decode_at_position(signature, data, endianness, starting_position) ==
+                 values
+      end
+    end
   end
 
   describe "variant and dictionary types" do
