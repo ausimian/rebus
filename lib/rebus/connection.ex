@@ -81,6 +81,7 @@ defmodule Rebus.Connection do
     field :inbound_segments, [{pos_integer(), binary()}], default: []
     field :inbound_size, non_neg_integer(), default: 0
     field :inbound_expected_size, pos_integer() | nil, default: nil
+    field :inbound_flatten_count, non_neg_integer(), default: 0
     field :name, binary() | nil, default: nil
     field :serial, non_neg_integer(), default: 1
     field :write_timeout, pos_integer(), default: @default_write_timeout
@@ -120,10 +121,8 @@ defmodule Rebus.Connection do
       true ->
         case :socket.open(family, :stream, :default) do
           {:ok, sock} ->
-            case configure_receive_buffer(sock) do
-              :ok -> initialize(sock, addr, write_timeout, read_timeout)
-              {:error, reason} -> stop_and_close(sock, reason)
-            end
+            _ = configure_receive_buffer(sock)
+            initialize(sock, addr, write_timeout, read_timeout)
 
           {:error, reason} ->
             {:stop, normalize_socket_error(reason)}
@@ -310,25 +309,49 @@ defmodule Rebus.Connection do
   end
 
   def handle_continue(:recv, %__MODULE__{rref: nil} = state) do
-    case :socket.recv(state.sock, 0, [], :nowait) do
-      {:ok, data} ->
-        append_inbound(data, state, :recv)
-
-      {:select, {:select_info, :recv, handle}} ->
-        {:noreply, %{state | rref: handle}}
-
-      {:select, {{:select_info, :recv, handle}, data}} ->
-        append_inbound(data, %{state | rref: handle}, :recv)
-
-      {:completion, {:completion_info, :recv, handle}} ->
-        {:noreply, %{state | rref: {:completion, handle}}}
-
-      {:error, reason} ->
-        stop_for_transport_error(reason, state)
-    end
+    handle_receive_result(:socket.recv(state.sock, 0, [], :nowait), state)
   end
 
+  # A pending socket operation owns the receive continuation. Keeping this
+  # catch-all prevents a stale continuation from crashing and exposing state.
+  def handle_continue(:recv, %__MODULE__{} = state), do: {:noreply, state}
+
   def handle_continue(:write, %__MODULE__{} = state), do: advance_writes(state)
+
+  @doc false
+  def handle_receive_result({:ok, data}, %__MODULE__{} = state) when is_binary(data) do
+    append_inbound(data, state, :recv)
+  end
+
+  def handle_receive_result(
+        {:select, {:select_info, :recv, handle}},
+        %__MODULE__{} = state
+      ) do
+    {:noreply, %{state | rref: handle}}
+  end
+
+  def handle_receive_result(
+        {:select, {{:select_info, :recv, handle}, data}},
+        %__MODULE__{} = state
+      )
+      when is_binary(data) do
+    append_inbound(data, %{state | rref: handle}, :recv)
+  end
+
+  def handle_receive_result(
+        {:completion, {:completion_info, :recv, handle}},
+        %__MODULE__{} = state
+      ) do
+    {:noreply, %{state | rref: {:completion, handle}}}
+  end
+
+  def handle_receive_result({:error, reason}, %__MODULE__{} = state) do
+    stop_for_transport_error(reason, state)
+  end
+
+  def handle_receive_result(_result, %__MODULE__{} = state) do
+    stop_for_transport_error(:receive_failed, state)
+  end
 
   defp receive_hello_reply(%__MODULE__{} = state, deadline) do
     case remaining_timeout(deadline, state.read_timeout) do
@@ -482,12 +505,23 @@ defmodule Rebus.Connection do
   end
 
   defp parse_complete_message(data, %__MODULE__{} = state, continuation) do
+    parse_flat_messages(data, state, continuation, data)
+  end
+
+  # `data` is already flat when a complete frame is available. Parse every
+  # coalesced frame directly from its sub-binary remainder, retaining only the
+  # final incomplete tail. This avoids re-flattening a receive buffer per frame.
+  defp parse_flat_messages(<<>>, %__MODULE__{} = state, continuation, _source) do
+    process_inbound(state, continuation)
+  end
+
+  defp parse_flat_messages(data, %__MODULE__{} = state, continuation, source) do
     case Message.parse(data) do
       {:ok, %Message{} = msg, rest} when is_nil(state.name) ->
         state = finish_frame(state)
 
         case hello_reply_result(msg) do
-          {:ok, name} -> append_remainder(rest, %{state | name: name}, :recv, data)
+          {:ok, name} -> parse_flat_messages(rest, %{state | name: name}, :recv, source)
           {:error, reason} -> stop_for_protocol_error(reason, state)
         end
 
@@ -495,23 +529,22 @@ defmodule Rebus.Connection do
         state = finish_frame(state)
 
         case reply(msg, state) do
-          {:ok, state} -> append_remainder(rest, state, continuation, data)
+          {:ok, state} -> parse_flat_messages(rest, state, continuation, source)
           {:error, reason} -> stop_for_protocol_error(reason, state)
         end
 
       {:ok, %Message{type: :signal} = msg, rest} ->
         state = finish_frame(state)
-        append_remainder(rest, notify(msg, state), continuation, data)
+        parse_flat_messages(rest, notify(msg, state), continuation, source)
 
       {:ok, %Message{type: :method_call}, rest} ->
-        append_remainder(rest, finish_frame(state), continuation, data)
+        parse_flat_messages(rest, finish_frame(state), continuation, source)
 
       {:ok, %Message{}, rest} ->
-        append_remainder(rest, finish_frame(state), continuation, data)
+        parse_flat_messages(rest, finish_frame(state), continuation, source)
 
       nil ->
-        # The accumulator only calls this after its declared size is available.
-        buffer_incomplete_message(state, continuation)
+        append_inbound(retain_remainder(data, source), state, continuation)
 
       {:error, reason} ->
         stop_for_protocol_error(reason, state)
@@ -554,13 +587,29 @@ defmodule Rebus.Connection do
     end
   end
 
-  defp configure_receive_buffer(sock) do
+  @doc false
+  def configure_receive_buffer(
+        sock,
+        setopt_fun \\ &:socket.setopt/3,
+        warning_fun \\ &Logger.warning/1
+      ) do
     # A zero-length receive returns the bytes currently available on every
     # supported OTP release. Keep the backing allocation independent of a
-    # peer-declared D-Bus frame length and make one OS read per receive call.
-    case :socket.setopt(sock, {:otp, :rcvbuf}, {@max_read_attempts, @max_read_chunk}) do
-      :ok -> :ok
-      {:error, reason} -> {:error, normalize_socket_error(reason)}
+    # peer-declared D-Bus frame length. Some backends only accept the scalar
+    # form, so failure to tune this hint must never make connections unavailable.
+    case setopt_fun.(sock, {:otp, :rcvbuf}, {@max_read_attempts, @max_read_chunk}) do
+      :ok ->
+        :tuple
+
+      {:error, _reason} ->
+        case setopt_fun.(sock, {:otp, :rcvbuf}, @max_read_chunk) do
+          :ok ->
+            :scalar
+
+          {:error, _reason} ->
+            warning_fun.("D-Bus connection is using OTP's default receive buffer")
+            :default
+        end
     end
   end
 
@@ -667,13 +716,6 @@ defmodule Rebus.Connection do
     end
   end
 
-  defp append_remainder(<<>>, %__MODULE__{} = state, continuation, _source),
-    do: process_inbound(state, continuation)
-
-  defp append_remainder(rest, %__MODULE__{} = state, continuation, source) do
-    append_inbound(retain_remainder(rest, source), state, continuation)
-  end
-
   defp process_inbound(%__MODULE__{inbound_size: 0} = state, continuation),
     do: buffer_incomplete_message(state, continuation)
 
@@ -693,7 +735,12 @@ defmodule Rebus.Connection do
   defp process_inbound(%__MODULE__{} = state, continuation) do
     if state.inbound_size >= state.inbound_expected_size do
       data = inbound_binary(state)
-      parse_complete_message(data, clear_inbound_frame(state), continuation)
+
+      parse_complete_message(
+        data,
+        clear_inbound_frame(%{state | inbound_flatten_count: state.inbound_flatten_count + 1}),
+        continuation
+      )
     else
       buffer_incomplete_message(state, continuation)
     end
@@ -758,6 +805,11 @@ defmodule Rebus.Connection do
   # A timer exists only while a nonempty frame is incomplete. Each retained
   # fragment replaces it, so a peer that is making progress remains connected
   # while a peer that stops or dribbles too slowly cannot pin retained data.
+  defp buffer_incomplete_message(%__MODULE__{inbound_size: 0, rref: rref} = state, _continuation)
+       when not is_nil(rref) do
+    {:noreply, clear_partial_frame(state)}
+  end
+
   defp buffer_incomplete_message(%__MODULE__{inbound_size: 0} = state, continuation) do
     {:noreply, clear_partial_frame(state), {:continue, continuation}}
   end

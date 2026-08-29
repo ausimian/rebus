@@ -19,6 +19,8 @@ jobs:
             otp-version: '26.2'
           - elixir-version: '1.19.1'
             otp-version: '27.1'
+          - elixir-version: '1.19.5'
+            otp-version: '28.3'
 
     steps:
     - name: Checkout code
@@ -71,15 +73,15 @@ jobs:
 
     - name: Run tests with coverage
       run: mix test --cover
-      if: matrix.elixir-version == '1.18.2' && matrix.otp-version == '27.1'
+      if: matrix.elixir-version == '1.19.5' && matrix.otp-version == '28.3'
 
   dialyzer:
     name: Dialyzer
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        elixir-version: ['1.18.2']
-        otp-version: ['27.1']
+        elixir-version: ['1.19.5']
+        otp-version: ['28.3']
 
     steps:
     - name: Checkout code

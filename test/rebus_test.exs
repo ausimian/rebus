@@ -258,10 +258,14 @@ defmodule RebusTest do
           ref = Process.monitor(cli)
           body_length = Message.max_message_size() - 16 + 1
 
-          fixed_header = <<?l, 4, 0, 1, body_length::little-32, 1::little-32>>
+          fixed_header =
+            <<?l, 4, 0, 1, body_length::little-32, 1::little-32, 0::little-32>>
 
-          assert :ok =
-                   TestServer.push_raw_fragments(svr, fixed_header <> <<0::little-32>>)
+          assert {:error, :message_too_large} = Message.expected_size(fixed_header)
+
+          # Only the complete fixed header is sent; no message body is ever
+          # placed on the socket before the declared size is rejected.
+          :ok = TestServer.push_raw(svr, fixed_header)
 
           assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :message_too_large}}, 1_000
         end)
@@ -280,6 +284,10 @@ defmodule RebusTest do
 
       assert :ok = TestServer.push_raw_fragments(svr, :binary.copy(<<0>>, 256))
 
+      assert wait_until(fn ->
+               :sys.get_state(cli).inbound_size == byte_size(fixed_header) + 256
+             end)
+
       state = :sys.get_state(cli)
 
       assert state.inbound_size <= byte_size(fixed_header) + 256
@@ -293,8 +301,13 @@ defmodule RebusTest do
 
       assert Connection.inbound_receive_buffer_size() == 65_536
 
-      assert {:ok, {1, buffer_size}} =
-               :socket.getopt(:sys.get_state(cli).sock, {:otp, :rcvbuf})
+      assert {:ok, receive_buffer} = :socket.getopt(:sys.get_state(cli).sock, {:otp, :rcvbuf})
+
+      buffer_size =
+        case receive_buffer do
+          {1, size} -> size
+          size when is_integer(size) -> size
+        end
 
       assert buffer_size == Connection.inbound_receive_buffer_size()
       assert buffer_size < Message.max_message_size()
@@ -438,6 +451,109 @@ defmodule RebusTest do
 
       assert {"rest", ^continuation, :nowait} =
                Connection.socket_send_args("rest", {:continue, continuation})
+    end
+
+    test "falls back safely when configuring the OTP receive buffer" do
+      parent = self()
+      tuple_value = {1, Connection.inbound_receive_buffer_size()}
+
+      assert :tuple =
+               Connection.configure_receive_buffer(
+                 :test_socket,
+                 fn _sock, _option, value ->
+                   send(parent, {:setopt, value})
+                   :ok
+                 end,
+                 fn warning -> send(parent, {:warning, warning}) end
+               )
+
+      assert_receive {:setopt, ^tuple_value}
+      refute_receive {:warning, _}
+
+      assert :scalar =
+               Connection.configure_receive_buffer(
+                 :test_socket,
+                 fn _sock, _option, value ->
+                   send(parent, {:setopt, value})
+                   if is_tuple(value), do: {:error, :invalid}, else: :ok
+                 end,
+                 fn warning -> send(parent, {:warning, warning}) end
+               )
+
+      assert_receive {:setopt, ^tuple_value}
+      assert_receive {:setopt, 65_536}
+      refute_receive {:warning, _}
+
+      assert :default =
+               Connection.configure_receive_buffer(
+                 :test_socket,
+                 fn _sock, _option, value ->
+                   send(parent, {:setopt, value})
+                   {:error, :invalid}
+                 end,
+                 fn warning -> send(parent, {:warning, warning}) end
+               )
+
+      assert_receive {:setopt, ^tuple_value}
+      assert_receive {:setopt, 65_536}
+      assert_receive {:warning, "D-Bus connection is using OTP's default receive buffer"}
+    end
+
+    test "waits for a select after handling its attached receive data" do
+      {:ok, sock} = :socket.open(:inet, :stream, :default)
+
+      message =
+        Message.new!(:method_call, path: "/", interface: "org.example.Test", member: "Select")
+
+      {:ok, encoded} = Message.encode(message)
+      data = IO.iodata_to_binary(encoded)
+      select_info = {:select_info, :recv, make_ref()}
+      {:select_info, :recv, handle} = select_info
+      state = %Connection{sock: sock, name: ":1.100"}
+
+      assert {:noreply,
+              %Connection{rref: ^handle, inbound_size: 0, partial_frame_timer: nil} = state} =
+               Connection.handle_receive_result({:select, {select_info, data}}, state)
+
+      assert {:noreply, ^state} = Connection.handle_continue(:recv, state)
+      Connection.terminate(:normal, state)
+    end
+
+    test "parses coalesced frames with one materialization per receive" do
+      {:ok, sock} = :socket.open(:inet, :stream, :default)
+
+      message =
+        Message.new!(:method_call, path: "/", interface: "org.example.Test", member: "Coalesced")
+
+      {:ok, encoded} = Message.encode(message)
+      data = :binary.copy(IO.iodata_to_binary(encoded), 1_000)
+      handle = make_ref()
+
+      state = %Connection{
+        sock: sock,
+        name: ":1.100",
+        rref: {:completion, handle}
+      }
+
+      assert {:noreply, %Connection{inbound_size: 0, inbound_flatten_count: 1},
+              {:continue, :recv}} =
+               Connection.handle_info(
+                 {:"$socket", sock, :completion, {handle, {:ok, data}}},
+                 state
+               )
+
+      _ = :socket.close(sock)
+    end
+
+    test "ignores stale partial-frame timeout tokens" do
+      {:ok, sock} = :socket.open(:inet, :stream, :default)
+      current_token = make_ref()
+      state = %Connection{sock: sock, partial_frame_timer: {make_ref(), current_token}}
+
+      assert {:noreply, ^state} =
+               Connection.handle_info({:partial_frame_timeout, make_ref()}, state)
+
+      _ = :socket.close(sock)
     end
 
     test "normalizes only partial socket errors" do
