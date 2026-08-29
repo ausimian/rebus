@@ -13,6 +13,10 @@ defmodule Rebus.TestServer do
     GenServer.cast(svr, {:push, msg})
   end
 
+  def push_raw(svr, data) when is_binary(data) do
+    GenServer.cast(svr, {:push_raw, data})
+  end
+
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts)
   end
@@ -26,6 +30,8 @@ defmodule Rebus.TestServer do
     field :serial, non_neg_integer(), default: 1
     field :family, :inet | :local, default: :inet
     field :path, String.t() | nil, default: nil
+    field :auth_response, binary(), default: "OK 30313233343536373839414243444546\r\n"
+    field :close_after_begin, boolean(), default: false
   end
 
   @impl true
@@ -38,7 +44,15 @@ defmodule Rebus.TestServer do
         {:ok, sock} = :socket.open(:inet, :stream, :default)
         :ok = :socket.bind(sock, %{family: :inet, addr: :loopback, port: 0})
         :ok = :socket.listen(sock, 5)
-        {:ok, %__MODULE__{svr_sock: sock, tap: opts[:tap], family: family}, {:continue, :accept}}
+
+        {:ok,
+         %__MODULE__{
+           svr_sock: sock,
+           tap: opts[:tap],
+           family: family,
+           auth_response: opts[:auth_response] || "OK 30313233343536373839414243444546\r\n",
+           close_after_begin: opts[:close_after_begin] || false
+         }, {:continue, :accept}}
 
       :local ->
         {:ok, sock} = :socket.open(:local, :stream, :default)
@@ -46,8 +60,15 @@ defmodule Rebus.TestServer do
         :ok = :socket.bind(sock, %{family: :local, path: path})
         :ok = :socket.listen(sock, 5)
 
-        {:ok, %__MODULE__{svr_sock: sock, tap: opts[:tap], family: family, path: path},
-         {:continue, :accept}}
+        {:ok,
+         %__MODULE__{
+           svr_sock: sock,
+           tap: opts[:tap],
+           family: family,
+           path: path,
+           auth_response: opts[:auth_response] || "OK 30313233343536373839414243444546\r\n",
+           close_after_begin: opts[:close_after_begin] || false
+         }, {:continue, :accept}}
     end
   end
 
@@ -56,10 +77,22 @@ defmodule Rebus.TestServer do
     case :socket.accept(state.svr_sock, :nowait) do
       {:ok, cli} ->
         {:ok, "\0AUTH " <> _} = :socket.recv(cli)
-        guid = :binary.encode_hex(<<"0123456789ABCDEF">>)
-        :ok = :socket.send(cli, "OK #{guid}\r\n")
-        {:ok, "BEGIN \r\n"} = :socket.recv(cli, 8)
-        {:noreply, %{state | cli_sock: cli}, {:continue, :recv}}
+        :ok = :socket.send(cli, state.auth_response)
+
+        case state.auth_response do
+          <<"OK ", _::binary>> ->
+            {:ok, "BEGIN \r\n"} = :socket.recv(cli, 8)
+
+            if state.close_after_begin do
+              :ok = :socket.close(cli)
+              {:noreply, %{state | cli_sock: nil}, {:continue, :accept}}
+            else
+              {:noreply, %{state | cli_sock: cli}, {:continue, :recv}}
+            end
+
+          _ ->
+            observe_client_close(cli, state)
+        end
 
       {:select, {:select_info, :accept, handle}} ->
         {:noreply, %{state | handle: handle}}
@@ -76,6 +109,9 @@ defmodule Rebus.TestServer do
 
       {:select, {:select_info, :recv, handle}} ->
         {:noreply, %{state | handle: handle}}
+
+      {:error, :closed} ->
+        {:stop, :normal, state}
 
       {:error, reason} ->
         {:stop, reason, state}
@@ -101,6 +137,11 @@ defmodule Rebus.TestServer do
     {:noreply, %{state | serial: state.serial + 1}}
   end
 
+  def handle_cast({:push_raw, data}, %__MODULE__{} = state) do
+    :ok = :socket.send(state.cli_sock, data)
+    {:noreply, state}
+  end
+
   @impl true
   def terminate(_reason, %__MODULE__{family: :local, path: path} = _state) when is_binary(path) do
     # Clean up Unix socket file
@@ -109,6 +150,18 @@ defmodule Rebus.TestServer do
   end
 
   def terminate(_reason, _state), do: :ok
+
+  defp observe_client_close(cli, %__MODULE__{} = state) do
+    outcome =
+      case :socket.recv(cli, 0, [], 1_000) do
+        {:error, :closed} -> :client_closed
+        result -> {:client_close_outcome, result}
+      end
+
+    _ = :socket.close(cli)
+    send(state.tap, {self(), outcome})
+    {:noreply, %{state | cli_sock: nil, handle: nil, prev: <<>>}, {:continue, :accept}}
+  end
 
   defp parse(data, %__MODULE__{} = state) do
     case Message.parse(data) do
