@@ -720,8 +720,10 @@ defmodule RebusTest do
           assert :ok = Rebus.close(retry_cli)
         end)
 
-      refute log =~ ~r/GenServer #PID<[^>]+> terminating/
-      refute log =~ ~r/Child process #PID<[^>]+>[\s\S]*(?:exited|terminated)/
+      refute log =~ "GenServer :rebus_issue_15_dead_before_setup terminating"
+      refute log =~ "** (exit)"
+      refute log =~ "D-Bus connection transport stopped:"
+      refute log =~ "D-Bus connection protocol stopped:"
     end
 
     test "closes a stalled setup when its connecting caller exits" do
