@@ -7,8 +7,51 @@ defmodule Rebus.Connection do
   alias Rebus.Message
   require Logger
 
-  def send(pid, %Message{} = msg) when is_pid(pid) do
-    GenServer.call(pid, {:send, msg})
+  @default_write_timeout 5_000
+  @max_serial 4_294_967_295
+
+  @spec call(pid(), Message.t(), non_neg_integer()) :: Message.t() | {:error, term()}
+  def call(pid, %Message{} = msg, timeout)
+      when is_pid(pid) and is_integer(timeout) and timeout >= 0 do
+    if node(pid) == node() do
+      request_ref = make_ref()
+      deadline = System.monotonic_time(:millisecond) + timeout
+
+      try do
+        GenServer.call(pid, {:call, msg, deadline, request_ref}, timeout)
+      catch
+        :exit, {:timeout, _call} ->
+          GenServer.cast(pid, {:cancel, request_ref})
+          {:error, :timeout}
+
+        :exit, _reason ->
+          {:error, :disconnected}
+      end
+    else
+      {:error, :remote_connection_unsupported}
+    end
+  end
+
+  @spec send(pid(), Message.t(), non_neg_integer()) :: :ok | {:error, term()}
+  def send(pid, %Message{} = msg, dispatch_timeout \\ @default_write_timeout)
+      when is_pid(pid) and is_integer(dispatch_timeout) and dispatch_timeout >= 0 do
+    if node(pid) == node() do
+      request_ref = make_ref()
+      deadline = System.monotonic_time(:millisecond) + dispatch_timeout
+
+      try do
+        GenServer.call(pid, {:send, msg, deadline, request_ref}, dispatch_timeout)
+      catch
+        :exit, {:timeout, _call} ->
+          GenServer.cast(pid, {:cancel, request_ref})
+          {:error, :timeout}
+
+        :exit, _reason ->
+          {:error, :disconnected}
+      end
+    else
+      {:error, :remote_connection_unsupported}
+    end
   end
 
   @spec add_signal_handler(pid()) :: reference()
@@ -33,16 +76,37 @@ defmodule Rebus.Connection do
     field :prev, binary(), default: <<>>
     field :name, binary() | nil, default: nil
     field :serial, non_neg_integer(), default: 1
-    field :pending, %{non_neg_integer() => :gen_statem.from()}, default: %{}
+    field :write_timeout, pos_integer(), default: @default_write_timeout
+
+    field :pending,
+          %{
+            non_neg_integer() => {:gen_statem.from(), reference(), reference(), reference()}
+          },
+          default: %{}
+
+    field :request_index, %{reference() => non_neg_integer()}, default: %{}
+    field :monitor_index, %{reference() => non_neg_integer()}, default: %{}
+    field :active_write, map() | nil, default: nil
+    field :write_queue, :queue.queue(), default: :queue.new()
+    field :queued_requests, MapSet.t(reference()), default: MapSet.new()
+    field :cancelled_requests, MapSet.t(reference()), default: MapSet.new()
+    field :outbound_monitor_index, %{reference() => reference()}, default: %{}
+    field :send_fun, function(), default: &:socket.send/4
+    field :cancel_fun, function(), default: &:socket.cancel/2
   end
 
   @impl true
   def init(args) do
     %{family: family} = addr = Keyword.fetch!(args, :addr)
+    write_timeout = Keyword.get(args, :write_timeout, @default_write_timeout)
 
-    case :socket.open(family, :stream, :default) do
-      {:ok, sock} -> initialize(sock, addr)
-      {:error, reason} -> {:stop, normalize_socket_error(reason)}
+    if is_integer(write_timeout) and write_timeout > 0 do
+      case :socket.open(family, :stream, :default) do
+        {:ok, sock} -> initialize(sock, addr, write_timeout)
+        {:error, reason} -> {:stop, normalize_socket_error(reason)}
+      end
+    else
+      {:stop, :invalid_write_timeout}
     end
   end
 
@@ -57,6 +121,25 @@ defmodule Rebus.Connection do
     {:noreply, %{state | rref: nil}, {:continue, :recv}}
   end
 
+  # Send select handles are deliberately kept separate from the receive handle.
+  # A writable socket must not prevent us from continuing to drain inbound replies.
+  def handle_info(
+        {:"$socket", s, :select, h},
+        %__MODULE__{sock: s, active_write: %{wait: {:select, continuation, h}}} = state
+      ) do
+    advance_writes(%{
+      state
+      | active_write: %{state.active_write | wait: {:continue, continuation}}
+    })
+  end
+
+  def handle_info(
+        {:"$socket", s, :completion, {h, result}},
+        %__MODULE__{sock: s, active_write: %{wait: {:completion, _continuation, h}}} = state
+      ) do
+    handle_completion_result(result, %{state | active_write: %{state.active_write | wait: nil}})
+  end
+
   def handle_info(
         {:"$socket", s, :abort, {h, reason}},
         %__MODULE__{sock: s, rref: h} = state
@@ -64,9 +147,32 @@ defmodule Rebus.Connection do
     stop_for_transport_error(reason, state)
   end
 
-  def handle_info({:DOWN, ref, _, _, _}, %__MODULE__{} = state) do
-    :gen_event.delete_handler(SignalHandler, {SignalHandler, ref}, nil)
-    {:noreply, state}
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %__MODULE__{} = state) do
+    case Map.pop(state.monitor_index, ref) do
+      {nil, _index} ->
+        case Map.pop(state.outbound_monitor_index, ref) do
+          {nil, _outbound_index} ->
+            :gen_event.delete_handler(SignalHandler, {SignalHandler, ref}, nil)
+            {:noreply, state}
+
+          {request_ref, outbound_monitor_index} ->
+            state = %{state | outbound_monitor_index: outbound_monitor_index}
+            cancel_outbound_request(state, request_ref)
+        end
+
+      {serial, monitor_index} ->
+        {entry, pending} = Map.pop(state.pending, serial)
+        {_from, timer_ref, request_ref, _monitor_ref} = entry
+        _ = Process.cancel_timer(timer_ref)
+
+        {:noreply,
+         %{
+           state
+           | pending: pending,
+             monitor_index: monitor_index,
+             request_index: Map.delete(state.request_index, request_ref)
+         }}
+    end
   end
 
   def handle_info({:gen_event_EXIT, {SignalHandler, ref}, _reason}, %__MODULE__{} = state) do
@@ -76,6 +182,44 @@ defmodule Rebus.Connection do
     Process.demonitor(ref, [:flush])
     {:noreply, state}
   end
+
+  def handle_info({:request_timeout, serial, request_ref}, %__MODULE__{} = state) do
+    case Map.fetch(state.pending, serial) do
+      {:ok, {from, _timer_ref, ^request_ref, monitor_ref}} ->
+        {_pending_entry, pending} = Map.pop(state.pending, serial)
+        Process.demonitor(monitor_ref, [:flush])
+        GenServer.reply(from, {:error, :timeout})
+        {:noreply, remove_indexes(%{state | pending: pending}, request_ref, monitor_ref)}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(
+        {:write_timeout, request_ref},
+        %__MODULE__{active_write: %{request_ref: request_ref} = write} = state
+      ) do
+    if write.partial? do
+      stop_for_transport_error(:timeout, state)
+    else
+      # No bytes have entered the stream, so this frame can be safely abandoned.
+      reply_if_live(write, {:error, :timeout}, state)
+      advance_writes(drop_active(state, cancel?: true))
+    end
+  end
+
+  def handle_info(
+        {:"$socket", s, :abort, {h, reason}},
+        %__MODULE__{sock: s, active_write: %{wait: {:select, _continuation, h}}} = state
+      ),
+      do: stop_for_transport_error(reason, state)
+
+  def handle_info(
+        {:"$socket", s, :abort, {h, reason}},
+        %__MODULE__{sock: s, active_write: %{wait: {:completion, _continuation, h}}} = state
+      ),
+      do: stop_for_transport_error(reason, state)
 
   def handle_info(_message, %__MODULE__{} = state), do: {:noreply, state}
 
@@ -91,12 +235,16 @@ defmodule Rebus.Connection do
              member: "Hello"
            ),
          {:ok, bin} <- Message.encode(%{method | serial: state.serial}) do
-      case :socket.send(state.sock, bin) do
+      case :socket.send(state.sock, bin, [], state.write_timeout) do
         :ok ->
-          {:noreply, %{state | serial: state.serial + 1}, {:continue, :hello_reply_buffer}}
+          {:noreply, %{state | serial: next_serial(state.serial)},
+           {:continue, :hello_reply_buffer}}
 
         {:error, reason} ->
           stop_for_transport_error(reason, state)
+
+        _unexpected ->
+          stop_for_transport_error(:send_failed, state)
       end
     else
       {:error, reason} -> stop_for_protocol_error(reason, state)
@@ -132,21 +280,37 @@ defmodule Rebus.Connection do
     end
   end
 
+  def handle_continue(:write, %__MODULE__{} = state), do: advance_writes(state)
+
   @impl true
-  def handle_call({:send, %Message{} = msg}, from, %__MODULE__{} = state) do
-    msg = %{msg | serial: state.serial}
-    {:ok, bin} = Message.encode(msg)
-
-    case :socket.send(state.sock, bin) do
+  def handle_call({:call, %Message{} = msg, deadline, request_ref}, from, %__MODULE__{} = state) do
+    case validate_call_message(msg) do
       :ok ->
-        if msg.type == :method_call && !Enum.member?(msg.flags, :no_reply_expected) do
-          pending = Map.put(state.pending, msg.serial, from)
-          {:noreply, %{state | pending: pending, serial: state.serial + 1}}
-        else
-          {:reply, :ok, %{state | serial: state.serial + 1}}
-        end
+        enqueue_write(state, %{
+          kind: :call,
+          from: from,
+          msg: msg,
+          deadline: deadline,
+          request_ref: request_ref
+        })
 
-      error ->
+      {:error, _} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:send, %Message{} = msg, deadline, request_ref}, from, %__MODULE__{} = state) do
+    case validate_send_message(msg) do
+      :ok ->
+        enqueue_write(state, %{
+          kind: :send,
+          from: from,
+          msg: msg,
+          deadline: deadline,
+          request_ref: request_ref
+        })
+
+      {:error, _} = error ->
         {:reply, error, state}
     end
   end
@@ -161,6 +325,58 @@ defmodule Rebus.Connection do
     Process.demonitor(ref, [:flush])
     :gen_event.delete_handler(SignalHandler, {SignalHandler, ref}, nil)
     {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_cast({:cancel, request_ref}, %__MODULE__{} = state) do
+    case Map.pop(state.request_index, request_ref) do
+      {nil, _index} ->
+        case state.active_write do
+          %{request_ref: ^request_ref, partial?: false} ->
+            advance_writes(drop_active(state, cancel?: true))
+
+          %{request_ref: ^request_ref} ->
+            {:noreply,
+             %{state | cancelled_requests: MapSet.put(state.cancelled_requests, request_ref)}}
+
+          _ ->
+            if MapSet.member?(state.queued_requests, request_ref) do
+              {:noreply,
+               %{state | cancelled_requests: MapSet.put(state.cancelled_requests, request_ref)}}
+            else
+              {:noreply, state}
+            end
+        end
+
+      {serial, request_index} ->
+        {entry, pending} = Map.pop(state.pending, serial)
+        {_from, timer_ref, _request_ref, monitor_ref} = entry
+        _ = Process.cancel_timer(timer_ref)
+        Process.demonitor(monitor_ref, [:flush])
+
+        {:noreply,
+         %{
+           state
+           | pending: pending,
+             request_index: request_index,
+             monitor_index: Map.delete(state.monitor_index, monitor_ref)
+         }}
+    end
+  end
+
+  defp cancel_outbound_request(state, request_ref) do
+    case state.active_write do
+      %{request_ref: ^request_ref, partial?: false} ->
+        advance_writes(drop_active(state, cancel?: true))
+
+      %{request_ref: ^request_ref} ->
+        {:noreply,
+         %{state | cancelled_requests: MapSet.put(state.cancelled_requests, request_ref)}}
+
+      _ ->
+        {:noreply,
+         %{state | cancelled_requests: MapSet.put(state.cancelled_requests, request_ref)}}
+    end
   end
 
   defp parse(data, %__MODULE__{} = state) do
@@ -196,14 +412,15 @@ defmodule Rebus.Connection do
     end
   end
 
-  defp initialize(sock, addr) do
+  defp initialize(sock, addr, write_timeout) do
     auth = "AUTH EXTERNAL #{get_auth_id()}\r\n"
 
     with :ok <- :socket.connect(sock, addr),
-         :ok <- :socket.send(sock, [0, auth]),
+         :ok <- handshake_send(sock, [0, auth], write_timeout),
          {:ok, <<"OK ", guid::binary-size(32), "\r\n", rest::binary>>} <- :socket.recv(sock, 0),
-         :ok <- :socket.send(sock, "BEGIN \r\n") do
-      {:ok, %__MODULE__{sock: sock, guid: guid, prev: rest}, {:continue, :hello}}
+         :ok <- handshake_send(sock, "BEGIN \r\n", write_timeout) do
+      {:ok, %__MODULE__{sock: sock, guid: guid, prev: rest, write_timeout: write_timeout},
+       {:continue, :hello}}
     else
       {:ok, _} -> stop_and_close(sock, :auth_failed)
       {:error, reason} -> stop_and_close(sock, reason)
@@ -213,6 +430,14 @@ defmodule Rebus.Connection do
   defp stop_and_close(sock, reason) do
     _ = :socket.close(sock)
     {:stop, normalize_socket_error(reason)}
+  end
+
+  defp handshake_send(sock, data, timeout) do
+    case :socket.send(sock, data, [], timeout) do
+      :ok -> :ok
+      {:error, reason} -> {:error, normalize_socket_error(reason)}
+      _other -> {:error, :send_failed}
+    end
   end
 
   @doc false
@@ -226,13 +451,13 @@ defmodule Rebus.Connection do
   defp stop_for_transport_error(reason, %__MODULE__{} = state) do
     reason = normalize_socket_error(reason)
     Logger.warning("D-Bus connection transport stopped: #{inspect(reason)}")
-    {:stop, {:shutdown, reason}, state}
+    {:stop, {:shutdown, reason}, fail_pending(state)}
   end
 
   defp stop_for_protocol_error(reason, %__MODULE__{} = state) do
     reason = sanitize_protocol_reason(reason)
     Logger.warning("D-Bus connection protocol stopped: #{inspect(reason)}")
-    {:stop, {:shutdown, reason}, state}
+    {:stop, {:shutdown, reason}, fail_pending(state)}
   end
 
   defp handle_hello_reply(
@@ -388,17 +613,440 @@ defmodule Rebus.Connection do
       {:ok, reply_serial} ->
         case Map.pop(state.pending, reply_serial) do
           {nil, _pending} ->
+            Logger.info("Ignoring late or orphaned D-Bus reply for serial #{reply_serial}")
             {:ok, state}
 
-          {from, pending} ->
+          {{from, timer_ref, request_ref, monitor_ref}, pending} ->
+            _ = Process.cancel_timer(timer_ref)
+            Process.demonitor(monitor_ref, [:flush])
             GenServer.reply(from, msg)
-            {:ok, %{state | pending: pending}}
+            {:ok, remove_indexes(%{state | pending: pending}, request_ref, monitor_ref)}
         end
 
       :error ->
         {:error, {:malformed_reply, :missing_reply_serial}}
     end
   end
+
+  defp encode_message(%Message{} = msg) do
+    try do
+      {:ok, bin} = Message.encode(msg)
+      {:ok, bin}
+    rescue
+      exception ->
+        Logger.warning("D-Bus message encoding failed: #{inspect(exception.__struct__)}")
+        {:error, :encode_failed}
+    catch
+      kind, _reason ->
+        Logger.warning("D-Bus message encoding failed: #{inspect(kind)}")
+        {:error, :encode_failed}
+    end
+  end
+
+  defp validate_call_message(%Message{type: :method_call, flags: flags}) do
+    if :no_reply_expected in flags, do: {:error, :no_reply_expected}, else: :ok
+  end
+
+  defp validate_call_message(%Message{type: type}), do: {:error, {:invalid_message_type, type}}
+
+  defp validate_send_message(%Message{type: :signal}), do: :ok
+
+  defp validate_send_message(%Message{type: :method_call, flags: flags}) do
+    if :no_reply_expected in flags, do: :ok, else: {:error, :reply_expected}
+  end
+
+  defp validate_send_message(%Message{type: type}), do: {:error, {:invalid_message_type, type}}
+
+  defp remaining_timeout(deadline) when is_integer(deadline) do
+    case deadline - System.monotonic_time(:millisecond) do
+      remaining when remaining > 0 -> {:ok, remaining}
+      _ -> {:error, :timeout}
+    end
+  end
+
+  @doc false
+  defguardp is_select_info(info)
+            when is_tuple(info) and tuple_size(info) == 3 and elem(info, 0) == :select_info and
+                   elem(info, 1) == :send and is_reference(elem(info, 2))
+
+  defguardp is_completion_info(info)
+            when is_tuple(info) and tuple_size(info) == 3 and elem(info, 0) == :completion_info and
+                   elem(info, 1) == :send and is_reference(elem(info, 2))
+
+  @spec classify_send_result(term(), non_neg_integer()) ::
+          :ok
+          | {:continue, iodata()}
+          | {:select, tuple(), binary() | nil}
+          | {:completion, term()}
+          | {:error, term()}
+  def classify_send_result(:ok, _payload_length), do: :ok
+
+  def classify_send_result({:ok, rest}, _payload_length) when is_binary(rest),
+    do: {:continue, rest}
+
+  def classify_send_result({:select, {select_info, rest}}, _payload_length)
+      when is_select_info(select_info) and is_binary(rest),
+      do: {:select, select_info, rest}
+
+  def classify_send_result({:select, select_info}, _payload_length)
+      when is_select_info(select_info),
+      do: {:select, select_info, nil}
+
+  def classify_send_result({:completion, completion_info}, _payload_length)
+      when is_completion_info(completion_info),
+      do: {:completion, completion_info}
+
+  def classify_send_result({:error, {:timeout, rest}}, payload_length) do
+    if iolist?(rest) and IO.iodata_length(rest) == payload_length,
+      do: {:error, :timeout},
+      else: {:error, {:send_fatal, :timeout}}
+  end
+
+  def classify_send_result({:error, {reason, _rest}}, _payload_length) when is_atom(reason),
+    do: {:error, {:send_fatal, reason}}
+
+  def classify_send_result({:error, reason}, _payload_length) when is_atom(reason),
+    do: {:error, {:send_fatal, reason}}
+
+  def classify_send_result({:error, _reason}, _payload_length),
+    do: {:error, {:send_fatal, :send_failed}}
+
+  def classify_send_result(_result, _payload_length), do: {:error, {:send_fatal, :send_failed}}
+
+  # Writes are one-frame-at-a-time.  OTP retains the unaccepted RestData in every
+  # partial result; retaining it here is what preserves D-Bus stream framing.
+  defp enqueue_write(state, operation) do
+    monitor_ref = Process.monitor(elem(operation.from, 0))
+    operation = Map.put(operation, :monitor_ref, monitor_ref)
+
+    advance_writes(%{
+      state
+      | write_queue: :queue.in(operation, state.write_queue),
+        queued_requests: MapSet.put(state.queued_requests, operation.request_ref),
+        outbound_monitor_index:
+          Map.put(state.outbound_monitor_index, monitor_ref, operation.request_ref)
+    })
+  end
+
+  defp advance_writes(%__MODULE__{active_write: nil} = state) do
+    case :queue.out(state.write_queue) do
+      {:empty, _} ->
+        {:noreply, state}
+
+      {{:value, operation}, queue} ->
+        state = %{
+          state
+          | write_queue: queue,
+            queued_requests: MapSet.delete(state.queued_requests, operation.request_ref)
+        }
+
+        if cancelled_or_expired?(operation, state) do
+          state = release_outbound_monitor(state, operation)
+
+          advance_writes(%{
+            state
+            | cancelled_requests: MapSet.delete(state.cancelled_requests, operation.request_ref)
+          })
+        else
+          case allocate_serial(state.serial, state.pending) do
+            {:ok, serial} ->
+              case encode_message(%{operation.msg | serial: serial}) do
+                {:ok, bin} ->
+                  bin = IO.iodata_to_binary(bin)
+
+                  timer_ref =
+                    Process.send_after(
+                      self(),
+                      {:write_timeout, operation.request_ref},
+                      state.write_timeout
+                    )
+
+                  write =
+                    Map.merge(operation, %{
+                      serial: serial,
+                      rest: bin,
+                      frame_size: byte_size(bin),
+                      wait: nil,
+                      timer_ref: timer_ref,
+                      partial?: false
+                    })
+
+                  advance_writes(%{state | active_write: write})
+
+                {:error, reason} ->
+                  state = release_outbound_monitor(state, operation)
+                  GenServer.reply(operation.from, {:error, reason})
+                  advance_writes(state)
+              end
+
+            {:error, reason} ->
+              state = release_outbound_monitor(state, operation)
+              GenServer.reply(operation.from, {:error, reason})
+              advance_writes(state)
+          end
+        end
+    end
+  end
+
+  defp advance_writes(%__MODULE__{active_write: %{wait: {:select, _, _}}} = state),
+    do: {:noreply, state}
+
+  defp advance_writes(%__MODULE__{active_write: %{wait: {:completion, _, _}}} = state),
+    do: {:noreply, state}
+
+  defp advance_writes(%__MODULE__{active_write: write} = state) do
+    cond do
+      (expired?(write) or cancelled?(write, state)) and not write.partial? ->
+        advance_writes(drop_active(state, cancel?: true))
+
+      true ->
+        {rest, flags_or_cont, timeout} = socket_send_args(write.rest, write.wait)
+        result = state.send_fun.(state.sock, rest, flags_or_cont, timeout)
+        handle_write_result(result, %{state | active_write: %{write | wait: nil}})
+    end
+  end
+
+  defp handle_write_result(result, %__MODULE__{active_write: write} = state) do
+    case classify_send_result(result, write.frame_size) do
+      :ok ->
+        complete_active_write(state)
+
+      {:continue, rest} ->
+        state = put_active_rest(state, rest)
+        {:noreply, state, {:continue, :write}}
+
+      {:select, continuation, rest} ->
+        state = if rest, do: put_active_rest(state, rest), else: state
+        {:select_info, :send, handle} = continuation
+
+        {:noreply,
+         %{state | active_write: %{state.active_write | wait: {:select, continuation, handle}}}}
+
+      {:completion, {:completion_info, :send, notification_handle} = handle} ->
+        {:noreply,
+         %{
+           state
+           | active_write: %{
+               state.active_write
+               | wait: {:completion, handle, notification_handle}
+             }
+         }}
+
+      {:error, {:send_fatal, reason}} ->
+        stop_for_transport_error(reason, state)
+
+      {:error, reason} ->
+        if write.partial? do
+          stop_for_transport_error(reason, state)
+        else
+          reply_if_live(write, {:error, reason}, state)
+          advance_writes(drop_active(state, cancel?: true))
+        end
+    end
+  end
+
+  defp handle_completion_result(:ok, state), do: complete_active_write(state)
+
+  defp handle_completion_result({:ok, written}, %__MODULE__{active_write: write} = state)
+       when is_integer(written) and written >= 0 and written < byte_size(write.rest) do
+    <<_sent::binary-size(written), rest::binary>> = write.rest
+    state = put_active_rest(state, rest)
+    {:noreply, state, {:continue, :write}}
+  end
+
+  defp handle_completion_result({:error, reason}, state),
+    do: stop_for_transport_error(reason, state)
+
+  defp handle_completion_result(_unexpected, state),
+    do: stop_for_transport_error(:send_failed, state)
+
+  defp put_active_rest(%__MODULE__{active_write: write} = state, rest) do
+    partial? = write.partial? or byte_size(rest) < byte_size(write.rest)
+    %{state | active_write: %{write | rest: rest, partial?: partial?}}
+  end
+
+  defp complete_active_write(%__MODULE__{active_write: write} = state) do
+    live? = not cancelled_or_expired?(write, state)
+    state = drop_active(state, retain_monitor?: live? and write.kind == :call)
+    state = %{state | serial: next_serial(write.serial)}
+
+    if not live? do
+      advance_writes(state)
+    else
+      case write.kind do
+        :send ->
+          GenServer.reply(write.from, :ok)
+          advance_writes(state)
+
+        :call ->
+          case remaining_timeout(write.deadline) do
+            {:ok, remaining} ->
+              timer_ref =
+                Process.send_after(
+                  self(),
+                  {:request_timeout, write.serial, write.request_ref},
+                  remaining
+                )
+
+              state = %{
+                state
+                | outbound_monitor_index:
+                    Map.delete(state.outbound_monitor_index, write.monitor_ref)
+              }
+
+              pending =
+                Map.put(
+                  state.pending,
+                  write.serial,
+                  {write.from, timer_ref, write.request_ref, write.monitor_ref}
+                )
+
+              advance_writes(%{
+                state
+                | pending: pending,
+                  request_index: Map.put(state.request_index, write.request_ref, write.serial),
+                  monitor_index: Map.put(state.monitor_index, write.monitor_ref, write.serial)
+              })
+
+            {:error, :timeout} ->
+              advance_writes(release_outbound_monitor(state, write))
+          end
+      end
+    end
+  end
+
+  defp drop_active(%__MODULE__{active_write: write} = state, opts) do
+    _ = Process.cancel_timer(write.timer_ref)
+
+    if Keyword.get(opts, :cancel?, false), do: cancel_socket_write(state, write.wait)
+
+    state = %{
+      state
+      | active_write: nil,
+        cancelled_requests: MapSet.delete(state.cancelled_requests, write.request_ref)
+    }
+
+    if Keyword.get(opts, :retain_monitor?, false),
+      do: state,
+      else: release_outbound_monitor(state, write)
+  end
+
+  defp release_outbound_monitor(state, operation) do
+    Process.demonitor(operation.monitor_ref, [:flush])
+
+    %{
+      state
+      | outbound_monitor_index: Map.delete(state.outbound_monitor_index, operation.monitor_ref)
+    }
+  end
+
+  defp cancelled_or_expired?(operation, state) do
+    cancelled?(operation, state) or expired?(operation)
+  end
+
+  defp cancelled?(operation, state),
+    do: MapSet.member?(state.cancelled_requests, operation.request_ref)
+
+  defp expired?(operation), do: match?({:error, :timeout}, remaining_timeout(operation.deadline))
+
+  @doc false
+  @spec socket_send_args(binary(), nil | {:continue, tuple()}) ::
+          {binary(), [] | tuple(), :nowait}
+  def socket_send_args(rest, {:continue, continuation}), do: {rest, continuation, :nowait}
+  def socket_send_args(rest, _wait), do: {rest, [], :nowait}
+
+  defp cancel_socket_write(state, {:select, continuation, _handle}) do
+    _ = state.cancel_fun.(state.sock, continuation)
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp cancel_socket_write(state, {:completion, continuation, _handle}) do
+    _ = state.cancel_fun.(state.sock, continuation)
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp cancel_socket_write(_state, _wait), do: :ok
+
+  defp reply_if_live(operation, reply, state) do
+    if not cancelled_or_expired?(operation, state), do: GenServer.reply(operation.from, reply)
+  end
+
+  defp fail_pending(%__MODULE__{} = state) do
+    case state.active_write do
+      nil ->
+        :ok
+
+      write ->
+        _ = Process.cancel_timer(write.timer_ref)
+        Process.demonitor(write.monitor_ref, [:flush])
+        GenServer.reply(write.from, {:error, :disconnected})
+    end
+
+    :queue.to_list(state.write_queue)
+    |> Enum.each(fn operation ->
+      Process.demonitor(operation.monitor_ref, [:flush])
+      GenServer.reply(operation.from, {:error, :disconnected})
+    end)
+
+    Enum.each(state.pending, fn {_serial, {from, timer_ref, _request_ref, monitor_ref}} ->
+      _ = Process.cancel_timer(timer_ref)
+      Process.demonitor(monitor_ref, [:flush])
+      GenServer.reply(from, {:error, :disconnected})
+    end)
+
+    %{
+      state
+      | pending: %{},
+        request_index: %{},
+        monitor_index: %{},
+        outbound_monitor_index: %{},
+        active_write: nil,
+        write_queue: :queue.new(),
+        queued_requests: MapSet.new(),
+        cancelled_requests: MapSet.new()
+    }
+  end
+
+  defp remove_indexes(state, request_ref, monitor_ref) do
+    %{
+      state
+      | request_index: Map.delete(state.request_index, request_ref),
+        monitor_index: Map.delete(state.monitor_index, monitor_ref)
+    }
+  end
+
+  defp allocate_serial(serial, pending), do: allocate_serial(serial, pending, @max_serial)
+
+  @doc false
+  @spec allocate_serial(non_neg_integer(), map(), pos_integer()) ::
+          {:ok, pos_integer()} | {:error, :serial_exhausted}
+  def allocate_serial(serial, pending, max_serial)
+      when is_integer(serial) and is_map(pending) and is_integer(max_serial) and max_serial > 0 do
+    allocate_serial(serial, pending, max_serial, max_serial)
+  end
+
+  defp allocate_serial(_serial, _pending, _max_serial, 0), do: {:error, :serial_exhausted}
+
+  defp allocate_serial(serial, pending, max_serial, attempts) do
+    if Map.has_key?(pending, serial) do
+      allocate_serial(next_serial(serial, max_serial), pending, max_serial, attempts - 1)
+    else
+      {:ok, serial}
+    end
+  end
+
+  defp next_serial(@max_serial), do: 1
+  defp next_serial(serial), do: serial + 1
+  defp next_serial(max_serial, max_serial), do: 1
+  defp next_serial(serial, _max_serial), do: serial + 1
 
   defp get_auth_id do
     {resp, 0} = System.cmd("id", ["-u"])

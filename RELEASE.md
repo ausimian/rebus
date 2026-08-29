@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Add `Rebus.call/3` for public method calls with configurable timeouts and
+  `Rebus.send/2` and `Rebus.send/3` for fire-and-forget messages.
+- Add the `:write_timeout` connection option to bound outbound frame readiness.
+
 ### Fixed
 
 - Return clean connection and protocol errors instead of invalid GenServer
