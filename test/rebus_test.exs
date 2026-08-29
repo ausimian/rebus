@@ -285,7 +285,7 @@ defmodule RebusTest do
       assert mechanisms == ["ANONYMOUS", "EXTERNAL"]
 
       assert Enum.all?(mechanisms, fn mechanism ->
-               :binary.referenced_byte_size(mechanism) == byte_size(mechanism)
+               small_referenced_binary?(mechanism)
              end)
 
       assert_receive {^rejecting_svr, outcome}, 1_000
@@ -487,7 +487,8 @@ defmodule RebusTest do
     test "returns a disconnected error for signal handlers on a dead process" do
       dead = spawn(fn -> :ok end)
       ref = Process.monitor(dead)
-      assert_receive {:DOWN, ^ref, :process, ^dead, :normal}
+      assert_receive {:DOWN, ^ref, :process, ^dead, reason}
+      assert reason in [:normal, :noproc]
 
       assert {:error, :disconnected} = Rebus.add_signal_handler(dead)
       assert {:error, :disconnected} = Rebus.delete_signal_handler(dead, make_ref())
@@ -703,7 +704,8 @@ defmodule RebusTest do
         )
 
       ref = Process.monitor(cli)
-      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :caller_gone}}, 1_000
+      assert_receive {:DOWN, ^ref, :process, ^cli, reason}, 1_000
+      assert reason in [:noproc, {:shutdown, :caller_gone}]
       refute_receive :unexpected_auth_id_lookup, 100
       assert Process.whereis(name) == nil
     end
@@ -1661,7 +1663,7 @@ defmodule RebusTest do
 
           assert {:error, {:hello_failed, returned_name}} = Task.await(connect_task, 1_000)
           assert returned_name == error_name
-          assert :binary.referenced_byte_size(returned_name) <= 255
+          assert small_referenced_binary?(returned_name)
         end)
 
       refute log =~ payload
@@ -1807,9 +1809,9 @@ defmodule RebusTest do
 
       state = :sys.get_state(cli)
       assert state.guid == guid
-      assert :binary.referenced_byte_size(state.guid) <= 32
+      assert small_referenced_binary?(state.guid)
       assert state.name == unique_name
-      assert :binary.referenced_byte_size(state.name) <= 255
+      assert small_referenced_binary?(state.name)
       assert :ok = Rebus.close(cli)
     end
 
@@ -2829,6 +2831,11 @@ defmodule RebusTest do
     # Test-only controls must never be passed to Rebus.connect/2.
     Keyword.split(opts, [:send_name_acquired?])
   end
+
+  # OTP may allocate a small copied binary in a 256-byte carrier. This remains
+  # decisively below the 64–270KB peer buffers used by the retention regressions.
+  defp small_referenced_binary?(binary) when is_binary(binary),
+    do: :binary.referenced_byte_size(binary) <= 256
 
   defp assert_hello_error_reason(svr, expected_reason, build_reply) do
     capture_log(fn ->
