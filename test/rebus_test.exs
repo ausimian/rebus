@@ -915,7 +915,7 @@ defmodule RebusTest do
     end
 
     test "does not set a name from an empty steady reply", %{svr: svr} do
-      cli = connect_until_ready(svr)
+      cli = connect_until_ready(svr, send_name_acquired?: false)
       :ok = :sys.suspend(cli)
       _ = :sys.replace_state(cli, fn state -> %{state | name: nil} end)
       :ok = :sys.resume(cli)
@@ -1651,7 +1651,7 @@ defmodule RebusTest do
     %{cli: cli}
   end
 
-  defp handle_hello(%Message{} = msg, svr) do
+  defp handle_hello(%Message{} = msg, svr, opts \\ []) do
     reply =
       Rebus.Message.new!(
         :method_return,
@@ -1663,19 +1663,21 @@ defmodule RebusTest do
 
     :ok = TestServer.push(svr, reply)
 
-    signal =
-      Rebus.Message.new!(
-        :signal,
-        path: "/org/freedesktop/DBus",
-        interface: "org.freedesktop.DBus",
-        member: "NameAcquired",
-        destination: ":1.100",
-        signature: "s",
-        flags: [],
-        body: [":1.100"]
-      )
+    if Keyword.get(opts, :send_name_acquired?, true) do
+      signal =
+        Rebus.Message.new!(
+          :signal,
+          path: "/org/freedesktop/DBus",
+          interface: "org.freedesktop.DBus",
+          member: "NameAcquired",
+          destination: ":1.100",
+          signature: "s",
+          flags: [],
+          body: [":1.100"]
+        )
 
-    :ok = TestServer.push(svr, signal)
+      :ok = TestServer.push(svr, signal)
+    end
   end
 
   defp connect_until_hello(svr, opts \\ []) do
@@ -1687,7 +1689,7 @@ defmodule RebusTest do
 
   defp connect_until_ready(svr, opts \\ []) do
     {cli, hello} = connect_until_hello(svr, opts)
-    handle_hello(hello, svr)
+    handle_hello(hello, svr, opts)
     assert wait_until(fn -> :sys.get_state(cli).name == ":1.100" end)
     cli
   end
