@@ -25,6 +25,8 @@
   fixed headers as soon as they arrive.
 - Keep partial inbound frame storage bounded when peers fragment messages into
   very small socket writes.
+- Fall back to OTP's default receive buffer if a socket backend rejects either
+  supported receive-buffer option form.
 - Bound socket setup, complete authentication, and initial Hello reads with
   `:read_timeout`, including peers that dribble progress indefinitely.
 - Accept fragmented D-Bus authentication responses and initial Hello replies.
