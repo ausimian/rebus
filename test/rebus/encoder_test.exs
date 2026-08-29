@@ -3,6 +3,8 @@ defmodule Rebus.EncoderTest do
 
   alias Rebus.Encoder
 
+  doctest Rebus.Encoder
+
   describe "basic types" do
     test "encodes byte" do
       result = Encoder.encode("y", [42])
@@ -558,37 +560,18 @@ defmodule Rebus.EncoderTest do
     end
 
     test "encodes nested array of structs" do
-      # This is an array containing structs, where each struct contains an array of integers
-      # Signature: a(ai) - array of structs containing array of integers
-      _result = Encoder.encode("a(ai)", [[[[1, 2]], [[3, 4, 5]]]])
+      for endianness <- [:little, :big] do
+        binary = Encoder.encode("a(ai)", [[[[1, 2]]]], endianness) |> IO.iodata_to_binary()
 
-      # Let's decode this step by step to understand the actual structure
-      # The actual output shows this pattern - let me analyze what we got:
-      # <<0, 0, 0, 0, 12, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0>>
+        expected =
+          case endianness do
+            :little -> <<12::little-32, 0, 0, 0, 0, 8::little-32, 1::little-32, 2::little-32>>
+            :big -> <<12::big-32, 0, 0, 0, 0, 8::big-32, 1::big-32, 2::big-32>>
+          end
 
-      # This suggests the first array is empty (0 length) and we have a second array with [3,4,5]
-      # Let me adjust the test data to match a simpler case first
-
-      # Actually, let me use simpler test data for now:
-      result2 = Encoder.encode("a(ai)", [[[[1, 2]]]])
-      binary2 = IO.iodata_to_binary(result2)
-
-      # Outer array length for one struct
-      <<outer_length::little-32, rest1::binary>> = binary2
-
-      # Padding to align to 8-byte boundary for struct
-      <<0, 0, 0, 0, rest2::binary>> = rest1
-
-      # Inner array length: 8 bytes (2 int32s)
-      <<8, 0, 0, 0, rest3::binary>> = rest2
-
-      # Array elements: 1, 2
-      <<1, 0, 0, 0, 2, 0, 0, 0, rest4::binary>> = rest3
-
-      assert rest4 == <<>>
-
-      # The outer length should be 4 (inner array length) + 8 (data) = 12 bytes (no extra padding needed)
-      assert outer_length == 12
+        assert byte_size(binary) == 20
+        assert binary == expected
+      end
     end
 
     test "encodes empty array" do
@@ -601,6 +584,145 @@ defmodule Rebus.EncoderTest do
 
       # No padding needed for empty array
       assert rest1 == <<>>
+    end
+
+    test "declares variant data length at its actual stream position" do
+      for endianness <- [:little, :big] do
+        binary = Encoder.encode("av", [[{"x", 5}]], endianness) |> IO.iodata_to_binary()
+
+        expected =
+          case endianness do
+            :little -> <<12::little-32, 1, "x", 0, 0, 5::little-signed-64>>
+            :big -> <<12::big-32, 1, "x", 0, 0, 5::big-signed-64>>
+          end
+
+        assert byte_size(binary) == 16
+        assert binary == expected
+      end
+    end
+
+    test "declares multi-element variant data including inter-element padding" do
+      for endianness <- [:little, :big] do
+        binary =
+          Encoder.encode("av", [[{"x", 5}, {"d", 3.25}]], endianness)
+          |> IO.iodata_to_binary()
+
+        expected =
+          case endianness do
+            :little ->
+              <<28::little-32, 1, "x", 0, 0, 5::little-signed-64, 1, "d", 0, 0, 0, 0, 0, 0,
+                3.25::little-float-64>>
+
+            :big ->
+              <<28::big-32, 1, "x", 0, 0, 5::big-signed-64, 1, "d", 0, 0, 0, 0, 0, 0,
+                3.25::big-float-64>>
+          end
+
+        assert byte_size(binary) == 32
+        assert binary == expected
+      end
+    end
+
+    test "preserves 8-byte-aligned primitive array layout" do
+      for {signature, values} <- [{"ax", [5]}, {"ad", [3.25]}], endianness <- [:little, :big] do
+        binary = Encoder.encode(signature, [values], endianness) |> IO.iodata_to_binary()
+
+        array_length =
+          case endianness do
+            :little -> <<8::little-32>>
+            :big -> <<8::big-32>>
+          end
+
+        element_data =
+          case {signature, endianness} do
+            {"ax", :little} -> <<5::little-signed-64>>
+            {"ax", :big} -> <<5::big-signed-64>>
+            {"ad", :little} -> <<3.25::little-float-64>>
+            {"ad", :big} -> <<3.25::big-float-64>>
+          end
+
+        assert byte_size(binary) == 16
+        assert binary == array_length <> <<0, 0, 0, 0>> <> element_data
+      end
+    end
+
+    test "declares nested array lengths at their actual stream positions" do
+      for {signature, values, expected_size} <- [
+            {"aax", [[[5]]], 16},
+            {"aad", [[[3.25]]], 16},
+            {"aav", [[[{"x", 5}]]], 24}
+          ],
+          endianness <- [:little, :big] do
+        binary = Encoder.encode(signature, values, endianness) |> IO.iodata_to_binary()
+
+        expected =
+          case {signature, endianness} do
+            {"aax", :little} ->
+              <<12::little-32, 8::little-32, 5::little-signed-64>>
+
+            {"aax", :big} ->
+              <<12::big-32, 8::big-32, 5::big-signed-64>>
+
+            {"aad", :little} ->
+              <<12::little-32, 8::little-32, 3.25::little-float-64>>
+
+            {"aad", :big} ->
+              <<12::big-32, 8::big-32, 3.25::big-float-64>>
+
+            {"aav", :little} ->
+              <<20::little-32, 16::little-32, 1, "x", 0, 0, 0, 0, 0, 0, 5::little-signed-64>>
+
+            {"aav", :big} ->
+              <<20::big-32, 16::big-32, 1, "x", 0, 0, 0, 0, 0, 0, 5::big-signed-64>>
+          end
+
+        assert byte_size(binary) == expected_size
+        assert binary == expected
+      end
+    end
+
+    test "encodes arrays at their requested stream positions" do
+      for {signature, values, starting_position, expected_size} <- [
+            {"av", [[{"x", 5}]], 1, 23},
+            {"aax", [[[5]]], 2, 22},
+            {"av", [[{"x", 5}]], 4, 20},
+            {"ai", [[1, 2]], 12, 12}
+          ],
+          endianness <- [:little, :big] do
+        binary =
+          Encoder.encode_at_position(signature, values, endianness, starting_position)
+          |> IO.iodata_to_binary()
+
+        expected =
+          case {signature, starting_position, endianness} do
+            {"av", 1, :little} ->
+              <<0, 0, 0, 16::little-32, 1, "x", 0, 0, 0, 0, 0, 0, 5::little-signed-64>>
+
+            {"av", 1, :big} ->
+              <<0, 0, 0, 16::big-32, 1, "x", 0, 0, 0, 0, 0, 0, 5::big-signed-64>>
+
+            {"aax", 2, :little} ->
+              <<0, 0, 16::little-32, 8::little-32, 0, 0, 0, 0, 5::little-signed-64>>
+
+            {"aax", 2, :big} ->
+              <<0, 0, 16::big-32, 8::big-32, 0, 0, 0, 0, 5::big-signed-64>>
+
+            {"av", 4, :little} ->
+              <<16::little-32, 1, "x", 0, 0, 0, 0, 0, 0, 5::little-signed-64>>
+
+            {"av", 4, :big} ->
+              <<16::big-32, 1, "x", 0, 0, 0, 0, 0, 0, 5::big-signed-64>>
+
+            {"ai", 12, :little} ->
+              <<8::little-32, 1::little-32, 2::little-32>>
+
+            {"ai", 12, :big} ->
+              <<8::big-32, 1::big-32, 2::big-32>>
+          end
+
+        assert byte_size(binary) == expected_size
+        assert binary == expected
+      end
     end
   end
 

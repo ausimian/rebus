@@ -315,6 +315,28 @@ defmodule Rebus.MessageTest do
       assert encoded_little != encoded_big
     end
 
+    test "round-trips variant array bodies through parse and decode" do
+      message =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "VariantArray",
+          body: [[{"x", 5}, {"d", 3.25}]],
+          signature: "av"
+        )
+
+      for endianness <- [:little, :big] do
+        assert {:ok, iodata} = Message.encode(message, endianness)
+        binary = IO.iodata_to_binary(iodata)
+
+        assert {:ok, parsed, <<>>} = Message.parse(binary)
+        assert parsed.body == message.body
+
+        assert {:ok, decoded} = Message.decode(binary)
+        assert decoded.body == message.body
+      end
+    end
+
     test "round-trip with flags" do
       original =
         Message.new!(:method_call,

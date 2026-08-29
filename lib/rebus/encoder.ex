@@ -73,20 +73,20 @@ defmodule Rebus.Encoder do
   ## Examples
 
       # Encode a simple integer
-      iex> Rebus.Encoder.encode("i", [42])
-      [[[], <<42, 0, 0, 0>>]]
+      iex> Rebus.Encoder.encode("i", [42]) |> IO.iodata_to_binary()
+      <<42, 0, 0, 0>>
 
       # Encode a string
-      iex> Rebus.Encoder.encode("s", ["hello"])
-      [[[], <<5, 0, 0, 0>>, "hello", <<0>>]]
+      iex> Rebus.Encoder.encode("s", ["hello"]) |> IO.iodata_to_binary()
+      <<5, 0, 0, 0, "hello", 0>>
 
       # Encode an array of integers
-      iex> Rebus.Encoder.encode("ai", [[1, 2, 3]])
-      [[[], <<12, 0, 0, 0>>, <<1, 0, 0, 0>>, <<2, 0, 0, 0>>, <<3, 0, 0, 0>>]]
+      iex> Rebus.Encoder.encode("ai", [[1, 2, 3]]) |> IO.iodata_to_binary()
+      <<12, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0>>
 
       # Encode a struct with mixed types
-      iex> Rebus.Encoder.encode("(si)", [["hello", 42]])
-      [[[], <<5, 0, 0, 0>>, "hello", [<<0>>, <<0, 0, 0>>], <<42, 0, 0, 0>>]]
+      iex> Rebus.Encoder.encode("(si)", [["hello", 42]]) |> IO.iodata_to_binary()
+      <<5, 0, 0, 0, "hello", 0, 0, 0, 42, 0, 0, 0>>
 
   ## D-Bus Type Signatures
 
@@ -336,25 +336,30 @@ defmodule Rebus.Encoder do
   end
 
   defp encode_single({:array, element_type}, values, state) when is_list(values) do
-    # First, encode all array elements to calculate total length
     element_alignment = get_alignment(element_type)
 
-    # Create a temporary state to encode elements and calculate length
-    temp_state = %{state | position: 0, buffer: []}
-    temp_aligned = align_to(temp_state, element_alignment)
+    # Reserve the aligned uint32 length field so elements are encoded at their
+    # actual stream position. Their padding can depend on that position.
+    array_state = align_to(state, 4)
+    element_state = %{array_state | position: array_state.position + 4, buffer: []}
+    aligned_element_state = align_to(element_state, element_alignment)
+    final_element_state = encode_array_elements(element_type, values, aligned_element_state)
 
-    # Encode all elements
-    final_temp = encode_array_elements(element_type, values, temp_aligned)
+    data_length = final_element_state.position - aligned_element_state.position
 
-    # Calculate data length (after alignment padding)
-    data_length = final_temp.position - temp_aligned.position
+    length_data =
+      case state.endianness do
+        :little -> <<data_length::little-32>>
+        :big -> <<data_length::big-32>>
+      end
 
-    # Now encode for real: length + alignment + data
-    length_state = encode_uint32(data_length, state)
-    aligned_state = align_to(length_state, element_alignment)
-
-    # Encode elements again in the real buffer
-    encode_array_elements(element_type, values, aligned_state)
+    # The encoder stores chunks in reverse order. Keep the elements as one
+    # iodata chunk so the finalized output places the length before them.
+    %{
+      array_state
+      | buffer: [Enum.reverse(final_element_state.buffer), length_data | array_state.buffer],
+        position: final_element_state.position
+    }
   end
 
   defp encode_single({:variant, _}, {signature, value}, state)
