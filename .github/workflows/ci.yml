@@ -126,7 +126,7 @@ jobs:
         key: |
           plt-${{ runner.os }}-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('**/mix.lock') }}
         path: |
-          priv/plts
+          _build/plts
 
     - name: Install dependencies
       if: steps.cache-deps.outputs.cache-hit != 'true'
@@ -151,7 +151,7 @@ jobs:
         key: |
           plt-${{ runner.os }}-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('**/mix.lock') }}
         path: |
-          priv/plts
+          _build/plts
 
     - name: Run dialyzer
       # Two formats are included for ease of debugging and it is lightly recommended to use both, see https://github.com/jeremyjh/dialyxir/issues/530 for reasoning

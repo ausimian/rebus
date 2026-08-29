@@ -544,6 +544,19 @@ defmodule RebusTest do
       assert_receive {:warning, "D-Bus connection is using OTP's default receive buffer"}
     end
 
+    test "uses the production warning callback for receive-buffer fallback" do
+      log =
+        capture_log(fn ->
+          assert :default =
+                   Connection.configure_receive_buffer(:test_socket, fn _sock, _option, _value ->
+                     {:error, :invalid}
+                   end)
+        end)
+
+      assert log =~ "D-Bus connection is using OTP's default receive buffer"
+      refute log =~ "test_socket"
+    end
+
     test "rejects a pathological inbound segment count without logging data" do
       {:ok, sock} = :socket.open(:inet, :stream, :default)
 

@@ -591,7 +591,7 @@ defmodule Rebus.Connection do
   def configure_receive_buffer(
         sock,
         setopt_fun \\ &:socket.setopt/3,
-        warning_fun \\ &Logger.warning/1
+        warning_fun \\ fn message -> Logger.warning(message) end
       ) do
     # A zero-length receive returns the bytes currently available on every
     # supported OTP release. Keep the backing allocation independent of a
