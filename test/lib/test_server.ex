@@ -9,6 +9,11 @@ defmodule Rebus.TestServer do
     GenServer.call(svr, :get_listen_addr)
   end
 
+  def set_auto_hello(svr, enabled, send_name_acquired? \\ true)
+      when is_pid(svr) and is_boolean(enabled) and is_boolean(send_name_acquired?) do
+    GenServer.call(svr, {:set_auto_hello, enabled, send_name_acquired?})
+  end
+
   def push(svr, %Message{} = msg) do
     GenServer.cast(svr, {:push, msg})
   end
@@ -45,6 +50,9 @@ defmodule Rebus.TestServer do
     field :partial_auth, binary() | nil, default: nil
     field :close_after_begin, boolean(), default: false
     field :silent_auth, boolean(), default: false
+    field :notify_auth, boolean(), default: false
+    field :auto_hello, boolean(), default: true
+    field :auto_hello_name_acquired?, boolean(), default: true
   end
 
   @impl true
@@ -68,7 +76,10 @@ defmodule Rebus.TestServer do
            auth_fragment_delay: opts[:auth_fragment_delay] || 0,
            partial_auth: opts[:partial_auth],
            close_after_begin: opts[:close_after_begin] || false,
-           silent_auth: opts[:silent_auth] || false
+           silent_auth: opts[:silent_auth] || false,
+           notify_auth: opts[:notify_auth] || false,
+           auto_hello: Keyword.get(opts, :auto_hello, true),
+           auto_hello_name_acquired?: Keyword.get(opts, :auto_hello_name_acquired?, true)
          }, {:continue, :accept}}
 
       :local ->
@@ -88,7 +99,10 @@ defmodule Rebus.TestServer do
            auth_fragment_delay: opts[:auth_fragment_delay] || 0,
            partial_auth: opts[:partial_auth],
            close_after_begin: opts[:close_after_begin] || false,
-           silent_auth: opts[:silent_auth] || false
+           silent_auth: opts[:silent_auth] || false,
+           notify_auth: opts[:notify_auth] || false,
+           auto_hello: Keyword.get(opts, :auto_hello, true),
+           auto_hello_name_acquired?: Keyword.get(opts, :auto_hello_name_acquired?, true)
          }, {:continue, :accept}}
     end
   end
@@ -98,6 +112,8 @@ defmodule Rebus.TestServer do
     case :socket.accept(state.svr_sock, :nowait) do
       {:ok, cli} ->
         {:ok, "\0AUTH " <> _} = :socket.recv(cli)
+
+        if state.notify_auth, do: send(state.tap, {self(), :auth_received})
 
         cond do
           state.silent_auth ->
@@ -170,6 +186,10 @@ defmodule Rebus.TestServer do
   @impl true
   def handle_call(:get_listen_addr, _from, %__MODULE__{} = state) do
     {:reply, :socket.sockname(state.svr_sock), state}
+  end
+
+  def handle_call({:set_auto_hello, enabled, send_name_acquired?}, _from, %__MODULE__{} = state) do
+    {:reply, :ok, %{state | auto_hello: enabled, auto_hello_name_acquired?: send_name_acquired?}}
   end
 
   def handle_call({:push_raw_fragments, data}, _from, %__MODULE__{} = state) do
@@ -249,7 +269,7 @@ defmodule Rebus.TestServer do
     case Message.parse(data) do
       {:ok, %Message{} = msg, rest} ->
         send(state.tap, {self(), msg})
-        parse(rest, state)
+        parse(rest, maybe_reply_hello(msg, state))
 
       nil ->
         # Incomplete message, store data for next recv
@@ -259,4 +279,41 @@ defmodule Rebus.TestServer do
         {:stop, :parse_error, state}
     end
   end
+
+  defp maybe_reply_hello(
+         %Message{type: :method_call, header_fields: %{member: "Hello"}, serial: serial},
+         %__MODULE__{auto_hello: true, cli_sock: cli} = state
+       ) do
+    reply =
+      Message.new!(:method_return,
+        reply_serial: serial,
+        serial: state.serial,
+        signature: "s",
+        body: [":1.100"]
+      )
+
+    {:ok, encoded} = Message.encode(reply)
+    :ok = :socket.send(cli, encoded)
+
+    if state.auto_hello_name_acquired? do
+      signal =
+        Message.new!(:signal,
+          path: "/org/freedesktop/DBus",
+          interface: "org.freedesktop.DBus",
+          member: "NameAcquired",
+          destination: ":1.100",
+          serial: state.serial + 1,
+          signature: "s",
+          body: [":1.100"]
+        )
+
+      {:ok, encoded} = Message.encode(signal)
+      :ok = :socket.send(cli, encoded)
+      %{state | serial: state.serial + 2}
+    else
+      %{state | serial: state.serial + 1}
+    end
+  end
+
+  defp maybe_reply_hello(_msg, state), do: state
 end

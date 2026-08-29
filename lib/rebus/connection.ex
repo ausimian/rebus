@@ -10,6 +10,7 @@ defmodule Rebus.Connection do
   @default_write_timeout 5_000
   @default_read_timeout 5_000
   @max_auth_line_size 1_024
+  @max_auth_id_output 64
   @max_read_chunk 65_536
   @max_read_attempts 1
   @max_inbound_segments 64
@@ -59,19 +60,31 @@ defmodule Rebus.Connection do
     end
   end
 
-  @spec add_signal_handler(pid()) :: reference()
+  @spec add_signal_handler(pid()) ::
+          reference() | {:error, :timeout | :disconnected | :not_connected}
   def add_signal_handler(conn) when is_pid(conn) do
-    GenServer.call(conn, {:add_signal_handler, self()})
+    handler_ref = make_ref()
+
+    safe_setup_call(
+      conn,
+      {:add_signal_handler, self(), handler_ref},
+      {:cancel_signal_handler, handler_ref}
+    )
   end
 
-  @spec delete_signal_handler(pid(), reference()) :: :ok
+  @spec delete_signal_handler(pid(), reference()) ::
+          :ok | {:error, :timeout | :disconnected | :not_connected}
   def delete_signal_handler(conn, ref) when is_pid(conn) and is_reference(ref) do
-    GenServer.call(conn, {:delete_signal_handler, ref})
+    safe_setup_call(conn, {:delete_signal_handler, ref})
   end
 
   @spec start_link(keyword()) :: :ignore | {:error, any()} | {:ok, pid()}
   def start_link(args) do
-    GenServer.start_link(__MODULE__, args)
+    case Keyword.get(args, :name) do
+      nil -> GenServer.start_link(__MODULE__, args)
+      name when is_atom(name) -> GenServer.start_link(__MODULE__, args, name: name)
+      _name -> {:error, :invalid_name}
+    end
   end
 
   typedstruct enforce: true do
@@ -84,8 +97,15 @@ defmodule Rebus.Connection do
     field :inbound_flatten_count, non_neg_integer(), default: 0
     field :name, binary() | nil, default: nil
     field :serial, non_neg_integer(), default: 1
+    field :hello_serial, non_neg_integer() | nil, default: nil
+    field :established?, boolean(), default: false
     field :write_timeout, pos_integer(), default: @default_write_timeout
     field :read_timeout, pos_integer(), default: @default_read_timeout
+    field :setup_timeout, pos_integer(), default: @default_read_timeout
+    field :connect_waiter, {pid(), reference()} | nil, default: nil
+    field :connect_waiter_monitor, reference() | nil, default: nil
+    field :connect_accepted?, boolean(), default: false
+    field :auth_id_runner, function() | nil, default: nil
     field :partial_frame_timer, {reference(), reference()} | nil, default: nil
 
     field :pending,
@@ -101,6 +121,7 @@ defmodule Rebus.Connection do
     field :queued_requests, MapSet.t(reference()), default: MapSet.new()
     field :cancelled_requests, MapSet.t(reference()), default: MapSet.new()
     field :outbound_monitor_index, %{reference() => reference()}, default: %{}
+    field :signal_handler_monitor_index, %{reference() => reference()}, default: %{}
     field :send_fun, function(), default: &:socket.send/4
     field :cancel_fun, function(), default: &:socket.cancel/2
   end
@@ -109,20 +130,44 @@ defmodule Rebus.Connection do
   def init(args) do
     %{family: family} = addr = Keyword.fetch!(args, :addr)
     write_timeout = Keyword.get(args, :write_timeout, @default_write_timeout)
+    timeout = Keyword.get(args, :timeout, @default_read_timeout)
     read_timeout = Keyword.get(args, :read_timeout, @default_read_timeout)
+    setup_timeout = Keyword.get(args, :read_timeout, timeout)
+    name = Keyword.get(args, :name)
+    connect_waiter = Keyword.get(args, :connect_waiter)
+    auth_id_runner = Keyword.get(args, :auth_id_fun, &run_auth_id/1)
 
     cond do
       not (is_integer(write_timeout) and write_timeout > 0) ->
         {:stop, :invalid_write_timeout}
 
+      not (is_integer(timeout) and timeout > 0) ->
+        {:stop, :invalid_timeout}
+
       not (is_integer(read_timeout) and read_timeout > 0) ->
         {:stop, :invalid_read_timeout}
+
+      not (is_nil(name) or is_atom(name)) ->
+        {:stop, :invalid_name}
+
+      not is_function(auth_id_runner, 1) ->
+        {:stop, :invalid_auth_id_fun}
 
       true ->
         case :socket.open(family, :stream, :default) do
           {:ok, sock} ->
             _ = configure_receive_buffer(sock)
-            initialize(sock, addr, write_timeout, read_timeout)
+
+            {:ok,
+             %__MODULE__{
+               sock: sock,
+               write_timeout: write_timeout,
+               read_timeout: read_timeout,
+               setup_timeout: setup_timeout,
+               connect_waiter: connect_waiter,
+               connect_waiter_monitor: monitor_connect_waiter(connect_waiter),
+               auth_id_runner: auth_id_runner
+             }, {:continue, {:setup, addr}}}
 
           {:error, reason} ->
             {:stop, normalize_socket_error(reason)}
@@ -138,6 +183,23 @@ defmodule Rebus.Connection do
   end
 
   @impl true
+  def handle_info(
+        {connect_ref, :accepted},
+        %__MODULE__{connect_waiter: {_pid, connect_ref}, connect_accepted?: false} = state
+      ) do
+    # The continuation runs before queued application calls, making Hello the
+    # first D-Bus frame after setup acceptance. The final acknowledgement is
+    # withheld until its correlated reply has established the connection.
+    {:noreply, %{state | connect_accepted?: true}, {:continue, :hello}}
+  end
+
+  def handle_info(
+        {:DOWN, ref, :process, _pid, _reason},
+        %__MODULE__{connect_waiter_monitor: ref} = state
+      ) do
+    {:stop, {:shutdown, :caller_gone}, state}
+  end
+
   def handle_info({:"$socket", s, :select, h}, %__MODULE__{sock: s, rref: h} = state) do
     {:noreply, %{state | rref: nil}, {:continue, :recv}}
   end
@@ -183,30 +245,13 @@ defmodule Rebus.Connection do
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %__MODULE__{} = state) do
-    case Map.pop(state.monitor_index, ref) do
-      {nil, _index} ->
-        case Map.pop(state.outbound_monitor_index, ref) do
-          {nil, _outbound_index} ->
-            :gen_event.delete_handler(SignalHandler, {SignalHandler, ref}, nil)
-            {:noreply, state}
+    case Map.pop(state.signal_handler_monitor_index, ref) do
+      {handler_ref, signal_handler_monitor_index} when is_reference(handler_ref) ->
+        :gen_event.delete_handler(SignalHandler, {SignalHandler, handler_ref}, nil)
+        {:noreply, %{state | signal_handler_monitor_index: signal_handler_monitor_index}}
 
-          {request_ref, outbound_monitor_index} ->
-            state = %{state | outbound_monitor_index: outbound_monitor_index}
-            cancel_outbound_request(state, request_ref)
-        end
-
-      {serial, monitor_index} ->
-        {entry, pending} = Map.pop(state.pending, serial)
-        {_from, timer_ref, request_ref, _monitor_ref} = entry
-        _ = Process.cancel_timer(timer_ref)
-
-        {:noreply,
-         %{
-           state
-           | pending: pending,
-             monitor_index: monitor_index,
-             request_index: Map.delete(state.request_index, request_ref)
-         }}
+      {nil, _signal_handler_monitor_index} ->
+        handle_down_for_request(ref, state)
     end
   end
 
@@ -214,8 +259,7 @@ defmodule Rebus.Connection do
     # Because handlers are addede via :gen_event.add_sup_handler/3, we receive
     # `:gen_event_EXIT` messages when they are removed. We can use this to clean
     # up the monitor
-    Process.demonitor(ref, [:flush])
-    {:noreply, state}
+    {:noreply, remove_signal_handler_monitor(state, ref)}
   end
 
   def handle_info({:request_timeout, serial, request_ref}, %__MODULE__{} = state) do
@@ -267,7 +311,58 @@ defmodule Rebus.Connection do
 
   def handle_info(_message, %__MODULE__{} = state), do: {:noreply, state}
 
+  defp handle_down_for_request(ref, %__MODULE__{} = state) do
+    case Map.pop(state.monitor_index, ref) do
+      {nil, _index} ->
+        case Map.pop(state.outbound_monitor_index, ref) do
+          {nil, _outbound_index} ->
+            {:noreply, state}
+
+          {request_ref, outbound_monitor_index} ->
+            state = %{state | outbound_monitor_index: outbound_monitor_index}
+            cancel_outbound_request(state, request_ref)
+        end
+
+      {serial, monitor_index} ->
+        {entry, pending} = Map.pop(state.pending, serial)
+        {_from, timer_ref, request_ref, _monitor_ref} = entry
+        _ = Process.cancel_timer(timer_ref)
+
+        {:noreply,
+         %{
+           state
+           | pending: pending,
+             monitor_index: monitor_index,
+             request_index: Map.delete(state.request_index, request_ref)
+         }}
+    end
+  end
+
   @impl true
+
+  def handle_continue({:setup, addr}, %__MODULE__{} = state) do
+    if connect_waiter_gone?(state) do
+      {:stop, {:shutdown, :caller_gone}, state}
+    else
+      case initialize(state, addr) do
+        {:ok, initialized, {:continue, :hello}} ->
+          if is_nil(initialized.connect_waiter) do
+            {:noreply, initialized, {:continue, :hello}}
+          else
+            notify_connect_waiter(initialized.connect_waiter, {:ok, self()})
+            {:noreply, initialized}
+          end
+
+        {:stop, reason} ->
+          if connect_waiter_alive?(state) do
+            notify_connect_waiter(state.connect_waiter, {:error, reason})
+            {:stop, {:shutdown, reason}, state}
+          else
+            {:stop, {:shutdown, :caller_gone}, state}
+          end
+      end
+    end
+  end
 
   def handle_continue(:hello, %__MODULE__{} = state) do
     # Send the Hello method call
@@ -281,7 +376,7 @@ defmodule Rebus.Connection do
          {:ok, bin} <- Message.encode(%{method | serial: state.serial}) do
       case :socket.send(state.sock, bin, [], state.write_timeout) do
         :ok ->
-          {:noreply, %{state | serial: next_serial(state.serial)},
+          {:noreply, %{state | hello_serial: state.serial, serial: next_serial(state.serial)},
            {:continue, :hello_reply_buffer}}
 
         {:error, reason} ->
@@ -408,6 +503,14 @@ defmodule Rebus.Connection do
   end
 
   @impl true
+  def handle_call(
+        {:call, %Message{}, _deadline, _request_ref},
+        _from,
+        %__MODULE__{established?: false} = state
+      ) do
+    {:reply, {:error, :not_connected}, state}
+  end
+
   def handle_call({:call, %Message{} = msg, deadline, request_ref}, from, %__MODULE__{} = state) do
     case validate_call_message(msg) do
       :ok ->
@@ -422,6 +525,14 @@ defmodule Rebus.Connection do
       {:error, _} = error ->
         {:reply, error, state}
     end
+  end
+
+  def handle_call(
+        {:send, %Message{}, _deadline, _request_ref},
+        _from,
+        %__MODULE__{established?: false} = state
+      ) do
+    {:reply, {:error, :not_connected}, state}
   end
 
   def handle_call({:send, %Message{} = msg, deadline, request_ref}, from, %__MODULE__{} = state) do
@@ -440,16 +551,38 @@ defmodule Rebus.Connection do
     end
   end
 
-  def handle_call({:add_signal_handler, pid}, _from, %__MODULE__{} = state) do
-    ref = Process.monitor(pid)
-    :ok = :gen_event.add_sup_handler(SignalHandler, {SignalHandler, ref}, {self(), pid, ref})
-    {:reply, ref, state}
+  def handle_call(
+        {:add_signal_handler, _pid, _handler_ref},
+        _from,
+        %__MODULE__{established?: false} = state
+      ) do
+    {:reply, {:error, :not_connected}, state}
+  end
+
+  def handle_call({:add_signal_handler, pid, handler_ref}, _from, %__MODULE__{} = state) do
+    monitor_ref = Process.monitor(pid)
+
+    :ok =
+      :gen_event.add_sup_handler(
+        SignalHandler,
+        {SignalHandler, handler_ref},
+        {self(), pid, handler_ref}
+      )
+
+    {:reply, handler_ref,
+     %{
+       state
+       | signal_handler_monitor_index:
+           Map.put(state.signal_handler_monitor_index, monitor_ref, handler_ref)
+     }}
+  end
+
+  def handle_call({:delete_signal_handler, _ref}, _from, %__MODULE__{established?: false} = state) do
+    {:reply, {:error, :not_connected}, state}
   end
 
   def handle_call({:delete_signal_handler, ref}, _from, %__MODULE__{} = state) do
-    Process.demonitor(ref, [:flush])
-    :gen_event.delete_handler(SignalHandler, {SignalHandler, ref}, nil)
-    {:reply, :ok, state}
+    {:reply, :ok, remove_signal_handler(state, ref)}
   end
 
   @impl true
@@ -489,6 +622,10 @@ defmodule Rebus.Connection do
     end
   end
 
+  def handle_cast({:cancel_signal_handler, handler_ref}, %__MODULE__{} = state) do
+    {:noreply, remove_signal_handler(state, handler_ref)}
+  end
+
   defp cancel_outbound_request(state, request_ref) do
     case state.active_write do
       %{request_ref: ^request_ref, partial?: false} ->
@@ -517,12 +654,27 @@ defmodule Rebus.Connection do
 
   defp parse_flat_messages(data, %__MODULE__{} = state, continuation, source) do
     case Message.parse(data) do
-      {:ok, %Message{} = msg, rest} when is_nil(state.name) ->
+      {:ok, %Message{} = msg, rest} when not is_nil(state.hello_serial) ->
         state = finish_frame(state)
 
-        case hello_reply_result(msg) do
-          {:ok, name} -> parse_flat_messages(rest, %{state | name: name}, :recv, source)
-          {:error, reason} -> stop_for_protocol_error(reason, state)
+        # dbus-daemon's bus/dispatch.c replies to Hello before emitting the
+        # directed NameAcquired signal. Until that reply supplies our unique
+        # name, any other frame is a protocol error rather than application
+        # traffic that can be routed safely.
+        case hello_reply_result(msg, state.hello_serial) do
+          {:ok, name} ->
+            case establish_connection(%{
+                   state
+                   | name: name,
+                     hello_serial: nil,
+                     established?: true
+                 }) do
+              {:ok, state} -> parse_flat_messages(rest, state, :recv, source)
+              {:error, :caller_gone} -> {:stop, {:shutdown, :caller_gone}, state}
+            end
+
+          {:error, reason} ->
+            stop_for_protocol_error(reason, state)
         end
 
       {:ok, %Message{type: type} = msg, rest} when type in [:method_return, :error] ->
@@ -551,26 +703,274 @@ defmodule Rebus.Connection do
     end
   end
 
-  defp initialize(sock, addr, write_timeout, read_timeout) do
-    auth = "AUTH EXTERNAL #{get_auth_id()}\r\n"
+  defp initialize(%__MODULE__{} = state, addr) do
+    sock = state.sock
 
-    with :ok <- connect_socket(sock, addr, read_timeout),
-         :ok <- handshake_send(sock, [0, auth], write_timeout),
-         {:ok, <<"OK ", guid::binary-size(32)>>, rest} <-
-           handshake_recv(sock, read_timeout),
-         :ok <- handshake_send(sock, "BEGIN \r\n", write_timeout) do
+    with {:ok, auth_id} <- get_auth_id(state.setup_timeout, state.auth_id_runner),
+         :ok <- connect_socket(sock, addr, state.setup_timeout),
+         :ok <- handshake_send(sock, [0, "AUTH EXTERNAL ", auth_id, "\r\n"], state.write_timeout),
+         {:ok, auth_line, rest} <- handshake_recv(sock, state.setup_timeout),
+         {:ok, guid} <- parse_auth_response(auth_line),
+         :ok <- handshake_send(sock, "BEGIN \r\n", state.write_timeout) do
       {:ok,
-       %__MODULE__{
-         sock: sock,
-         guid: guid,
-         inbound_segments: if(rest == <<>>, do: [], else: [{byte_size(rest), rest}]),
-         inbound_size: byte_size(rest),
-         write_timeout: write_timeout,
-         read_timeout: read_timeout
+       %{
+         state
+         | guid: guid,
+           inbound_segments: if(rest == <<>>, do: [], else: [{byte_size(rest), rest}]),
+           inbound_size: byte_size(rest)
        }, {:continue, :hello}}
     else
-      {:ok, _, _} -> stop_and_close(sock, :auth_failed)
       {:error, reason} -> stop_and_close(sock, reason)
+    end
+  end
+
+  defp parse_auth_response(<<"OK ", guid::binary-size(32)>>), do: {:ok, :binary.copy(guid)}
+
+  defp parse_auth_response("REJECTED"), do: {:error, {:auth_rejected, []}}
+
+  defp parse_auth_response("REJECTED " <> mechanisms) do
+    {:error,
+     {:auth_rejected,
+      mechanisms
+      |> :binary.split(" ", [:global])
+      |> Enum.reject(&(&1 == <<>>))
+      |> Enum.map(&:binary.copy/1)}}
+  end
+
+  defp parse_auth_response(_line), do: {:error, :auth_failed}
+
+  defp notify_connect_waiter({pid, ref}, result) when is_pid(pid) and is_reference(ref),
+    do: Kernel.send(pid, {ref, result})
+
+  defp notify_connect_waiter(nil, _result), do: :ok
+
+  defp establish_connection(
+         %__MODULE__{connect_waiter: {pid, connect_ref}, connect_waiter_monitor: monitor_ref} =
+           state
+       ) do
+    receive do
+      {:DOWN, ^monitor_ref, :process, ^pid, _reason} ->
+        {:error, :caller_gone}
+    after
+      0 ->
+        # This acknowledgement is the ownership-transfer boundary. Check the
+        # queued monitor event first, then send the acknowledgement before
+        # releasing the monitor: a caller that dies after this send owns the
+        # normal established-connection lifecycle, while a prior death wins.
+        Kernel.send(pid, {connect_ref, :accepted})
+        {:ok, release_connect_waiter(state)}
+    end
+  end
+
+  defp establish_connection(%__MODULE__{} = state), do: {:ok, state}
+
+  defp safe_setup_call(conn, message, cancellation \\ nil) do
+    try do
+      GenServer.call(conn, message, @default_read_timeout)
+    catch
+      :exit, {:timeout, _call} ->
+        if cancellation, do: GenServer.cast(conn, cancellation)
+        {:error, :timeout}
+
+      :exit, _reason ->
+        {:error, :disconnected}
+    end
+  end
+
+  defp monitor_connect_waiter({pid, _ref}) when is_pid(pid), do: Process.monitor(pid)
+  defp monitor_connect_waiter(nil), do: nil
+
+  defp connect_waiter_alive?(%__MODULE__{connect_waiter: nil}), do: true
+
+  defp connect_waiter_alive?(%__MODULE__{connect_waiter: {pid, _ref}}), do: Process.alive?(pid)
+
+  defp connect_waiter_gone?(%__MODULE__{connect_waiter: nil}), do: false
+
+  defp connect_waiter_gone?(%__MODULE__{
+         connect_waiter: {pid, _ref},
+         connect_waiter_monitor: monitor_ref
+       })
+       when is_reference(monitor_ref) do
+    receive do
+      {:DOWN, ^monitor_ref, :process, ^pid, _reason} -> true
+    after
+      0 -> not Process.alive?(pid)
+    end
+  end
+
+  defp release_connect_waiter(%__MODULE__{connect_waiter_monitor: monitor_ref} = state)
+       when is_reference(monitor_ref) do
+    Process.demonitor(monitor_ref, [:flush])
+    %{state | connect_waiter: nil, connect_waiter_monitor: nil, connect_accepted?: false}
+  end
+
+  defp release_connect_waiter(%__MODULE__{} = state),
+    do: %{state | connect_waiter: nil, connect_accepted?: false}
+
+  defp remove_signal_handler(%__MODULE__{} = state, handler_ref) do
+    case pop_signal_handler_monitor(state, handler_ref) do
+      {:ok, state} ->
+        :gen_event.delete_handler(SignalHandler, {SignalHandler, handler_ref}, nil)
+        state
+
+      :error ->
+        state
+    end
+  end
+
+  defp remove_signal_handler_monitor(%__MODULE__{} = state, handler_ref) do
+    case pop_signal_handler_monitor(state, handler_ref) do
+      {:ok, state} -> state
+      :error -> state
+    end
+  end
+
+  defp pop_signal_handler_monitor(%__MODULE__{} = state, handler_ref) do
+    case Enum.find(state.signal_handler_monitor_index, fn {_monitor_ref, ref} ->
+           ref == handler_ref
+         end) do
+      {monitor_ref, ^handler_ref} ->
+        Process.demonitor(monitor_ref, [:flush])
+
+        {:ok,
+         %{
+           state
+           | signal_handler_monitor_index:
+               Map.delete(state.signal_handler_monitor_index, monitor_ref)
+         }}
+
+      nil ->
+        :error
+    end
+  end
+
+  @doc false
+  @spec get_auth_id(pos_integer(), (pos_integer() -> {:ok, binary()} | {:error, term()})) ::
+          {:ok, binary()} | {:error, :auth_id_unavailable | :read_timeout}
+  def get_auth_id(timeout, runner \\ &run_auth_id/1) when is_integer(timeout) and timeout > 0 do
+    case safely_run_auth_id(runner, timeout) do
+      {:ok, output} when is_binary(output) and byte_size(output) <= @max_auth_id_output ->
+        case String.trim(output) do
+          uid when uid != <<>> ->
+            if uid_bytes?(uid),
+              do: {:ok, :binary.encode_hex(uid)},
+              else: {:error, :auth_id_unavailable}
+
+          _ ->
+            {:error, :auth_id_unavailable}
+        end
+
+      {:error, :timeout} ->
+        {:error, :read_timeout}
+
+      _ ->
+        {:error, :auth_id_unavailable}
+    end
+  end
+
+  @doc false
+  @spec run_auth_id(
+          pos_integer(),
+          (String.t() -> String.t() | nil),
+          ({:spawn_executable, charlist()}, keyword() -> port())
+        ) :: {:ok, binary()} | {:error, term()}
+  def run_auth_id(
+        timeout,
+        executable_finder \\ &System.find_executable/1,
+        port_opener \\ &Port.open/2
+      )
+      when is_integer(timeout) and timeout > 0 and is_function(executable_finder, 1) and
+             is_function(port_opener, 2) do
+    case safely_find_executable(executable_finder) do
+      nil ->
+        {:error, :enoent}
+
+      executable ->
+        safely_open_auth_id_port(executable, port_opener, timeout)
+    end
+  end
+
+  defp safely_run_auth_id(runner, timeout) do
+    try do
+      runner.(timeout)
+    rescue
+      _exception -> {:error, :runner_failed}
+    catch
+      _kind, _reason -> {:error, :runner_failed}
+    end
+  end
+
+  defp safely_find_executable(executable_finder) do
+    try do
+      executable_finder.("id")
+    rescue
+      _exception -> nil
+    catch
+      _kind, _reason -> nil
+    end
+  end
+
+  defp safely_open_auth_id_port(executable, port_opener, timeout) do
+    try do
+      port =
+        port_opener.({:spawn_executable, String.to_charlist(executable)}, [
+          :binary,
+          :exit_status,
+          args: ["-u"]
+        ])
+
+      collect_auth_id_output(port, <<>>, read_deadline(timeout), timeout)
+    rescue
+      _exception -> {:error, :port_open_failed}
+    catch
+      _kind, _reason -> {:error, :port_open_failed}
+    end
+  end
+
+  defp collect_auth_id_output(port, output, deadline, maximum) do
+    case remaining_timeout(deadline, maximum) do
+      :expired ->
+        safe_close_port(port)
+        {:error, :timeout}
+
+      {:ok, timeout} ->
+        receive do
+          {^port, {:data, data}}
+          when is_binary(data) and byte_size(output) + byte_size(data) <= @max_auth_id_output ->
+            collect_auth_id_output(port, output <> data, deadline, maximum)
+
+          {^port, {:data, _data}} ->
+            safe_close_port(port)
+            {:error, :output_too_large}
+
+          {^port, {:exit_status, 0}} ->
+            {:ok, output}
+
+          {^port, {:exit_status, _status}} ->
+            {:error, :exit_status}
+
+          {:EXIT, ^port, _reason} ->
+            {:error, :port_exit}
+        after
+          timeout ->
+            safe_close_port(port)
+            {:error, :timeout}
+        end
+    end
+  end
+
+  defp safe_close_port(port) do
+    try do
+      Port.close(port)
+    catch
+      _kind, _reason -> :ok
+    end
+  end
+
+  defp uid_bytes?(uid) do
+    for <<byte <- uid>>, reduce: true do
+      true -> byte in ?0..?9
+      false -> false
     end
   end
 
@@ -683,6 +1083,8 @@ defmodule Rebus.Connection do
 
   @doc false
   @spec normalize_socket_error(term()) :: term()
+  def normalize_socket_error({:auth_rejected, _mechanisms} = error), do: error
+
   def normalize_socket_error({reason, partial} = error) when is_atom(reason) do
     if is_binary(partial) or iolist?(partial), do: reason, else: error
   end
@@ -871,24 +1273,37 @@ defmodule Rebus.Connection do
     nil
   end
 
-  defp hello_reply_result(%Message{
-         type: :method_return,
-         header_fields: %{reply_serial: 1},
-         body: [name | _]
-       })
+  defp hello_reply_result(
+         %Message{
+           type: :method_return,
+           header_fields: %{reply_serial: hello_serial},
+           body: [name | _]
+         },
+         hello_serial
+       )
        when is_binary(name) do
-    {:ok, name}
+    # Preserve compatibility with peers that include extra decoded values, but
+    # retain only the validated unique-name result.
+    if valid_unique_name?(name),
+      do: {:ok, :binary.copy(name)},
+      else: {:error, {:hello_failed, :invalid_unique_name}}
   end
 
-  defp hello_reply_result(%Message{type: :method_return, header_fields: %{reply_serial: 1}}) do
+  defp hello_reply_result(
+         %Message{type: :method_return, header_fields: %{reply_serial: hello_serial}},
+         hello_serial
+       ) do
     {:error, {:hello_failed, :missing_unique_name}}
   end
 
-  defp hello_reply_result(%Message{type: :error, header_fields: %{reply_serial: 1}} = msg) do
+  defp hello_reply_result(
+         %Message{type: :error, header_fields: %{reply_serial: hello_serial}} = msg,
+         hello_serial
+       ) do
     {:error, {:hello_failed, hello_error_reason(msg.header_fields)}}
   end
 
-  defp hello_reply_result(%Message{type: type}) do
+  defp hello_reply_result(%Message{type: type}, _hello_serial) do
     {:error, {:unexpected_handshake_message, type}}
   end
 
@@ -913,18 +1328,27 @@ defmodule Rebus.Connection do
           | :unsupported_protocol_version
           | :protocol_error
           | {:hello_failed,
-             binary() | :invalid_error_name | :missing_error_name | :missing_unique_name}
+             binary()
+             | :invalid_error_name
+             | :invalid_unique_name
+             | :missing_error_name
+             | :missing_unique_name}
           | {:malformed_reply, :missing_reply_serial}
           | {:unexpected_handshake_message, Message.message_type()}
   def sanitize_protocol_reason(reason) do
     case reason do
       {:hello_failed, reason}
-      when reason in [:missing_unique_name, :missing_error_name, :invalid_error_name] ->
+      when reason in [
+             :missing_unique_name,
+             :missing_error_name,
+             :invalid_error_name,
+             :invalid_unique_name
+           ] ->
         {:hello_failed, reason}
 
       {:hello_failed, error_name} when is_binary(error_name) ->
         if valid_error_name?(error_name),
-          do: {:hello_failed, error_name},
+          do: {:hello_failed, :binary.copy(error_name)},
           else: {:hello_failed, :invalid_error_name}
 
       {:hello_failed, _reason} ->
@@ -977,6 +1401,23 @@ defmodule Rebus.Connection do
   end
 
   defp valid_error_name_tail?(_rest), do: false
+
+  defp valid_unique_name?(<<":", rest::binary>> = name) when byte_size(name) <= 255 do
+    case :binary.split(rest, ".", [:global]) do
+      [_, _ | _] = parts -> Enum.all?(parts, &valid_unique_name_element?/1)
+      _ -> false
+    end
+  end
+
+  defp valid_unique_name?(_name), do: false
+
+  defp valid_unique_name_element?(<<>>), do: false
+
+  defp valid_unique_name_element?(element) do
+    Enum.all?(:binary.bin_to_list(element), fn char ->
+      char in ?A..?Z or char in ?a..?z or char in ?0..?9 or char in [?_, ?-]
+    end)
+  end
 
   defp iolist?(data) do
     try do
@@ -1450,12 +1891,4 @@ defmodule Rebus.Connection do
   defp next_serial(serial), do: serial + 1
   defp next_serial(max_serial, max_serial), do: 1
   defp next_serial(serial, _max_serial), do: serial + 1
-
-  defp get_auth_id do
-    {resp, 0} = System.cmd("id", ["-u"])
-
-    resp
-    |> String.trim()
-    |> :binary.encode_hex()
-  end
 end
