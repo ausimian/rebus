@@ -19,21 +19,45 @@ Rebus provides a clean, Elixir-native interface for communicating over D-Bus, th
 # Connect to a D-Bus endpoint
 {:ok, conn} = Rebus.connect(:session)
 
-# Add a signal handler to receive D-Bus signals
-ref = Rebus.add_signal_handler(conn)
-
-# Create and send a D-Bus message
-{:ok, message} = Rebus.Message.new(:method_call,
+# Build and call a D-Bus method
+message = Rebus.Message.new!(:method_call,
   path: "/com/example/Object",
-  interface: "com.example.Interface", 
+  interface: "com.example.Interface",
   member: "TestMethod",
   body: [42, "hello"],
   signature: "is"
 )
 
-# Clean up when done
-Rebus.delete_signal_handler(conn, ref)
+# A reply is always the full D-Bus message, including error replies.
+%Rebus.Message{type: :method_return, body: [result]} = Rebus.call(conn, message)
+
+# Set a per-call timeout in milliseconds. Timed-out calls are cleaned up.
+{:error, :timeout} = Rebus.call(conn, message, 1_000)
+
+# Emit a signal (or a method call with :no_reply_expected) without waiting.
+signal = Rebus.Message.new!(:signal,
+  path: "/com/example/Object",
+  interface: "com.example.Interface",
+  member: "Changed",
+  signature: "s",
+  body: ["updated"]
+)
+
+:ok = Rebus.send(conn, signal)
 ```
+
+`Rebus.call/3` returns `%Rebus.Message{}` for both `:method_return` and
+`:error` replies. It returns `{:error, :timeout}` when no reply arrives before
+the configured timeout, and `{:error, :encode_failed}` if the outgoing message
+cannot be encoded. `Rebus.send/2` is fire-and-forget and is intended for
+signals and method calls with the `:no_reply_expected` flag. `Rebus.call/3`
+rejects signals and no-reply method calls; `Rebus.send/2` rejects method calls
+that expect replies. Both functions return `{:error, :disconnected}` if the
+connection closes while sending or waiting. `{:error, :timeout}` is
+delivery-ambiguous: the message may already have reached the peer, so do not
+blindly retry it. `{:error, :serial_exhausted}` means all D-Bus serials are in
+use. Connections must be local to the caller's node; remote PIDs return
+`{:error, :remote_connection_unsupported}`.
 
 ## Architecture
 
@@ -121,4 +145,3 @@ Make sure to run the test suite before submitting:
 mix test
 mix test --cover  # With coverage reporting
 ```
-

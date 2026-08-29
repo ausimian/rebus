@@ -26,6 +26,11 @@ defmodule RebusTest do
       assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
     end
 
+    test "rejects an invalid write timeout", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      assert {:error, :invalid_write_timeout} = Rebus.connect(addr, write_timeout: -1)
+    end
+
     test "connect! raises on failure" do
       # Try to connect to non-existent socket
       assert_raise RuntimeError, ~r/Failed to connect to D-Bus/, fn ->
@@ -69,6 +74,65 @@ defmodule RebusTest do
   end
 
   describe "Connection callbacks" do
+    test "allocates serials within a bounded range" do
+      assert {:ok, 2} = Connection.allocate_serial(1, %{1 => :pending}, 2)
+      assert {:ok, 1} = Connection.allocate_serial(2, %{2 => :pending}, 2)
+
+      assert {:error, :serial_exhausted} =
+               Connection.allocate_serial(1, %{1 => :pending, 2 => :pending}, 2)
+    end
+
+    test "classifies socket send results without exposing payloads" do
+      assert :ok = Connection.classify_send_result(:ok, 3)
+      assert {:error, :timeout} = Connection.classify_send_result({:error, {:timeout, "abc"}}, 3)
+
+      assert {:error, {:send_fatal, :timeout}} =
+               Connection.classify_send_result({:error, {:timeout, "a"}}, 3)
+
+      assert {:error, {:send_fatal, :closed}} =
+               Connection.classify_send_result({:error, {:closed, "abc"}}, 3)
+
+      assert {:error, {:send_fatal, :closed}} =
+               Connection.classify_send_result({:error, :closed}, 3)
+
+      assert {:error, {:send_fatal, :timeout}} =
+               Connection.classify_send_result({:error, {:timeout, %{}}}, 3)
+
+      assert {:error, {:send_fatal, :send_failed}} =
+               Connection.classify_send_result({:error, {"weird", "abc"}}, 3)
+
+      assert {:continue, "bc"} = Connection.classify_send_result({:ok, "bc"}, 3)
+
+      assert {:error, {:send_fatal, :send_failed}} =
+               Connection.classify_send_result({:ok, ["bc"]}, 3)
+
+      assert {:error, {:send_fatal, :timeout}} =
+               Connection.classify_send_result({:error, {:timeout, "bc"}}, 3)
+
+      select_info = {:select_info, :send, make_ref()}
+      completion_info = {:completion_info, :send, make_ref()}
+
+      assert {:select, ^select_info, nil} =
+               Connection.classify_send_result({:select, select_info}, 3)
+
+      assert {:select, ^select_info, "bc"} =
+               Connection.classify_send_result({:select, {select_info, "bc"}}, 3)
+
+      assert {:completion, ^completion_info} =
+               Connection.classify_send_result({:completion, completion_info}, 3)
+
+      assert {:error, {:send_fatal, :send_failed}} =
+               Connection.classify_send_result({:unexpected, :socket_shape}, 3)
+    end
+
+    test "builds nonblocking socket continuation arguments" do
+      continuation = {:select_info, :send, make_ref()}
+      assert {"rest", [], :nowait} = Connection.socket_send_args("rest", nil)
+
+      assert {"rest", ^continuation, :nowait} =
+               Connection.socket_send_args("rest", {:continue, continuation})
+    end
+
     test "normalizes only partial socket errors" do
       assert :closed == Connection.normalize_socket_error({:closed, "partial peer data"})
       assert :closed == Connection.normalize_socket_error({:closed, ["partial", ?\n]})
@@ -500,10 +564,10 @@ defmodule RebusTest do
     end
   end
 
-  describe "Methods" do
+  describe "Public message API" do
     setup [:server_setup, :client_setup]
 
-    test "block when called", %{cli: cli, svr: svr} do
+    test "returns the complete reply message when called", %{cli: cli, svr: svr} do
       method =
         Rebus.Message.new!(
           :method_call,
@@ -515,7 +579,7 @@ defmodule RebusTest do
         )
 
       # Call the method (in a task to avoid blocking the test)
-      task = Task.async(fn -> Connection.send(cli, method) end)
+      task = Task.async(fn -> Rebus.call(cli, method) end)
       # Confirm the server received it
       assert_receive {^svr, %Message{} = rcvd}
       assert rcvd.body == ["foobar"]
@@ -534,6 +598,563 @@ defmodule RebusTest do
 
       resp = Task.await(task)
       assert resp.body == ["response"]
+    end
+
+    test "returns D-Bus error replies as complete messages", %{cli: cli, svr: svr} do
+      method =
+        Message.new!(:method_call,
+          path: "/org/freedesktop/DBus",
+          member: "FakeMethod"
+        )
+
+      task = Task.async(fn -> Rebus.call(cli, method) end)
+      assert_receive {^svr, %Message{} = received}
+
+      error =
+        Message.new!(:error,
+          error_name: "org.example.Failed",
+          reply_serial: received.serial,
+          signature: "s",
+          body: ["failed"]
+        )
+
+      :ok = TestServer.push(svr, error)
+
+      assert %Message{type: :error, header_fields: %{error_name: "org.example.Failed"}} =
+               Task.await(task)
+    end
+
+    test "cleans pending calls that time out", %{cli: cli, svr: svr} do
+      method =
+        Message.new!(:method_call,
+          path: "/org/freedesktop/DBus",
+          member: "NeverReplies"
+        )
+
+      task = Task.async(fn -> Rebus.call(cli, method, 500) end)
+      assert_receive {^svr, %Message{header_fields: %{member: "NeverReplies"}}}
+
+      [{serial, {_from, _timer_ref, request_ref, _monitor_ref}}] =
+        :sys.get_state(cli).pending |> Map.to_list()
+
+      send(cli, {:request_timeout, serial, request_ref})
+
+      assert {:error, :timeout} = Task.await(task)
+      assert :sys.get_state(cli).pending == %{}
+      assert :sys.get_state(cli).request_index == %{}
+      assert :sys.get_state(cli).monitor_index == %{}
+      assert Process.alive?(cli)
+    end
+
+    test "bounds the caller timeout while the connection is busy", %{cli: cli, svr: svr} do
+      :ok = :sys.suspend(cli)
+      method = Message.new!(:method_call, path: "/org/freedesktop/DBus", member: "Queued")
+      started_at = System.monotonic_time(:millisecond)
+
+      assert {:error, :timeout} = Rebus.call(cli, method, 20)
+      assert System.monotonic_time(:millisecond) - started_at < 250
+
+      :ok = :sys.resume(cli)
+      refute_receive {^svr, %Message{header_fields: %{member: "Queued"}}}, 50
+      assert :sys.get_state(cli).pending == %{}
+    end
+
+    test "does not stop a shared connection for a tiny call timeout", %{cli: cli, svr: svr} do
+      method = Message.new!(:method_call, path: "/org/freedesktop/DBus", member: "Tiny")
+
+      assert {:error, :timeout} = Rebus.call(cli, method, 0)
+      assert Process.alive?(cli)
+
+      signal =
+        Message.new!(:signal,
+          path: "/org/freedesktop/DBus",
+          interface: "org.freedesktop.DBus",
+          member: "StillAvailable"
+        )
+
+      assert :ok = Rebus.send(cli, signal)
+      assert_receive {^svr, %Message{header_fields: %{member: "StillAvailable"}}}
+    end
+
+    test "times out a busy send without delivering it later", %{cli: cli, svr: svr} do
+      signal =
+        Message.new!(:signal,
+          path: "/org/freedesktop/DBus",
+          interface: "org.freedesktop.DBus",
+          member: "QueuedSend"
+        )
+
+      :ok = :sys.suspend(cli)
+      task = Task.async(fn -> Rebus.send(cli, signal, 20) end)
+
+      assert {:ok, {:error, :timeout}} = Task.yield(task, 500)
+      :ok = :sys.resume(cli)
+
+      refute_receive {^svr, %Message{header_fields: %{member: "QueuedSend"}}}, 50
+      assert Process.alive?(cli)
+    end
+
+    test "removes a pending call when its caller exits", %{cli: cli, svr: svr} do
+      method = Message.new!(:method_call, path: "/org/freedesktop/DBus", member: "CallerDies")
+      task = Task.async(fn -> Rebus.call(cli, method, 5_000) end)
+
+      assert_receive {^svr, %Message{header_fields: %{member: "CallerDies"}}}
+      assert map_size(:sys.get_state(cli).pending) == 1
+      _ = Task.shutdown(task, :brutal_kill)
+
+      assert wait_until(fn -> :sys.get_state(cli).pending == %{} end)
+      assert :sys.get_state(cli).request_index == %{}
+      assert :sys.get_state(cli).monitor_index == %{}
+      assert Process.alive?(cli)
+    end
+
+    test "fails pending calls when the transport closes", %{cli: cli, svr: svr} do
+      method = Message.new!(:method_call, path: "/org/freedesktop/DBus", member: "Pending")
+      task = Task.async(fn -> Rebus.call(cli, method, 5_000) end)
+      assert_receive {^svr, %Message{header_fields: %{member: "Pending"}}}
+      ref = Process.monitor(cli)
+      :ok = :socket.close(:sys.get_state(cli).sock)
+
+      assert {:error, :disconnected} = Task.await(task)
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, _reason}}
+    end
+
+    test "correlates concurrent calls when replies arrive out of order", %{cli: cli, svr: svr} do
+      first = Message.new!(:method_call, path: "/org/freedesktop/DBus", member: "First")
+      second = Message.new!(:method_call, path: "/org/freedesktop/DBus", member: "Second")
+      first_task = Task.async(fn -> Rebus.call(cli, first) end)
+      second_task = Task.async(fn -> Rebus.call(cli, second) end)
+
+      assert_receive {^svr, %Message{header_fields: %{member: first_member}} = first_received}
+      assert_receive {^svr, %Message{header_fields: %{member: second_member}} = second_received}
+
+      received = %{first_member => first_received, second_member => second_received}
+
+      :ok =
+        TestServer.push(
+          svr,
+          Message.new!(:method_return,
+            reply_serial: received["Second"].serial,
+            signature: "s",
+            body: ["second reply"]
+          )
+        )
+
+      :ok =
+        TestServer.push(
+          svr,
+          Message.new!(:method_return,
+            reply_serial: received["First"].serial,
+            signature: "s",
+            body: ["first reply"]
+          )
+        )
+
+      assert %Message{body: ["first reply"]} = Task.await(first_task)
+      assert %Message{body: ["second reply"]} = Task.await(second_task)
+    end
+
+    test "rejects operation and message combinations it cannot honour", %{cli: cli} do
+      signal =
+        Message.new!(:signal,
+          path: "/org/freedesktop/DBus",
+          interface: "org.freedesktop.DBus",
+          member: "Changed"
+        )
+
+      no_reply_call =
+        Message.new!(:method_call,
+          path: "/org/freedesktop/DBus",
+          member: "NoReply",
+          flags: [:no_reply_expected]
+        )
+
+      assert {:error, {:invalid_message_type, :signal}} = Rebus.call(cli, signal)
+      assert {:error, :no_reply_expected} = Rebus.call(cli, no_reply_call)
+
+      reply_expected =
+        Message.new!(:method_call,
+          path: "/org/freedesktop/DBus",
+          member: "ReplyExpected"
+        )
+
+      assert {:error, :reply_expected} = Rebus.send(cli, reply_expected)
+      assert :ok = Rebus.send(cli, no_reply_call)
+    end
+
+    test "skips live pending serials when serial numbers wrap", %{cli: cli, svr: svr} do
+      first = Message.new!(:method_call, path: "/org/freedesktop/DBus", member: "First")
+      first_task = Task.async(fn -> Rebus.call(cli, first) end)
+      assert_receive {^svr, %Message{} = first_received}
+
+      :ok = :sys.suspend(cli)
+      _ = :sys.replace_state(cli, fn state -> %{state | serial: 4_294_967_295} end)
+      :ok = :sys.resume(cli)
+
+      signal =
+        Message.new!(:signal,
+          path: "/org/freedesktop/DBus",
+          interface: "org.freedesktop.DBus",
+          member: "Wrapped"
+        )
+
+      assert :ok = Rebus.send(cli, signal)
+      assert_receive {^svr, %Message{serial: 4_294_967_295}}
+      assert :ok = Rebus.send(cli, signal)
+      assert_receive {^svr, %Message{serial: 1}}
+
+      second = Message.new!(:method_call, path: "/org/freedesktop/DBus", member: "Second")
+      second_task = Task.async(fn -> Rebus.call(cli, second) end)
+      assert_receive {^svr, %Message{serial: 3} = second_received}
+
+      :ok =
+        TestServer.push(svr, Message.new!(:method_return, reply_serial: second_received.serial))
+
+      :ok =
+        TestServer.push(svr, Message.new!(:method_return, reply_serial: first_received.serial))
+
+      assert %Message{serial: _} = Task.await(first_task)
+      assert %Message{serial: _} = Task.await(second_task)
+    end
+
+    test "stops the connection when a send fails", %{cli: cli} do
+      sock = :sys.get_state(cli).sock
+      ref = Process.monitor(cli)
+      :ok = :socket.close(sock)
+
+      signal =
+        Message.new!(:signal,
+          path: "/org/freedesktop/DBus",
+          interface: "org.freedesktop.DBus",
+          member: "AfterClose"
+        )
+
+      assert {:error, :disconnected} = Rebus.send(cli, signal)
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, _reason}}
+    end
+
+    test "rejects remote connection PIDs" do
+      node_name = "synthetic@remote"
+
+      remote_connection =
+        :erlang.binary_to_term(
+          <<131, 103, 100, byte_size(node_name)::16, node_name::binary, 1::32, 0::32, 0>>
+        )
+
+      message = Message.new!(:method_call, path: "/org/freedesktop/DBus", member: "Remote")
+
+      assert {:error, :remote_connection_unsupported} = Rebus.call(remote_connection, message)
+      assert {:error, :remote_connection_unsupported} = Rebus.send(remote_connection, message)
+    end
+
+    test "keeps the connection alive when an outgoing message cannot be encoded", %{
+      cli: cli,
+      svr: svr
+    } do
+      invalid_message =
+        Message.new!(:method_call,
+          path: "/org/freedesktop/DBus",
+          member: "BadBody",
+          signature: "s",
+          body: [42]
+        )
+
+      assert {:error, :encode_failed} = Rebus.call(cli, invalid_message)
+      assert Process.alive?(cli)
+
+      signal =
+        Message.new!(:signal,
+          path: "/org/freedesktop/DBus",
+          interface: "org.freedesktop.DBus",
+          member: "StillConnected"
+        )
+
+      assert :ok = Rebus.send(cli, signal)
+      assert_receive {^svr, %Message{type: :signal, header_fields: %{member: "StillConnected"}}}
+      assert Process.alive?(cli)
+    end
+
+    test "resumes a selected outbound frame with its OTP continuation", %{cli: cli} do
+      parent = self()
+      continuation = {:select_info, :send, make_ref()}
+      {:select_info, :send, handle} = continuation
+      calls = :atomics.new(1, [])
+
+      :sys.replace_state(cli, fn state ->
+        %{
+          state
+          | send_fun: fn _sock, rest, flags_or_cont, timeout ->
+              call = :atomics.add_get(calls, 1, 1)
+              send(parent, {:outbound_send, call, rest, flags_or_cont, timeout})
+              if call == 1, do: {:select, continuation}, else: :ok
+            end
+        }
+      end)
+
+      signal = Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Selected")
+      task = Task.async(fn -> Rebus.send(cli, signal, 500) end)
+      assert_receive {:outbound_send, 1, _rest, [], :nowait}
+      sock = :sys.get_state(cli).sock
+      send(cli, {:"$socket", sock, :select, handle})
+      assert_receive {:outbound_send, 2, _rest, ^continuation, :nowait}
+      assert :ok = Task.await(task)
+    end
+
+    test "cancels a zero-byte selected frame after its caller times out", %{cli: cli} do
+      parent = self()
+      continuation = {:select_info, :send, make_ref()}
+
+      :sys.replace_state(cli, fn state ->
+        %{
+          state
+          | send_fun: fn _, _, _, _ -> {:select, continuation} end,
+            cancel_fun: fn _sock, info ->
+              send(parent, {:cancelled_write, info})
+              :ok
+            end
+        }
+      end)
+
+      signal =
+        Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Cancelled")
+
+      assert {:error, :timeout} = Rebus.send(cli, signal, 20)
+      assert_receive {:cancelled_write, ^continuation}, 500
+      assert :sys.get_state(cli).active_write == nil
+    end
+
+    test "continues an immediate partial outbound write with its exact binary tail", %{cli: cli} do
+      parent = self()
+      calls = :atomics.new(1, [])
+
+      :sys.replace_state(cli, fn state ->
+        %{
+          state
+          | send_fun: fn _sock, rest, _flags, _timeout ->
+              case :atomics.add_get(calls, 1, 1) do
+                1 ->
+                  tail = binary_part(rest, 1, byte_size(rest) - 1)
+                  send(parent, {:first_tail, tail})
+                  {:ok, tail}
+
+                2 ->
+                  send(parent, {:second_tail, rest})
+                  :ok
+              end
+            end
+        }
+      end)
+
+      signal = Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Partial")
+      assert :ok = Rebus.send(cli, signal, 500)
+      assert_receive {:first_tail, tail}
+      assert_receive {:second_tail, ^tail}
+    end
+
+    test "handles select results that include a partial tail", %{cli: cli} do
+      parent = self()
+      continuation = {:select_info, :send, make_ref()}
+      {:select_info, :send, handle} = continuation
+      calls = :atomics.new(1, [])
+
+      :sys.replace_state(cli, fn state ->
+        %{
+          state
+          | send_fun: fn _sock, rest, flags, timeout ->
+              case :atomics.add_get(calls, 1, 1) do
+                1 ->
+                  tail = binary_part(rest, 1, byte_size(rest) - 1)
+                  send(parent, {:selected_tail, tail})
+                  {:select, {continuation, tail}}
+
+                2 ->
+                  send(parent, {:resumed_tail, rest, flags, timeout})
+                  :ok
+              end
+            end
+        }
+      end)
+
+      signal =
+        Message.new!(:signal, path: "/", interface: "org.example.Test", member: "SelectPartial")
+
+      task = Task.async(fn -> Rebus.send(cli, signal, 500) end)
+      assert_receive {:selected_tail, tail}
+      send(cli, {:"$socket", :sys.get_state(cli).sock, :select, handle})
+      assert_receive {:resumed_tail, ^tail, ^continuation, :nowait}
+      assert :ok = Task.await(task)
+    end
+
+    test "completes a Windows-style completion write", %{cli: cli} do
+      completion = {:completion_info, :send, make_ref()}
+      {:completion_info, :send, handle} = completion
+
+      :sys.replace_state(cli, fn state ->
+        %{state | send_fun: fn _, _, _, _ -> {:completion, completion} end}
+      end)
+
+      signal =
+        Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Completion")
+
+      task = Task.async(fn -> Rebus.send(cli, signal, 500) end)
+      send(cli, {:"$socket", :sys.get_state(cli).sock, :completion, {handle, :ok}})
+      assert :ok = Task.await(task)
+    end
+
+    test "continues a partial completion write", %{cli: cli} do
+      parent = self()
+      completion = {:completion_info, :send, make_ref()}
+      {:completion_info, :send, handle} = completion
+      calls = :atomics.new(1, [])
+
+      :sys.replace_state(cli, fn state ->
+        %{
+          state
+          | send_fun: fn _, rest, _, _ ->
+              if :atomics.add_get(calls, 1, 1) == 1 do
+                send(parent, {:completion_rest, rest})
+                {:completion, completion}
+              else
+                send(parent, {:completion_tail, rest})
+                :ok
+              end
+            end
+        }
+      end)
+
+      signal =
+        Message.new!(:signal,
+          path: "/",
+          interface: "org.example.Test",
+          member: "PartialCompletion"
+        )
+
+      task = Task.async(fn -> Rebus.send(cli, signal, 500) end)
+      assert_receive {:completion_rest, rest}
+      tail = binary_part(rest, 1, byte_size(rest) - 1)
+      send(cli, {:"$socket", :sys.get_state(cli).sock, :completion, {handle, {:ok, 1}}})
+      assert_receive {:completion_tail, ^tail}
+      assert :ok = Task.await(task)
+    end
+
+    test "stops all queued callers when a selected partial frame times out", %{cli: cli} do
+      parent = self()
+      continuation = {:select_info, :send, make_ref()}
+
+      :sys.replace_state(cli, fn state ->
+        %{
+          state
+          | write_timeout: 20,
+            send_fun: fn _, rest, _, _ ->
+              {:select, {continuation, binary_part(rest, 1, byte_size(rest) - 1)}}
+            end,
+            cancel_fun: fn _, info ->
+              send(parent, {:cancelled_write, info})
+              :ok
+            end
+        }
+      end)
+
+      signal =
+        Message.new!(:signal, path: "/", interface: "org.example.Test", member: "TimeoutPartial")
+
+      ref = Process.monitor(cli)
+      first = Task.async(fn -> Rebus.send(cli, signal, 500) end)
+      second = Task.async(fn -> Rebus.send(cli, signal, 500) end)
+      assert {:error, :disconnected} = Task.await(first, 1_000)
+      assert {:error, :disconnected} = Task.await(second, 1_000)
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :timeout}}, 1_000
+    end
+
+    test "does not transmit a queued frame after its caller exits", %{cli: cli} do
+      parent = self()
+      continuation = {:select_info, :send, make_ref()}
+      {:select_info, :send, handle} = continuation
+      calls = :atomics.new(1, [])
+
+      :sys.replace_state(cli, fn state ->
+        %{
+          state
+          | send_fun: fn _, _rest, _flags, _timeout ->
+              call = :atomics.add_get(calls, 1, 1)
+              send(parent, {:queued_down_send, call})
+              if call == 1, do: {:select, continuation}, else: :ok
+            end
+        }
+      end)
+
+      signal =
+        Message.new!(:signal, path: "/", interface: "org.example.Test", member: "QueuedDown")
+
+      first = Task.async(fn -> Rebus.send(cli, signal, 500) end)
+      assert_receive {:queued_down_send, 1}
+      second = Task.async(fn -> Rebus.send(cli, signal, 500) end)
+      assert wait_until(fn -> :queue.len(:sys.get_state(cli).write_queue) == 1 end)
+      _ = Task.shutdown(second, :brutal_kill)
+      assert wait_until(fn -> MapSet.size(:sys.get_state(cli).cancelled_requests) == 1 end)
+
+      send(cli, {:"$socket", :sys.get_state(cli).sock, :select, handle})
+      assert_receive {:queued_down_send, 2}
+      assert :ok = Task.await(first)
+      assert :atomics.get(calls, 1) == 2
+
+      assert wait_until(fn ->
+               state = :sys.get_state(cli)
+
+               :queue.is_empty(state.write_queue) and MapSet.size(state.queued_requests) == 0 and
+                 MapSet.size(state.cancelled_requests) == 0 and
+                 map_size(state.outbound_monitor_index) == 0
+             end)
+
+      assert Process.alive?(cli)
+    end
+
+    test "finishes a partial frame after its caller exits without registering a reply", %{
+      cli: cli
+    } do
+      parent = self()
+      continuation = {:select_info, :send, make_ref()}
+      {:select_info, :send, handle} = continuation
+      calls = :atomics.new(1, [])
+
+      :sys.replace_state(cli, fn state ->
+        %{
+          state
+          | send_fun: fn _, rest, _flags, _timeout ->
+              case :atomics.add_get(calls, 1, 1) do
+                1 ->
+                  tail = binary_part(rest, 1, byte_size(rest) - 1)
+                  send(parent, {:partial_down_tail, tail})
+                  {:select, {continuation, tail}}
+
+                _ ->
+                  send(parent, {:partial_down_resume, rest})
+                  :ok
+              end
+            end
+        }
+      end)
+
+      signal =
+        Message.new!(:signal, path: "/", interface: "org.example.Test", member: "PartialDown")
+
+      task = Task.async(fn -> Rebus.send(cli, signal, 500) end)
+      assert_receive {:partial_down_tail, tail}
+      _ = Task.shutdown(task, :brutal_kill)
+      assert wait_until(fn -> MapSet.size(:sys.get_state(cli).cancelled_requests) == 1 end)
+
+      send(cli, {:"$socket", :sys.get_state(cli).sock, :select, handle})
+      assert_receive {:partial_down_resume, ^tail}
+
+      assert wait_until(fn ->
+               state = :sys.get_state(cli)
+
+               state.active_write == nil and state.pending == %{} and state.request_index == %{} and
+                 state.monitor_index == %{} and map_size(state.outbound_monitor_index) == 0 and
+                 MapSet.size(state.cancelled_requests) == 0
+             end)
+
+      assert Process.alive?(cli)
     end
   end
 
