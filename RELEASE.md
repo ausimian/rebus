@@ -13,6 +13,11 @@
   complete initial Hello reply, plus gaps between inbound fragments without
   timing out idle connections.
 
+### Changed
+
+- Treat any frame other than a valid Hello reply as a protocol error before a
+  connection is established.
+
 ### Fixed
 
 - Reject inbound D-Bus frames over the protocol's 128 MiB limit or with

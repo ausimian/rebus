@@ -779,6 +779,32 @@ defmodule RebusTest do
                      1_000
     end
 
+    test "rejects a signal before the Hello reply", %{svr: svr} do
+      {cli, _hello} = connect_until_hello(svr)
+
+      signal =
+        Message.new!(:signal,
+          path: "/org/freedesktop/DBus",
+          interface: "org.freedesktop.DBus",
+          member: "BeforeHello"
+        )
+
+      assert_unexpected_handshake_message(svr, cli, signal, :signal)
+    end
+
+    test "rejects a method call before the Hello reply", %{svr: svr} do
+      {cli, _hello} = connect_until_hello(svr)
+
+      method_call =
+        Message.new!(:method_call,
+          path: "/org/freedesktop/DBus",
+          interface: "org.freedesktop.DBus",
+          member: "BeforeHello"
+        )
+
+      assert_unexpected_handshake_message(svr, cli, method_call, :method_call)
+    end
+
     test "drains a coalesced method call and signal after a Hello reply", %{svr: svr} do
       {cli, hello} = connect_until_hello(svr)
       ref = make_ref()
@@ -1681,17 +1707,24 @@ defmodule RebusTest do
   end
 
   defp connect_until_hello(svr, opts \\ []) do
+    {_fixture_opts, connect_opts} = split_fixture_options(opts)
     {:ok, addr} = TestServer.get_listen_addr(svr)
-    {:ok, cli} = Rebus.connect(addr, opts)
+    {:ok, cli} = Rebus.connect(addr, connect_opts)
     assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
     {cli, hello}
   end
 
   defp connect_until_ready(svr, opts \\ []) do
-    {cli, hello} = connect_until_hello(svr, opts)
-    handle_hello(hello, svr, opts)
+    {fixture_opts, connect_opts} = split_fixture_options(opts)
+    {cli, hello} = connect_until_hello(svr, connect_opts)
+    handle_hello(hello, svr, fixture_opts)
     assert wait_until(fn -> :sys.get_state(cli).name == ":1.100" end)
     cli
+  end
+
+  defp split_fixture_options(opts) do
+    # Test-only controls must never be passed to Rebus.connect/2.
+    Keyword.split(opts, [:send_name_acquired?])
   end
 
   defp assert_hello_error_reason(svr, expected_reason, build_reply) do
@@ -1707,6 +1740,15 @@ defmodule RebusTest do
                       {:shutdown, {:hello_failed, ^expected_reason}}},
                      1_000
     end)
+  end
+
+  defp assert_unexpected_handshake_message(svr, cli, message, type) do
+    ref = Process.monitor(cli)
+    :ok = TestServer.push(svr, message)
+
+    assert_receive {:DOWN, ^ref, :process, ^cli,
+                    {:shutdown, {:unexpected_handshake_message, ^type}}},
+                   1_000
   end
 
   defp assert_missing_reply_serial(svr, type) do
