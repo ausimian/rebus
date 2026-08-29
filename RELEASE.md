@@ -4,6 +4,10 @@
 
 ### Added
 
+- Add the documented `:timeout` and `:name` connection options. `:timeout`
+  bounds socket setup and authentication reads, while `:name` registers the
+  connection process locally.
+- Add `Rebus.close/1` to explicitly stop a supervisor-owned local connection.
 - Add `Rebus.call/3` for public method calls with configurable timeouts and
   `Rebus.send/2` and `Rebus.send/3` for fire-and-forget messages.
 - Add the `:write_timeout` connection option to bound outbound frame readiness.
@@ -15,11 +19,28 @@
 
 ### Changed
 
+- `connect/2` now returns `{:error, {:auth_rejected, mechanisms}}` for a
+  `REJECTED` authentication response instead of `{:error, :auth_failed}`.
+- `connect/2` now waits for a validated initial `Hello` reply before returning
+  its connection PID, so that PID can be used immediately.
+- Named connection collisions now return `{:error, {:name_taken, pid}}`, so a
+  caller can adopt or close the existing local connection.
+- Collisions with unrelated local registrations now return
+  `{:error, {:name_registered, pid}}` instead of advertising that PID as a
+  Rebus connection.
+- `call/3`, `send/2`, `send/3`, and signal-handler registration/removal now
+  return `{:error, :not_connected}` during setup and safe timeout/disconnection
+  errors when their connection is unavailable.
+- Document that an operation issued to a named PID before its corresponding
+  `connect/2` returns can time out before any frame is written, and is safe to
+  retry after setup succeeds.
 - Treat any frame other than a valid Hello reply as a protocol error before a
   connection is established.
 
 ### Fixed
 
+- Allow independent connections to establish concurrently so a stalled
+  authentication handshake does not block the shared connection supervisor.
 - Reject inbound D-Bus frames over the protocol's 128 MiB limit or with
   header-fields arrays over the 64 MiB array limit, and validate malformed
   fixed headers as soon as they arrive.
@@ -29,6 +50,16 @@
   supported receive-buffer option form.
 - Bound socket setup, complete authentication, and initial Hello reads with
   `:read_timeout`, including peers that dribble progress indefinitely.
+- Return stable `:auth_id_unavailable` and named-connection collision errors
+  when the local authentication identity cannot be read or a requested local
+  registration name is already in use.
+- Reject invalid or oversized unique names in initial `Hello` replies before
+  retaining them for the connection lifetime.
+- Copy retained authentication GUIDs and unique names so small validated values
+  cannot pin large peer-controlled receive buffers.
+- Keep signal-handler removal scoped to the connection that registered it.
+- Copy peer-provided Hello error names and authentication mechanisms before
+  returning them, so callers cannot retain a larger receive buffer indirectly.
 - Accept fragmented D-Bus authentication responses and initial Hello replies.
 - Reject D-Bus messages whose array/struct or total container nesting exceeds
   the protocol limits.

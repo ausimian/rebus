@@ -31,11 +31,11 @@ defmodule Rebus do
 
       %Rebus.Message{type: :method_return, body: [names]} = Rebus.call(conn, message)
 
-      # Add a signal handler to receive all signals
-      ref = Rebus.add_signal_handler(conn)
-
-      # Later, remove the signal handler
-      Rebus.remove_signal_handler(conn, ref)
+      # Add a signal handler to receive all signals.
+      case Rebus.add_signal_handler(conn) do
+        ref when is_reference(ref) -> Rebus.delete_signal_handler(conn, ref)
+        {:error, reason} -> {:error, reason}
+      end
 
   ## Connection Types
 
@@ -84,6 +84,7 @@ defmodule Rebus do
 
   @type error_reason ::
           :timeout
+          | :not_connected
           | :encode_failed
           | :disconnected
           | :reply_expected
@@ -112,19 +113,40 @@ defmodule Rebus do
     - `%{family: :inet, addr: {ip, port}}` - TCP/IP connection to a remote D-Bus daemon
 
   - `opts` - Optional keyword list of connection options:
+    - `:timeout` - Positive maximum time in milliseconds for the auth-ID lookup,
+      each socket connect, and authentication read (default: 5000). This is the original
+      public connection-timeout option. It has no effect after authentication.
+      `:read_timeout`, when supplied, takes precedence for setup as well.
+      `connect/2` has no aggregate timeout: its worst-case wait includes this
+      bounded auth-ID lookup, one socket connect, one authentication read, the
+      validated initial Hello reply at `:read_timeout`, and the `AUTH`, `BEGIN`,
+      and Hello writes at `:write_timeout`.
+    - `:name` - Optional local atom used to register the connection process.
+      It is intended for local discovery and lifecycle management; pass the
+      returned PID to `call/3`, `send/2`, `send/3`, and signal-handler APIs. The
+      name is held from process start through setup and is released if setup fails
+      or the connection stops. Established connections are supervisor-owned and
+      outlive the process that connected them; call `close/1` when their local
+      lifecycle is complete. A PID discovered with `Process.whereis/1` before
+      its corresponding `connect/2` returns is still establishing; operations
+      issued to it can time out before they reach the connection and are safe to
+      retry after `connect/2` succeeds.
     - `:write_timeout` - Positive maximum time for each authentication write
       (default: 5000). Once connected it bounds how long an outbound frame may
       await socket readiness. If no bytes were accepted, only that caller times
       out; after a partial frame, the temporary connection is terminated and
       inflight callers receive `{:error, :disconnected}` (it does not restart).
-    - `:read_timeout` - Positive maximum time in milliseconds to establish the
-      socket or receive the complete, line-framed authentication response
-      before `connect/2` returns (default: 5000). Each setup operation has one
+    - `:read_timeout` - Positive maximum time in milliseconds for the complete
+      initial Hello reply and gaps between inbound fragments after connection
+      (default: 5000). When supplied, it also overrides `:timeout` for socket
+      setup and the complete, line-framed authentication response before
+      `connect/2` returns. Each setup operation has one
       total budget, so peer progress cannot extend an authentication response
       indefinitely. Expiry makes `connect/2` return
-      `{:error, :read_timeout}`. After `connect/2` returns `{:ok, pid}`, it
-      bounds the complete initial Hello reply from the time it is sent; peer
-      progress cannot extend that setup budget. Once established, it bounds
+      `{:error, :read_timeout}`. `connect/2` waits for the validated initial
+      Hello reply before returning `{:ok, pid}`; that reply is bounded from the
+      time Hello is sent and peer progress cannot extend the setup budget. Once
+      established, it bounds
       gaps between inbound fragments, is reset whenever a peer makes progress,
       and is inactive while no frame is buffered. Expiry then terminates the
       temporary connection; inflight callers receive `{:error, :disconnected}`.
@@ -132,7 +154,23 @@ defmodule Rebus do
   ## Return Values
 
   - `{:ok, pid}` - Returns the PID of the connection process
-  - `{:error, reason}` - Connection failed due to the specified reason
+  - `{:error, :read_timeout}` - Socket setup or authentication did not finish
+    within its configured per-operation budget.
+  - `{:error, :auth_id_unavailable}` - The local numeric identity required for
+    `EXTERNAL` authentication could not be obtained.
+  - `{:error, :auth_failed}` - The peer sent an invalid authentication response.
+  - `{:error, {:auth_rejected, mechanisms}}` - The peer rejected `EXTERNAL`
+    authentication and advertised its supported mechanisms.
+  - `{:error, {:hello_failed, :invalid_unique_name}}` - The peer's initial
+    Hello reply did not contain a valid D-Bus unique name.
+  - `{:error, :invalid_timeout | :invalid_read_timeout | :invalid_write_timeout |
+    :invalid_name}` - A connection option was invalid.
+  - `{:error, {:name_taken, pid}}` - The requested local name is held by a
+    setup or established connection process. The PID can be adopted or passed to
+    `close/1` when it is no longer needed.
+  - `{:error, {:name_registered, pid}}` - The requested local name belongs to
+    another process, not a supervised Rebus connection.
+  - `{:error, reason}` - Another socket or setup failure occurred.
 
   ## Examples
 
@@ -143,13 +181,18 @@ defmodule Rebus do
       address = %{family: :inet, addr: {127, 0, 0, 1}, port: 12345}
       {:ok, conn} = Rebus.connect(address)
 
+      # Explicitly release a named connection when its lifecycle is complete.
+      {:ok, conn} = Rebus.connect(address, name: :local_bus)
+      :ok = Rebus.close(conn)
+
   ## Notes
 
   The returned PID is for the connection process, which is the main interface for
-  sending and receiving D-Bus messages.
+  sending and receiving D-Bus messages. Connections are supervisor-owned; close
+  them with `close/1` when they are no longer needed.
 
   """
-  @spec connect(address(), keyword()) :: DynamicSupervisor.on_start_child()
+  @spec connect(address(), keyword()) :: {:ok, pid()} | {:error, term()}
   def connect(address, opts \\ [])
 
   def connect(:system, opts) do
@@ -173,12 +216,104 @@ defmodule Rebus do
   end
 
   def connect(%{family: family} = addr, opts) when family in [:inet, :local] do
+    connect_ref = make_ref()
+
     args =
       opts
+      |> Keyword.delete(:auth_id_fun)
       |> Keyword.put(:addr, addr)
+      |> Keyword.put(:connect_waiter, {self(), connect_ref})
 
     child_spec = {Rebus.Connection, args}
-    DynamicSupervisor.start_child(Rebus.ConnectionSupervisor, child_spec)
+
+    case DynamicSupervisor.start_child(Rebus.ConnectionSupervisor, child_spec) do
+      {:ok, pid} -> await_connection(pid, connect_ref, Process.monitor(pid))
+      {:error, {:already_started, pid}} -> name_collision(pid)
+      other -> other
+    end
+  end
+
+  defp name_collision(pid) do
+    if connection_child?(pid),
+      do: {:error, {:name_taken, pid}},
+      else: {:error, {:name_registered, pid}}
+  end
+
+  defp connection_child?(pid) do
+    try do
+      Enum.any?(DynamicSupervisor.which_children(Rebus.ConnectionSupervisor), fn
+        {_id, ^pid, _type, _modules} -> true
+        _child -> false
+      end)
+    catch
+      :exit, _reason -> false
+    end
+  end
+
+  defp await_connection(pid, connect_ref, monitor_ref) do
+    receive do
+      {^connect_ref, {:ok, ^pid}} ->
+        Kernel.send(pid, {connect_ref, :accepted})
+        await_accepted_connection(pid, connect_ref, monitor_ref)
+
+      {^connect_ref, {:error, reason}} ->
+        await_failed_connection(pid, monitor_ref, reason)
+
+      {:DOWN, ^monitor_ref, :process, ^pid, {:shutdown, reason}} ->
+        {:error, reason}
+
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp await_failed_connection(pid, monitor_ref, reason) do
+    receive do
+      {:DOWN, ^monitor_ref, :process, ^pid, _stop_reason} -> {:error, reason}
+    end
+  end
+
+  defp await_accepted_connection(pid, connect_ref, monitor_ref) do
+    receive do
+      {^connect_ref, :accepted} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:ok, pid}
+
+      {:DOWN, ^monitor_ref, :process, ^pid, {:shutdown, reason}} ->
+        {:error, reason}
+
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  Stops a local connection process created by `connect/2`.
+
+  Connections are supervised and remain alive after the connecting process exits.
+  Use this function to release a named or otherwise no-longer-needed connection.
+  It accepts only local connection PIDs; remote PIDs are not supported.
+
+  ## Return Values
+
+  - `:ok` - The supervised connection was stopped.
+  - `{:error, :not_found}` - The PID is not a current Rebus connection.
+  - `{:error, :remote_connection_unsupported}` - The PID belongs to another node.
+  """
+  @spec close(pid()) :: :ok | {:error, :not_found | :remote_connection_unsupported}
+  def close(conn) when is_pid(conn) do
+    if node(conn) == node() do
+      try do
+        case DynamicSupervisor.terminate_child(Rebus.ConnectionSupervisor, conn) do
+          :ok -> :ok
+          _ -> {:error, :not_found}
+        end
+      catch
+        :exit, _reason -> {:error, :not_found}
+      end
+    else
+      {:error, :remote_connection_unsupported}
+    end
   end
 
   @doc """
@@ -205,7 +340,12 @@ defmodule Rebus do
   `{:error, :no_reply_expected}` or `{:error, {:invalid_message_type, type}}`.
   A closed connection returns `{:error, :disconnected}`. A timed-out call may
   already have reached the peer, so callers must treat it as delivery-ambiguous.
+  The exception is a PID discovered with `Process.whereis(name)` before its
+  corresponding `connect/2` returns: while setup is blocked on authentication or
+  Hello I/O, the request can time out before the connection reads it. That frame
+  was definitely not written and is safe to retry after `connect/2` succeeds.
   `{:error, :serial_exhausted}` means all valid D-Bus serials are in use.
+  `{:error, :not_connected}` means setup has not yet been accepted.
 
   Connections must be local to the calling node; remote connection PIDs return
   `{:error, :remote_connection_unsupported}`.
@@ -240,7 +380,12 @@ defmodule Rebus do
   `{:error, :encode_failed}` if the message cannot be encoded. A closed
   connection returns `{:error, :disconnected}`. `{:error, :timeout}` means the
   message may already have reached the peer, so it must not be blindly retried.
+  The exception is a PID discovered with `Process.whereis(name)` before its
+  corresponding `connect/2` returns: while setup is blocked on authentication or
+  Hello I/O, the send can time out before the connection reads it. That frame was
+  definitely not written and is safe to retry after `connect/2` succeeds.
   `{:error, :serial_exhausted}` means all valid D-Bus serials are in use.
+  `{:error, :not_connected}` means setup has not yet been accepted.
   `send/2` has a fixed five-second caller dispatch timeout; use `send/3` when
   the caller needs a different bound. This is distinct from the connection's
   `:write_timeout`, which bounds socket readiness for a frame.
@@ -275,14 +420,24 @@ defmodule Rebus do
   ## Return Values
 
   - `reference()` - A unique reference that identifies this signal handler
+  - `{:error, :not_connected}` - Connection establishment has not completed.
+  - `{:error, :timeout}` - The connection did not service the request promptly.
+  - `{:error, :disconnected}` - The connection has stopped.
 
   ## Examples
 
       {:ok, conn} = Rebus.connect(%{family: :local, path: "/tmp/my-dbus"})
-      ref = Rebus.add_signal_handler(conn)
 
-      # The calling process will now receive messages like:
-      # {^ref, %Rebus.Message{type: :signal, ...}}
+      case Rebus.add_signal_handler(conn) do
+        ref when is_reference(ref) ->
+          # The calling process will now receive messages like:
+          # {^ref, %Rebus.Message{type: :signal, ...}}
+          ref
+
+        {:error, reason} ->
+          # Retry or handle the unavailable connection.
+          {:error, reason}
+      end
 
   ## Signal Message Format
 
@@ -307,12 +462,18 @@ defmodule Rebus do
   messages depending on the activity on the D-Bus. Consider using selective
   receive or GenServer message handling for robust signal processing.
 
-  Remember to call `remove_signal_handler/2` when you no longer need to
+  Remember to call `delete_signal_handler/2` when you no longer need to
   receive signals to avoid message queue buildup.
 
   Signal handlers are automatically cleaned up when the connection is closed
   or when the handler exits.
+
+  Returns `{:error, :not_connected}` while connection establishment is pending,
+  `{:error, :timeout}` if the connection cannot service the request promptly,
+  or `{:error, :disconnected}` if it has stopped.
   """
+  @spec add_signal_handler(pid()) ::
+          reference() | {:error, :not_connected | :timeout | :disconnected}
   defdelegate add_signal_handler(conn), to: Rebus.Connection
 
   @doc """
@@ -329,16 +490,20 @@ defmodule Rebus do
   ## Return Values
 
   - `:ok` - The signal handler was successfully removed
+  - `{:error, :not_connected}` - Connection establishment has not completed.
+  - `{:error, :timeout}` - The connection did not service the request promptly.
+  - `{:error, :disconnected}` - The connection has stopped.
 
   ## Examples
 
       {:ok, conn} = Rebus.connect(%{family: :local, path: "/tmp/my-dbus"})
-      ref = Rebus.add_signal_handler(conn)
 
-      # ... handle signals ...
-
-      # Remove the handler when done
-      :ok = Rebus.delete_signal_handler(conn, ref)
+      with ref when is_reference(ref) <- Rebus.add_signal_handler(conn),
+           :ok <- Rebus.delete_signal_handler(conn, ref) do
+        :ok
+      else
+        {:error, reason} -> {:error, reason}
+      end
 
   ## Notes
 
@@ -346,8 +511,12 @@ defmodule Rebus do
   signal messages for that handler. Other signal handlers on the same connection
   (if any) will continue to receive signals normally.
 
-  It's safe to call this function multiple times with the same reference -
-  subsequent calls will simply return `:ok` without error.
+  Deleting the same reference repeatedly returns `:ok` while the connection is
+  available. It can return an error if the connection becomes unavailable.
+
+  Returns the same connection-state errors as `add_signal_handler/1`.
   """
+  @spec delete_signal_handler(pid(), reference()) ::
+          :ok | {:error, :not_connected | :timeout | :disconnected}
   defdelegate delete_signal_handler(conn, ref), to: Rebus.Connection
 end

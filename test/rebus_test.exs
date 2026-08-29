@@ -36,6 +36,199 @@ defmodule RebusTest do
       assert {:error, :invalid_read_timeout} = Rebus.connect(addr, read_timeout: 0)
     end
 
+    test "rejects an invalid connection timeout", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      assert {:error, :invalid_timeout} = Rebus.connect(addr, timeout: 0)
+    end
+
+    test "returns the live PID for a local name collision", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      name = :rebus_issue_15_name_taken
+      assert {:ok, cli} = Rebus.connect(addr, name: name)
+      assert {:error, {:name_taken, ^cli}} = Rebus.connect(addr, name: name)
+
+      on_exit(fn ->
+        if pid = Process.whereis(name), do: Rebus.close(pid)
+      end)
+
+      assert cli == Process.whereis(name)
+    end
+
+    test "distinguishes an unrelated local name registration", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      name = :rebus_issue_15_unrelated_name
+      owner = self()
+      assert Process.register(owner, name)
+
+      on_exit(fn ->
+        if Process.whereis(name) == owner, do: Process.unregister(name)
+      end)
+
+      assert {:error, {:name_registered, ^owner}} = Rebus.connect(addr, name: name)
+    end
+
+    test "can recover a named connection after its owner exits", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      name = :rebus_issue_15_owner_exit_connection
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          send(parent, {:owner_connection, Rebus.connect(addr, name: name)})
+        end)
+
+      owner_monitor = Process.monitor(owner)
+      assert_receive {:owner_connection, {:ok, cli}}, 1_000
+      assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :normal}, 1_000
+      assert Process.whereis(name) == cli
+      assert {:error, {:name_taken, ^cli}} = Rebus.connect(addr, name: name)
+
+      assert :ok = Rebus.close(cli)
+      assert wait_until(fn -> Process.whereis(name) == nil end)
+
+      {:ok, retry_svr} =
+        start_supervised({Rebus.TestServer, tap: self()}, id: :owner_exit_retry_server)
+
+      {:ok, retry_addr} = TestServer.get_listen_addr(retry_svr)
+      assert {:ok, retry_cli} = Rebus.connect(retry_addr, name: name)
+      assert Process.whereis(name) == retry_cli
+      assert :ok = Rebus.close(retry_cli)
+    end
+
+    test "returns not found when closing a non-connection PID" do
+      assert {:error, :not_found} = Rebus.close(self())
+    end
+
+    test "keeps signal-handler deletion scoped to its connection" do
+      {:ok, svr_a} = start_supervised({Rebus.TestServer, tap: self()}, id: :signal_scope_a)
+      {:ok, svr_b} = start_supervised({Rebus.TestServer, tap: self()}, id: :signal_scope_b)
+      {:ok, addr_a} = TestServer.get_listen_addr(svr_a)
+      {:ok, addr_b} = TestServer.get_listen_addr(svr_b)
+      {:ok, conn_a} = Rebus.connect(addr_a)
+      {:ok, conn_b} = Rebus.connect(addr_b)
+      ref_b = Rebus.add_signal_handler(conn_b)
+
+      assert :ok = Rebus.delete_signal_handler(conn_a, ref_b)
+
+      :ok =
+        TestServer.push(
+          svr_b,
+          Message.new!(:signal,
+            path: "/",
+            interface: "org.example.Test",
+            member: "ForeignDelete",
+            body: []
+          )
+        )
+
+      assert_receive {^ref_b, %Message{header_fields: %{member: "ForeignDelete"}}}, 1_000
+
+      assert :ok = Rebus.delete_signal_handler(conn_b, ref_b)
+
+      :ok =
+        TestServer.push(
+          svr_b,
+          Message.new!(:signal,
+            path: "/",
+            interface: "org.example.Test",
+            member: "DeletedOnOwner",
+            body: []
+          )
+        )
+
+      refute_receive {^ref_b, %Message{header_fields: %{member: "DeletedOnOwner"}}}, 100
+      assert :ok = Rebus.close(conn_a)
+      assert :ok = Rebus.close(conn_b)
+    end
+
+    test "normalizes bounded auth identity lookup outcomes", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+
+      assert {:ok, "353031"} = Connection.get_auth_id(100, fn _timeout -> {:ok, "501\n"} end)
+
+      assert {:error, :auth_id_unavailable} =
+               Connection.get_auth_id(100, fn _ -> {:error, :exit_status} end)
+
+      assert {:error, :auth_id_unavailable} =
+               Connection.get_auth_id(100, fn _ -> {:ok, "uid"} end)
+
+      assert {:error, :auth_id_unavailable} =
+               Connection.get_auth_id(100, fn _ -> {:ok, String.duplicate("1", 65)} end)
+
+      assert {:error, :read_timeout} = Connection.get_auth_id(100, fn _ -> {:error, :timeout} end)
+
+      assert {:error, :auth_id_unavailable} =
+               Connection.get_auth_id(100, fn _ -> raise "auth identity runner failed" end)
+
+      assert {:error, :auth_id_unavailable} =
+               Connection.get_auth_id(100, fn _ -> throw(:auth_identity_runner_failed) end)
+
+      assert {:error, :auth_id_unavailable} =
+               Connection.get_auth_id(100, fn _ ->
+                 Connection.run_auth_id(
+                   100,
+                   fn _ -> "/missing/id" end,
+                   fn _, _ -> raise "port open failed" end
+                 )
+               end)
+
+      assert {:error, :enoent} = Connection.run_auth_id(100, fn _ -> nil end)
+
+      assert {:error, :enoent} =
+               Connection.run_auth_id(100, fn _ -> raise "executable lookup failed" end)
+
+      assert {:error, :enoent} =
+               Connection.run_auth_id(100, fn _ -> throw(:executable_lookup_failed) end)
+
+      assert {:error, :port_open_failed} =
+               Connection.run_auth_id(
+                 100,
+                 fn _ -> "/missing/id" end,
+                 fn _, _ -> throw(:port_open_failed) end
+               )
+
+      parent = self()
+
+      assert {:ok, cli} =
+               Rebus.connect(addr,
+                 auth_id_fun: fn _timeout ->
+                   send(parent, :malicious_auth_id_fun)
+                   {:error, :exit_status}
+                 end
+               )
+
+      refute_receive :malicious_auth_id_fun
+      assert :ok = Rebus.close(cli)
+    end
+
+    test "registers the connection under its optional name", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      name = :rebus_issue_15_named_connection
+
+      assert {:ok, cli} = Rebus.connect(addr, name: name)
+      assert Process.whereis(name) == cli
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+
+      on_exit(fn ->
+        if pid = Process.whereis(name), do: Rebus.close(pid)
+      end)
+    end
+
+    test "rejects a non-atom connection name", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      assert {:error, :invalid_name} = Rebus.connect(addr, name: "rebus")
+    end
+
+    test "rejects an invalid internal authentication identity runner", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+
+      assert {:error, :invalid_auth_id_fun} =
+               DynamicSupervisor.start_child(
+                 Rebus.ConnectionSupervisor,
+                 {Connection, addr: addr, auth_id_fun: :invalid}
+               )
+    end
+
     test "connect! raises on failure" do
       # Try to connect to non-existent socket
       assert_raise RuntimeError, ~r/Failed to connect to D-Bus/, fn ->
@@ -59,7 +252,55 @@ defmodule RebusTest do
 
       {:ok, addr} = TestServer.get_listen_addr(rejecting_svr)
 
-      assert {:error, :auth_failed} = Rebus.connect(addr)
+      assert {:error, {:auth_rejected, ["EXTERNAL"]}} = Rebus.connect(addr)
+      assert_receive {^rejecting_svr, :client_closed}, 1_000
+    end
+
+    test "reports every mechanism advertised by a rejected authentication peer" do
+      {:ok, rejecting_svr} =
+        start_supervised(
+          {Rebus.TestServer, tap: self(), auth_response: "REJECTED ANONYMOUS EXTERNAL\r\n"},
+          id: :multi_mechanism_rejecting_server
+        )
+
+      {:ok, addr} = TestServer.get_listen_addr(rejecting_svr)
+
+      assert {:error, {:auth_rejected, ["ANONYMOUS", "EXTERNAL"]}} = Rebus.connect(addr)
+      assert_receive {^rejecting_svr, :client_closed}, 1_000
+    end
+
+    test "copies rejected mechanisms from coalesced authentication input" do
+      padding = String.duplicate("x", 65_536)
+
+      {:ok, rejecting_svr} =
+        start_supervised(
+          {Rebus.TestServer,
+           tap: self(), auth_response: "REJECTED ANONYMOUS EXTERNAL\r\n" <> padding},
+          id: :coalesced_rejecting_server
+        )
+
+      {:ok, addr} = TestServer.get_listen_addr(rejecting_svr)
+
+      assert {:error, {:auth_rejected, mechanisms}} = Rebus.connect(addr)
+      assert mechanisms == ["ANONYMOUS", "EXTERNAL"]
+
+      assert Enum.all?(mechanisms, fn mechanism ->
+               :binary.referenced_byte_size(mechanism) == byte_size(mechanism)
+             end)
+
+      assert_receive {^rejecting_svr, outcome}, 1_000
+      assert outcome in [:client_closed, {:client_close_outcome, {:error, :econnreset}}]
+    end
+
+    test "reports an empty mechanism list after a bare authentication rejection" do
+      {:ok, rejecting_svr} =
+        start_supervised(
+          {Rebus.TestServer, tap: self(), auth_response: "REJECTED\r\n"},
+          id: :bare_rejecting_server
+        )
+
+      {:ok, addr} = TestServer.get_listen_addr(rejecting_svr)
+      assert {:error, {:auth_rejected, []}} = Rebus.connect(addr)
       assert_receive {^rejecting_svr, :client_closed}, 1_000
     end
 
@@ -80,13 +321,494 @@ defmodule RebusTest do
       assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
     end
 
-    test "stops after an unanswered Hello reply timeout", %{svr: svr} do
+    test "does not let a silent setup block an independent connection" do
+      {:ok, silent_svr} =
+        start_supervised(
+          {Rebus.TestServer, tap: self(), silent_auth: true},
+          id: :concurrent_silent_auth_server
+        )
+
+      {:ok, healthy_svr} =
+        start_supervised(
+          {Rebus.TestServer, tap: self(), notify_auth: true},
+          id: :concurrent_healthy_auth_server
+        )
+
+      {:ok, silent_addr} = TestServer.get_listen_addr(silent_svr)
+      silent_connect = Task.async(fn -> Rebus.connect(silent_addr, timeout: 1_000) end)
+      assert_receive {^silent_svr, :auth_received}, 1_000
+
+      {:ok, healthy_addr} = TestServer.get_listen_addr(healthy_svr)
+      healthy_connect = Task.async(fn -> Rebus.connect(healthy_addr, timeout: 1_000) end)
+
+      assert_receive {^healthy_svr, :auth_received}, 500
+      assert {:ok, _cli} = Task.await(healthy_connect, 1_000)
+      assert_receive {^healthy_svr, %Message{header_fields: %{member: "Hello"}}}
+      assert {:error, :read_timeout} = Task.await(silent_connect, 1_500)
+    end
+
+    test "waits for a validated Hello reply before returning a usable connection", %{svr: svr} do
       {:ok, addr} = TestServer.get_listen_addr(svr)
-      assert {:ok, cli} = Rebus.connect(addr, read_timeout: 300)
+      :ok = TestServer.set_auto_hello(svr, false)
+      connect_task = Task.async(fn -> Rebus.connect(addr) end)
+
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      assert nil == Task.yield(connect_task, 50)
+      handle_hello(hello, svr)
+      assert {:ok, cli} = Task.await(connect_task, 1_000)
+
+      method =
+        Message.new!(:method_call,
+          path: "/",
+          interface: "org.example.Test",
+          member: "ImmediatelyUsable"
+        )
+
+      call_task = Task.async(fn -> Rebus.call(cli, method, 500) end)
+
+      assert_receive {^svr, %Message{header_fields: %{member: "ImmediatelyUsable"}} = request},
+                     500
+
+      :ok = TestServer.push(svr, Message.new!(:method_return, reply_serial: request.serial))
+      assert %Message{type: :method_return} = Task.await(call_task, 1_000)
+    end
+
+    test "makes pre-establishment discovery timeouts safe to retry", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      name = :rebus_issue_15_pre_establishment_timeout
+      :ok = TestServer.set_auto_hello(svr, false)
+      connect_task = Task.async(fn -> Rebus.connect(addr, name: name) end)
+
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      cli = Process.whereis(name)
+      assert is_pid(cli)
+
+      initial_call =
+        Message.new!(:method_call,
+          path: "/",
+          interface: "org.example.Test",
+          member: "BeforeReadyCall"
+        )
+
+      initial_send =
+        Message.new!(:signal,
+          path: "/",
+          interface: "org.example.Test",
+          member: "BeforeReadySend"
+        )
+
+      call_task = Task.async(fn -> Rebus.call(cli, initial_call, 50) end)
+      send_task = Task.async(fn -> Rebus.send(cli, initial_send, 50) end)
+
+      assert {:error, :timeout} = Task.await(call_task, 1_000)
+      assert {:error, :timeout} = Task.await(send_task, 1_000)
+      refute_receive {^svr, %Message{header_fields: %{member: "BeforeReadyCall"}}}, 100
+      refute_receive {^svr, %Message{header_fields: %{member: "BeforeReadySend"}}}, 100
+
+      handle_hello(hello, svr)
+      assert {:ok, ^cli} = Task.await(connect_task, 1_000)
+      refute_receive {^svr, %Message{header_fields: %{member: "BeforeReadyCall"}}}, 100
+      refute_receive {^svr, %Message{header_fields: %{member: "BeforeReadySend"}}}, 100
+
+      retry_call = %{
+        initial_call
+        | header_fields: %{initial_call.header_fields | member: "RetryCall"}
+      }
+
+      retry_task = Task.async(fn -> Rebus.call(cli, retry_call, 500) end)
+
+      assert_receive {^svr, %Message{header_fields: %{member: "RetryCall"}} = request}, 1_000
+      :ok = TestServer.push(svr, Message.new!(:method_return, reply_serial: request.serial))
+      assert %Message{type: :method_return} = Task.await(retry_task, 1_000)
+
+      retry_send = %{
+        initial_send
+        | header_fields: %{initial_send.header_fields | member: "RetrySend"}
+      }
+
+      assert :ok = Rebus.send(cli, retry_send, 500)
+      assert_receive {^svr, %Message{header_fields: %{member: "RetrySend"}}}, 1_000
+      assert :ok = Rebus.close(cli)
+    end
+
+    test "stops a named connection when its caller dies during a delayed Hello", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      name = :rebus_issue_15_caller_gone_during_hello
+      :ok = TestServer.set_auto_hello(svr, false)
+      connect_task = Task.async(fn -> Rebus.connect(addr, name: name) end)
+
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      cli = Process.whereis(name)
+      assert is_pid(cli)
       ref = Process.monitor(cli)
 
+      _ = Task.shutdown(connect_task, :brutal_kill)
+      handle_hello(hello, svr)
+
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :caller_gone}}, 2_000
+      assert nil == Process.whereis(name)
+    end
+
+    test "returns readiness errors from discovered signal-handler operations" do
+      auth_response = "OK 30313233343536373839414243444546\r\n"
+
+      {:ok, svr} =
+        start_supervised(
+          {Rebus.TestServer,
+           tap: self(),
+           notify_auth: true,
+           auth_response_fragments: [
+             binary_part(auth_response, 0, 8),
+             binary_part(auth_response, 8, byte_size(auth_response) - 8)
+           ],
+           auth_fragment_delay: 300},
+          id: :pre_established_signal_handler_server
+        )
+
+      name = :rebus_issue_15_signal_handler_connection
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      connect_task = Task.async(fn -> Rebus.connect(addr, name: name) end)
+      assert_receive {^svr, :auth_received}, 1_000
+      pid = Process.whereis(name)
+      assert is_pid(pid)
+
+      add_task = Task.async(fn -> Rebus.add_signal_handler(pid) end)
+      delete_task = Task.async(fn -> Rebus.delete_signal_handler(pid, make_ref()) end)
+
+      assert {:ok, _cli} = Task.await(connect_task, 1_000)
+      assert {:error, :not_connected} = Task.await(add_task, 1_000)
+      assert {:error, :not_connected} = Task.await(delete_task, 1_000)
+
+      on_exit(fn ->
+        if connection = Process.whereis(name), do: Rebus.close(connection)
+      end)
+    end
+
+    test "returns a disconnected error for signal handlers on a dead process" do
+      dead = spawn(fn -> :ok end)
+      ref = Process.monitor(dead)
+      assert_receive {:DOWN, ^ref, :process, ^dead, :normal}
+
+      assert {:error, :disconnected} = Rebus.add_signal_handler(dead)
+      assert {:error, :disconnected} = Rebus.delete_signal_handler(dead, make_ref())
+    end
+
+    test "cancels a signal handler registration that times out during Hello", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      name = :rebus_issue_15_timed_out_signal_handler
+      :ok = TestServer.set_auto_hello(svr, false)
+      connect_task = Task.async(fn -> Rebus.connect(addr, name: name, read_timeout: 6_000) end)
+
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      cli = Process.whereis(name)
+      assert is_pid(cli)
+
+      registration_task = Task.async(fn -> Rebus.add_signal_handler(cli) end)
+      assert {:error, :timeout} = Task.await(registration_task, 6_000)
+
+      handle_hello(hello, svr)
+      assert {:ok, ^cli} = Task.await(connect_task, 1_000)
+      assert :sys.get_state(cli).signal_handler_monitor_index == %{}
+      refute Enum.any?(:gen_event.which_handlers(SignalHandler), &match?({SignalHandler, _}, &1))
+
+      :ok =
+        TestServer.push(
+          svr,
+          Message.new!(:signal,
+            path: "/",
+            interface: "org.example.Test",
+            member: "TimedOutRegistration",
+            body: []
+          )
+        )
+
+      refute_receive {_unknown_ref, %Message{header_fields: %{member: "TimedOutRegistration"}}},
+                     100
+    end
+
+    test "rejects discovered traffic before accepting setup" do
+      auth_response = "OK 30313233343536373839414243444546\r\n"
+
+      {:ok, svr} =
+        start_supervised(
+          {Rebus.TestServer,
+           tap: self(),
+           notify_auth: true,
+           auth_response_fragments: [
+             binary_part(auth_response, 0, 8),
+             binary_part(auth_response, 8, byte_size(auth_response) - 8)
+           ],
+           auth_fragment_delay: 300},
+          id: :pre_accept_traffic_server
+        )
+
+      name = :rebus_issue_15_pre_accept_connection
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      connect_task = Task.async(fn -> Rebus.connect(addr, name: name) end)
+      assert_receive {^svr, :auth_received}, 1_000
+
+      pid = Process.whereis(name)
+      assert is_pid(pid)
+
+      method =
+        Message.new!(:method_call,
+          path: "/",
+          interface: "org.example.Test",
+          member: "Queued"
+        )
+
+      call_task = Task.async(fn -> Rebus.call(pid, method, 1_000) end)
+
+      assert {:ok, _cli} = Task.await(connect_task, 1_000)
+      assert {:error, :not_connected} = Task.await(call_task, 1_000)
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}, serial: 1}}
+
+      on_exit(fn ->
+        if connection = Process.whereis(name), do: Rebus.close(connection)
+      end)
+    end
+
+    test "uses timeout for authentication reads when read_timeout is omitted" do
+      {:ok, silent_svr} =
+        start_supervised(
+          {Rebus.TestServer, tap: self(), silent_auth: true},
+          id: :timeout_silent_auth_server
+        )
+
+      {:ok, addr} = TestServer.get_listen_addr(silent_svr)
+
+      assert {:error, :read_timeout} =
+               Rebus.connect(addr, timeout: 1_000)
+
+      assert_receive {^silent_svr, :auth_received}, 1_000
+    end
+
+    test "lets read_timeout override timeout", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      assert {:ok, _cli} = Rebus.connect(addr, timeout: 1, read_timeout: 500)
       assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
-      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :read_timeout}}, 1_000
+    end
+
+    test "keeps the default inbound read timeout after a short setup timeout", %{svr: svr} do
+      cli =
+        connect_until_ready_direct(svr,
+          timeout: 100,
+          auth_id_fun: fn _timeout -> {:ok, "501\n"} end
+        )
+
+      signal =
+        Message.new!(:signal,
+          path: "/",
+          interface: "org.example.Test",
+          member: "Fragmented",
+          signature: "s",
+          body: [String.duplicate("a", 128)]
+        )
+
+      {:ok, encoded} = Message.encode(signal)
+      encoded = IO.iodata_to_binary(encoded)
+      first = binary_part(encoded, 0, 20)
+      rest = binary_part(encoded, 20, byte_size(encoded) - 20)
+
+      assert :ok = TestServer.push_raw_delayed_fragments(svr, [first, rest], 250)
+      assert Process.alive?(cli)
+    end
+
+    test "releases a failed connection name before an immediate retry", %{svr: svr} do
+      {:ok, silent_svr} =
+        start_supervised(
+          {Rebus.TestServer, tap: self(), silent_auth: true},
+          id: :named_retry_silent_auth_server
+        )
+
+      name = :rebus_issue_15_retry_connection
+      {:ok, silent_addr} = TestServer.get_listen_addr(silent_svr)
+
+      assert {:error, :read_timeout} =
+               Rebus.connect(silent_addr,
+                 name: name,
+                 timeout: 1_000
+               )
+
+      assert Process.whereis(name) == nil
+
+      {:ok, working_addr} = TestServer.get_listen_addr(svr)
+      assert {:ok, cli} = Rebus.connect(working_addr, name: name)
+      assert Process.whereis(name) == cli
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+
+      on_exit(fn ->
+        if pid = Process.whereis(name), do: Rebus.close(pid)
+      end)
+    end
+
+    test "closes setup when its waiting caller exits before accepting it" do
+      {:ok, svr} =
+        start_supervised({Rebus.TestServer, tap: self()}, id: :abandoned_connect_server)
+
+      name = :rebus_issue_15_abandoned_connection
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      parent = self()
+      connect_ref = make_ref()
+
+      waiter =
+        spawn(fn ->
+          receive do
+            {^connect_ref, {:ok, pid}} ->
+              send(parent, {:setup_ready, pid})
+              Process.sleep(:infinity)
+          end
+        end)
+
+      {:ok, cli} =
+        DynamicSupervisor.start_child(
+          Rebus.ConnectionSupervisor,
+          {Rebus.Connection, addr: addr, name: name, connect_waiter: {waiter, connect_ref}}
+        )
+
+      ref = Process.monitor(cli)
+      assert_receive {:setup_ready, ^cli}, 1_000
+      assert Process.whereis(name) == cli
+      Process.exit(waiter, :kill)
+
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :caller_gone}}, 2_000
+      assert Process.whereis(name) == nil
+    end
+
+    test "releases a name when its waiter died before setup starts", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      name = :rebus_issue_15_dead_before_setup
+
+      waiter =
+        spawn(fn ->
+          receive do
+          end
+        end)
+
+      Process.exit(waiter, :kill)
+      connect_ref = make_ref()
+      parent = self()
+
+      {:ok, cli} =
+        DynamicSupervisor.start_child(
+          Rebus.ConnectionSupervisor,
+          {Rebus.Connection,
+           addr: addr,
+           name: name,
+           connect_waiter: {waiter, connect_ref},
+           auth_id_fun: fn _timeout ->
+             send(parent, :unexpected_auth_id_lookup)
+             {:ok, "501\n"}
+           end}
+        )
+
+      ref = Process.monitor(cli)
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :caller_gone}}, 1_000
+      refute_receive :unexpected_auth_id_lookup, 100
+      assert Process.whereis(name) == nil
+    end
+
+    test "closes a stalled setup when its connecting caller exits" do
+      {:ok, svr} =
+        start_supervised(
+          {Rebus.TestServer, tap: self(), silent_auth: true},
+          id: :caller_gone_during_setup_server
+        )
+
+      name = :rebus_issue_15_caller_gone_connection
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+
+      task =
+        Task.async(fn ->
+          Rebus.connect(addr,
+            name: name,
+            timeout: 1_000
+          )
+        end)
+
+      assert_receive {^svr, :auth_received}, 1_000
+
+      cli = Process.whereis(name)
+      assert is_pid(cli)
+      ref = Process.monitor(cli)
+      _ = Task.shutdown(task, :brutal_kill)
+
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :caller_gone}}, 2_000
+      assert Process.whereis(name) == nil
+    end
+
+    test "returns an error if the connection dies before accepting setup" do
+      auth_response = "OK 30313233343536373839414243444546\r\n"
+
+      {:ok, svr} =
+        start_supervised(
+          {Rebus.TestServer,
+           tap: self(),
+           notify_auth: true,
+           auth_response_fragments: [
+             binary_part(auth_response, 0, 8),
+             binary_part(auth_response, 8, byte_size(auth_response) - 8)
+           ],
+           auth_fragment_delay: 300},
+          id: :accepted_connection_death_server
+        )
+
+      name = :rebus_issue_15_acceptance_death_connection
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      task = Task.async(fn -> Rebus.connect(addr, name: name) end)
+      assert_receive {^svr, :auth_received}, 1_000
+
+      cli = Process.whereis(name)
+      assert is_pid(cli)
+      assert :ok = :sys.suspend(cli)
+      Process.exit(cli, :kill)
+
+      assert {:error, :killed} = Task.await(task, 1_000)
+      assert Process.whereis(name) == nil
+    end
+
+    test "correlates Hello replies with the serial sent during setup" do
+      {:ok, svr} =
+        start_supervised({Rebus.TestServer, tap: self()}, id: :dynamic_hello_serial_server)
+
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      parent = self()
+      connect_ref = make_ref()
+
+      waiter =
+        spawn(fn ->
+          receive do
+            {^connect_ref, {:ok, pid}} ->
+              send(parent, {:setup_ready, pid})
+
+              receive do
+                {^connect_ref, :accepted} -> send(parent, :setup_accepted)
+              end
+          end
+        end)
+
+      {:ok, cli} =
+        DynamicSupervisor.start_child(
+          Rebus.ConnectionSupervisor,
+          {Rebus.Connection, addr: addr, connect_waiter: {waiter, connect_ref}}
+        )
+
+      assert_receive {:setup_ready, ^cli}, 1_000
+      :sys.replace_state(cli, fn state -> %{state | serial: 42} end)
+      send(cli, {connect_ref, :accepted})
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}, serial: 42} = hello}
+      handle_hello(hello, svr)
+      assert_receive :setup_accepted, 1_000
+      assert wait_until(fn -> :sys.get_state(cli).name == ":1.100" end)
+    end
+
+    test "stops after an unanswered Hello reply timeout", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      :ok = TestServer.set_auto_hello(svr, false)
+      task = Task.async(fn -> Rebus.connect(addr, read_timeout: 300) end)
+
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      assert {:error, :read_timeout} = Task.await(task, 1_000)
     end
 
     test "continues a fragmented authentication response" do
@@ -160,7 +882,11 @@ defmodule RebusTest do
     test "times out after partial Hello reply progress with a protocol reason", %{svr: svr} do
       log =
         capture_log(fn ->
-          {cli, hello} = connect_until_hello(svr, read_timeout: 100)
+          {cli, hello} =
+            connect_until_hello(svr,
+              read_timeout: 100,
+              auth_id_fun: fn _ -> {:ok, "501\n"} end
+            )
 
           reply =
             Message.new!(:method_return,
@@ -407,6 +1133,16 @@ defmodule RebusTest do
       assert :ok = TestServer.push_raw(svr, rest)
       assert wait_until(fn -> :sys.get_state(cli).inbound_size == 0 end)
       assert :sys.get_state(cli).partial_frame_timer == nil
+    end
+  end
+
+  describe "signal handler callbacks" do
+    test "ignores unrecognised events and replies to handler calls" do
+      state = {self(), self(), make_ref()}
+
+      assert {:ok, ^state} = SignalHandler.handle_event(:unrecognised, state)
+      assert {:ok, ^state} = SignalHandler.handle_info(:unrecognised, state)
+      assert {:ok, :ok, ^state} = SignalHandler.handle_call(:status, state)
     end
   end
 
@@ -762,6 +1498,16 @@ defmodule RebusTest do
       _ = :socket.close(sock)
     end
 
+    test "ignores a stray process down message" do
+      {:ok, sock} = :socket.open(:inet, :stream, :default)
+      state = %Connection{sock: sock}
+
+      assert {:noreply, ^state} =
+               Connection.handle_info({:DOWN, make_ref(), :process, self(), :normal}, state)
+
+      _ = :socket.close(sock)
+    end
+
     test "Hello callbacks stop cleanly when the socket is closed" do
       {:ok, sock} = :socket.open(:inet, :stream, :default)
       :ok = :socket.close(sock)
@@ -784,10 +1530,7 @@ defmodule RebusTest do
 
       log =
         capture_log(fn ->
-          {:ok, cli} = Rebus.connect(addr)
-          ref = Process.monitor(cli)
-
-          assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, reason}}, 1_000
+          assert {:error, reason} = Rebus.connect(addr)
           assert reason in [:closed, :econnreset]
         end)
 
@@ -812,7 +1555,7 @@ defmodule RebusTest do
       second = binary_part(encoded, split_size, byte_size(encoded) - split_size)
 
       {sock, server} = start_fragmented_socket_server(first)
-      state = %Connection{sock: sock}
+      state = %Connection{sock: sock, hello_serial: 1}
 
       log =
         capture_log(fn ->
@@ -849,6 +1592,7 @@ defmodule RebusTest do
 
       state = %Connection{
         sock: sock,
+        hello_serial: 1,
         inbound_segments: [{byte_size(data), data}],
         inbound_size: byte_size(data)
       }
@@ -890,6 +1634,37 @@ defmodule RebusTest do
 
       assert log =~
                "D-Bus connection protocol stopped: {:hello_failed, \"org.example.SecretError\"}"
+    end
+
+    test "returns a copied valid Hello error name from a large frame", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      :ok = TestServer.set_auto_hello(svr, false)
+      connect_task = Task.async(fn -> Rebus.connect(addr) end)
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+
+      error_name = "org.example.LargeReply"
+      payload = String.duplicate("sensitive hello error body ", 10_000)
+
+      error_reply =
+        Message.new!(:error,
+          error_name: error_name,
+          reply_serial: hello.serial,
+          signature: "s",
+          body: [payload]
+        )
+
+      {:ok, encoded} = Message.encode(error_reply)
+
+      log =
+        capture_log(fn ->
+          :ok = TestServer.push_raw(svr, IO.iodata_to_binary(encoded))
+
+          assert {:error, {:hello_failed, returned_name}} = Task.await(connect_task, 1_000)
+          assert returned_name == error_name
+          assert :binary.referenced_byte_size(returned_name) <= 255
+        end)
+
+      refute log =~ payload
     end
 
     test "classifies a missing error name", %{svr: svr} do
@@ -941,6 +1716,125 @@ defmodule RebusTest do
 
       assert log =~ "D-Bus connection protocol stopped: {:hello_failed, :missing_unique_name}"
       refute log =~ "%Rebus.Connection"
+    end
+
+    test "rejects invalid unique names without retaining peer input" do
+      invalid_names = [
+        {:missing_prefix, "1.100"},
+        {:empty_element, ":1..100"},
+        {:invalid_character, ":1.10/0"},
+        {:oversized, ":" <> String.duplicate("a", 253) <> ".a"}
+      ]
+
+      Enum.each(invalid_names, fn {kind, invalid_name} ->
+        {:ok, invalid_svr} =
+          start_supervised(
+            {Rebus.TestServer, tap: self()},
+            id: {:invalid_unique_name_server, kind}
+          )
+
+        log =
+          capture_log(fn ->
+            {cli, hello} = connect_until_hello(invalid_svr)
+            ref = Process.monitor(cli)
+
+            :ok =
+              TestServer.push(
+                invalid_svr,
+                Message.new!(:method_return,
+                  reply_serial: hello.serial,
+                  signature: "s",
+                  body: [invalid_name]
+                )
+              )
+
+            assert_receive {:DOWN, ^ref, :process, ^cli,
+                            {:shutdown, {:hello_failed, :invalid_unique_name}}},
+                           1_000
+          end)
+
+        refute log =~ invalid_name
+        assert log =~ "D-Bus connection protocol stopped: {:hello_failed, :invalid_unique_name}"
+      end)
+    end
+
+    test "accepts the longest valid unique name", %{svr: svr} do
+      valid_name = ":" <> String.duplicate("a", 252) <> ".a"
+      assert byte_size(valid_name) == 255
+
+      {cli, hello} = connect_until_hello(svr)
+
+      :ok =
+        TestServer.push(
+          svr,
+          Message.new!(:method_return,
+            reply_serial: hello.serial,
+            signature: "s",
+            body: [valid_name]
+          )
+        )
+
+      assert wait_until(fn -> :sys.get_state(cli).name == valid_name end)
+      assert :sys.get_state(cli).established?
+      assert :ok = Rebus.close(cli)
+    end
+
+    test "copies retained auth and Hello identifiers from large peer input" do
+      guid = "30313233343536373839414243444546"
+      unique_name = ":1.100"
+
+      hello_reply =
+        Message.new!(:method_return,
+          reply_serial: 1,
+          signature: "ss",
+          body: [unique_name, String.duplicate("x", 262_144)]
+        )
+
+      {:ok, encoded_hello_reply} = Message.encode(hello_reply)
+
+      {:ok, svr} =
+        start_supervised(
+          {Rebus.TestServer,
+           tap: self(),
+           auto_hello: false,
+           auth_response: "OK " <> guid <> "\r\n" <> IO.iodata_to_binary(encoded_hello_reply)},
+          id: :retained_peer_identifier_server
+        )
+
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      assert {:ok, cli} = Rebus.connect(addr)
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+
+      state = :sys.get_state(cli)
+      assert state.guid == guid
+      assert :binary.referenced_byte_size(state.guid) <= 32
+      assert state.name == unique_name
+      assert :binary.referenced_byte_size(state.name) <= 255
+      assert :ok = Rebus.close(cli)
+    end
+
+    test "returns a stable setup error for an invalid unique name", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      :ok = TestServer.set_auto_hello(svr, false)
+      connect_task = Task.async(fn -> Rebus.connect(addr) end)
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+
+      log =
+        capture_log(fn ->
+          :ok =
+            TestServer.push(
+              svr,
+              Message.new!(:method_return,
+                reply_serial: hello.serial,
+                signature: "s",
+                body: [":1..100"]
+              )
+            )
+
+          assert {:error, {:hello_failed, :invalid_unique_name}} = Task.await(connect_task, 1_000)
+        end)
+
+      refute log =~ ":1..100"
     end
 
     test "returns the unexpected message type without its payload", %{svr: svr} do
@@ -1125,7 +2019,7 @@ defmodule RebusTest do
     test "does not set a name from an empty steady reply", %{svr: svr} do
       cli = connect_until_ready(svr, send_name_acquired?: false)
       :ok = :sys.suspend(cli)
-      _ = :sys.replace_state(cli, fn state -> %{state | name: nil} end)
+      _ = :sys.replace_state(cli, fn state -> %{state | name: nil, hello_serial: 1} end)
       :ok = :sys.resume(cli)
 
       empty_reply = Message.new!(:method_return, reply_serial: 1)
@@ -1651,6 +2545,7 @@ defmodule RebusTest do
         Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Completion")
 
       task = Task.async(fn -> Rebus.send(cli, signal, 500) end)
+      assert wait_until(fn -> :sys.get_state(cli).active_write != nil end)
       send(cli, {:"$socket", :sys.get_state(cli).sock, :completion, {handle, :ok}})
       assert :ok = Task.await(task)
     end
@@ -1843,8 +2738,8 @@ defmodule RebusTest do
   end
 
   defp server_setup(_) do
-    # The 'tap' process will receive all messages received by the test server.
-    # The server does not respond to any messages unless instructed to do so.
+    # The 'tap' process receives client frames. The server automatically replies
+    # to Hello; tests that need to control the handshake disable that behaviour.
     {:ok, svr} = start_supervised({Rebus.TestServer, tap: self()})
     %{svr: svr}
   end
@@ -1853,8 +2748,7 @@ defmodule RebusTest do
     {:ok, addr} = TestServer.get_listen_addr(svr)
     {:ok, cli} = Rebus.connect(addr)
 
-    assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = msg}
-    handle_hello(msg, svr)
+    assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
 
     %{cli: cli}
   end
@@ -1891,16 +2785,43 @@ defmodule RebusTest do
   defp connect_until_hello(svr, opts \\ []) do
     {_fixture_opts, connect_opts} = split_fixture_options(opts)
     {:ok, addr} = TestServer.get_listen_addr(svr)
-    {:ok, cli} = Rebus.connect(addr, connect_opts)
+    :ok = TestServer.set_auto_hello(svr, false)
+    args = Keyword.put(connect_opts, :addr, addr)
+
+    {:ok, cli} =
+      DynamicSupervisor.start_child(Rebus.ConnectionSupervisor, {Rebus.Connection, args})
+
     assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+    assert hello.serial == 1
     {cli, hello}
   end
 
   defp connect_until_ready(svr, opts \\ []) do
     {fixture_opts, connect_opts} = split_fixture_options(opts)
-    {cli, hello} = connect_until_hello(svr, connect_opts)
-    handle_hello(hello, svr, fixture_opts)
-    assert wait_until(fn -> :sys.get_state(cli).name == ":1.100" end)
+
+    :ok =
+      TestServer.set_auto_hello(svr, true, Keyword.get(fixture_opts, :send_name_acquired?, true))
+
+    {:ok, addr} = TestServer.get_listen_addr(svr)
+    {:ok, cli} = Rebus.connect(addr, connect_opts)
+    assert_receive {^svr, %Message{header_fields: %{member: "Hello"}, serial: 1}}
+    cli
+  end
+
+  defp connect_until_ready_direct(svr, opts) do
+    {fixture_opts, connect_opts} = split_fixture_options(opts)
+
+    :ok =
+      TestServer.set_auto_hello(svr, true, Keyword.get(fixture_opts, :send_name_acquired?, true))
+
+    {:ok, addr} = TestServer.get_listen_addr(svr)
+    args = Keyword.put(connect_opts, :addr, addr)
+
+    {:ok, cli} =
+      DynamicSupervisor.start_child(Rebus.ConnectionSupervisor, {Rebus.Connection, args})
+
+    assert_receive {^svr, %Message{header_fields: %{member: "Hello"}, serial: 1}}
+    assert wait_until(fn -> :sys.get_state(cli).established? end)
     cli
   end
 
