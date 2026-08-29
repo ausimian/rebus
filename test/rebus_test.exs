@@ -8,6 +8,11 @@ defmodule RebusTest do
   alias Rebus.SignalHandler
   alias Rebus.TestServer
 
+  # GitHub run 33276531794 on Elixir 1.19.1/OTP 27.1 observed a referenced
+  # byte size of 256 for copied GUID and mechanism binaries. This remains far
+  # below the 64–270KB source buffers used by the retention regressions.
+  @max_copied_referenced_bytes 256
+
   describe "Connections" do
     setup [:server_setup]
 
@@ -284,9 +289,9 @@ defmodule RebusTest do
       assert {:error, {:auth_rejected, mechanisms}} = Rebus.connect(addr)
       assert mechanisms == ["ANONYMOUS", "EXTERNAL"]
 
-      assert Enum.all?(mechanisms, fn mechanism ->
-               small_referenced_binary?(mechanism)
-             end)
+      for mechanism <- mechanisms do
+        assert :binary.referenced_byte_size(mechanism) <= @max_copied_referenced_bytes
+      end
 
       assert_receive {^rejecting_svr, outcome}, 1_000
       assert outcome in [:client_closed, {:client_close_outcome, {:error, :econnreset}}]
@@ -679,35 +684,44 @@ defmodule RebusTest do
     test "releases a name when its waiter died before setup starts", %{svr: svr} do
       {:ok, addr} = TestServer.get_listen_addr(svr)
       name = :rebus_issue_15_dead_before_setup
-
-      waiter =
-        spawn(fn ->
-          receive do
-          end
-        end)
-
-      Process.exit(waiter, :kill)
-      connect_ref = make_ref()
       parent = self()
 
-      {:ok, cli} =
-        DynamicSupervisor.start_child(
-          Rebus.ConnectionSupervisor,
-          {Rebus.Connection,
-           addr: addr,
-           name: name,
-           connect_waiter: {waiter, connect_ref},
-           auth_id_fun: fn _timeout ->
-             send(parent, :unexpected_auth_id_lookup)
-             {:ok, "501\n"}
-           end}
-        )
+      log =
+        capture_log(fn ->
+          waiter =
+            spawn(fn ->
+              receive do
+              end
+            end)
 
-      ref = Process.monitor(cli)
-      assert_receive {:DOWN, ^ref, :process, ^cli, reason}, 1_000
-      assert reason in [:noproc, {:shutdown, :caller_gone}]
-      refute_receive :unexpected_auth_id_lookup, 100
-      assert Process.whereis(name) == nil
+          Process.exit(waiter, :kill)
+          connect_ref = make_ref()
+
+          {:ok, cli} =
+            DynamicSupervisor.start_child(
+              Rebus.ConnectionSupervisor,
+              {Rebus.Connection,
+               addr: addr,
+               name: name,
+               connect_waiter: {waiter, connect_ref},
+               auth_id_fun: fn _timeout ->
+                 send(parent, :unexpected_auth_id_lookup)
+                 {:ok, "501\n"}
+               end}
+            )
+
+          ref = Process.monitor(cli)
+          assert_receive {:DOWN, ^ref, :process, ^cli, reason}, 1_000
+          assert reason in [:noproc, {:shutdown, :caller_gone}]
+          refute_receive :unexpected_auth_id_lookup, 100
+
+          assert {:ok, retry_cli} = Rebus.connect(addr, name: name)
+          assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}, 1_000
+          assert :ok = Rebus.close(retry_cli)
+        end)
+
+      refute log =~ ~r/GenServer #PID<[^>]+> terminating/
+      refute log =~ ~r/Child process #PID<[^>]+>[\s\S]*(?:exited|terminated)/
     end
 
     test "closes a stalled setup when its connecting caller exits" do
@@ -1663,7 +1677,7 @@ defmodule RebusTest do
 
           assert {:error, {:hello_failed, returned_name}} = Task.await(connect_task, 1_000)
           assert returned_name == error_name
-          assert small_referenced_binary?(returned_name)
+          assert :binary.referenced_byte_size(returned_name) <= @max_copied_referenced_bytes
         end)
 
       refute log =~ payload
@@ -1809,9 +1823,9 @@ defmodule RebusTest do
 
       state = :sys.get_state(cli)
       assert state.guid == guid
-      assert small_referenced_binary?(state.guid)
+      assert :binary.referenced_byte_size(state.guid) <= @max_copied_referenced_bytes
       assert state.name == unique_name
-      assert small_referenced_binary?(state.name)
+      assert :binary.referenced_byte_size(state.name) <= @max_copied_referenced_bytes
       assert :ok = Rebus.close(cli)
     end
 
@@ -2831,11 +2845,6 @@ defmodule RebusTest do
     # Test-only controls must never be passed to Rebus.connect/2.
     Keyword.split(opts, [:send_name_acquired?])
   end
-
-  # OTP may allocate a small copied binary in a 256-byte carrier. This remains
-  # decisively below the 64–270KB peer buffers used by the retention regressions.
-  defp small_referenced_binary?(binary) when is_binary(binary),
-    do: :binary.referenced_byte_size(binary) <= 256
 
   defp assert_hello_error_reason(svr, expected_reason, build_reply) do
     capture_log(fn ->
