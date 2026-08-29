@@ -17,7 +17,9 @@ defmodule Rebus.MixProject do
       test_coverage: [ignore_modules: [Rebus.TestServer]],
       dialyzer: [
         plt_core_path: "priv/plts",
-        plt_file: {:no_warn, "priv/plts/dialyzer-#{Mix.env()}.plt"}
+        plt_file:
+          {:no_warn,
+           "priv/plts/dialyzer-#{System.otp_release()}-#{System.version()}-#{Mix.env()}.plt"}
       ]
     ]
   end

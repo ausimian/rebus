@@ -377,19 +377,36 @@ defmodule RebusTest do
 
       {:ok, encoded} = Message.encode(message)
       binary = IO.iodata_to_binary(encoded)
-      <<first::binary-size(12), second::binary-size(1), _rest::binary>> = binary
-      ref = Process.monitor(cli)
+      <<first::binary-size(12), second::binary-size(1), rest::binary>> = binary
 
-      task =
-        Task.async(fn -> TestServer.push_raw_delayed_fragments(svr, [first, second], 600) end)
+      assert :ok = TestServer.push_raw(svr, first)
 
-      assert :ok = Task.await(task)
+      assert wait_until(fn ->
+               %Connection{inbound_size: size, partial_frame_timer: timer} = :sys.get_state(cli)
+               size == byte_size(first) and timer != nil
+             end)
 
-      # Without resetting on the second fragment, the original 1,000 ms budget
-      # would expire during this interval.
-      refute_receive {:DOWN, ^ref, :process, ^cli, _reason}, 500
+      first_timer = :sys.get_state(cli).partial_frame_timer
 
-      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :read_timeout}}, 1_000
+      assert :ok = TestServer.push_raw(svr, second)
+
+      assert wait_until(fn ->
+               %Connection{inbound_size: size, partial_frame_timer: timer} = :sys.get_state(cli)
+
+               size == byte_size(first) + byte_size(second) and timer != nil and
+                 timer != first_timer
+             end)
+
+      second_timer = :sys.get_state(cli).partial_frame_timer
+      {_timer_ref, stale_token} = first_timer
+      send(cli, {:partial_frame_timeout, stale_token})
+
+      assert wait_until(fn -> :sys.get_state(cli).partial_frame_timer == second_timer end)
+      assert Process.alive?(cli)
+
+      assert :ok = TestServer.push_raw(svr, rest)
+      assert wait_until(fn -> :sys.get_state(cli).inbound_size == 0 end)
+      assert :sys.get_state(cli).partial_frame_timer == nil
     end
   end
 
@@ -497,6 +514,60 @@ defmodule RebusTest do
       assert_receive {:setopt, ^tuple_value}
       assert_receive {:setopt, 65_536}
       assert_receive {:warning, "D-Bus connection is using OTP's default receive buffer"}
+
+      assert :default =
+               Connection.configure_receive_buffer(
+                 :test_socket,
+                 fn _sock, _option, value ->
+                   send(parent, {:setopt, value})
+                   :unexpected
+                 end,
+                 fn warning -> send(parent, {:warning, warning}) end
+               )
+
+      assert_receive {:setopt, ^tuple_value}
+      refute_receive {:setopt, 65_536}
+      assert_receive {:warning, "D-Bus connection is using OTP's default receive buffer"}
+
+      assert :default =
+               Connection.configure_receive_buffer(
+                 :test_socket,
+                 fn _sock, _option, value ->
+                   send(parent, {:setopt, value})
+                   if is_tuple(value), do: {:error, :invalid}, else: :unexpected
+                 end,
+                 fn warning -> send(parent, {:warning, warning}) end
+               )
+
+      assert_receive {:setopt, ^tuple_value}
+      assert_receive {:setopt, 65_536}
+      assert_receive {:warning, "D-Bus connection is using OTP's default receive buffer"}
+    end
+
+    test "rejects a pathological inbound segment count without logging data" do
+      {:ok, sock} = :socket.open(:inet, :stream, :default)
+
+      segments =
+        Enum.map(64..1//-1, fn size ->
+          {size, :binary.copy(<<0>>, size)}
+        end)
+
+      state = %Connection{
+        sock: sock,
+        inbound_segments: segments,
+        inbound_size: Enum.sum(Enum.map(segments, &elem(&1, 0)))
+      }
+
+      log =
+        capture_log(fn ->
+          assert {:stop, {:shutdown, :message_too_large}, ^state} =
+                   Connection.append_inbound_fragment("sensitive peer payload", state, :recv)
+        end)
+
+      assert log =~ "D-Bus connection protocol stopped: :message_too_large"
+      refute log =~ "sensitive peer payload"
+      refute log =~ "%Rebus.Connection"
+      _ = :socket.close(sock)
     end
 
     test "waits for a select after handling its attached receive data" do

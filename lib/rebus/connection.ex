@@ -607,10 +607,20 @@ defmodule Rebus.Connection do
             :scalar
 
           {:error, _reason} ->
-            warning_fun.("D-Bus connection is using OTP's default receive buffer")
-            :default
+            default_receive_buffer(warning_fun)
+
+          _other ->
+            default_receive_buffer(warning_fun)
         end
+
+      _other ->
+        default_receive_buffer(warning_fun)
     end
+  end
+
+  defp default_receive_buffer(warning_fun) do
+    warning_fun.("D-Bus connection is using OTP's default receive buffer")
+    :default
   end
 
   defp handshake_recv(sock, timeout) do
@@ -694,6 +704,14 @@ defmodule Rebus.Connection do
   # Each zero-length receive returns data already available through the fixed
   # OTP buffer. Fixed-header validation still happens as soon as 16 bytes are
   # retained, without making allocation depend on a peer-declared frame length.
+  @doc false
+  @spec append_inbound_fragment(binary(), t(), term()) ::
+          {:noreply, t()} | {:noreply, t(), {:continue, term()}} | {:stop, term(), t()}
+  def append_inbound_fragment(data, %__MODULE__{} = state, continuation)
+      when is_binary(data) do
+    append_inbound(data, state, continuation)
+  end
+
   defp append_inbound(<<>>, %__MODULE__{} = state, continuation),
     do: process_inbound(state, continuation)
 
