@@ -3,53 +3,30 @@ defmodule Rebus.Encoder do
   D-Bus message encoder that marshals data according to D-Bus wire format.
 
   Implements the D-Bus marshaling format with proper alignment and byte ordering.
+  Double special values use `:infinity`, `:negative_infinity`, and `:nan`;
+  `:nan` encodes as a canonical quiet NaN.
   """
 
-  # D-Bus type codes
-  # 'y'
-  @type_byte 121
-  # 'b'
-  @type_boolean 98
-  # 'n'
-  @type_int16 110
-  # 'q'
-  @type_uint16 113
-  # 'i'
-  @type_int32 105
-  # 'u'
-  @type_uint32 117
-  # 'x'
-  @type_int64 120
-  # 't'
-  @type_uint64 116
-  # 'd'
-  @type_double 100
-  # 's'
-  @type_string 115
-  # 'o'
-  @type_object_path 111
-  # 'g'
-  @type_signature 103
-  # 'a'
-  @type_array 97
-  # '('
-  @type_struct_begin 40
-  # ')'
-  @type_struct_end 41
-  # 'v'
-  @type_variant 118
-  # '{'
-  @type_dict_begin 123
-  # '}'
-  @type_dict_end 125
-  # 'h'
-  @type_unix_fd 104
+  alias Rebus.ResourceLimitError
+  alias Rebus.Signature
+  alias Rebus.WireValue
+
+  @min_int16 -32_768
+  @max_int16 32_767
+  @max_uint16 65_535
+  @min_int32 -2_147_483_648
+  @max_int32 2_147_483_647
+  @max_uint32 4_294_967_295
+  @min_int64 -9_223_372_036_854_775_808
+  @max_int64 9_223_372_036_854_775_807
+  @max_uint64 18_446_744_073_709_551_615
 
   @type endianness :: :little | :big
   @type encoding_state :: %{
           endianness: endianness(),
           position: non_neg_integer(),
-          buffer: iodata()
+          buffer: iodata(),
+          scalar_budget: non_neg_integer()
         }
 
   @doc """
@@ -69,6 +46,10 @@ defmodule Rebus.Encoder do
 
   Returns an iodata structure containing the encoded binary data that can be
   converted to binary using `IO.iodata_to_binary/1`.
+
+  Encoding accepts at most 1,000,000 fixed-width scalar elements in total per
+  encode operation, matching the decoder's scalar-array cap. The budget is
+  shared cumulatively across every fixed-width scalar array in that operation.
 
   ## Examples
 
@@ -130,110 +111,21 @@ defmodule Rebus.Encoder do
   """
   @spec encode_at_position(binary(), [any()], endianness(), non_neg_integer()) :: iodata()
   def encode_at_position(signature, data, endianness, starting_position) do
-    state = %{endianness: endianness, position: starting_position, buffer: []}
+    state =
+      Map.merge(
+        %{
+          endianness: endianness,
+          position: starting_position,
+          buffer: [],
+          scalar_budget: Rebus.Message.max_scalar_elements()
+        },
+        Signature.new_nesting_state()
+      )
 
     signature
-    |> parse_signature()
+    |> Signature.parse!()
     |> encode_types(data, state)
     |> then(fn %{buffer: buffer} -> Enum.reverse(buffer) end)
-  end
-
-  # Parse a D-Bus signature into a list of type structures
-  defp parse_signature(signature) when is_binary(signature) do
-    signature
-    |> :binary.bin_to_list()
-    |> parse_signature_types([])
-  end
-
-  defp parse_signature_types([], acc), do: Enum.reverse(acc)
-
-  defp parse_signature_types([type | rest], acc) do
-    case type do
-      @type_array ->
-        {element_type, remaining} = parse_single_type(rest)
-        parse_signature_types(remaining, [{:array, element_type} | acc])
-
-      @type_struct_begin ->
-        {struct_types, remaining} = parse_struct_types(rest, [])
-        parse_signature_types(remaining, [{:struct, struct_types} | acc])
-
-      @type_dict_begin ->
-        {key_type, rest1} = parse_single_type(rest)
-        {value_type, [@type_dict_end | rest2]} = parse_single_type(rest1)
-        parse_signature_types(rest2, [{:dict_entry, key_type, value_type} | acc])
-
-      _ ->
-        {single_type, remaining} = parse_single_type([type | rest])
-        parse_signature_types(remaining, [single_type | acc])
-    end
-  end
-
-  defp parse_single_type([type | rest]) do
-    case type do
-      @type_byte ->
-        {{:byte, nil}, rest}
-
-      @type_boolean ->
-        {{:boolean, nil}, rest}
-
-      @type_int16 ->
-        {{:int16, nil}, rest}
-
-      @type_uint16 ->
-        {{:uint16, nil}, rest}
-
-      @type_int32 ->
-        {{:int32, nil}, rest}
-
-      @type_uint32 ->
-        {{:uint32, nil}, rest}
-
-      @type_int64 ->
-        {{:int64, nil}, rest}
-
-      @type_uint64 ->
-        {{:uint64, nil}, rest}
-
-      @type_double ->
-        {{:double, nil}, rest}
-
-      @type_string ->
-        {{:string, nil}, rest}
-
-      @type_object_path ->
-        {{:object_path, nil}, rest}
-
-      @type_signature ->
-        {{:signature, nil}, rest}
-
-      @type_variant ->
-        {{:variant, nil}, rest}
-
-      @type_unix_fd ->
-        {{:unix_fd, nil}, rest}
-
-      @type_array ->
-        {element_type, remaining} = parse_single_type(rest)
-        {{:array, element_type}, remaining}
-
-      @type_struct_begin ->
-        {struct_types, remaining} = parse_struct_types(rest, [])
-        {{:struct, struct_types}, remaining}
-
-      @type_dict_begin ->
-        {key_type, rest1} = parse_single_type(rest)
-        {value_type, [@type_dict_end | rest2]} = parse_single_type(rest1)
-        {{:dict_entry, key_type, value_type}, rest2}
-    end
-  end
-
-  defp parse_struct_types([@type_struct_end | rest], acc) do
-    {Enum.reverse(acc), rest}
-  end
-
-  defp parse_struct_types(types, acc) do
-    {type, remaining} = parse_single_type(types)
-    parse_struct_types(remaining, [type | acc])
   end
 
   # Encode parsed types with corresponding data
@@ -255,7 +147,8 @@ defmodule Rebus.Encoder do
     encode_uint32(bool_value, state)
   end
 
-  defp encode_single({:int16, _}, value, state) when is_integer(value) do
+  defp encode_single({:int16, _}, value, state)
+       when is_integer(value) and value >= @min_int16 and value <= @max_int16 do
     data =
       case state.endianness do
         :little -> <<value::little-signed-16>>
@@ -265,7 +158,8 @@ defmodule Rebus.Encoder do
     add_aligned_data(state, data, 2)
   end
 
-  defp encode_single({:uint16, _}, value, state) when is_integer(value) and value >= 0 do
+  defp encode_single({:uint16, _}, value, state)
+       when is_integer(value) and value >= 0 and value <= @max_uint16 do
     data =
       case state.endianness do
         :little -> <<value::little-16>>
@@ -275,15 +169,18 @@ defmodule Rebus.Encoder do
     add_aligned_data(state, data, 2)
   end
 
-  defp encode_single({:int32, _}, value, state) when is_integer(value) do
+  defp encode_single({:int32, _}, value, state)
+       when is_integer(value) and value >= @min_int32 and value <= @max_int32 do
     encode_int32(value, state)
   end
 
-  defp encode_single({:uint32, _}, value, state) when is_integer(value) and value >= 0 do
+  defp encode_single({:uint32, _}, value, state)
+       when is_integer(value) and value >= 0 and value <= @max_uint32 do
     encode_uint32(value, state)
   end
 
-  defp encode_single({:int64, _}, value, state) when is_integer(value) do
+  defp encode_single({:int64, _}, value, state)
+       when is_integer(value) and value >= @min_int64 and value <= @max_int64 do
     data =
       case state.endianness do
         :little -> <<value::little-signed-64>>
@@ -293,7 +190,8 @@ defmodule Rebus.Encoder do
     add_aligned_data(state, data, 8)
   end
 
-  defp encode_single({:uint64, _}, value, state) when is_integer(value) and value >= 0 do
+  defp encode_single({:uint64, _}, value, state)
+       when is_integer(value) and value >= 0 and value <= @max_uint64 do
     data =
       case state.endianness do
         :little -> <<value::little-64>>
@@ -313,39 +211,65 @@ defmodule Rebus.Encoder do
     add_aligned_data(state, data, 8)
   end
 
+  defp encode_single({:double, _}, value, state)
+       when value in [:infinity, :negative_infinity, :nan] do
+    bits =
+      case value do
+        :infinity -> 0x7FF0_0000_0000_0000
+        :negative_infinity -> 0xFFF0_0000_0000_0000
+        :nan -> 0x7FF8_0000_0000_0000
+      end
+
+    data =
+      case state.endianness do
+        :little -> <<bits::little-64>>
+        :big -> <<bits::big-64>>
+      end
+
+    add_aligned_data(state, data, 8)
+  end
+
   defp encode_single({:string, _}, value, state) when is_binary(value) do
+    WireValue.validate!(:string, value)
     encode_string_like(value, state, 4)
   end
 
   defp encode_single({:object_path, _}, value, state) when is_binary(value) do
-    # TODO: Validate object path format
+    WireValue.validate!(:object_path, value)
     encode_string_like(value, state, 4)
   end
 
   defp encode_single({:signature, _}, value, state) when is_binary(value) do
-    # TODO: Validate signature format
+    WireValue.validate!(:signature, value)
     encode_string_like(value, state, 1)
   end
 
   defp encode_single({:struct, field_types}, values, state) when is_list(values) do
     # Structs are aligned to 8-byte boundary
-    aligned_state = align_to(state, 8)
+    nested_state = Signature.enter_container!(state, :struct)
+    aligned_state = align_to(nested_state, 8)
 
     # Encode each field in sequence
-    encode_types(field_types, values, aligned_state)
+    field_types |> encode_types(values, aligned_state) |> Signature.leave_container(state)
   end
 
   defp encode_single({:array, element_type}, values, state) when is_list(values) do
+    scalar_state = charge_scalar_array!(state, element_type, length(values))
     element_alignment = get_alignment(element_type)
 
     # Reserve the aligned uint32 length field so elements are encoded at their
     # actual stream position. Their padding can depend on that position.
-    array_state = align_to(state, 4)
+    array_state = align_to(scalar_state, 4)
     element_state = %{array_state | position: array_state.position + 4, buffer: []}
-    aligned_element_state = align_to(element_state, element_alignment)
+    nested_element_state = Signature.enter_container!(element_state, :array)
+    aligned_element_state = align_to(nested_element_state, element_alignment)
     final_element_state = encode_array_elements(element_type, values, aligned_element_state)
 
     data_length = final_element_state.position - aligned_element_state.position
+
+    if data_length > Rebus.Message.max_array_size() do
+      raise ArgumentError, "D-Bus array size limit exceeded"
+    end
 
     length_data =
       case state.endianness do
@@ -358,7 +282,8 @@ defmodule Rebus.Encoder do
     %{
       array_state
       | buffer: [Enum.reverse(final_element_state.buffer), length_data | array_state.buffer],
-        position: final_element_state.position
+        position: final_element_state.position,
+        scalar_budget: final_element_state.scalar_budget
     }
   end
 
@@ -369,12 +294,20 @@ defmodule Rebus.Encoder do
     signature_state = encode_single({:signature, nil}, signature, state)
 
     # Then parse and encode the value according to the signature
-    [parsed_type] = parse_signature(signature)
-    encode_single(parsed_type, value, signature_state)
+    [parsed_type] = Signature.parse!(signature)
+    nested_state = Signature.enter_container!(signature_state, :variant)
+    Signature.validate_nesting!([parsed_type], nested_state)
+
+    payload_state =
+      encode_single(parsed_type, value, nested_state)
+
+    # A variant contributes to nesting only while its payload is being encoded.
+    # Its siblings share the parent's depth, just as decoded variants do.
+    Signature.leave_container(payload_state, state)
   end
 
   defp encode_single({:unix_fd, _}, fd_index, state)
-       when is_integer(fd_index) and fd_index >= 0 do
+       when is_integer(fd_index) and fd_index >= 0 and fd_index <= @max_uint32 do
     # Unix FD: encode as UINT32 index into the file descriptor array
     encode_uint32(fd_index, state)
   end
@@ -382,11 +315,15 @@ defmodule Rebus.Encoder do
   defp encode_single({:dict_entry, key_type, value_type}, {key, value}, state) do
     # Dictionary entry: encode as struct with key and value
     # Dict entries are aligned to 8-byte boundary like structs
-    aligned_state = align_to(state, 8)
+    nested_state = Signature.enter_container!(state, :dict_entry)
+    aligned_state = align_to(nested_state, 8)
 
     # Encode key then value
     key_state = encode_single(key_type, key, aligned_state)
-    encode_single(value_type, value, key_state)
+
+    key_state
+    |> then(&encode_single(value_type, value, &1))
+    |> Signature.leave_container(state)
   end
 
   # Helper functions
@@ -416,6 +353,10 @@ defmodule Rebus.Encoder do
     length = byte_size(string_bytes)
 
     # Encode length
+    if (length_size == 1 and length > 255) or (length_size == 4 and length > @max_uint32) do
+      raise ArgumentError, "D-Bus string length exceeds its wire limit"
+    end
+
     length_state =
       case length_size do
         1 -> add_aligned_data(state, <<length::8>>, 1)
@@ -495,4 +436,25 @@ defmodule Rebus.Encoder do
     new_state = encode_single(element_type, value, aligned_state)
     encode_array_elements(element_type, rest, new_state)
   end
+
+  defp charge_scalar_array!(state, element_type, count) do
+    if scalar_width(element_type) do
+      if state.scalar_budget >= count do
+        %{state | scalar_budget: state.scalar_budget - count}
+      else
+        raise ResourceLimitError, limit: :scalar
+      end
+    else
+      state
+    end
+  end
+
+  defp scalar_width({:byte, _}), do: true
+  defp scalar_width({:boolean, _}), do: true
+
+  defp scalar_width({type, _})
+       when type in [:int16, :uint16, :int32, :uint32, :int64, :uint64, :double, :unix_fd],
+       do: true
+
+  defp scalar_width(_), do: false
 end

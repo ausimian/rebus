@@ -1,9 +1,17 @@
 defmodule Rebus.EncoderTest do
   use ExUnit.Case, async: true
 
-  alias Rebus.Encoder
+  alias Rebus.{Encoder, ResourceLimitError}
 
   doctest Rebus.Encoder
+
+  defp nested_arrays(0), do: 1
+  defp nested_arrays(depth), do: [nested_arrays(depth - 1)]
+
+  defp nested_variants(0, signature, value), do: {signature, value}
+
+  defp nested_variants(depth, signature, value),
+    do: {"v", nested_variants(depth - 1, signature, value)}
 
   describe "basic types" do
     test "encodes byte" do
@@ -122,6 +130,26 @@ defmodule Rebus.EncoderTest do
       # Signature takes 3 bytes, then padding to align int32 to 4-byte boundary
       expected = <<1>> <> "i" <> <<0, 0, 42, 0, 0, 0>>
       assert IO.iodata_to_binary(result) == expected
+    end
+
+    test "does not count sibling variants as nested" do
+      values = List.duplicate({"i", 1}, 200)
+
+      assert [^values] =
+               Rebus.Decoder.decode("av", Encoder.encode("av", [values]) |> IO.iodata_to_binary())
+    end
+
+    test "counts containers across variant boundaries" do
+      signature = String.duplicate("a", 32) <> "i"
+      accepted = nested_variants(31, signature, nested_arrays(32))
+      rejected = nested_variants(32, signature, nested_arrays(32))
+
+      encoded = Encoder.encode("v", [accepted])
+      assert [^accepted] = Rebus.Decoder.decode("v", IO.iodata_to_binary(encoded))
+
+      assert_raise ResourceLimitError, fn ->
+        Encoder.encode("v", [rejected])
+      end
     end
 
     test "encodes unix file descriptor" do
@@ -334,16 +362,16 @@ defmodule Rebus.EncoderTest do
     end
 
     test "encodes array with big endian" do
-      result = Encoder.encode("ai", [[0x12345678, 0x9ABCDEF0]], :big)
+      result = Encoder.encode("au", [[0x12345678, 0x9ABCDEF0]], :big)
       binary = IO.iodata_to_binary(result)
 
-      # Array length: 8 bytes (2 int32s) - big endian
+      # Array length: 8 bytes (2 uint32s) - big endian
       <<0, 0, 0, 8, rest1::binary>> = binary
 
-      # First int32: 0x12345678 (big endian)
+      # First uint32: 0x12345678 (big endian)
       <<0x12, 0x34, 0x56, 0x78, rest2::binary>> = rest1
 
-      # Second int32: 0x9ABCDEF0 (big endian)
+      # Second uint32: 0x9ABCDEF0 (big endian)
       <<0x9A, 0xBC, 0xDE, 0xF0, rest3::binary>> = rest2
 
       assert rest3 == <<>>
@@ -454,14 +482,10 @@ defmodule Rebus.EncoderTest do
       assert rest2 == <<>>
     end
 
-    test "encodes empty struct" do
-      # Empty structs are not typically valid in D-Bus but let's test the behavior
-      result = Encoder.encode("()", [[]])
-
-      binary = IO.iodata_to_binary(result)
-
-      # Should just be alignment padding if any is needed
-      assert binary == <<>>
+    test "rejects empty structs" do
+      assert_raise ArgumentError, "invalid D-Bus signature", fn ->
+        Encoder.encode("()", [[]])
+      end
     end
 
     test "encodes struct with signature type" do

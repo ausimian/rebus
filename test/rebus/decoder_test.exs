@@ -1,7 +1,9 @@
 defmodule Rebus.DecoderTest do
   use ExUnit.Case, async: true
+  doctest Rebus.Decoder
 
-  alias Rebus.{Decoder, Encoder, Message}
+  alias Rebus.{Decoder, Encoder, Message, ResourceLimitError}
+  alias Rebus.WireValue
 
   defp nested_array_signature(depth), do: String.duplicate("a", depth) <> "i"
 
@@ -26,7 +28,67 @@ defmodule Rebus.DecoderTest do
   defp nested_variant(0), do: {"i", 42}
   defp nested_variant(depth), do: {"v", nested_variant(depth - 1)}
 
+  defp canonical_double(:infinity), do: 0x7FF0_0000_0000_0000
+  defp canonical_double(:negative_infinity), do: 0xFFF0_0000_0000_0000
+  defp canonical_double(:nan), do: 0x7FF8_0000_0000_0000
+
   describe "basic types" do
+    test "bounds decoded elements with an injectable budget" do
+      assert [] = Decoder.decode("", <<>>, :little, 1)
+
+      data = <<3::little-32, 1, 2, 3>>
+      assert [[1, 2, 3]] = Decoder.decode("ay", data, :little, 4)
+      assert [[1, 2, 3]] = Decoder.decode("ay", data, :little, 1)
+      assert [[1, 2, 3]] = Decoder.decode("ay", data, :little, 1, 3)
+
+      assert_raise ResourceLimitError, fn ->
+        Decoder.decode("ay", data, :little, 1, 2)
+      end
+
+      for {signature, data, budget} <- [
+            {"ayay", [[1, 2], [3, 4]], 2},
+            {"aay", [[[1, 2], [3, 4]]], 3},
+            {"av", [[{"ay", [1, 2, 3]}]], 3},
+            {"a{si}", [[{"one", 1}, {"two", 2}]], 7}
+          ] do
+        encoded = Encoder.encode(signature, data) |> IO.iodata_to_binary()
+        assert ^data = Decoder.decode(signature, encoded, :little, budget)
+
+        assert_raise ResourceLimitError, fn ->
+          Decoder.decode(signature, encoded, :little, budget - 1)
+        end
+      end
+    end
+
+    test "classifies truncated declared arrays as malformed before resource limits" do
+      truncated = <<1_000_001::little-32, 1>>
+
+      assert_raise MatchError, fn -> Decoder.decode("ay", truncated, :little, 1, 1) end
+    end
+
+    test "rejects malformed string-like wire values" do
+      assert_raise ArgumentError, "invalid D-Bus string", fn ->
+        Decoder.decode("s", <<1::little-32, 255, 0>>)
+      end
+
+      assert_raise MatchError, fn -> Decoder.decode("s", <<1::little-32, "x", 1>>) end
+
+      assert_raise ArgumentError, "invalid D-Bus object path", fn ->
+        Decoder.decode("o", <<3::little-32, "bad", 0>>)
+      end
+
+      assert_raise ArgumentError, "invalid D-Bus signature", fn ->
+        Decoder.decode("g", <<1, "(", 0>>)
+      end
+
+      assert_raise ArgumentError, "invalid D-Bus string", fn ->
+        Decoder.decode("s", <<1::little-32, 0, 0>>)
+      end
+
+      refute WireValue.valid_object_path?(42)
+      refute WireValue.valid_signature?(42)
+    end
+
     test "decodes byte" do
       data = <<42>>
       result = Decoder.decode("y", data)
@@ -130,6 +192,14 @@ defmodule Rebus.DecoderTest do
     end
   end
 
+  describe "decoded positions" do
+    test "returns values and the number of bytes consumed" do
+      data = Encoder.encode("ys", [1, "value"]) |> IO.iodata_to_binary()
+      assert {[1, "value"], consumed} = Decoder.decode_with_position("ys", data)
+      assert consumed == byte_size(data)
+    end
+  end
+
   describe "alignment" do
     test "properly handles int16 after byte" do
       # Encode then decode with alignment
@@ -211,12 +281,10 @@ defmodule Rebus.DecoderTest do
       assert result == [[[10, 20], 30]]
     end
 
-    test "decodes empty struct" do
-      encoded = Encoder.encode("()", [[]])
-      data = IO.iodata_to_binary(encoded)
-
-      result = Decoder.decode("()", data)
-      assert result == [[]]
+    test "rejects empty structs" do
+      assert_raise ArgumentError, "invalid D-Bus signature", fn ->
+        Decoder.decode("()", <<>>)
+      end
     end
   end
 
@@ -270,7 +338,7 @@ defmodule Rebus.DecoderTest do
     end
 
     test "rejects a nonempty array of zero-width structs" do
-      assert_raise ArgumentError, "D-Bus array element did not consume input", fn ->
+      assert_raise ArgumentError, "invalid D-Bus signature", fn ->
         Decoder.decode("a()", <<1::little-32, 0::size(5 * 8)>>)
       end
     end
@@ -357,13 +425,12 @@ defmodule Rebus.DecoderTest do
       assert Decoder.decode(signature, IO.iodata_to_binary(encoded)) == [value]
     end
 
-    test "rejects array nesting beyond the D-Bus limit before decoding" do
+    test "rejects array nesting beyond the local resource limit before decoding" do
       signature = nested_array_signature(33)
       value = nested_array_value(33)
-      encoded = Encoder.encode(signature, [value])
 
-      assert_raise ArgumentError, "D-Bus nesting limit exceeded", fn ->
-        Decoder.decode(signature, IO.iodata_to_binary(encoded))
+      assert_raise ResourceLimitError, fn ->
+        Encoder.encode(signature, [value])
       end
     end
 
@@ -374,14 +441,13 @@ defmodule Rebus.DecoderTest do
       over_limit_value = nested_struct_value(33)
 
       maximum_data = Encoder.encode(maximum_signature, [maximum_value])
-      over_limit_data = Encoder.encode(over_limit_signature, [over_limit_value])
 
       assert Decoder.decode(maximum_signature, IO.iodata_to_binary(maximum_data)) == [
                maximum_value
              ]
 
-      assert_raise ArgumentError, "D-Bus nesting limit exceeded", fn ->
-        Decoder.decode(over_limit_signature, IO.iodata_to_binary(over_limit_data))
+      assert_raise ResourceLimitError, fn ->
+        Encoder.encode(over_limit_signature, [over_limit_value])
       end
     end
 
@@ -401,17 +467,14 @@ defmodule Rebus.DecoderTest do
 
       assert Decoder.decode("v", IO.iodata_to_binary(maximum_data)) == [maximum]
 
-      message =
-        Message.new!(:signal,
-          path: "/test",
-          interface: "test.interface",
-          member: "NestedVariant",
-          signature: "v",
-          body: [over_limit]
-        )
-
-      assert {:ok, encoded_message} = Message.encode(message)
-      assert {:error, :invalid_message} = Message.decode(IO.iodata_to_binary(encoded_message))
+      assert {:error, :resource_limit} =
+               Message.new(:signal,
+                 path: "/test",
+                 interface: "test.interface",
+                 member: "NestedVariant",
+                 signature: "v",
+                 body: [over_limit]
+               )
     end
   end
 
@@ -576,6 +639,22 @@ defmodule Rebus.DecoderTest do
       data_neg = IO.iodata_to_binary(encoded_neg)
       result_neg = Decoder.decode("d", data_neg)
       assert result_neg == [-42.5]
+
+      for {bits, expected} <- [
+            {0x7FF0_0000_0000_0000, :infinity},
+            {0xFFF0_0000_0000_0000, :negative_infinity},
+            {0x7FF8_0000_0000_0001, :nan}
+          ],
+          endianness <- [:little, :big] do
+        data = if endianness == :little, do: <<bits::little-64>>, else: <<bits::big-64>>
+        assert [^expected] = Decoder.decode("d", data, endianness)
+
+        assert IO.iodata_to_binary(Encoder.encode("d", [expected], endianness)) ==
+                 if(endianness == :little,
+                   do: <<canonical_double(expected)::little-64>>,
+                   else: <<canonical_double(expected)::big-64>>
+                 )
+      end
     end
 
     test "decodes maximum boundary values" do

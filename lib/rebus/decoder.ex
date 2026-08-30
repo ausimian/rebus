@@ -4,32 +4,18 @@ defmodule Rebus.Decoder do
 
   Implements the D-Bus unmarshaling format with proper alignment and byte ordering.
   All structs and arrays are represented as Elixir lists for consistency.
+  D-Bus infinities decode as `:infinity`/`:negative_infinity`; all NaNs decode
+  as `:nan`, canonically losing their wire sign and payload.
   """
 
-  # D-Bus type codes (reuse from encoder)
-  @type_byte 121
-  @type_boolean 98
-  @type_int16 110
-  @type_uint16 113
-  @type_int32 105
-  @type_uint32 117
-  @type_int64 120
-  @type_uint64 116
-  @type_double 100
-  @type_string 115
-  @type_object_path 111
-  @type_signature 103
-  @type_array 97
-  @type_struct_begin 40
-  @type_struct_end 41
-  @type_variant 118
-  @type_dict_begin 123
-  @type_dict_end 125
-  @type_unix_fd 104
+  alias Rebus.ResourceLimitError
+  alias Rebus.Signature
+  alias Rebus.WireValue
 
-  @max_array_depth 32
-  @max_struct_depth 32
-  @max_total_depth 64
+  import Bitwise, only: [&&&: 2]
+
+  @default_element_budget 100_000
+  @default_scalar_budget 1_000_000
 
   @type endianness :: :little | :big
   @type decoding_state :: %{
@@ -38,7 +24,9 @@ defmodule Rebus.Decoder do
           data: binary(),
           array_depth: non_neg_integer(),
           struct_depth: non_neg_integer(),
-          total_depth: non_neg_integer()
+          total_depth: non_neg_integer(),
+          element_budget: non_neg_integer(),
+          scalar_budget: non_neg_integer()
         }
 
   @doc """
@@ -60,8 +48,12 @@ defmodule Rebus.Decoder do
 
   ## Raises
 
-  Raises `ArgumentError` when D-Bus container nesting exceeds the protocol limit
-  of 32 array levels, 32 struct levels, or 64 total levels.
+  Raises `ArgumentError` for an invalid signature. Raises
+  `Rebus.ResourceLimitError` when local resource limits are exceeded: 32 array
+  levels, 32 struct levels, 64 total container levels, 100,000 structural
+  terms, or 1,000,000 fixed-width scalar-array elements. `Rebus.Message`
+  applies the structural and scalar limits independently to its header and body
+  decodes.
 
   ## Examples
 
@@ -84,14 +76,63 @@ defmodule Rebus.Decoder do
   """
   @spec decode(binary(), binary(), endianness()) :: [any()]
   def decode(signature, data, endianness \\ :little) do
-    state = new_state(endianness, 0, data)
-    types = parse_signature(signature)
-    validate_type_nesting(types, state)
+    {values, _position} = decode_with_position(signature, data, endianness)
+    values
+  end
 
-    types
-    |> decode_types(state)
-    # Return just the values, not the final state
-    |> elem(0)
+  @doc false
+  @spec decode(binary(), binary(), endianness(), pos_integer()) :: [any()]
+  def decode(signature, data, endianness, element_budget) do
+    {values, _position} =
+      decode_with_position(signature, data, endianness, element_budget, @default_scalar_budget)
+
+    values
+  end
+
+  @doc false
+  @spec decode(binary(), binary(), endianness(), pos_integer(), pos_integer()) :: [any()]
+  def decode(signature, data, endianness, element_budget, scalar_budget) do
+    {values, _position} =
+      decode_with_position(signature, data, endianness, element_budget, scalar_budget)
+
+    values
+  end
+
+  @doc """
+  Decodes data and returns the number of bytes consumed.
+
+  This is useful for callers that need to verify that a signature accounts for
+  every byte in a bounded frame.
+
+  D-Bus infinities are represented by atoms and NaNs by canonical `:nan`.
+  Raises `Rebus.ResourceLimitError` when the 100,000 structural-term or
+  1,000,000 fixed-width-scalar budget is exceeded.
+  """
+  @spec decode_with_position(binary(), binary(), endianness()) :: {[any()], non_neg_integer()}
+  def decode_with_position(signature, data, endianness \\ :little) do
+    decode_with_position(signature, data, endianness, @default_element_budget)
+  end
+
+  @doc false
+  @spec decode_with_position(binary(), binary(), endianness(), pos_integer()) ::
+          {[any()], non_neg_integer()}
+  def decode_with_position(signature, data, endianness, element_budget)
+      when is_integer(element_budget) and element_budget > 0 do
+    decode_with_position(signature, data, endianness, element_budget, @default_scalar_budget)
+  end
+
+  @doc false
+  @spec decode_with_position(binary(), binary(), endianness(), pos_integer(), pos_integer()) ::
+          {[any()], non_neg_integer()}
+  def decode_with_position(signature, data, endianness, element_budget, scalar_budget)
+      when is_integer(element_budget) and element_budget > 0 and is_integer(scalar_budget) and
+             scalar_budget > 0 do
+    state = new_state(endianness, 0, data, element_budget, scalar_budget)
+    types = Signature.parse!(signature)
+    Signature.validate_nesting!(types, state)
+
+    {values, final_state} = decode_types(types, state)
+    {values, final_state.position}
   end
 
   @doc """
@@ -103,9 +144,17 @@ defmodule Rebus.Decoder do
   @spec decode_at_position(binary(), binary(), endianness(), non_neg_integer()) :: list()
   def decode_at_position(signature, data, endianness, starting_position) do
     # Create state with the starting position for proper alignment calculations
-    state = new_state(endianness, starting_position, data)
-    types = parse_signature(signature)
-    validate_type_nesting(types, state)
+    state =
+      new_state(
+        endianness,
+        starting_position,
+        data,
+        @default_element_budget,
+        @default_scalar_budget
+      )
+
+    types = Signature.parse!(signature)
+    Signature.validate_nesting!(types, state)
 
     types
     |> decode_types(state)
@@ -113,109 +162,11 @@ defmodule Rebus.Decoder do
     |> elem(0)
   end
 
-  # Parse a D-Bus signature into a list of type structures (reuse encoder logic)
-  defp parse_signature(signature) when is_binary(signature) do
-    signature
-    |> :binary.bin_to_list()
-    |> parse_signature_types([])
-  end
-
-  defp parse_signature_types([], acc), do: Enum.reverse(acc)
-
-  defp parse_signature_types([type | rest], acc) do
-    case type do
-      @type_array ->
-        {element_type, remaining} = parse_single_type(rest)
-        parse_signature_types(remaining, [{:array, element_type} | acc])
-
-      @type_struct_begin ->
-        {struct_types, remaining} = parse_struct_types(rest, [])
-        parse_signature_types(remaining, [{:struct, struct_types} | acc])
-
-      @type_dict_begin ->
-        {key_type, rest1} = parse_single_type(rest)
-        {value_type, [@type_dict_end | rest2]} = parse_single_type(rest1)
-        parse_signature_types(rest2, [{:dict_entry, key_type, value_type} | acc])
-
-      _ ->
-        {single_type, remaining} = parse_single_type([type | rest])
-        parse_signature_types(remaining, [single_type | acc])
-    end
-  end
-
-  defp parse_single_type([type | rest]) do
-    case type do
-      @type_byte ->
-        {{:byte, nil}, rest}
-
-      @type_boolean ->
-        {{:boolean, nil}, rest}
-
-      @type_int16 ->
-        {{:int16, nil}, rest}
-
-      @type_uint16 ->
-        {{:uint16, nil}, rest}
-
-      @type_int32 ->
-        {{:int32, nil}, rest}
-
-      @type_uint32 ->
-        {{:uint32, nil}, rest}
-
-      @type_int64 ->
-        {{:int64, nil}, rest}
-
-      @type_uint64 ->
-        {{:uint64, nil}, rest}
-
-      @type_double ->
-        {{:double, nil}, rest}
-
-      @type_string ->
-        {{:string, nil}, rest}
-
-      @type_object_path ->
-        {{:object_path, nil}, rest}
-
-      @type_signature ->
-        {{:signature, nil}, rest}
-
-      @type_variant ->
-        {{:variant, nil}, rest}
-
-      @type_unix_fd ->
-        {{:unix_fd, nil}, rest}
-
-      @type_array ->
-        {element_type, remaining} = parse_single_type(rest)
-        {{:array, element_type}, remaining}
-
-      @type_struct_begin ->
-        {struct_types, remaining} = parse_struct_types(rest, [])
-        {{:struct, struct_types}, remaining}
-
-      @type_dict_begin ->
-        {key_type, rest1} = parse_single_type(rest)
-        {value_type, [@type_dict_end | rest2]} = parse_single_type(rest1)
-        {{:dict_entry, key_type, value_type}, rest2}
-    end
-  end
-
-  defp parse_struct_types([@type_struct_end | rest], acc) do
-    {Enum.reverse(acc), rest}
-  end
-
-  defp parse_struct_types(types, acc) do
-    {type, remaining} = parse_single_type(types)
-    parse_struct_types(remaining, [type | acc])
-  end
-
   # Decode parsed types from binary data
   defp decode_types([], state), do: {[], state}
 
   defp decode_types([type | types], state) do
-    {value, new_state} = decode_single(type, state)
+    {value, new_state} = state |> consume_element!() |> then(&decode_single(type, &1))
     {rest_values, final_state} = decode_types(types, new_state)
     {[value | rest_values], final_state}
   end
@@ -311,44 +262,56 @@ defmodule Rebus.Decoder do
   defp decode_single({:double, _}, state) do
     {value, new_state} = read_aligned_bytes(state, 8, 8)
 
-    decoded_value =
+    bits =
       case state.endianness do
         :little ->
-          <<result::little-float-64>> = value
+          <<result::little-64>> = value
           result
 
         :big ->
-          <<result::big-float-64>> = value
+          <<result::big-64>> = value
           result
       end
+
+    decoded_value = decode_double(bits, state.endianness)
 
     {decoded_value, new_state}
   end
 
   defp decode_single({:string, _}, state) do
-    decode_string_like(state, 4)
+    {value, new_state} = decode_string_like(state, 4)
+    WireValue.validate!(:string, value)
+    {value, new_state}
   end
 
   defp decode_single({:object_path, _}, state) do
-    decode_string_like(state, 4)
+    {value, new_state} = decode_string_like(state, 4)
+    WireValue.validate!(:object_path, value)
+    {value, new_state}
   end
 
   defp decode_single({:signature, _}, state) do
-    decode_string_like(state, 1)
+    {value, new_state} = decode_string_like(state, 1)
+    WireValue.validate!(:signature, value)
+    {value, new_state}
   end
 
   defp decode_single({:struct, field_types}, state) do
     # Structs are aligned to 8-byte boundary
-    nested_state = enter_container(state, :struct)
+    nested_state = Signature.enter_container!(state, :struct)
     aligned_state = align_to(nested_state, 8)
     {values, final_state} = decode_types(field_types, aligned_state)
     # Return struct as list
-    {values, leave_container(final_state, state)}
+    {values, Signature.leave_container(final_state, state)}
   end
 
   defp decode_single({:array, element_type}, state) do
     # Read array length
     {array_length, length_state} = decode_uint32(state)
+
+    if array_length > Rebus.Message.max_array_size() do
+      raise ArgumentError, "D-Bus array size limit exceeded"
+    end
 
     # Calculate how much data this array should consume in total
     # This includes alignment padding + the actual array data
@@ -365,9 +328,11 @@ defmodule Rebus.Decoder do
     # Extract exactly the data for this array
     <<array_binary::binary-size(total_array_size), remaining_data::binary>> = length_state.data
 
+    scalar_state = charge_scalar_array!(length_state, element_type, array_length)
+
     # Create a temporary state to decode just this array
-    temp_state = %{length_state | data: array_binary}
-    nested_state = enter_container(temp_state, :array)
+    temp_state = %{scalar_state | data: array_binary}
+    nested_state = Signature.enter_container!(temp_state, :array)
 
     # Align to element type boundary
     element_alignment = get_alignment(element_type)
@@ -377,14 +342,16 @@ defmodule Rebus.Decoder do
     array_end_position = aligned_state.position + array_length
 
     # Decode elements until we reach the end
-    {elements, _final_temp_state} =
+    {elements, final_temp_state} =
       decode_array_elements(element_type, aligned_state, array_end_position, [])
 
     # Return with the remaining data and updated position
     final_state = %{
       length_state
       | data: remaining_data,
-        position: length_state.position + total_array_size
+        position: length_state.position + total_array_size,
+        element_budget: final_temp_state.element_budget,
+        scalar_budget: final_temp_state.scalar_budget
     }
 
     {elements, final_state}
@@ -395,12 +362,14 @@ defmodule Rebus.Decoder do
     {signature, signature_state} = decode_single({:signature, nil}, state)
 
     # Parse signature and decode value
-    [parsed_type] = parse_signature(signature)
-    nested_state = enter_container(signature_state, :variant)
-    validate_type_nesting([parsed_type], nested_state)
-    {value, final_state} = decode_single(parsed_type, nested_state)
+    [parsed_type] = Signature.parse!(signature)
+    nested_state = Signature.enter_container!(signature_state, :variant)
+    Signature.validate_nesting!([parsed_type], nested_state)
 
-    {{signature, value}, leave_container(final_state, state)}
+    {value, final_state} =
+      nested_state |> consume_element!() |> then(&decode_single(parsed_type, &1))
+
+    {{signature, value}, Signature.leave_container(final_state, state)}
   end
 
   defp decode_single({:unix_fd, _}, state) do
@@ -409,102 +378,52 @@ defmodule Rebus.Decoder do
 
   defp decode_single({:dict_entry, key_type, value_type}, state) do
     # Dictionary entries are like structs with key and value
-    nested_state = enter_container(state, :dict_entry)
+    nested_state = Signature.enter_container!(state, :dict_entry)
     aligned_state = align_to(nested_state, 8)
-    {key, key_state} = decode_single(key_type, aligned_state)
-    {value, final_state} = decode_single(value_type, key_state)
-    {{key, value}, leave_container(final_state, state)}
+    {key, key_state} = aligned_state |> consume_element!() |> then(&decode_single(key_type, &1))
+
+    {value, final_state} = key_state |> consume_element!() |> then(&decode_single(value_type, &1))
+    {{key, value}, Signature.leave_container(final_state, state)}
   end
 
   # Helper functions
 
-  defp new_state(endianness, position, data) do
-    %{
-      endianness: endianness,
-      position: position,
-      data: data,
-      array_depth: 0,
-      struct_depth: 0,
-      total_depth: 0
-    }
+  defp new_state(endianness, position, data, element_budget, scalar_budget) do
+    Map.merge(
+      %{
+        endianness: endianness,
+        position: position,
+        data: data,
+        element_budget: element_budget,
+        scalar_budget: scalar_budget
+      },
+      Signature.new_nesting_state()
+    )
   end
 
-  defp validate_type_nesting(types, state) when is_list(types) do
-    Enum.each(types, &validate_type_nesting(&1, state))
+  defp consume_element!(%{element_budget: budget} = state) when budget > 0,
+    do: %{state | element_budget: budget - 1}
+
+  defp consume_element!(_state), do: raise(ResourceLimitError, limit: :structural)
+
+  defp charge_scalar_array!(state, element_type, array_length) do
+    case scalar_width(element_type) do
+      nil -> state
+      width -> consume_scalars!(state, div(array_length, width))
+    end
   end
 
-  defp validate_type_nesting({:array, element_type}, state) do
-    state |> enter_container(:array) |> then(&validate_type_nesting(element_type, &1))
-  end
+  defp consume_scalars!(%{scalar_budget: budget} = state, count) when budget >= count,
+    do: %{state | scalar_budget: budget - count}
 
-  defp validate_type_nesting({:struct, field_types}, state) do
-    nested_state = enter_container(state, :struct)
-    validate_type_nesting(field_types, nested_state)
-  end
+  defp consume_scalars!(_state, _count), do: raise(ResourceLimitError, limit: :scalar)
 
-  defp validate_type_nesting({:dict_entry, key_type, value_type}, state) do
-    nested_state = enter_container(state, :dict_entry)
-    validate_type_nesting([key_type, value_type], nested_state)
-  end
-
-  defp validate_type_nesting({:variant, _}, state) do
-    _ = enter_container(state, :variant)
-    :ok
-  end
-
-  defp validate_type_nesting(_type, _state), do: :ok
-
-  defp enter_container(state, :variant) do
-    ensure_total_depth!(state)
-    %{state | total_depth: state.total_depth + 1}
-  end
-
-  defp enter_container(state, :array) do
-    ensure_array_depth!(state)
-    ensure_total_depth!(state)
-
-    %{
-      state
-      | array_depth: state.array_depth + 1,
-        total_depth: state.total_depth + 1
-    }
-  end
-
-  defp enter_container(state, _struct_or_dict_entry) do
-    ensure_struct_depth!(state)
-    ensure_total_depth!(state)
-
-    %{
-      state
-      | struct_depth: state.struct_depth + 1,
-        total_depth: state.total_depth + 1
-    }
-  end
-
-  defp leave_container(state, parent_state) do
-    %{
-      state
-      | array_depth: parent_state.array_depth,
-        struct_depth: parent_state.struct_depth,
-        total_depth: parent_state.total_depth
-    }
-  end
-
-  defp ensure_array_depth!(%{array_depth: depth}) when depth < @max_array_depth,
-    do: :ok
-
-  defp ensure_array_depth!(_state),
-    do: raise(ArgumentError, "D-Bus nesting limit exceeded")
-
-  defp ensure_struct_depth!(%{struct_depth: depth}) when depth < @max_struct_depth,
-    do: :ok
-
-  defp ensure_struct_depth!(_state),
-    do: raise(ArgumentError, "D-Bus nesting limit exceeded")
-
-  defp ensure_total_depth!(%{total_depth: depth}) when depth < @max_total_depth, do: :ok
-
-  defp ensure_total_depth!(_state), do: raise(ArgumentError, "D-Bus nesting limit exceeded")
+  defp scalar_width({:byte, _}), do: 1
+  defp scalar_width({:boolean, _}), do: 4
+  defp scalar_width({type, _}) when type in [:int16, :uint16], do: 2
+  defp scalar_width({type, _}) when type in [:int32, :uint32, :unix_fd], do: 4
+  defp scalar_width({type, _}) when type in [:int64, :uint64, :double], do: 8
+  defp scalar_width(_), do: nil
 
   defp decode_int32(state) do
     {value, new_state} = read_aligned_bytes(state, 4, 4)
@@ -557,7 +476,8 @@ defmodule Rebus.Decoder do
     {string_data, string_state} = read_bytes(length_state, length)
 
     # Skip null terminator
-    {_null, final_state} = read_bytes(string_state, 1)
+    {null, final_state} = read_bytes(string_state, 1)
+    <<0>> = null
 
     {string_data, final_state}
   end
@@ -628,12 +548,42 @@ defmodule Rebus.Decoder do
         _ -> state
       end
 
-    {value, new_state} = decode_single(element_type, aligned_state)
+    element_state =
+      if budgeted_array_element?(element_type),
+        do: consume_element!(aligned_state),
+        else: aligned_state
+
+    {value, new_state} = decode_single(element_type, element_state)
 
     if new_state.position <= aligned_state.position do
       raise ArgumentError, "D-Bus array element did not consume input"
     end
 
     decode_array_elements(element_type, new_state, end_position, [value | acc])
+  end
+
+  defp budgeted_array_element?({type, _})
+       when type in [:string, :object_path, :signature, :variant],
+       do: true
+
+  defp budgeted_array_element?({type, _}) when type in [:array, :struct], do: true
+  defp budgeted_array_element?({:dict_entry, _, _}), do: true
+  defp budgeted_array_element?(_), do: false
+
+  defp decode_double(0x7FF0_0000_0000_0000, _endianness), do: :infinity
+  defp decode_double(0xFFF0_0000_0000_0000, _endianness), do: :negative_infinity
+
+  defp decode_double(bits, _endianness)
+       when (bits &&& 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000,
+       do: :nan
+
+  defp decode_double(bits, :little) do
+    <<value::little-float-64>> = <<bits::little-64>>
+    value
+  end
+
+  defp decode_double(bits, :big) do
+    <<value::big-float-64>> = <<bits::big-64>>
+    value
   end
 end

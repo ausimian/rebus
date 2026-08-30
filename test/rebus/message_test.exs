@@ -24,7 +24,243 @@ defmodule Rebus.MessageTest do
       header_fields_length::binary>>
   end
 
+  defp message_with_body(signature, value) do
+    Message.new(:signal,
+      path: "/test",
+      interface: "test.interface",
+      member: "Test",
+      signature: signature,
+      body: [value]
+    )
+  end
+
+  defp wire_message(header_fields, body, endianness \\ :little, type \\ 4) do
+    header =
+      header_fields
+      |> then(&Rebus.Encoder.encode_at_position("a(yv)", [&1], endianness, 12))
+      |> IO.iodata_to_binary()
+
+    body = IO.iodata_to_binary(body)
+    header_size = 12 + byte_size(header)
+    padding = :binary.copy(<<0>>, rem(8 - rem(header_size, 8), 8))
+    fixed_header = fixed_header(endianness, type, 1, byte_size(body), byte_size(header) - 4)
+
+    fixed_header <> binary_part(header, 4, byte_size(header) - 4) <> padding <> body
+  end
+
   describe "new/2" do
+    test "rejects decoded signals without required header fields" do
+      raw = <<?l, 4, 0, 1, 0::little-32, 1::little-32, 0::little-32>>
+      assert {:error, :invalid_message} = Message.decode(raw)
+    end
+
+    test "bounds aggregate unknown header-field materialization" do
+      fields =
+        [[1, {"o", "/test"}], [2, {"s", "test.interface"}], [3, {"s", "Budget"}]] ++
+          List.duplicate([10, {"ay", []}], 25_001)
+
+      header =
+        Rebus.Encoder.encode_at_position("a(yv)", [fields], :little, 12)
+        |> IO.iodata_to_binary()
+
+      padding = :binary.copy(<<0>>, rem(8 - rem(12 + byte_size(header), 8), 8))
+      raw = <<?l, 4, 0, 1, 0::little-32, 1::little-32, header::binary, padding::binary>>
+
+      assert {:error, :resource_limit} = Message.decode(raw)
+    end
+
+    test "keeps a validated reply envelope for an inbound body resource limit" do
+      limited =
+        wire_message(
+          [[5, {"u", 123}], [8, {"g", "ay"}]],
+          <<1_000_001::little-32>> <> :binary.copy(<<1>>, 1_000_001),
+          :little,
+          2
+        )
+
+      valid =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "AfterLimitedReply"
+        )
+
+      {:ok, valid_data} = encode_to_binary(valid)
+
+      assert {:error, :resource_limit, %{type: :method_return, reply_serial: 123}, ^valid_data} =
+               Message.parse_inbound(limited <> valid_data)
+
+      assert {:error, :resource_limit} = Message.parse(limited <> valid_data)
+      assert {:error, :resource_limit} = Message.decode(limited)
+    end
+
+    test "keeps a validated error name in an error reply resource envelope" do
+      error_name = "org.example.ResourceLimited"
+
+      limited =
+        wire_message(
+          [[4, {"s", error_name}], [5, {"u", 123}], [8, {"g", "ay"}]],
+          <<1_000_001::little-32>> <> :binary.copy(<<1>>, 1_000_001),
+          :little,
+          3
+        )
+
+      assert {:error, :resource_limit, envelope, <<>>} = Message.parse_inbound(limited)
+
+      assert %{type: :error, reply_serial: 123, error_name: ^error_name} = envelope
+    end
+
+    test "classifies local resource exceptions by type, not their text" do
+      limited =
+        wire_message(
+          [[5, {"u", 123}], [8, {"g", "ay"}]],
+          <<1_000_001::little-32>> <> :binary.copy(<<1>>, 1_000_001),
+          :little,
+          2
+        )
+
+      exception = %Rebus.ResourceLimitError{limit: :scalar, message: "changed limit text"}
+      assert exception.message == "changed limit text"
+      assert {:error, :resource_limit} = Message.decode(limited)
+    end
+
+    test "keeps malformed signature grammar fatal" do
+      malformed =
+        wire_message(
+          [
+            [1, {"o", "/test"}],
+            [2, {"s", "test.interface"}],
+            [3, {"s", "Malformed"}],
+            [8, {"g", "v"}]
+          ],
+          <<3, "a()", 0>>,
+          :little,
+          4
+        )
+
+      assert {:error, :invalid_message} = Message.decode(malformed)
+    end
+
+    test "exposes and accepts exactly the local scalar element cap" do
+      limit = Message.max_scalar_elements()
+      values = List.duplicate(0, limit)
+
+      assert {:ok, message} =
+               Message.new(:signal,
+                 path: "/test",
+                 interface: "test.interface",
+                 member: "ScalarLimit",
+                 signature: "ay",
+                 body: [values]
+               )
+
+      assert {:ok, _iodata} = Message.encode(message)
+    end
+
+    test "rejects one scalar element over the local cap from new and encode" do
+      values = List.duplicate(0, Message.max_scalar_elements() + 1)
+
+      assert {:error, :resource_limit} =
+               Message.new(:signal,
+                 path: "/test",
+                 interface: "test.interface",
+                 member: "ScalarLimit",
+                 signature: "ay",
+                 body: [values]
+               )
+
+      message = %Message{
+        type: :signal,
+        flags: [],
+        version: 1,
+        body_length: 0,
+        serial: 1,
+        header_fields: %{
+          path: "/test",
+          interface: "test.interface",
+          member: "ScalarLimit",
+          signature: "ay"
+        },
+        body: [values]
+      }
+
+      assert {:error, :resource_limit} = Message.encode(message)
+
+      assert_raise ArgumentError, ~r/local resource limit/, fn ->
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "ScalarLimit",
+          signature: "ay",
+          body: [values]
+        )
+      end
+    end
+
+    test "shares the outbound scalar cap across fixed-width arrays" do
+      values = List.duplicate(0, div(Message.max_scalar_elements(), 2) + 1)
+
+      assert {:error, :resource_limit} =
+               Message.new(:signal,
+                 path: "/test",
+                 interface: "test.interface",
+                 member: "AggregateScalarLimit",
+                 signature: "ayay",
+                 body: [values, values]
+               )
+
+      message = %Message{
+        type: :signal,
+        flags: [],
+        version: 1,
+        body_length: 0,
+        serial: 1,
+        header_fields: %{
+          path: "/test",
+          interface: "test.interface",
+          member: "AggregateScalarLimit",
+          signature: "ayay"
+        },
+        body: [values, values]
+      }
+
+      assert {:error, :resource_limit} = Message.encode(message)
+    end
+
+    test "round-trips byte arrays beyond the composite term budget" do
+      bytes = List.duplicate(1, 150_000)
+
+      message =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "Bytes",
+          signature: "ay",
+          body: [bytes]
+        )
+
+      assert {:ok, encoded} = Message.encode(message)
+      assert {:ok, decoded} = encoded |> IO.iodata_to_binary() |> Message.decode()
+      assert decoded.body == [bytes]
+    end
+
+    test "infers and round-trips special D-Bus doubles" do
+      for value <- [:infinity, :negative_infinity, :nan] do
+        assert {:ok, message} =
+                 Message.new(:signal,
+                   path: "/test",
+                   interface: "test.interface",
+                   member: "SpecialDouble",
+                   body: [value]
+                 )
+
+        assert Message.signature(message) == "d"
+        assert {:ok, encoded} = Message.encode(message)
+        assert {:ok, decoded} = encoded |> IO.iodata_to_binary() |> Message.decode()
+        assert decoded.body == [value]
+      end
+    end
+
     test "creates a valid method call message" do
       assert {:ok, message} =
                Message.new(:method_call,
@@ -351,6 +587,27 @@ defmodule Rebus.MessageTest do
       end
     end
 
+    test "round-trips wide dictionaries of sibling variants" do
+      properties = Enum.map(1..100, &{"property#{&1}", {"i", &1}})
+
+      message =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "PropertiesChanged",
+          body: [properties],
+          signature: "a{sv}"
+        )
+
+      for endianness <- [:little, :big] do
+        assert {:ok, encoded} = Message.encode(message, endianness)
+        assert {:ok, decoded} = encoded |> IO.iodata_to_binary() |> Message.decode()
+        assert decoded.body == message.body
+        assert :ok = Message.validate(decoded)
+        assert {:ok, _reencoded} = Message.encode(decoded, endianness)
+      end
+    end
+
     test "round-trip with flags" do
       original =
         Message.new!(:method_call,
@@ -561,6 +818,264 @@ defmodule Rebus.MessageTest do
     end
   end
 
+  describe "body encoding validation" do
+    test "rejects invalid fixed message envelopes before marshaling" do
+      base = %Message{
+        type: :method_call,
+        flags: [],
+        version: 1,
+        body_length: 0,
+        serial: 1,
+        header_fields: %{path: "/test", member: "Test"},
+        body: []
+      }
+
+      invalid_messages = [
+        %{base | type: :invalid},
+        %{base | header_fields: %{}},
+        %{base | header_fields: []},
+        %{base | header_fields: nil},
+        %{base | version: 0},
+        %{base | version: 2},
+        %{base | version: 256},
+        %{base | serial: 0},
+        %{base | serial: -1},
+        %{base | serial: 4_294_967_296},
+        %{base | flags: [:invalid]}
+      ]
+
+      for message <- invalid_messages do
+        assert {:error, :invalid_message} = Message.encode(message)
+      end
+
+      assert {:ok, _encoded} = Message.encode(%{base | serial: 4_294_967_295})
+    end
+
+    test "enforces encoded message and header-fields size limits without large allocations" do
+      assert :ok = Message.validate_encoded_size(4, Message.max_message_size() - 16)
+
+      assert {:error, :message_too_large} =
+               Message.validate_encoded_size(4, Message.max_message_size())
+
+      assert {:error, :message_too_large} =
+               Message.validate_encoded_size(67_108_864 + 5, 0)
+
+      assert {:error, :message_too_large} = Message.validate_encoded_size(3, 0)
+    end
+
+    test "rejects invalid inferred signatures at construction" do
+      assert {:error, reason} =
+               Message.new(:signal,
+                 path: "/test",
+                 interface: "test.interface",
+                 member: "Test",
+                 body: List.duplicate(1, 300)
+               )
+
+      assert reason =~ "Invalid signature format"
+
+      nested = Enum.reduce(1..33, 1, fn _, value -> [value] end)
+
+      assert {:error, :resource_limit} =
+               Message.new(:signal,
+                 path: "/test",
+                 interface: "test.interface",
+                 member: "Test",
+                 body: [nested]
+               )
+    end
+
+    test "accepts integer boundaries and rejects out-of-range values" do
+      ranges = [
+        {"y", 0, 255},
+        {"n", -32_768, 32_767},
+        {"q", 0, 65_535},
+        {"i", -2_147_483_648, 2_147_483_647},
+        {"u", 0, 4_294_967_295},
+        {"x", -9_223_372_036_854_775_808, 9_223_372_036_854_775_807},
+        {"t", 0, 18_446_744_073_709_551_615},
+        {"h", 0, 4_294_967_295}
+      ]
+
+      for {signature, minimum, maximum} <- ranges do
+        for value <- [minimum, maximum] do
+          assert {:ok, message} = message_with_body(signature, value)
+          assert {:ok, _encoded} = Message.encode(message)
+        end
+
+        assert {:error, :invalid_body} = message_with_body(signature, minimum - 1)
+        assert {:error, :invalid_body} = message_with_body(signature, maximum + 1)
+      end
+    end
+
+    test "rejects invalid signature values in body data and variants" do
+      long_signature = String.duplicate("i", 300)
+
+      assert {:error, :invalid_body} = message_with_body("g", long_signature)
+      assert {:error, :invalid_body} = message_with_body("g", "(")
+      assert {:error, :invalid_body} = message_with_body("v", {"g", "("})
+    end
+
+    test "rejects control characters in D-Bus names and paths" do
+      invalid_options = [
+        [path: "/foo\n", interface: "test.interface", member: "Test"],
+        [path: "/foo\r", interface: "test.interface", member: "Test"],
+        [path: "/foo\0", interface: "test.interface", member: "Test"],
+        [path: "/test", interface: "test.interface\n", member: "Test"],
+        [path: "/test", interface: "test.interface", member: "Test\n"],
+        [
+          path: "/test",
+          interface: "test.interface",
+          member: "Test",
+          destination: "org.example\n"
+        ],
+        [path: "/test", interface: "test.interface", member: "Test", sender: ":1.42\r"]
+      ]
+
+      for options <- invalid_options do
+        assert {:error, _reason} = Message.new(:signal, options)
+      end
+    end
+
+    test "returns a bounded header-fields error for manually constructed messages" do
+      message = %Message{
+        type: :signal,
+        flags: [],
+        version: 1,
+        body_length: 0,
+        serial: 1,
+        header_fields: %{path: 42, interface: "test.interface", member: "Test"},
+        body: []
+      }
+
+      assert {:error, :invalid_header_fields} = Message.encode(message)
+      assert {:error, reason} = Message.validate(message)
+      assert reason =~ "Invalid value for field path"
+    end
+
+    test "validate/1 rejects unknown and non-map header fields" do
+      message = %Message{
+        type: :signal,
+        flags: [],
+        version: 1,
+        body_length: 0,
+        serial: 1,
+        header_fields: %{
+          path: "/test",
+          interface: "test.interface",
+          member: "Test",
+          unknown: "x"
+        },
+        body: []
+      }
+
+      assert {:error, "Invalid header field"} = Message.validate(message)
+      assert {:error, "Invalid header fields"} = Message.validate(%{message | header_fields: []})
+    end
+
+    test "new! names the signature without including body data" do
+      assert_raise ArgumentError, ~r/body does not match signature "i"/, fn ->
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "Test",
+          signature: "i",
+          body: ["sensitive body"]
+        )
+      end
+    end
+
+    test "new! names an inferred signature without inspecting the body" do
+      assert_raise ArgumentError, ~r/body does not match signature "v"/, fn ->
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "Test",
+          body: [%{secret: "body data"}]
+        )
+      end
+    end
+
+    test "normalizes invalid variant signatures without leaking values" do
+      assert {:error, :invalid_body} =
+               message_with_body("v", {"", "sensitive body data"})
+    end
+
+    test "rejects invalid signature grammar without raising" do
+      for signature <- ["is)", "}", "["] do
+        assert {:error, reason} =
+                 Message.new(:signal,
+                   path: "/test",
+                   interface: "test.interface",
+                   member: "Test",
+                   signature: signature,
+                   body: []
+                 )
+
+        assert reason =~ "Invalid signature format"
+
+        message = %Message{
+          type: :signal,
+          flags: [],
+          version: 1,
+          body_length: 0,
+          serial: 1,
+          header_fields: %{
+            path: "/test",
+            interface: "test.interface",
+            member: "Test",
+            signature: signature
+          },
+          body: []
+        }
+
+        assert {:error, :invalid_header_fields} = Message.encode(message)
+        assert {:error, validation_reason} = Message.validate(message)
+        assert validation_reason =~ "Invalid signature format"
+
+        assert_raise ArgumentError, ~r/Invalid signature format/, fn ->
+          Message.new!(:signal,
+            path: "/test",
+            interface: "test.interface",
+            member: "Test",
+            signature: signature,
+            body: []
+          )
+        end
+      end
+    end
+
+    test "accepts balanced nested signatures" do
+      assert {:ok, message} =
+               Message.new(:signal,
+                 path: "/test",
+                 interface: "test.interface",
+                 member: "Test",
+                 signature: "a{sa(iy)}",
+                 body: [[{"key", [[1, 2]]}]]
+               )
+
+      assert {:ok, _encoded} = Message.encode(message)
+      assert :ok = Message.validate(message)
+    end
+
+    test "allows hyphens in well-known bus-name elements only" do
+      assert {:ok, _message} =
+               Message.new(:method_call,
+                 path: "/test",
+                 member: "Test",
+                 destination: "org.example-service.Name"
+               )
+
+      for name <- ["org.1service", "org..service", "org.service!"] do
+        assert {:error, reason} =
+                 Message.new(:method_call, path: "/test", member: "Test", destination: name)
+
+        assert reason =~ "Invalid destination"
+      end
+    end
+  end
+
   describe "decode/1 error handling" do
     test "rejects invalid endianness flag" do
       # Create a message with invalid endianness (not 'l' or 'B')
@@ -597,21 +1112,32 @@ defmodule Rebus.MessageTest do
     end
 
     test "rejects a nonempty array of zero-width structs" do
-      message =
-        Message.new!(:signal,
-          path: "/test",
-          interface: "test.interface",
-          member: "ZeroWidth",
-          signature: "a()",
-          body: [[]]
-        )
-
-      {:ok, encoded} = encode_to_binary(message)
-      header_size = byte_size(encoded) - message.body_length
-      <<header::binary-size(header_size), _body::binary>> = encoded
       malformed_body = <<1::little-32, 0::size(4 * 8)>>
 
-      assert {:error, :invalid_message} = Message.decode(header <> malformed_body)
+      valid_fields = [
+        [1, {"o", "/test"}],
+        [2, {"s", "test.interface"}],
+        [3, {"s", "ZeroWidth"}]
+      ]
+
+      valid_header =
+        valid_fields
+        |> then(&Rebus.Encoder.encode_at_position("a(yv)", [&1], :little, 12))
+        |> IO.iodata_to_binary()
+
+      valid_data = binary_part(valid_header, 4, byte_size(valid_header) - 4)
+      signature_field = <<8, 1, "g", 0, 3, "a()", 0>>
+      padding = :binary.copy(<<0>>, rem(8 - rem(16 + byte_size(valid_data), 8), 8))
+      fields_data = valid_data <> padding <> signature_field
+
+      header_padding =
+        :binary.copy(<<0>>, rem(8 - rem(12 + 4 + byte_size(fields_data), 8), 8))
+
+      wire =
+        fixed_header(:little, 4, 1, byte_size(malformed_body), byte_size(fields_data)) <>
+          fields_data <> header_padding <> malformed_body
+
+      assert {:error, :invalid_message} = Message.decode(wire)
     end
 
     test "rejects invalid message type in binary" do
@@ -749,6 +1275,118 @@ defmodule Rebus.MessageTest do
     end
   end
 
+  describe "decoded header validation and offsets" do
+    test "uses the declared header size with unknown fields in both byte orders" do
+      fields = [
+        [1, {"o", "/test"}],
+        [2, {"s", "test.interface"}],
+        [3, {"s", "Test"}],
+        [8, {"g", "i"}],
+        [10, {"s", "ignored unknown field"}]
+      ]
+
+      for endianness <- [:little, :big] do
+        body = Rebus.Encoder.encode("i", [42], endianness)
+        assert {:ok, message} = Message.decode(wire_message(fields, body, endianness))
+        assert message.body == [42]
+        assert message.header_fields.path == "/test"
+        refute Map.has_key?(message.header_fields, 10)
+      end
+    end
+
+    test "rejects declared header lengths that do not match their contents" do
+      fields = [[1, {"o", "/test"}], [2, {"s", "test.interface"}], [3, {"s", "Test"}]]
+      valid = wire_message(fields, [], :little)
+      <<prefix::binary-size(12), length::little-32, rest::binary>> = valid
+
+      assert {:error, :invalid_message} =
+               Message.decode(<<prefix::binary, length - 1::little-32, rest::binary>>)
+
+      assert {:error, :invalid_message} =
+               Message.decode(<<prefix::binary, length + 1::little-32, rest::binary>>)
+    end
+
+    test "rejects known header fields encoded with the wrong variant type" do
+      fields = [[1, {"u", 42}], [2, {"s", "test.interface"}], [3, {"s", "Test"}]]
+      assert {:error, :invalid_message} = Message.decode(wire_message(fields, []))
+    end
+
+    test "rejects duplicate known header fields" do
+      fields = [
+        [1, {"o", "/test"}],
+        [2, {"s", "test.interface"}],
+        [3, {"s", "First"}],
+        [3, {"s", "Second"}]
+      ]
+
+      assert {:error, :invalid_message} = Message.decode(wire_message(fields, []))
+    end
+
+    test "rejects a nonempty signature with an empty body" do
+      fields = [
+        [1, {"o", "/test"}],
+        [2, {"s", "test.interface"}],
+        [3, {"s", "Test"}],
+        [8, {"g", "s"}]
+      ]
+
+      assert {:error, :invalid_message} = Message.decode(wire_message(fields, []))
+
+      message = %Message{
+        type: :signal,
+        flags: [],
+        version: 1,
+        body_length: 0,
+        serial: 1,
+        header_fields: %{
+          path: "/test",
+          interface: "test.interface",
+          member: "Test",
+          signature: "s"
+        },
+        body: []
+      }
+
+      assert {:error, :invalid_body} = Message.validate(message)
+      assert {:error, :invalid_body} = Message.encode(message)
+    end
+
+    test "validates a decoded nonempty signed body before re-encoding it" do
+      message =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "Test",
+          signature: "s",
+          body: ["value"]
+        )
+
+      assert :ok = Message.validate(message)
+      assert {:ok, encoded} = Message.encode(message)
+      assert {:ok, decoded} = Message.decode(IO.iodata_to_binary(encoded))
+      assert :ok = Message.validate(decoded)
+    end
+
+    test "rejects body bytes not consumed by the signature" do
+      fields = [
+        [1, {"o", "/test"}],
+        [2, {"s", "test.interface"}],
+        [3, {"s", "Test"}],
+        [8, {"g", "s"}]
+      ]
+
+      for endianness <- [:little, :big] do
+        body = IO.iodata_to_binary(Rebus.Encoder.encode("s", ["value"], endianness)) <> <<0, 0>>
+        assert {:error, :invalid_message} = Message.decode(wire_message(fields, body, endianness))
+      end
+    end
+
+    test "rejects a body when no signature is declared" do
+      fields = [[1, {"o", "/test"}], [2, {"s", "test.interface"}], [3, {"s", "Test"}]]
+      assert {:error, :invalid_message} = Message.decode(wire_message(fields, <<0>>))
+    end
+  end
+
   describe "additional edge cases for coverage" do
     test "validates unix_fds field type" do
       assert {:error, reason} =
@@ -811,7 +1449,7 @@ defmodule Rebus.MessageTest do
           member: "Test"
         )
 
-      assert message.serial == 0
+      assert message.serial == 1
     end
 
     test "ignores serial option and always uses zero" do
@@ -824,7 +1462,7 @@ defmodule Rebus.MessageTest do
           serial: 999_999
         )
 
-      assert message.serial == 0
+      assert message.serial == 1
     end
 
     test "handles encoding and decoding with all header fields" do
@@ -848,7 +1486,7 @@ defmodule Rebus.MessageTest do
       assert decoded.header_fields.destination == "test.destination"
       assert decoded.header_fields.sender == "test.sender"
       assert decoded.header_fields.signature == "s"
-      assert decoded.serial == 0
+      assert decoded.serial == 1
       assert decoded.body == ["test"]
     end
 
@@ -1041,16 +1679,14 @@ defmodule Rebus.MessageTest do
       # int32, string, boolean
       assert Message.signature(message) == "isb"
 
-      # Test with variant (unsupported type)
-      {:ok, message} =
-        Message.new(:signal,
-          path: "/test",
-          interface: "test.interface",
-          member: "Test",
-          body: [%{key: "value"}]
-        )
-
-      assert Message.signature(message) == "v"
+      # Inferred variants still require a D-Bus variant value tuple.
+      assert {:error, :invalid_body} =
+               Message.new(:signal,
+                 path: "/test",
+                 interface: "test.interface",
+                 member: "Test",
+                 body: [%{key: "value"}]
+               )
     end
   end
 
@@ -1136,28 +1772,33 @@ defmodule Rebus.MessageTest do
       assert decoded.body == large_body
     end
 
-    test "handles body length calculation errors" do
-      # Test with invalid signature that would cause encoding issues
-      # This tests the rescue clause in calculate_body_length
+    test "rejects a body that does not match its signature" do
+      assert {:error, :invalid_body} =
+               Message.new(:signal,
+                 path: "/test",
+                 interface: "test.interface",
+                 member: "Test",
+                 signature: "i",
+                 body: ["not an integer"]
+               )
+
       message = %Message{
         type: :signal,
         flags: [],
         version: 1,
-        # Will be calculated
         body_length: 0,
         serial: 123,
         header_fields: %{
           path: "/test",
           interface: "test.interface",
           member: "Test",
-          signature: "invalid_signature!"
+          signature: "i"
         },
-        body: ["test"]
+        body: ["not an integer"]
       }
 
-      # The validation should catch the invalid signature
-      assert {:error, reason} = Message.validate(message)
-      assert reason =~ "Invalid signature format"
+      assert {:error, :invalid_body} = Message.encode(message)
+      assert {:error, :invalid_body} = Message.validate(message)
     end
 
     test "covers infer_type for all data types" do
@@ -1181,10 +1822,8 @@ defmodule Rebus.MessageTest do
         {[], "as"},
         # Array of ints
         {[1, 2, 3], "ai"},
-        # Map -> variant
-        {%{}, "v"},
-        # Atom -> variant
-        {:atom, "v"}
+        # Valid variant
+        {{"s", "value"}, "v"}
       ]
 
       for {value, expected_sig} <- test_values do
@@ -1248,9 +1887,8 @@ defmodule Rebus.MessageTest do
         body: []
       }
 
-      # This should still validate the basic structure
-      assert {:ok, encoded} = encode_to_binary(message_with_rescue_path, :little)
-      assert is_binary(encoded)
+      # A body and signature must agree, even for manually constructed messages.
+      assert {:error, :invalid_body} = Message.encode(message_with_rescue_path, :little)
 
       # Test decode error path with too short data
       too_short_data = <<108, 1, 0, 0, 12>>

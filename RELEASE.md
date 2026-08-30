@@ -13,12 +13,37 @@
 - Add the `:write_timeout` connection option to bound outbound frame readiness.
 - Add `Rebus.Message.max_message_size/0`, exposing the 128 MiB D-Bus message
   limit.
+- Add `Rebus.Message.max_array_size/0` and `max_scalar_elements/0`, exposing
+  the 64 MiB D-Bus wire-array limit and the local 1,000,000 scalar-element cap.
 - Add the `:read_timeout` connection option to bound connection setup and the
   complete initial Hello reply, plus gaps between inbound fragments without
   timing out idle connections.
 
 ### Changed
 
+- `Rebus.Message.new/2` now returns `{:error, :invalid_body}` and `new!/2`
+  raises when a body cannot be encoded for its signature, including out-of-range
+  D-Bus integers. `encode/2` now also returns `:invalid_header_fields` for
+  malformed manually constructed messages, `:invalid_message` for malformed
+  envelopes, and `:message_too_large` for frames over D-Bus size limits.
+- Message signatures are now validated as complete D-Bus type expressions;
+  malformed, unbalanced, oversized, or over-nested signatures are rejected
+  before encoding, including `g` values in bodies and variants.
+- Decoding now rejects messages with missing or invalid required header fields.
+  The D-Bus wire limits remain 64 MiB for an array payload and 128 MiB for a
+  complete frame. Separately, each header or body decode locally allows up to
+  100,000 structural terms and 1,000,000 materialized fixed-width scalar
+  elements. Encoding applies the 1,000,000 scalar-element cap cumulatively
+  across all fixed-width scalar arrays in one operation. Wire-valid frames over
+  these local resource caps are dropped without closing an established
+  connection.
+- D-Bus special doubles use `:infinity`, `:negative_infinity`, and `:nan`.
+  NaN payload and sign are canonicalized on decode.
+- `call/3` now returns `{:error, {:reply_dropped, :method_return}}` when a
+  successful peer reply exceeds local decode caps, or
+  `{:error, {:reply_dropped, {:error, error_name}}}` for a dropped D-Bus error
+  reply. The peer definitely received the request and produced a reply; decide
+  whether to retry from the operation and error semantics, never blindly.
 - `connect/2` now returns `{:error, {:auth_rejected, mechanisms}}` for a
   `REJECTED` authentication response instead of `{:error, :auth_failed}`.
 - `connect/2` now waits for a validated initial `Hello` reply before returning
@@ -39,6 +64,17 @@
 
 ### Fixed
 
+- Return `:invalid_body` when a message body cannot be encoded for its
+  signature, rather than silently declaring an empty body.
+- Reject duplicate or trailing body data in decoded D-Bus messages, and accept
+  hyphens in valid well-known bus names.
+- Reject control characters in outbound D-Bus names and paths, and reject body
+  arrays over the D-Bus 64 MiB array limit before emitting a frame.
+- Bound scalar-array materialization independently of wire-size limits to avoid
+  large BEAM list allocations from otherwise valid inbound frames.
+- Treat local container-nesting exhaustion as a nonfatal resource limit for an
+  established connection, while malformed D-Bus signature grammar remains an
+  invalid message.
 - Allow independent connections to establish concurrently so a stalled
   authentication handshake does not block the shared connection supervisor.
 - Reject inbound D-Bus frames over the protocol's 128 MiB limit or with
