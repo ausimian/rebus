@@ -407,7 +407,8 @@ defmodule RebusTest do
                  auth_id_fun: fn _timeout ->
                    send(parent, :malicious_auth_id_fun)
                    {:error, :exit_status}
-                 end
+                 end,
+                 auth_username_fun: :invalid
                )
 
       refute_receive :malicious_auth_id_fun
@@ -428,6 +429,34 @@ defmodule RebusTest do
       assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
       refute_receive :precomputed_auth_id_runner
       assert Rebus.close(precomputed_cli) in [:ok, {:error, :not_found}]
+    end
+
+    test "normalizes internal username lookup outcomes" do
+      assert {:ok, "rebus-user"} =
+               Connection.get_auth_username(100, fn _timeout -> {:ok, "rebus-user\n"} end)
+
+      assert {:error, :auth_cookie_unavailable} =
+               Connection.get_auth_username(100, fn _timeout -> {:error, :exit_status} end)
+
+      assert {:error, :auth_cookie_unavailable} =
+               Connection.get_auth_username(100, fn _timeout ->
+                 {:ok, String.duplicate("a", 65)}
+               end)
+
+      assert {:error, :auth_cookie_unavailable} =
+               Connection.get_auth_username(100, fn _timeout -> {:ok, "invalid user"} end)
+
+      assert {:error, :read_timeout} =
+               Connection.get_auth_username(100, fn _timeout -> {:error, :timeout} end)
+
+      assert {:error, :enoent} = Connection.run_auth_username(100, fn _ -> nil end)
+
+      assert {:error, :port_open_failed} =
+               Connection.run_auth_username(
+                 100,
+                 fn _ -> "/missing/id" end,
+                 fn _, _ -> throw(:port_open_failed) end
+               )
     end
 
     test "registers the connection under its optional name", %{svr: svr} do
@@ -3214,6 +3243,22 @@ defmodule RebusTest do
 
       assert_receive {:aborted, %{path: "/tmp/one"}}
       refute_receive {:aborted, %{path: "/tmp/two"}}
+
+      unavailable_cookie_connector = fn address, _opts ->
+        send(parent, {:cookie_unavailable, address})
+        {:error, :auth_cookie_unavailable}
+      end
+
+      assert {:error, :auth_cookie_unavailable} =
+               Rebus.connect_address_candidates(
+                 [{:local, "/tmp/one", nil}, {:local, "/tmp/two", nil}],
+                 [timeout: 50],
+                 connector: unavailable_cookie_connector,
+                 monotonic_time: monotonic_time
+               )
+
+      assert_receive {:cookie_unavailable, %{path: "/tmp/one"}}
+      refute_receive {:cookie_unavailable, %{path: "/tmp/two"}}
     end
   end
 

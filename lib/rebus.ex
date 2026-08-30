@@ -128,6 +128,7 @@ defmodule Rebus do
   @publicly_ignored_connection_options [
     :auth_id,
     :auth_id_fun,
+    :auth_username_fun,
     :address_list_auth_id,
     :address_list_setup_timeout,
     :expected_guid,
@@ -156,11 +157,11 @@ defmodule Rebus do
       each socket connect, and authentication read (default: 5000). This is the original
       public connection-timeout option. It has no effect after authentication.
       `:read_timeout`, when supplied, takes precedence for setup as well.
-      Direct socket addresses have no aggregate timeout: their worst-case wait
-      includes this bounded auth-ID lookup, one socket connect, one
-      authentication read, the validated initial Hello reply at
-      `:read_timeout`, and the `AUTH`, `BEGIN`, and Hello writes at
-      `:write_timeout`.
+      Direct socket addresses retain independent auth-ID lookup and socket
+      connect budgets. After connecting, all D-Bus authentication exchanges and
+      `BEGIN` share one setup budget; each authentication write is also capped
+      by `:write_timeout`. The validated initial Hello reply separately uses
+      `:read_timeout`.
     - `:name` - Optional local atom used to register the connection process.
       It is intended for local discovery and lifecycle management; pass the
       returned PID to `call/3`, `send/2`, `send/3`, and signal-handler APIs. The
@@ -190,6 +191,14 @@ defmodule Rebus do
       gaps between inbound fragments, is reset whenever a peer makes progress,
       and is inactive while no frame is buffered. Expiry then terminates the
       temporary connection; inflight callers receive `{:error, :disconnected}`.
+    - `:allow_anonymous` - Boolean, default `false`. When `true`, Rebus can
+      use the peer-advertised D-Bus `ANONYMOUS` mechanism only after `EXTERNAL`
+      is rejected and `DBUS_COOKIE_SHA1` was not advertised, or before cookie
+      `AUTH` starts when the local username is unavailable. Once cookie `AUTH`
+      starts or a cookie challenge is received, it is never selected; failures
+      are terminal and Rebus sends neither `CANCEL` nor `AUTH ANONYMOUS`.
+      `ANONYMOUS` provides no authentication, confidentiality, or integrity;
+      use it only for deliberately unauthenticated peer-to-peer services.
 
   ## Return Values
 
@@ -198,18 +207,24 @@ defmodule Rebus do
     within its configured per-operation budget.
   - `{:error, :auth_id_unavailable}` - The local numeric identity required for
     `EXTERNAL` authentication could not be obtained.
-  - `{:error, :auth_failed}` - The peer sent an invalid authentication response.
+  - `{:error, :auth_cookie_unavailable}` - The peer offered
+    `DBUS_COOKIE_SHA1`, but its local username or matching local cookie could
+    not be read safely. For a bus address list this is terminal and no later
+    candidate address or IP is attempted.
+  - `{:error, :auth_failed}` - The peer sent malformed authentication data or
+    rejected a DBUS_COOKIE_SHA1 response. Neither error includes peer data.
   - `{:error, :guid_mismatch}` - A configured bus-address GUID did not match
     the server's `AUTH OK` GUID. Rebus does not try another address or IP after
     this identity failure.
-  - `{:error, {:auth_rejected, mechanisms}}` - The peer rejected `EXTERNAL`
-    authentication and advertised its supported mechanisms.
+  - `{:error, {:auth_rejected, mechanisms}}` - The peer rejected an attempted
+    mechanism and no safe advertised fallback remains. `mechanisms` is bounded
+    and contains only validated mechanism names.
   - `{:error, {:hello_failed, :invalid_unique_name}}` - The peer's initial
     Hello reply did not contain a valid D-Bus unique name.
   - `{:error, {:hello_failed, :resource_limit}}` - The peer's initial Hello
     reply exceeded a local decoding safety cap.
   - `{:error, :invalid_timeout | :invalid_read_timeout | :invalid_write_timeout |
-    :invalid_name}` - A connection option was invalid.
+    :invalid_allow_anonymous | :invalid_name}` - A connection option was invalid.
   - `{:error, {:name_taken, pid}}` - The requested local name is held by a
     setup or established connection process. The PID can be adopted or passed to
     `close/1` when it is no longer needed.
@@ -267,6 +282,32 @@ defmodule Rebus do
   has authenticated. Address-list failure diagnostics are emitted only at debug
   level and contain candidate/IP ordinals, transport, slice, and a bounded
   reason—never an address, host, path, or GUID.
+
+  ## Authentication mechanisms
+
+  Rebus sends `AUTH EXTERNAL` first. On a valid bounded `REJECTED` list it
+  prefers `DBUS_COOKIE_SHA1`, using the effective `id -un` username and only a
+  private `$HOME/.dbus-keyrings/<context>` file owned by the effective UID.
+  A final home symlink is followed only after its target directory is validated;
+  the keyring directory and file must be non-symlink. The resolved home cannot
+  be group/other writable and the keyring directory and file are inaccessible
+  to group and other users. Unsupported owner/mode metadata fails closed.
+  Cookie data, challenges, authorization identities, server GUIDs, and peer
+  authentication payloads are not logged or returned. Cookie authentication can
+  support local TCP endpoints where Unix credentials cannot be passed, but it
+  provides no transport encryption or integrity.
+
+  Rebus accepts either hex case from a peer or cookie file for interoperability,
+  while always emitting the lower-case form required by DBUS_COOKIE_SHA1. Cookie
+  contexts follow the D-Bus grammar and therefore cannot contain a period,
+  whitespace, or path separator. Cookie reads accept at most 256 bounded lines,
+  skipping malformed unrelated records but rejecting ambiguous target records.
+  To bound peer-controlled state, a `REJECTED` list is limited to 64 mechanism
+  names; larger lists are treated as malformed.
+
+  `ANONYMOUS` remains disabled unless `allow_anonymous: true` is passed. It is
+  appropriate only for intentionally unauthenticated peer-to-peer services and
+  is not a safe message-bus or network trust mechanism.
 
   ## Examples
 
@@ -953,9 +994,12 @@ defmodule Rebus do
   defp retryable_bus_address_error?(:invalid_timeout), do: false
   defp retryable_bus_address_error?(:invalid_read_timeout), do: false
   defp retryable_bus_address_error?(:invalid_write_timeout), do: false
+  defp retryable_bus_address_error?(:invalid_allow_anonymous), do: false
   defp retryable_bus_address_error?(:invalid_name), do: false
   defp retryable_bus_address_error?(:invalid_auth_id_fun), do: false
+  defp retryable_bus_address_error?(:invalid_auth_username_fun), do: false
   defp retryable_bus_address_error?(:auth_id_unavailable), do: false
+  defp retryable_bus_address_error?(:auth_cookie_unavailable), do: false
   defp retryable_bus_address_error?(:guid_mismatch), do: false
   defp retryable_bus_address_error?({:read_timeout, _reason}), do: false
   defp retryable_bus_address_error?({:name_taken, _pid}), do: false
