@@ -105,9 +105,9 @@ defmodule Rebus.MessageTest do
           3
         )
 
-      assert {:error, :resource_limit,
-              %{type: :error, reply_serial: 123, error_name: ^error_name}, <<>>} =
-               Message.parse_inbound(limited)
+      assert {:error, :resource_limit, envelope, <<>>} = Message.parse_inbound(limited)
+
+      assert %{type: :error, reply_serial: 123, error_name: ^error_name} = envelope
     end
 
     test "classifies local resource exceptions by type, not their text" do
