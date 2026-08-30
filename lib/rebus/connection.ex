@@ -1377,7 +1377,8 @@ defmodule Rebus.Connection do
   end
 
   defp authenticate_anonymous(state, sock, rest, deadline, maximum) do
-    with :ok <- handshake_send_with_deadline(sock, "AUTH ANONYMOUS\r\n", state, deadline, maximum),
+    with :ok <-
+           handshake_send_with_deadline(sock, "AUTH ANONYMOUS\r\n", state, deadline, maximum),
          {:ok, line, rest} <- handshake_recv_with_deadline(sock, rest, deadline, maximum) do
       case parse_auth_response(line) do
         {:ok, guid} -> {:ok, guid, rest}
