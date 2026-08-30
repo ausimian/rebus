@@ -42,7 +42,7 @@ defmodule Rebus.TestServer do
     field :prev, binary(), default: <<>>
     field :tap, pid()
     field :serial, non_neg_integer(), default: 1
-    field :family, :inet | :local, default: :inet
+    field :family, :inet | :inet6 | :local, default: :inet
     field :path, String.t() | nil, default: nil
     field :auth_response, binary(), default: "OK 30313233343536373839414243444546\r\n"
     field :auth_response_fragments, [binary()] | nil, default: nil
@@ -61,9 +61,9 @@ defmodule Rebus.TestServer do
     path = opts[:path]
 
     case family do
-      :inet ->
-        {:ok, sock} = :socket.open(:inet, :stream, :default)
-        :ok = :socket.bind(sock, %{family: :inet, addr: :loopback, port: 0})
+      family when family in [:inet, :inet6] ->
+        {:ok, sock} = :socket.open(family, :stream, :default)
+        :ok = :socket.bind(sock, %{family: family, addr: loopback_address(family), port: 0})
         :ok = :socket.listen(sock, 5)
 
         {:ok,
@@ -231,6 +231,10 @@ defmodule Rebus.TestServer do
   end
 
   @impl true
+  def terminate(_reason, %__MODULE__{family: :local, path: <<0, _rest::binary>>} = _state) do
+    :ok
+  end
+
   def terminate(_reason, %__MODULE__{family: :local, path: path} = _state) when is_binary(path) do
     # Clean up Unix socket file
     File.rm(path)
@@ -238,6 +242,9 @@ defmodule Rebus.TestServer do
   end
 
   def terminate(_reason, _state), do: :ok
+
+  defp loopback_address(:inet), do: :loopback
+  defp loopback_address(:inet6), do: {0, 0, 0, 0, 0, 0, 0, 1}
 
   defp observe_client_close(cli, %__MODULE__{} = state) do
     outcome =

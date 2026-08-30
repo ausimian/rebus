@@ -46,7 +46,7 @@ defmodule Rebus do
   - `:session` - Connects to the session bus using the address specified in
      the `DBUS_SESSION_BUS_ADDRESS` environment variable.
   - `%{family: :local, path: path}` - Unix domain socket connection to a local D-Bus daemon
-  - `%{family: :inet, addr: {ip, port}}` - TCP/IP connection to a remote D-Bus daemon
+  - `%{family: :inet | :inet6, addr: ip, port: port}` - TCP/IP connection to a remote D-Bus daemon
 
   ## Configuration
 
@@ -80,7 +80,14 @@ defmodule Rebus do
   modules in this package.
   """
 
-  @type address :: :system | :session | :socket.sockaddr_in() | :socket.sockaddr_un()
+  require Logger
+
+  @type address ::
+          :system
+          | :session
+          | :socket.sockaddr_in()
+          | :socket.sockaddr_in6()
+          | :socket.sockaddr_un()
 
   @type error_reason ::
           :timeout
@@ -95,6 +102,18 @@ defmodule Rebus do
           | {:invalid_message_type, Rebus.Message.message_type()}
 
   @default_system_bus_address "unix:path=/run/dbus/system_bus_socket"
+  @default_connection_timeout 5_000
+  @max_tcp_addresses_per_family 4
+  @minimum_address_attempt_timeout 50
+
+  @publicly_ignored_connection_options [
+    :auth_id,
+    :auth_id_fun,
+    :address_list_auth_id,
+    :address_list_setup_timeout,
+    :expected_guid,
+    :precomputed_auth_id
+  ]
 
   @doc """
   Establishes a connection to a D-Bus message bus.
@@ -111,17 +130,18 @@ defmodule Rebus do
     - `:session` - Connects to the session bus using the address specified in
        the `DBUS_SESSION_BUS_ADDRESS` environment variable.
     - `%{family: :local, path: path}` - Unix domain socket connection to a local D-Bus daemon
-    - `%{family: :inet, addr: {ip, port}}` - TCP/IP connection to a remote D-Bus daemon
+    - `%{family: :inet | :inet6, addr: ip, port: port}` - TCP/IP connection to a remote D-Bus daemon
 
   - `opts` - Optional keyword list of connection options:
     - `:timeout` - Positive maximum time in milliseconds for the auth-ID lookup,
       each socket connect, and authentication read (default: 5000). This is the original
       public connection-timeout option. It has no effect after authentication.
       `:read_timeout`, when supplied, takes precedence for setup as well.
-      `connect/2` has no aggregate timeout: its worst-case wait includes this
-      bounded auth-ID lookup, one socket connect, one authentication read, the
-      validated initial Hello reply at `:read_timeout`, and the `AUTH`, `BEGIN`,
-      and Hello writes at `:write_timeout`.
+      Direct socket addresses have no aggregate timeout: their worst-case wait
+      includes this bounded auth-ID lookup, one socket connect, one
+      authentication read, the validated initial Hello reply at
+      `:read_timeout`, and the `AUTH`, `BEGIN`, and Hello writes at
+      `:write_timeout`.
     - `:name` - Optional local atom used to register the connection process.
       It is intended for local discovery and lifecycle management; pass the
       returned PID to `call/3`, `send/2`, `send/3`, and signal-handler APIs. The
@@ -160,6 +180,9 @@ defmodule Rebus do
   - `{:error, :auth_id_unavailable}` - The local numeric identity required for
     `EXTERNAL` authentication could not be obtained.
   - `{:error, :auth_failed}` - The peer sent an invalid authentication response.
+  - `{:error, :guid_mismatch}` - A configured bus-address GUID did not match
+    the server's `AUTH OK` GUID. Rebus does not try another address or IP after
+    this identity failure.
   - `{:error, {:auth_rejected, mechanisms}}` - The peer rejected `EXTERNAL`
     authentication and advertised its supported mechanisms.
   - `{:error, {:hello_failed, :invalid_unique_name}}` - The peer's initial
@@ -173,7 +196,58 @@ defmodule Rebus do
     `close/1` when it is no longer needed.
   - `{:error, {:name_registered, pid}}` - The requested local name belongs to
     another process, not a supervised Rebus connection.
+  - `{:error, {:invalid_bus_address, reason}}` - The configured system or
+    session address was malformed. `reason` is a stable atom and never includes
+    the address value.
+  - `{:error, :unsupported_bus_transport}` - The configured address list did
+    not contain a transport Rebus supports.
+  - `{:error, {:tcp_resolution_failed, reason}}` - A TCP address resolved to
+    no usable IP address. `reason` is a stable atom and never includes the
+    configured host name.
+  - `{:error, {:read_timeout, reason}}` - An address-list deadline elapsed
+    after at least one setup attempt. `reason` is a stable, payload-free atom
+    describing the last failed attempt. Before any attempt, expiry remains
+    `{:error, :read_timeout}`.
   - `{:error, reason}` - Another socket or setup failure occurred.
+
+  ## Bus address lists
+
+  System and session address strings use the D-Bus
+  `transport:key=value;next-transport:key=value` format. Rebus supports
+  `unix:path=...`, `unix:abstract=...`, and `tcp:host=...,port=...` (with an
+  optional `family=ipv4` or `family=ipv6`). Without `family`, Rebus resolves
+  IPv6 addresses first and IPv4 addresses second, preserving each resolver
+  result order and duplicates, trying at most the first four results per family
+  before the next D-Bus entry. Values are percent-decoded; literal non-NUL bytes
+  are accepted where they are not address separators. A 32-hex-digit `guid` is
+  ignored for socket selection but compared case-insensitively with the server's
+  `AUTH OK` GUID before `BEGIN` or Hello. A mismatch is `:guid_mismatch` and is
+  never retried. Other syntactically valid transport parameters are ignored for
+  forward compatibility. Parameterless unknown transports (for example
+  `autolaunch:`) are skipped, while `unix:`, `unix:path=`, `unix:guid=...`, and
+  `tcp:`/`tcp:family=...` return their missing-required-field errors. Rebus tries
+  supported entries in their listed order until one establishes a connection;
+  syntactically valid unsupported entries are skipped. A malformed entry rejects
+  the whole list, and if every supported attempt fails the final attempt's error
+  is returned.
+
+  Rebus obtains the local `EXTERNAL` auth ID once in the calling process before
+  it begins a supported address list, then privately supplies that value to all
+  candidate connections. Caller-provided auth-ID and address-list setup options
+  are ignored; they cannot bypass this ownership or candidate identity checks.
+  For an address list only, `:timeout` (or `:read_timeout` when supplied) is
+  one aggregate budget for DNS lookup and pre-Hello socket/authentication setup
+  across all candidates. Each resolver and pre-Hello setup attempt gets
+  `min(remaining, max(floor, floor(remaining / outstanding_attempts)))`
+  milliseconds. The floor is 50 ms when the remaining budget can grant every
+  outstanding attempt 50 ms; otherwise it is 1 ms, and it never exceeds the
+  remaining time. Before DNS completes, outstanding attempts are resolver
+  families plus later D-Bus entries; afterward they are the capped resolved IPs
+  plus later entries. This does not change the independent `:write_timeout` or
+  the normal `:read_timeout` budget for an initial Hello reply after a candidate
+  has authenticated. Address-list failure diagnostics are emitted only at debug
+  level and contain candidate/IP ordinals, transport, slice, and a bounded
+  reason—never an address, host, path, or GUID.
 
   ## Examples
 
@@ -200,32 +274,46 @@ defmodule Rebus do
 
   def connect(:system, opts) do
     case Application.get_env(:rebus, :system_bus_address, @default_system_bus_address) do
-      nil ->
-        {:error, :no_system_bus_address}
-
-      "unix:path=" <> address ->
-        connect(%{family: :local, path: address}, opts)
+      nil -> {:error, :no_system_bus_address}
+      address -> connect_bus_address(address, opts)
     end
   end
 
   def connect(:session, opts) do
     case System.get_env("DBUS_SESSION_BUS_ADDRESS") do
-      nil ->
-        {:error, :no_session_bus_address}
-
-      "unix:path=" <> address ->
-        connect(%{family: :local, path: address}, opts)
+      nil -> {:error, :no_session_bus_address}
+      address -> connect_bus_address(address, opts)
     end
   end
 
-  def connect(%{family: family} = addr, opts) when family in [:inet, :local] do
+  def connect(%{family: family} = addr, opts) when family in [:inet, :inet6, :local] do
+    opts = strip_public_connection_options(opts)
+    start_connection(addr, opts)
+  end
+
+  defp connect_address_candidate(%{family: family} = addr, opts)
+       when family in [:inet, :inet6, :local] do
+    case Keyword.pop(opts, :address_list_auth_id) do
+      {auth_id, candidate_opts} when is_binary(auth_id) ->
+        start_connection(addr, candidate_opts, auth_id)
+
+      _missing_auth_id ->
+        {:error, :invalid_bus_address_implementation}
+    end
+  end
+
+  defp start_connection(addr, opts, precomputed_auth_id \\ nil) do
     connect_ref = make_ref()
 
     args =
       opts
-      |> Keyword.delete(:auth_id_fun)
       |> Keyword.put(:addr, addr)
       |> Keyword.put(:connect_waiter, {self(), connect_ref})
+
+    args =
+      if is_binary(precomputed_auth_id),
+        do: Keyword.put(args, :precomputed_auth_id, precomputed_auth_id),
+        else: args
 
     child_spec = {Rebus.Connection, args}
 
@@ -235,6 +323,611 @@ defmodule Rebus do
       other -> other
     end
   end
+
+  defp strip_public_connection_options(opts) do
+    Keyword.drop(opts, @publicly_ignored_connection_options)
+  end
+
+  defp connect_bus_address(address, opts) do
+    case Rebus.BusAddress.parse(address) do
+      {:ok, candidates} -> connect_address_candidates(candidates, opts)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc false
+  @spec connect_address_candidates([Rebus.BusAddress.candidate()], keyword(), keyword()) ::
+          {:ok, pid()} | {:error, term()}
+  def connect_address_candidates(candidates, opts, implementation \\ [])
+      when is_list(candidates) and is_list(opts) and is_list(implementation) do
+    opts = strip_public_connection_options(opts)
+
+    with {:ok, timeout} <- address_list_timeout(opts),
+         {:ok, resolver} <- implementation_function(implementation, :resolver, 3, &resolve_tcp/3),
+         {:ok, connector} <-
+           implementation_function(implementation, :connector, 2, &connect_address_candidate/2),
+         {:ok, auth_id_runner} <-
+           implementation_function(
+             implementation,
+             :auth_id_runner,
+             1,
+             &Rebus.Connection.run_auth_id/1
+           ),
+         {:ok, monotonic_time} <-
+           implementation_function(
+             implementation,
+             :monotonic_time,
+             0,
+             fn -> System.monotonic_time(:millisecond) end
+           ) do
+      deadline = monotonic_time.() + timeout
+
+      case resolve_list_auth_id(candidates, deadline, auth_id_runner, monotonic_time) do
+        {:ok, auth_id} ->
+          connect_bus_candidates(
+            candidates,
+            Keyword.put(opts, :address_list_auth_id, auth_id),
+            deadline,
+            resolver,
+            connector,
+            monotonic_time,
+            nil,
+            1
+          )
+
+        {:error, {:address_list_timeout, reason}} ->
+          {:error, reason}
+
+        {:error, _reason} = error ->
+          error
+      end
+    end
+  end
+
+  defp implementation_function(implementation, key, arity, default) do
+    case Keyword.get(implementation, key, default) do
+      function when is_function(function, arity) -> {:ok, function}
+      _function -> {:error, :invalid_bus_address_implementation}
+    end
+  end
+
+  defp resolve_list_auth_id([], _deadline, _auth_id_runner, _monotonic_time),
+    do: {:error, :unsupported_bus_transport}
+
+  defp resolve_list_auth_id(candidates, deadline, auth_id_runner, monotonic_time) do
+    candidate_count = connectable_candidate_count(candidates)
+
+    if candidate_count == 0 do
+      {:error, :unsupported_bus_transport}
+    else
+      with {:ok, timeout} <-
+             address_attempt_timeout(deadline, candidate_count + 1, monotonic_time, nil),
+           {:ok, auth_id} <- Rebus.Connection.get_auth_id(timeout, auth_id_runner) do
+        {:ok, auth_id}
+      end
+    end
+  end
+
+  defp connect_bus_candidates(
+         [],
+         _opts,
+         _deadline,
+         _resolver,
+         _connector,
+         _monotonic_time,
+         nil,
+         _candidate_ordinal
+       ),
+       do: {:error, :unsupported_bus_transport}
+
+  defp connect_bus_candidates(
+         [],
+         _opts,
+         _deadline,
+         _resolver,
+         _connector,
+         _monotonic_time,
+         error,
+         _candidate_ordinal
+       ),
+       do: final_address_list_error(error)
+
+  defp connect_bus_candidates(
+         [:unsupported | candidates],
+         opts,
+         deadline,
+         resolver,
+         connector,
+         monotonic_time,
+         last_error,
+         candidate_ordinal
+       ) do
+    connect_bus_candidates(
+      candidates,
+      opts,
+      deadline,
+      resolver,
+      connector,
+      monotonic_time,
+      last_error,
+      candidate_ordinal + 1
+    )
+  end
+
+  defp connect_bus_candidates(
+         [candidate | candidates],
+         opts,
+         deadline,
+         resolver,
+         connector,
+         monotonic_time,
+         last_error,
+         candidate_ordinal
+       ) do
+    case connect_bus_candidate(
+           candidate,
+           candidates,
+           opts,
+           deadline,
+           resolver,
+           connector,
+           monotonic_time,
+           last_error,
+           candidate_ordinal
+         ) do
+      {:ok, _pid} = result ->
+        result
+
+      {:error, {:address_list_timeout, reason}} ->
+        {:error, reason}
+
+      {:error, reason} = error ->
+        if retryable_bus_address_error?(reason) do
+          connect_bus_candidates(
+            candidates,
+            opts,
+            deadline,
+            resolver,
+            connector,
+            monotonic_time,
+            reason,
+            candidate_ordinal + 1
+          )
+        else
+          error
+        end
+    end
+  end
+
+  defp connect_bus_candidate(
+         {:local, path, expected_guid},
+         remaining_candidates,
+         opts,
+         deadline,
+         _resolver,
+         connector,
+         monotonic_time,
+         last_error,
+         candidate_ordinal
+       ) do
+    with {:ok, timeout} <-
+           address_attempt_timeout(
+             deadline,
+             1 + connectable_candidate_count(remaining_candidates),
+             monotonic_time,
+             last_error
+           ) do
+      connect_with_address_diagnostic(
+        connector,
+        %{family: :local, path: path},
+        opts
+        |> Keyword.put(:address_list_setup_timeout, timeout)
+        |> Keyword.put(:expected_guid, expected_guid),
+        candidate_ordinal,
+        0,
+        :unix,
+        timeout
+      )
+    end
+  end
+
+  defp connect_bus_candidate(
+         {:tcp, host, port, family, expected_guid},
+         remaining_candidates,
+         opts,
+         deadline,
+         resolver,
+         connector,
+         monotonic_time,
+         last_error,
+         candidate_ordinal
+       ) do
+    with {:ok, addresses} <-
+           resolve_tcp_addresses(
+             host,
+             family,
+             deadline,
+             resolver,
+             monotonic_time,
+             connectable_candidate_count(remaining_candidates),
+             last_error,
+             candidate_ordinal
+           ) do
+      connect_tcp_addresses(
+        addresses,
+        port,
+        expected_guid,
+        opts,
+        deadline,
+        connector,
+        monotonic_time,
+        connectable_candidate_count(remaining_candidates),
+        last_error,
+        candidate_ordinal,
+        1
+      )
+    end
+  end
+
+  defp resolve_tcp_addresses(
+         host,
+         family,
+         deadline,
+         resolver,
+         monotonic_time,
+         remaining_candidate_count,
+         last_error,
+         candidate_ordinal
+       ) do
+    families = if family == :unspec, do: [:inet6, :inet], else: [family]
+
+    resolve_tcp_families(
+      host,
+      families,
+      deadline,
+      resolver,
+      monotonic_time,
+      remaining_candidate_count,
+      [],
+      [],
+      last_error,
+      candidate_ordinal
+    )
+  end
+
+  defp resolve_tcp_families(
+         _host,
+         [],
+         _deadline,
+         _resolver,
+         _monotonic_time,
+         _remaining_candidate_count,
+         [],
+         reasons,
+         _last_error,
+         _candidate_ordinal
+       ),
+       do: {:error, {:tcp_resolution_failed, List.first(reasons) || :no_addresses}}
+
+  defp resolve_tcp_families(
+         _host,
+         [],
+         _deadline,
+         _resolver,
+         _monotonic_time,
+         _remaining_candidate_count,
+         addresses,
+         _reasons,
+         _last_error,
+         _candidate_ordinal
+       ),
+       do: {:ok, addresses}
+
+  defp resolve_tcp_families(
+         host,
+         [family | families],
+         deadline,
+         resolver,
+         monotonic_time,
+         remaining_candidate_count,
+         addresses,
+         reasons,
+         last_error,
+         candidate_ordinal
+       ) do
+    with {:ok, timeout} <-
+           address_attempt_timeout(
+             deadline,
+             length([family | families]) + remaining_candidate_count,
+             monotonic_time,
+             last_error
+           ) do
+      case resolver.(host, family, timeout) do
+        {:ok, resolved} when is_list(resolved) ->
+          resolved_addresses =
+            resolved
+            |> Enum.take(@max_tcp_addresses_per_family)
+            |> Enum.map(&{family, &1})
+
+          resolve_tcp_families(
+            host,
+            families,
+            deadline,
+            resolver,
+            monotonic_time,
+            remaining_candidate_count,
+            addresses ++ resolved_addresses,
+            reasons,
+            last_error,
+            candidate_ordinal
+          )
+
+        {:error, reason} ->
+          safe_reason = safe_resolver_reason(reason)
+
+          log_address_attempt(
+            candidate_ordinal,
+            0,
+            :tcp,
+            timeout,
+            {:tcp_resolution_failed, safe_reason}
+          )
+
+          resolve_tcp_families(
+            host,
+            families,
+            deadline,
+            resolver,
+            monotonic_time,
+            remaining_candidate_count,
+            addresses,
+            [safe_reason | reasons],
+            {:tcp_resolution_failed, safe_reason},
+            candidate_ordinal
+          )
+
+        _other ->
+          log_address_attempt(candidate_ordinal, 0, :tcp, timeout, :resolution_failed)
+
+          resolve_tcp_families(
+            host,
+            families,
+            deadline,
+            resolver,
+            monotonic_time,
+            remaining_candidate_count,
+            addresses,
+            [:resolution_failed | reasons],
+            {:tcp_resolution_failed, :resolution_failed},
+            candidate_ordinal
+          )
+      end
+    end
+  end
+
+  defp connect_tcp_addresses(
+         [],
+         _port,
+         _expected_guid,
+         _opts,
+         _deadline,
+         _connector,
+         _monotonic_time,
+         _remaining_candidate_count,
+         nil,
+         _candidate_ordinal,
+         _ip_ordinal
+       ),
+       do: {:error, {:tcp_resolution_failed, :no_addresses}}
+
+  defp connect_tcp_addresses(
+         [],
+         _port,
+         _expected_guid,
+         _opts,
+         _deadline,
+         _connector,
+         _monotonic_time,
+         remaining_candidate_count,
+         error,
+         _candidate_ordinal,
+         _ip_ordinal
+       )
+       when remaining_candidate_count > 0,
+       do: {:error, error}
+
+  defp connect_tcp_addresses(
+         [],
+         _port,
+         _expected_guid,
+         _opts,
+         _deadline,
+         _connector,
+         _monotonic_time,
+         _remaining_candidate_count,
+         error,
+         _candidate_ordinal,
+         _ip_ordinal
+       ),
+       do: final_address_list_error(error)
+
+  defp connect_tcp_addresses(
+         [{family, address} | addresses],
+         port,
+         expected_guid,
+         opts,
+         deadline,
+         connector,
+         monotonic_time,
+         remaining_candidate_count,
+         last_error,
+         candidate_ordinal,
+         ip_ordinal
+       ) do
+    with {:ok, timeout} <-
+           address_attempt_timeout(
+             deadline,
+             length(addresses) + 1 + remaining_candidate_count,
+             monotonic_time,
+             last_error
+           ) do
+      case connect_with_address_diagnostic(
+             connector,
+             %{family: family, addr: address, port: port},
+             opts
+             |> Keyword.put(:address_list_setup_timeout, timeout)
+             |> Keyword.put(:expected_guid, expected_guid),
+             candidate_ordinal,
+             ip_ordinal,
+             :tcp,
+             timeout
+           ) do
+        {:ok, _pid} = result ->
+          result
+
+        {:error, reason} = error ->
+          if retryable_bus_address_error?(reason) do
+            connect_tcp_addresses(
+              addresses,
+              port,
+              expected_guid,
+              opts,
+              deadline,
+              connector,
+              monotonic_time,
+              remaining_candidate_count,
+              reason,
+              candidate_ordinal,
+              ip_ordinal + 1
+            )
+          else
+            error
+          end
+      end
+    end
+  end
+
+  defp connectable_candidate_count(candidates) do
+    Enum.count(candidates, &connectable_candidate?/1)
+  end
+
+  defp connectable_candidate?({:local, _path, _expected_guid}), do: true
+  defp connectable_candidate?({:tcp, _host, _port, _family, _expected_guid}), do: true
+  defp connectable_candidate?(_candidate), do: false
+
+  defp connect_with_address_diagnostic(
+         connector,
+         address,
+         opts,
+         candidate_ordinal,
+         ip_ordinal,
+         transport,
+         timeout
+       ) do
+    case connector.(address, opts) do
+      {:error, reason} = error ->
+        log_address_attempt(candidate_ordinal, ip_ordinal, transport, timeout, reason)
+        error
+
+      result ->
+        result
+    end
+  end
+
+  defp log_address_attempt(candidate_ordinal, ip_ordinal, transport, timeout, reason) do
+    safe_reason = safe_address_failure_reason(reason)
+
+    Logger.debug(fn ->
+      "D-Bus address attempt candidate=#{candidate_ordinal} ip=#{ip_ordinal} " <>
+        "transport=#{transport} slice_ms=#{timeout} reason=#{safe_reason}"
+    end)
+  end
+
+  defp address_attempt_timeout(deadline, attempt_count, monotonic_time, last_error) do
+    case remaining_address_list_timeout(deadline, monotonic_time) do
+      {:ok, remaining} ->
+        {:ok, fair_address_attempt_timeout(remaining, attempt_count)}
+
+      {:error, :read_timeout} ->
+        {:error, {:address_list_timeout, address_list_timeout_error(last_error)}}
+    end
+  end
+
+  defp fair_address_attempt_timeout(remaining, attempt_count) do
+    attempt_count = max(attempt_count, 1)
+    fair_share = max(1, div(remaining, attempt_count))
+
+    floor =
+      if remaining >= @minimum_address_attempt_timeout * attempt_count,
+        do: @minimum_address_attempt_timeout,
+        else: 1
+
+    min(remaining, max(floor, fair_share))
+  end
+
+  defp final_address_list_error(:read_timeout), do: {:error, {:read_timeout, :read_timeout}}
+
+  defp final_address_list_error({:read_timeout, reason}) do
+    {:error, {:read_timeout, safe_address_failure_reason(reason)}}
+  end
+
+  defp final_address_list_error(error), do: {:error, error}
+
+  defp address_list_timeout_error(nil), do: :read_timeout
+
+  defp address_list_timeout_error(last_error) do
+    {:read_timeout, safe_address_failure_reason(last_error)}
+  end
+
+  defp safe_address_failure_reason(reason) when is_atom(reason), do: reason
+  defp safe_address_failure_reason({:tcp_resolution_failed, _reason}), do: :tcp_resolution_failed
+  defp safe_address_failure_reason(_reason), do: :connection_failed
+
+  defp address_list_timeout(opts) do
+    case Keyword.fetch(opts, :read_timeout) do
+      {:ok, timeout} when is_integer(timeout) and timeout > 0 ->
+        {:ok, timeout}
+
+      {:ok, _timeout} ->
+        {:error, :invalid_read_timeout}
+
+      :error ->
+        case Keyword.get(opts, :timeout, @default_connection_timeout) do
+          timeout when is_integer(timeout) and timeout > 0 -> {:ok, timeout}
+          _timeout -> {:error, :invalid_timeout}
+        end
+    end
+  end
+
+  defp remaining_address_list_timeout(deadline, monotonic_time) do
+    case deadline - monotonic_time.() do
+      timeout when timeout > 0 -> {:ok, timeout}
+      _timeout -> {:error, :read_timeout}
+    end
+  end
+
+  defp resolve_tcp(host, family, timeout) do
+    try do
+      :inet.getaddrs(:binary.bin_to_list(host), family, timeout)
+    catch
+      _kind, _reason -> {:error, :resolution_failed}
+    end
+  end
+
+  defp safe_resolver_reason(reason) when is_atom(reason), do: reason
+  defp safe_resolver_reason(_reason), do: :resolution_failed
+
+  defp retryable_bus_address_error?(:invalid_timeout), do: false
+  defp retryable_bus_address_error?(:invalid_read_timeout), do: false
+  defp retryable_bus_address_error?(:invalid_write_timeout), do: false
+  defp retryable_bus_address_error?(:invalid_name), do: false
+  defp retryable_bus_address_error?(:invalid_auth_id_fun), do: false
+  defp retryable_bus_address_error?(:auth_id_unavailable), do: false
+  defp retryable_bus_address_error?(:guid_mismatch), do: false
+  defp retryable_bus_address_error?({:read_timeout, _reason}), do: false
+  defp retryable_bus_address_error?({:name_taken, _pid}), do: false
+  defp retryable_bus_address_error?({:name_registered, _pid}), do: false
+  defp retryable_bus_address_error?(_reason), do: true
 
   defp name_collision(pid) do
     if connection_child?(pid),

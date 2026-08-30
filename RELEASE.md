@@ -4,6 +4,15 @@
 
 ### Added
 
+- Parse D-Bus system and session address lists, including percent-escaped
+  `unix:path`, Linux `unix:abstract`, and `tcp` host/port entries. Address
+  selection follows the listed fallback order, tries all IPv6 then IPv4 TCP
+  results when no family is specified (capped at four per family), verifies a
+  valid address `guid` against `AUTH OK`, accepts bounded libdbus-compatible
+  literal values and parameterless unsupported transports, ignores other
+  forward-compatible parameters, and divides one address-selection setup budget
+  fairly between one caller-owned auth-ID lookup, resolver, IP, and
+  later-address attempts.
 - Add the documented `:timeout` and `:name` connection options. `:timeout`
   bounds socket setup and authentication reads, while `:name` registers the
   connection process locally.

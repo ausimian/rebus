@@ -12,6 +12,7 @@ defmodule RebusTest do
   # byte size of 256 for copied GUID and mechanism binaries. This remains far
   # below the 64–270KB source buffers used by the retention regressions.
   @max_copied_referenced_bytes 256
+  @test_bus_guid "30313233343536373839414243444546"
 
   describe "Connections" do
     setup [:server_setup]
@@ -411,6 +412,22 @@ defmodule RebusTest do
 
       refute_receive :malicious_auth_id_fun
       assert :ok = Rebus.close(cli)
+
+      assert {:ok, precomputed_cli} =
+               DynamicSupervisor.start_child(
+                 Rebus.ConnectionSupervisor,
+                 {Connection,
+                  addr: addr,
+                  precomputed_auth_id: "353031",
+                  auth_id_fun: fn _timeout ->
+                    send(parent, :precomputed_auth_id_runner)
+                    {:error, :exit_status}
+                  end}
+               )
+
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      refute_receive :precomputed_auth_id_runner
+      assert Rebus.close(precomputed_cli) in [:ok, {:error, :not_found}]
     end
 
     test "registers the connection under its optional name", %{svr: svr} do
@@ -2303,61 +2320,900 @@ defmodule RebusTest do
   end
 
   describe "Connection address parsing" do
-    test ":system parses unix:path= format" do
-      # Test with a non-existent path to verify parsing works
-      Application.put_env(
-        :rebus,
-        :system_bus_address,
-        "unix:path=/tmp/nonexistent-test-system-bus"
-      )
+    test ":system connects through a configured Unix pathname address" do
+      path = socket_path()
+      {:ok, svr} = start_supervised({Rebus.TestServer, tap: self(), family: :local, path: path})
+      put_system_bus_address("unix:path=#{path},guid=#{@test_bus_guid}")
 
-      # This will fail to connect but tests address parsing
-      result = Rebus.connect(:system)
-
-      # Should get a connection error, not a parsing error
-      assert {:error, reason} = result
-      assert reason != :no_system_bus_address
-
-      # Clean up
-      Application.delete_env(:rebus, :system_bus_address)
+      assert {:ok, _cli} = Rebus.connect(:system)
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
     end
 
     test ":system returns error when address is nil" do
-      # Temporarily set address to nil
-      Application.put_env(:rebus, :system_bus_address, nil)
+      put_system_bus_address(nil)
 
       assert {:error, :no_system_bus_address} = Rebus.connect(:system)
-
-      # Clean up
-      Application.delete_env(:rebus, :system_bus_address)
     end
 
-    test ":session parses unix:path= format" do
-      # Test with a non-existent path to verify parsing works
-      System.put_env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/nonexistent-test-session-bus")
+    test ":session connects through a Unix pathname with a guid suffix" do
+      path = socket_path()
+      {:ok, svr} = start_supervised({Rebus.TestServer, tap: self(), family: :local, path: path})
+      put_session_bus_address("unix:path=#{path},guid=#{@test_bus_guid}")
 
-      # This will fail to connect but tests address parsing
-      result = Rebus.connect(:session)
+      assert {:ok, _cli} = Rebus.connect(:session)
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+    end
 
-      # Should get a connection error, not a parsing error
-      assert {:error, reason} = result
-      assert reason != :no_session_bus_address
+    test ":session ignores caller-supplied address-list setup internals" do
+      parent = self()
+      path = socket_path()
+      {:ok, svr} = start_supervised({Rebus.TestServer, tap: self(), family: :local, path: path})
+      put_session_bus_address("unix:path=#{path}")
 
-      # Clean up
-      System.delete_env("DBUS_SESSION_BUS_ADDRESS")
+      assert {:ok, _cli} =
+               Rebus.connect(:session,
+                 auth_id: "not-an-auth-id",
+                 auth_id_fun: fn _timeout ->
+                   send(parent, :malicious_list_auth_id_fun)
+                   {:error, :exit_status}
+                 end,
+                 address_list_auth_id: "not-an-auth-id",
+                 address_list_setup_timeout: 1,
+                 expected_guid: String.duplicate("f", 32),
+                 precomputed_auth_id: "not-an-auth-id"
+               )
+
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      refute_receive :malicious_list_auth_id_fun
+    end
+
+    test ":session verifies a Unix socket guid without adding it to the socket address" do
+      expected_guid = "ABCDEF0123456789ABCDEF0123456789"
+      path = socket_path()
+
+      {:ok, svr} =
+        start_supervised(
+          {Rebus.TestServer,
+           tap: self(),
+           family: :local,
+           path: path,
+           auth_response: "OK abcdef0123456789abcdef0123456789\r\n"}
+        )
+
+      put_session_bus_address("unix:path=#{path},guid=#{expected_guid}")
+
+      assert {:ok, _cli} = Rebus.connect(:session)
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+    end
+
+    test ":session fails closed on a guid mismatch without logging the configured value" do
+      expected_guid = String.duplicate("f", 32)
+      mismatched_path = socket_path()
+      fallback_path = socket_path()
+
+      {:ok, mismatched} =
+        start_supervised(
+          {Rebus.TestServer,
+           tap: self(), family: :local, path: mismatched_path, notify_auth: true},
+          id: :issue_14_guid_mismatch
+        )
+
+      {:ok, fallback} =
+        start_supervised(
+          {Rebus.TestServer, tap: self(), family: :local, path: fallback_path},
+          id: :issue_14_guid_mismatch_fallback
+        )
+
+      put_session_bus_address(
+        "unix:path=#{mismatched_path},guid=#{expected_guid};unix:path=#{fallback_path}"
+      )
+
+      log =
+        capture_log(fn ->
+          assert {:error, :guid_mismatch} = Rebus.connect(:session)
+        end)
+
+      assert_receive {^mismatched, :auth_received}
+      refute_receive {^fallback, %Message{header_fields: %{member: "Hello"}}}, 100
+      refute log =~ expected_guid
+    end
+
+    test ":session skips a parameterless unsupported transport but rejects known empty forms" do
+      path = socket_path()
+      {:ok, svr} = start_supervised({Rebus.TestServer, tap: self(), family: :local, path: path})
+
+      put_session_bus_address("autolaunch:;unix:path=#{path}")
+
+      assert {:ok, _cli} = Rebus.connect(:session)
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+
+      put_session_bus_address("unix:;unix:path=#{path}")
+      assert {:error, {:invalid_bus_address, :missing_path}} = Rebus.connect(:session)
+
+      put_session_bus_address("unix:guid=#{@test_bus_guid};unix:path=#{path}")
+      assert {:error, {:invalid_bus_address, :missing_path}} = Rebus.connect(:session)
+
+      put_session_bus_address("tcp:family=ipv4;unix:path=#{path}")
+      assert {:error, {:invalid_bus_address, :missing_host}} = Rebus.connect(:session)
+    end
+
+    test ":session connects through a TCP address" do
+      {:ok, svr} = start_supervised({Rebus.TestServer, tap: self()})
+      {:ok, %{port: port}} = TestServer.get_listen_addr(svr)
+      put_session_bus_address("tcp:host=127.0.0.1,port=#{port}")
+
+      assert {:ok, _cli} = Rebus.connect(:session)
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+    end
+
+    test ":session falls back to the next supported address in order" do
+      {:ok, svr} = start_supervised({Rebus.TestServer, tap: self()})
+      {:ok, %{port: port}} = TestServer.get_listen_addr(svr)
+
+      put_session_bus_address(
+        "nonce-tcp:noncefile=/tmp/nonce;unix:path=/definitely/not/a/bus;tcp:host=127.0.0.1,port=#{port}"
+      )
+
+      assert {:ok, _cli} = Rebus.connect(:session)
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+    end
+
+    test ":session falls back from unimplemented Unix forms" do
+      path = socket_path()
+      {:ok, svr} = start_supervised({Rebus.TestServer, tap: self(), family: :local, path: path})
+
+      put_session_bus_address(
+        "unix:runtime=/run/user/1000;unix:tmpdir=/tmp;unix:dir=/tmp;unix:path=#{path}"
+      )
+
+      assert {:ok, _cli} = Rebus.connect(:session)
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+    end
+
+    test ":session ignores a forward-compatible Unix parameter" do
+      path = socket_path()
+      {:ok, svr} = start_supervised({Rebus.TestServer, tap: self(), family: :local, path: path})
+      put_session_bus_address("unix:path=#{path},future=option")
+
+      assert {:ok, _cli} = Rebus.connect(:session)
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+    end
+
+    test ":session falls back after a TCP connection failure" do
+      path = socket_path()
+      {:ok, svr} = start_supervised({Rebus.TestServer, tap: self(), family: :local, path: path})
+      put_session_bus_address("tcp:host=127.0.0.1,port=1;unix:path=#{path}")
+
+      assert {:ok, _cli} = Rebus.connect(:session)
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+    end
+
+    test ":session returns the final supported connection failure" do
+      put_session_bus_address("unix:path=/definitely/not/a/bus;nonce-tcp:noncefile=/tmp/nonce")
+
+      assert {:error, :enoent} = Rebus.connect(:session)
+    end
+
+    test ":session does not fall back for invalid connection options" do
+      put_session_bus_address("unix:path=/definitely/not/a/bus;unix:path=/also/not/a/bus")
+
+      assert {:error, :invalid_timeout} = Rebus.connect(:session, timeout: 0)
+    end
+
+    if :os.type() == {:unix, :linux} do
+      test ":session connects through a Unix abstract address" do
+        assert :os.type() == {:unix, :linux}
+        abstract = "rebus_#{System.unique_integer([:positive])}"
+        path = <<0, abstract::binary>>
+        {:ok, svr} = start_supervised({Rebus.TestServer, tap: self(), family: :local, path: path})
+        put_session_bus_address("unix:abstract=#{abstract},guid=#{@test_bus_guid}")
+
+        assert {:ok, _cli} = Rebus.connect(:session)
+        assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      end
+
+      test ":session connects through an IPv6 TCP address" do
+        assert :os.type() == {:unix, :linux}
+        {:ok, svr} = start_supervised({Rebus.TestServer, tap: self(), family: :inet6})
+        {:ok, %{port: port}} = TestServer.get_listen_addr(svr)
+        put_session_bus_address("tcp:host=%3A%3A1,port=#{port},family=ipv6")
+
+        assert {:ok, _cli} = Rebus.connect(:session)
+        assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      end
+    end
+
+    test ":session returns bounded errors without logging the address payload" do
+      sentinel = "session-address-payload-sentinel"
+      put_session_bus_address("unix:path=/tmp/%00#{sentinel}")
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:invalid_bus_address, :nul_byte}} = Rebus.connect(:session)
+        end)
+
+      refute log =~ sentinel
+    end
+
+    test ":session returns an unsupported transport error when none are supported" do
+      put_session_bus_address("unix:runtime=/run/user/1000,tmpdir=/tmp,dir=/tmp")
+
+      assert {:error, :unsupported_bus_transport} = Rebus.connect(:session)
+    end
+
+    test ":session keeps malformed entries fatal even with a valid fallback" do
+      put_session_bus_address("unix:path=/tmp/%;unix:path=/definitely/not/a/bus")
+
+      assert {:error, {:invalid_bus_address, :invalid_escape}} = Rebus.connect(:session)
+    end
+
+    test ":session does not log a valid percent-escaped socket path" do
+      sentinel = "session-address-log-sentinel"
+
+      escaped_sentinel =
+        sentinel
+        |> :binary.bin_to_list()
+        |> Enum.map_join(fn byte -> "%#{Integer.to_string(byte, 16)}" end)
+
+      put_session_bus_address("unix:path=/tmp/rebus-%0A#{escaped_sentinel}")
+
+      log =
+        capture_log([level: :debug], fn ->
+          assert {:error, :enoent} = Rebus.connect(:session)
+        end)
+
+      assert log =~ "D-Bus address attempt candidate=1 ip=0 transport=unix"
+      assert log =~ "reason=enoent"
+      refute log =~ sentinel
+      refute log =~ "%0A"
+    end
+
+    test ":system returns a bounded error for a non-binary configured address" do
+      put_system_bus_address(:not_an_address)
+
+      assert {:error, {:invalid_bus_address, :not_binary}} = Rebus.connect(:system)
     end
 
     test ":session returns error when DBUS_SESSION_BUS_ADDRESS is not set" do
-      # Ensure the environment variable is not set
-      original_value = System.get_env("DBUS_SESSION_BUS_ADDRESS")
-      System.delete_env("DBUS_SESSION_BUS_ADDRESS")
+      put_session_bus_address(nil)
 
       assert {:error, :no_session_bus_address} = Rebus.connect(:session)
+    end
 
-      # Restore original value if it existed
-      if original_value do
-        System.put_env("DBUS_SESSION_BUS_ADDRESS", original_value)
+    test ":session cleans up a named child when its list setup budget expires" do
+      name = :rebus_issue_14_address_list_deadline
+
+      {:ok, first} =
+        start_supervised(
+          {Rebus.TestServer, tap: self(), silent_auth: true},
+          id: :issue_14_first_silent_server
+        )
+
+      {:ok, second} =
+        start_supervised(
+          {Rebus.TestServer, tap: self(), silent_auth: true},
+          id: :issue_14_second_silent_server
+        )
+
+      {:ok, %{port: first_port}} = TestServer.get_listen_addr(first)
+      {:ok, %{port: second_port}} = TestServer.get_listen_addr(second)
+
+      put_session_bus_address(
+        "tcp:host=127.0.0.1,port=#{first_port};tcp:host=127.0.0.1,port=#{second_port}"
+      )
+
+      started_at = System.monotonic_time(:millisecond)
+
+      assert {:error, {:read_timeout, :read_timeout}} =
+               Rebus.connect(:session, timeout: 400, name: name)
+
+      assert System.monotonic_time(:millisecond) - started_at < 800
+      assert_receive {^first, :auth_received}, 1_000
+      assert_receive {^second, :auth_received}, 1_000
+      assert Process.whereis(name) == nil
+    end
+
+    test "tries all TCP results before the next D-Bus address in stable order" do
+      parent = self()
+
+      resolver = fn _host, family, timeout ->
+        send(parent, {:resolved, family, timeout})
+
+        case family do
+          :inet6 -> {:ok, [{0, 0, 0, 0, 0, 0, 0, 1}]}
+          :inet -> {:ok, [{127, 0, 0, 1}, {127, 0, 0, 1}, {127, 0, 0, 2}]}
+        end
       end
+
+      connector = fn address, opts ->
+        send(parent, {:connected, address, Keyword.fetch!(opts, :address_list_setup_timeout)})
+        {:error, :econnrefused}
+      end
+
+      candidates = [
+        {:tcp, "example", 12_345, :unspec, nil},
+        {:local, "/tmp/fallback", nil}
+      ]
+
+      assert {:error, :econnrefused} =
+               Rebus.connect_address_candidates(candidates, [timeout: 100],
+                 resolver: resolver,
+                 connector: connector
+               )
+
+      assert_receive {:resolved, :inet6, timeout6}
+      assert timeout6 in 1..100
+      assert_receive {:resolved, :inet, timeout4}
+      assert timeout4 in 1..100
+      assert_receive {:connected, %{family: :inet6, addr: {0, 0, 0, 0, 0, 0, 0, 1}}, _}
+      assert_receive {:connected, %{family: :inet, addr: {127, 0, 0, 1}}, _}
+      assert_receive {:connected, %{family: :inet, addr: {127, 0, 0, 1}}, _}
+      assert_receive {:connected, %{family: :inet, addr: {127, 0, 0, 2}}, _}
+      assert_receive {:connected, %{family: :local, path: "/tmp/fallback"}, _}
+    end
+
+    test "caps resolver results per family without changing their order or duplicates" do
+      parent = self()
+      Process.put(:bus_address_cap_clock, 0)
+
+      monotonic_time = fn -> Process.get(:bus_address_cap_clock) end
+
+      ipv6 = [
+        {0, 0, 0, 0, 0, 0, 0, 1},
+        {0, 0, 0, 0, 0, 0, 0, 1},
+        {0, 0, 0, 0, 0, 0, 0, 2},
+        {0, 0, 0, 0, 0, 0, 0, 3}
+        | List.duplicate({0, 0, 0, 0, 0, 0, 0, 4}, 196)
+      ]
+
+      ipv4 = [
+        {127, 0, 0, 1},
+        {127, 0, 0, 1},
+        {127, 0, 0, 2},
+        {127, 0, 0, 3}
+        | List.duplicate({127, 0, 0, 4}, 196)
+      ]
+
+      resolver = fn _host, family, timeout ->
+        send(parent, {:resolved, family, timeout})
+        {:ok, if(family == :inet6, do: ipv6, else: ipv4)}
+      end
+
+      connector = fn address, opts ->
+        send(parent, {:attempted, address, Keyword.fetch!(opts, :address_list_setup_timeout)})
+        {:error, :econnrefused}
+      end
+
+      assert {:error, :econnrefused} =
+               Rebus.connect_address_candidates(
+                 [{:tcp, "example", 12_345, :unspec, nil}],
+                 [timeout: 5_000],
+                 resolver: resolver,
+                 connector: connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
+                 monotonic_time: monotonic_time
+               )
+
+      assert_receive {:resolved, :inet6, _}
+      assert_receive {:resolved, :inet, _}
+
+      for {family, address} <- [
+            {:inet6, {0, 0, 0, 0, 0, 0, 0, 1}},
+            {:inet6, {0, 0, 0, 0, 0, 0, 0, 1}},
+            {:inet6, {0, 0, 0, 0, 0, 0, 0, 2}},
+            {:inet6, {0, 0, 0, 0, 0, 0, 0, 3}},
+            {:inet, {127, 0, 0, 1}},
+            {:inet, {127, 0, 0, 1}},
+            {:inet, {127, 0, 0, 2}},
+            {:inet, {127, 0, 0, 3}}
+          ] do
+        assert_receive {:attempted, %{family: ^family, addr: ^address}, timeout}
+        assert timeout >= 50
+      end
+
+      refute_receive {:attempted, _, _}
+    end
+
+    test "resolves the auth ID once in the caller before all address attempts" do
+      parent = self()
+
+      resolver = fn _host, :inet, _timeout ->
+        {:ok, [{127, 0, 0, 1}, {127, 0, 0, 1}, {127, 0, 0, 2}, {127, 0, 0, 3}]}
+      end
+
+      connector = fn address, opts ->
+        send(
+          parent,
+          {:attempted, address, Keyword.fetch!(opts, :address_list_auth_id)}
+        )
+
+        if address.family == :local, do: {:ok, self()}, else: {:error, :econnrefused}
+      end
+
+      auth_id_runner = fn timeout ->
+        send(parent, {:auth_id, self(), timeout})
+        {:ok, "501\n"}
+      end
+
+      assert {:ok, _pid} =
+               Rebus.connect_address_candidates(
+                 [
+                   {:tcp, "example", 12_345, :inet, nil},
+                   {:local, "/tmp/fallback", nil}
+                 ],
+                 [timeout: 1_000],
+                 resolver: resolver,
+                 connector: connector,
+                 auth_id_runner: auth_id_runner
+               )
+
+      assert_receive {:auth_id, auth_id_owner, auth_timeout}
+      assert auth_id_owner == self()
+      assert auth_timeout in 1..1_000
+
+      for address <- [
+            %{family: :inet, addr: {127, 0, 0, 1}, port: 12_345},
+            %{family: :inet, addr: {127, 0, 0, 1}, port: 12_345},
+            %{family: :inet, addr: {127, 0, 0, 2}, port: 12_345},
+            %{family: :inet, addr: {127, 0, 0, 3}, port: 12_345},
+            %{family: :local, path: "/tmp/fallback"}
+          ] do
+        assert_receive {:attempted, ^address, "353031"}
+      end
+
+      refute_receive {:auth_id, _, _}
+    end
+
+    test "stops before candidate setup when the list auth ID is unavailable" do
+      parent = self()
+
+      connector = fn address, _opts ->
+        send(parent, {:attempted, address})
+        {:ok, self()}
+      end
+
+      assert {:error, :auth_id_unavailable} =
+               Rebus.connect_address_candidates(
+                 [{:local, "/tmp/never-attempted", nil}],
+                 [timeout: 100],
+                 connector: connector,
+                 auth_id_runner: fn _timeout -> {:error, :exit_status} end
+               )
+
+      refute_receive {:attempted, _}
+    end
+
+    test "owns the list auth-ID port in the calling process" do
+      parent = self()
+      executable = System.find_executable("cat")
+      assert is_binary(executable)
+
+      task =
+        Task.async(fn ->
+          Rebus.connect_address_candidates(
+            [{:local, "/tmp/never-attempted", nil}],
+            [timeout: 5_000],
+            connector: fn _address, _opts -> {:ok, self()} end,
+            auth_id_runner: fn _timeout ->
+              port = Port.open({:spawn_executable, String.to_charlist(executable)}, [:binary])
+              send(parent, {:auth_id_port, self(), port})
+
+              receive do
+                :continue -> {:ok, "501\n"}
+              end
+            end
+          )
+        end)
+
+      assert_receive {:auth_id_port, owner, port}, 1_000
+      assert owner == task.pid
+      assert Port.info(port) != nil
+
+      _ = Task.shutdown(task, :brutal_kill)
+      assert wait_until(fn -> Port.info(port) == nil end)
+    end
+
+    test "counts auth lookup and candidate slices against one aggregate deadline" do
+      parent = self()
+      Process.put(:bus_address_auth_budget_clock, 0)
+
+      monotonic_time = fn -> Process.get(:bus_address_auth_budget_clock) end
+
+      auth_id_runner = fn timeout ->
+        send(parent, {:auth_slice, timeout})
+
+        Process.put(
+          :bus_address_auth_budget_clock,
+          Process.get(:bus_address_auth_budget_clock) + timeout
+        )
+
+        {:ok, "501\n"}
+      end
+
+      connector = fn address, opts ->
+        timeout = Keyword.fetch!(opts, :address_list_setup_timeout)
+        send(parent, {:candidate_slice, address.path, timeout})
+
+        Process.put(
+          :bus_address_auth_budget_clock,
+          Process.get(:bus_address_auth_budget_clock) + timeout
+        )
+
+        if address.path == "/tmp/second", do: {:ok, self()}, else: {:error, :read_timeout}
+      end
+
+      assert {:ok, _pid} =
+               Rebus.connect_address_candidates(
+                 [{:local, "/tmp/first", nil}, {:local, "/tmp/second", nil}],
+                 [timeout: 60],
+                 connector: connector,
+                 auth_id_runner: auth_id_runner,
+                 monotonic_time: monotonic_time
+               )
+
+      assert_receive {:auth_slice, 20}
+      assert_receive {:candidate_slice, "/tmp/first", 20}
+      assert_receive {:candidate_slice, "/tmp/second", 20}
+      assert Process.get(:bus_address_auth_budget_clock) <= 60
+    end
+
+    test "keeps tiny aggregate budgets positive and bounded" do
+      parent = self()
+      Process.put(:bus_address_tiny_budget_clock, 0)
+
+      monotonic_time = fn -> Process.get(:bus_address_tiny_budget_clock) end
+
+      auth_id_runner = fn timeout ->
+        send(parent, {:tiny_auth_slice, timeout})
+
+        Process.put(
+          :bus_address_tiny_budget_clock,
+          Process.get(:bus_address_tiny_budget_clock) + timeout
+        )
+
+        {:ok, "501\n"}
+      end
+
+      connector = fn address, opts ->
+        timeout = Keyword.fetch!(opts, :address_list_setup_timeout)
+        send(parent, {:tiny_candidate_slice, address.path, timeout})
+        {:ok, self()}
+      end
+
+      assert {:ok, _pid} =
+               Rebus.connect_address_candidates(
+                 [{:local, "/tmp/one", nil}],
+                 [timeout: 5],
+                 connector: connector,
+                 auth_id_runner: auth_id_runner,
+                 monotonic_time: monotonic_time
+               )
+
+      assert_receive {:tiny_auth_slice, auth_timeout}
+      assert auth_timeout > 0
+      assert_receive {:tiny_candidate_slice, "/tmp/one", candidate_timeout}
+      assert candidate_timeout > 0
+      assert Process.get(:bus_address_tiny_budget_clock) <= 5
+    end
+
+    test "gives a stalled IPv6 result only its fair slice before trying IPv4" do
+      parent = self()
+      Process.put(:bus_address_slice_clock, 0)
+
+      monotonic_time = fn -> Process.get(:bus_address_slice_clock) end
+
+      resolver = fn _host, family, timeout ->
+        send(parent, {:resolved, family, timeout})
+
+        case family do
+          :inet6 -> {:ok, [{0, 0, 0, 0, 0, 0, 0, 1}]}
+          :inet -> {:ok, [{127, 0, 0, 1}]}
+        end
+      end
+
+      connector = fn address, opts ->
+        timeout = Keyword.fetch!(opts, :address_list_setup_timeout)
+        send(parent, {:attempted, address, timeout})
+
+        case address.family do
+          :inet6 ->
+            Process.put(:bus_address_slice_clock, Process.get(:bus_address_slice_clock) + timeout)
+            {:error, :read_timeout}
+
+          :inet ->
+            {:ok, self()}
+        end
+      end
+
+      assert {:ok, _pid} =
+               Rebus.connect_address_candidates(
+                 [
+                   {:tcp, "example", 12_345, :unspec, nil},
+                   {:local, "/tmp/fallback", nil}
+                 ],
+                 [timeout: 90],
+                 resolver: resolver,
+                 connector: connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
+                 monotonic_time: monotonic_time
+               )
+
+      assert_receive {:resolved, :inet6, 30}
+      assert_receive {:resolved, :inet, 45}
+      assert_receive {:attempted, %{family: :inet6}, 30}
+      assert_receive {:attempted, %{family: :inet}, 30}
+      refute_receive {:attempted, %{family: :local}, _}
+      assert Process.get(:bus_address_slice_clock) <= 90
+    end
+
+    test "gives a stalled Unix candidate a slice before a later entry" do
+      parent = self()
+      Process.put(:bus_address_later_candidate_clock, 0)
+
+      monotonic_time = fn -> Process.get(:bus_address_later_candidate_clock) end
+
+      connector = fn address, opts ->
+        timeout = Keyword.fetch!(opts, :address_list_setup_timeout)
+        send(parent, {:attempted, address, timeout})
+
+        case address.path do
+          "/tmp/first" ->
+            Process.put(
+              :bus_address_later_candidate_clock,
+              Process.get(:bus_address_later_candidate_clock) + timeout
+            )
+
+            {:error, :read_timeout}
+
+          "/tmp/second" ->
+            {:ok, self()}
+        end
+      end
+
+      assert {:ok, _pid} =
+               Rebus.connect_address_candidates(
+                 [{:local, "/tmp/first", nil}, {:local, "/tmp/second", nil}],
+                 [timeout: 90],
+                 connector: connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
+                 monotonic_time: monotonic_time
+               )
+
+      assert_receive {:attempted, %{path: "/tmp/first"}, 45}
+      assert_receive {:attempted, %{path: "/tmp/second"}, 45}
+      assert Process.get(:bus_address_later_candidate_clock) <= 90
+    end
+
+    test "stops TCP IP fallback immediately on a guid mismatch" do
+      parent = self()
+      expected_guid = String.duplicate("a", 32)
+
+      resolver = fn _host, :inet, _timeout ->
+        {:ok, [{127, 0, 0, 1}, {127, 0, 0, 2}]}
+      end
+
+      connector = fn address, opts ->
+        send(parent, {:attempted, address, Keyword.fetch!(opts, :expected_guid)})
+        {:error, :guid_mismatch}
+      end
+
+      assert {:error, :guid_mismatch} =
+               Rebus.connect_address_candidates(
+                 [{:tcp, "example", 12_345, :inet, expected_guid}],
+                 [timeout: 100],
+                 resolver: resolver,
+                 connector: connector
+               )
+
+      assert_receive {:attempted, %{family: :inet, addr: {127, 0, 0, 1}}, ^expected_guid}
+      refute_receive {:attempted, %{family: :inet, addr: {127, 0, 0, 2}}, _}
+    end
+
+    test "keeps the safe last error when the TCP IP loop reaches its deadline" do
+      parent = self()
+      Process.put(:bus_address_ip_deadline_clock, 0)
+
+      monotonic_time = fn -> Process.get(:bus_address_ip_deadline_clock) end
+
+      resolver = fn _host, :inet, _timeout ->
+        {:ok, [{127, 0, 0, 1}, {127, 0, 0, 2}]}
+      end
+
+      connector = fn address, opts ->
+        timeout = Keyword.fetch!(opts, :address_list_setup_timeout)
+        send(parent, {:attempted, address, timeout})
+
+        Process.put(
+          :bus_address_ip_deadline_clock,
+          Process.get(:bus_address_ip_deadline_clock) + timeout * 2 + 1
+        )
+
+        {:error, :econnrefused}
+      end
+
+      assert {:error, {:read_timeout, :econnrefused}} =
+               Rebus.connect_address_candidates(
+                 [{:tcp, "example", 12_345, :inet, nil}],
+                 [timeout: 50],
+                 resolver: resolver,
+                 connector: connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
+                 monotonic_time: monotonic_time
+               )
+
+      assert_receive {:attempted, %{addr: {127, 0, 0, 1}}, 25}
+      refute_receive {:attempted, %{addr: {127, 0, 0, 2}}, _}
+    end
+
+    test "honours explicit TCP family filters and skips empty resolutions" do
+      parent = self()
+
+      resolver = fn _host, family, _timeout ->
+        send(parent, {:resolved, family})
+        {:ok, []}
+      end
+
+      connector = fn address, _opts ->
+        send(parent, {:connected, address})
+        {:ok, self()}
+      end
+
+      assert {:ok, _pid} =
+               Rebus.connect_address_candidates(
+                 [
+                   {:tcp, "example", 12_345, :inet, nil},
+                   {:local, "/tmp/fallback", nil}
+                 ],
+                 [timeout: 100],
+                 resolver: resolver,
+                 connector: connector
+               )
+
+      assert_receive {:resolved, :inet}
+      refute_receive {:resolved, :inet6}
+      assert_receive {:connected, %{family: :local, path: "/tmp/fallback"}}
+    end
+
+    test "returns a safe TCP resolver reason without retaining the host" do
+      sentinel = "resolver-host-sentinel"
+
+      resolver = fn _host, family, _timeout ->
+        case family do
+          :inet6 -> {:error, :eafnosupport}
+          :inet -> {:error, :nxdomain}
+        end
+      end
+
+      assert {:error, {:tcp_resolution_failed, :nxdomain}} =
+               Rebus.connect_address_candidates(
+                 [{:tcp, sentinel, 12_345, :unspec, nil}],
+                 [timeout: 100],
+                 resolver: resolver
+               )
+    end
+
+    test "does not invoke a resolver after the aggregate deadline expires" do
+      parent = self()
+      Process.put(:bus_address_resolver_clock, 0)
+
+      monotonic_time = fn -> Process.get(:bus_address_resolver_clock) end
+
+      resolver = fn _host, family, timeout ->
+        send(parent, {:resolved, family, timeout})
+        Process.put(:bus_address_resolver_clock, 10)
+        {:error, {:untrusted, "resolver-payload-sentinel"}}
+      end
+
+      assert {:error, {:read_timeout, :tcp_resolution_failed}} =
+               Rebus.connect_address_candidates(
+                 [{:tcp, "example", 12_345, :unspec, nil}],
+                 [timeout: 5],
+                 resolver: resolver,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
+                 monotonic_time: monotonic_time
+               )
+
+      assert_receive {:resolved, :inet6, 2}
+      refute_receive {:resolved, :inet, _}
+    end
+
+    test "returns a bare aggregate timeout before any address attempt" do
+      parent = self()
+      Process.put(:bus_address_initial_deadline_clock, [0, 5])
+
+      monotonic_time = fn ->
+        [now | remaining] = Process.get(:bus_address_initial_deadline_clock)
+        Process.put(:bus_address_initial_deadline_clock, remaining)
+        now
+      end
+
+      connector = fn address, _opts ->
+        send(parent, {:attempted, address})
+        {:ok, self()}
+      end
+
+      assert {:error, :read_timeout} =
+               Rebus.connect_address_candidates(
+                 [{:local, "/tmp/never-attempted", nil}],
+                 [timeout: 5],
+                 connector: connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
+                 monotonic_time: monotonic_time
+               )
+
+      refute_receive {:attempted, _}
+    end
+
+    test "redacts non-atom failures from an aggregate timeout diagnostic" do
+      sentinel = "deadline-last-error-sentinel"
+      Process.put(:bus_address_safe_deadline_clock, 0)
+
+      monotonic_time = fn -> Process.get(:bus_address_safe_deadline_clock) end
+
+      connector = fn _address, _opts ->
+        Process.put(:bus_address_safe_deadline_clock, 10)
+        {:error, {:untrusted, sentinel}}
+      end
+
+      assert {:error, {:read_timeout, :connection_failed}} =
+               Rebus.connect_address_candidates(
+                 [{:local, "/tmp/one", nil}, {:local, "/tmp/two", nil}],
+                 [timeout: 5],
+                 connector: connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
+                 monotonic_time: monotonic_time
+               )
+    end
+
+    test "rejects an invalid internal address-list implementation seam" do
+      assert {:error, :invalid_bus_address_implementation} =
+               Rebus.connect_address_candidates([], [timeout: 100], resolver: :not_a_function)
+    end
+
+    test "shares one setup budget across list attempts and aborts global failures" do
+      parent = self()
+      Process.put(:bus_address_clock, 0)
+
+      monotonic_time = fn -> Process.get(:bus_address_clock) end
+
+      connector = fn address, opts ->
+        send(parent, {:attempted, address, Keyword.fetch!(opts, :address_list_setup_timeout)})
+        Process.put(:bus_address_clock, Process.get(:bus_address_clock) + 40)
+        {:error, :econnrefused}
+      end
+
+      assert {:error, {:read_timeout, :econnrefused}} =
+               Rebus.connect_address_candidates(
+                 [
+                   {:local, "/tmp/one", nil},
+                   {:local, "/tmp/two", nil},
+                   {:local, "/tmp/three", nil}
+                 ],
+                 [timeout: 50],
+                 connector: connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
+                 monotonic_time: monotonic_time
+               )
+
+      assert_receive {:attempted, %{path: "/tmp/one"}, 16}
+      assert_receive {:attempted, %{path: "/tmp/two"}, 5}
+      refute_receive {:attempted, %{path: "/tmp/three"}, _}
+
+      aborting_connector = fn address, _opts ->
+        send(parent, {:aborted, address})
+        {:error, :auth_id_unavailable}
+      end
+
+      assert {:error, :auth_id_unavailable} =
+               Rebus.connect_address_candidates(
+                 [{:local, "/tmp/one", nil}, {:local, "/tmp/two", nil}],
+                 [timeout: 50],
+                 connector: aborting_connector,
+                 monotonic_time: monotonic_time
+               )
+
+      assert_receive {:aborted, %{path: "/tmp/one"}}
+      refute_receive {:aborted, %{path: "/tmp/two"}}
     end
   end
 
@@ -3317,5 +4173,36 @@ defmodule RebusTest do
 
   defp socket_path do
     "/tmp/rebus_test_#{System.os_time(:nanosecond)}_#{:erlang.unique_integer([:positive])}.sock"
+  end
+
+  defp put_system_bus_address(address) do
+    previous = Application.fetch_env(:rebus, :system_bus_address)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, value} -> Application.put_env(:rebus, :system_bus_address, value)
+        :error -> Application.delete_env(:rebus, :system_bus_address)
+      end
+    end)
+
+    Application.put_env(:rebus, :system_bus_address, address)
+  end
+
+  defp put_session_bus_address(address) do
+    previous = System.get_env("DBUS_SESSION_BUS_ADDRESS")
+
+    on_exit(fn ->
+      if is_nil(previous) do
+        System.delete_env("DBUS_SESSION_BUS_ADDRESS")
+      else
+        System.put_env("DBUS_SESSION_BUS_ADDRESS", previous)
+      end
+    end)
+
+    if is_nil(address) do
+      System.delete_env("DBUS_SESSION_BUS_ADDRESS")
+    else
+      System.put_env("DBUS_SESSION_BUS_ADDRESS", address)
+    end
   end
 end
