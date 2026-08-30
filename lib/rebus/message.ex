@@ -34,6 +34,19 @@ defmodule Rebus.Message do
 
   Note: The signature is stored in `header_fields[:signature]` and can be accessed using `Rebus.Message.signature/1`.
 
+  ## Unix file descriptors
+
+  The `unix_fds` struct field is separate from the `:unix_fds` header count.
+  Construct outbound messages with `fds: [fd, ...]`; `h` body values are their
+  zero-based wire indexes. Outbound descriptors are borrowed and are never
+  closed by Rebus. Inbound descriptors appear in `message.unix_fds` only on a
+  successfully delivered live call reply and are then owned by that receiving
+  process, which must close each one exactly once with `Rebus.UnixFD.close/1`
+  or adopt it using a suitable OTP/OS API. Rebus retains inbound descriptors
+  until the public `Rebus.call/3` delivery is acknowledged internally, so a
+  caller timeout, cancellation, caller death, or connection teardown closes
+  them instead. Signals and orphaned replies do not transfer descriptors.
+
   ## Message Flags
 
   - `:no_reply_expected` - Don't expect a reply
@@ -83,6 +96,7 @@ defmodule Rebus.Message do
   @max_message_size 134_217_728
   @max_array_size 67_108_864
   @max_scalar_elements 1_000_000
+  @max_unix_fds 16
 
   @typedoc "Message type"
   @type message_type :: :method_call | :method_return | :error | :signal
@@ -102,13 +116,21 @@ defmodule Rebus.Message do
           | :signature
           | :unix_fds
 
-  @type construction_error :: String.t() | :invalid_body | :message_too_large | :resource_limit
+  @type construction_error ::
+          String.t()
+          | :invalid_body
+          | :invalid_unix_fds
+          | :message_too_large
+          | :resource_limit
+          | :unix_fd_limit
   @type encoding_error ::
           :invalid_body
           | :invalid_header_fields
           | :invalid_message
+          | :invalid_unix_fds
           | :message_too_large
           | :resource_limit
+          | :unix_fd_limit
 
   typedstruct enforce: true do
     @typedoc "D-Bus message structure"
@@ -119,6 +141,7 @@ defmodule Rebus.Message do
     field :serial, non_neg_integer()
     field :header_fields, %{optional(header_field()) => term()}
     field :body, [term()]
+    field :unix_fds, [Rebus.UnixFD.t()], default: []
   end
 
   # Message type constants
@@ -204,6 +227,15 @@ defmodule Rebus.Message do
   @spec max_scalar_elements() :: pos_integer()
   def max_scalar_elements, do: @max_scalar_elements
 
+  @doc """
+  The maximum number of Unix file descriptors accepted in one message.
+
+  This local bound applies to the D-Bus header count and the ancillary-data
+  control buffer. It is deliberately lower than operating-system limits.
+  """
+  @spec max_unix_fds() :: pos_integer()
+  def max_unix_fds, do: @max_unix_fds
+
   @doc false
   @spec validate_encoded_size(non_neg_integer(), non_neg_integer()) ::
           :ok | {:error, :message_too_large}
@@ -238,6 +270,8 @@ defmodule Rebus.Message do
     - `:body` - Message body as list of values (default: `[]`)
     - `:signature` - Message body signature (default: auto-generated from body;
       `:infinity`, `:negative_infinity`, and `:nan` infer `d`)
+    - `:fds` - Borrowed Unix file descriptors. Each `h` value in the body is
+      an index into this list. Rebus never closes outbound descriptors.
     - Header fields like `:path`, `:interface`, `:member`, etc.
 
   ## Note
@@ -273,17 +307,20 @@ defmodule Rebus.Message do
          {:ok, body} <- validate_body(Keyword.get(opts, :body, [])),
          {:ok, signature} <- get_or_generate_signature(opts, body),
          :ok <- validate_signature_format(signature),
+         {:ok, unix_fds} <- extract_unix_fds(opts),
          {:ok, header_fields} <- extract_header_fields(opts),
          {:ok, validated_fields} <- validate_header_fields(header_fields),
          :ok <- validate_required_fields(validated_type, header_fields),
-         {:ok, body_length} <- calculate_body_length(body, signature) do
+         {:ok, body_length} <- calculate_body_length(body, signature),
+         :ok <- validate_unix_fd_indices(signature, body, unix_fds) do
       # Add signature to header_fields if body is present
       validated_fields =
         if signature != "",
           do: Map.put(validated_fields, :signature, signature),
           else: validated_fields
 
-      with {:ok, header_fields_data} <- encode_header_fields(validated_fields, :little),
+      with {:ok, validated_fields} <- put_unix_fd_count(validated_fields, unix_fds),
+           {:ok, header_fields_data} <- encode_header_fields(validated_fields, :little),
            :ok <- validate_encoded_size(IO.iodata_length(header_fields_data), body_length) do
         {:ok,
          %__MODULE__{
@@ -293,7 +330,8 @@ defmodule Rebus.Message do
            body_length: body_length,
            serial: 1,
            header_fields: validated_fields,
-           body: body
+           body: body,
+           unix_fds: unix_fds
          }}
       end
     else
@@ -321,6 +359,12 @@ defmodule Rebus.Message do
       {:error, :resource_limit} ->
         raise ArgumentError,
               "message exceeds a local resource limit (fixed-width scalar arrays allow at most #{max_scalar_elements()} elements per encode)"
+
+      {:error, :unix_fd_limit} ->
+        raise ArgumentError, "message exceeds the Unix file descriptor limit"
+
+      {:error, :invalid_unix_fds} ->
+        raise ArgumentError, "Unix file descriptors do not match the message body"
 
       {:error, reason} when is_binary(reason) ->
         raise ArgumentError, reason
@@ -362,6 +406,7 @@ defmodule Rebus.Message do
          {:ok, header_fields_encoded} <- encode_header_fields(message.header_fields, endianness),
          {:ok, body_data} <-
            encode_body(message.body, Map.get(message.header_fields, :signature, ""), endianness),
+         :ok <- validate_unix_fds(message),
          :ok <-
            validate_encoded_size(
              IO.iodata_length(header_fields_encoded),
@@ -644,7 +689,8 @@ defmodule Rebus.Message do
          :ok <- validate_header_field_types(message.header_fields),
          :ok <- validate_required_fields(message.type, message.header_fields),
          :ok <- validate_signature_format(signature),
-         :ok <- validate_body_signature(message.body, signature) do
+         :ok <- validate_body_signature(message.body, signature),
+         :ok <- validate_unix_fds(message) do
       :ok
     end
   end
@@ -691,6 +737,28 @@ defmodule Rebus.Message do
   def signature(%__MODULE__{} = message) do
     Map.get(message.header_fields, :signature, "")
   end
+
+  @doc """
+  Attaches Unix descriptors received as ancillary data to a decoded message.
+
+  This is the boundary between `h` values on the wire (untrusted indexes) and
+  actual process-owned descriptors. The header count, local descriptor bound,
+  and every index in the decoded body must agree before a descriptor is made
+  visible to an application. `fds` must be closed by the caller if this
+  function returns an error.
+  """
+  @spec attach_unix_fds(t(), [Rebus.UnixFD.t()]) ::
+          {:ok, t()} | {:error, :invalid_unix_fds | :unix_fd_limit}
+  def attach_unix_fds(%__MODULE__{} = message, fds) when is_list(fds) do
+    message = %{message | unix_fds: fds}
+
+    case validate_unix_fds(message) do
+      :ok -> {:ok, message}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def attach_unix_fds(_message, _fds), do: {:error, :invalid_unix_fds}
 
   # Private helper functions
 
@@ -773,6 +841,123 @@ defmodule Rebus.Message do
 
     {:ok, fields}
   end
+
+  defp extract_unix_fds(opts) do
+    case Keyword.get(opts, :fds, []) do
+      fds when is_list(fds) -> validate_unix_fd_list(fds)
+      _fds -> {:error, :invalid_unix_fds}
+    end
+  end
+
+  defp put_unix_fd_count(header_fields, fds) do
+    count = length(fds)
+
+    case Map.fetch(header_fields, :unix_fds) do
+      :error when count == 0 -> {:ok, header_fields}
+      :error -> {:ok, Map.put(header_fields, :unix_fds, count)}
+      {:ok, ^count} -> {:ok, header_fields}
+      {:ok, _count} -> {:error, :invalid_unix_fds}
+    end
+  end
+
+  defp validate_unix_fds(%__MODULE__{header_fields: header_fields, unix_fds: fds} = message)
+       when is_map(header_fields) and is_list(fds) do
+    with {:ok, fds} <- validate_unix_fd_list(fds),
+         count <- length(fds),
+         ^count <- Map.get(header_fields, :unix_fds, 0),
+         :ok <- validate_unix_fd_indices(signature(message), message.body, fds) do
+      :ok
+    else
+      _ -> {:error, :invalid_unix_fds}
+    end
+  end
+
+  defp validate_unix_fds(_message), do: {:error, :invalid_unix_fds}
+
+  defp validate_unix_fd_list(fds) when length(fds) <= @max_unix_fds do
+    if Enum.all?(fds, &(is_integer(&1) and &1 >= 0)) do
+      {:ok, fds}
+    else
+      {:error, :invalid_unix_fds}
+    end
+  end
+
+  defp validate_unix_fd_list(fds) when is_list(fds), do: {:error, :unix_fd_limit}
+  defp validate_unix_fd_list(_fds), do: {:error, :invalid_unix_fds}
+
+  defp validate_unix_fd_indices(signature, body, fds)
+       when is_binary(signature) and is_list(body) do
+    with {:ok, types} <- Signature.parse(signature),
+         :ok <- validate_unix_fd_values(types, body, length(fds)) do
+      :ok
+    else
+      _ -> {:error, :invalid_unix_fds}
+    end
+  end
+
+  defp validate_unix_fd_indices(_signature, _body, _fds), do: {:error, :invalid_unix_fds}
+
+  defp validate_unix_fd_values([], [], _fd_count), do: :ok
+
+  defp validate_unix_fd_values([type | types], [value | values], fd_count) do
+    with :ok <- validate_unix_fd_value(type, value, fd_count) do
+      validate_unix_fd_values(types, values, fd_count)
+    end
+  end
+
+  defp validate_unix_fd_values(_types, _values, _fd_count), do: {:error, :invalid_unix_fds}
+
+  defp validate_unix_fd_value({:unix_fd, _}, index, fd_count)
+       when is_integer(index) and index >= 0 and index < fd_count,
+       do: :ok
+
+  defp validate_unix_fd_value({:unix_fd, _}, _index, _fd_count), do: {:error, :invalid_unix_fds}
+
+  defp validate_unix_fd_value({:array, type}, values, fd_count) when is_list(values) do
+    Enum.reduce_while(values, :ok, fn value, :ok ->
+      case validate_unix_fd_value(type, value, fd_count) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp validate_unix_fd_value({:struct, types}, values, fd_count) when is_list(values),
+    do: validate_unix_fd_values(types, values, fd_count)
+
+  defp validate_unix_fd_value({:dict_entry, key_type, value_type}, {key, value}, fd_count) do
+    with :ok <- validate_unix_fd_value(key_type, key, fd_count) do
+      validate_unix_fd_value(value_type, value, fd_count)
+    end
+  end
+
+  defp validate_unix_fd_value({:variant, _}, {nested_signature, value}, fd_count)
+       when is_binary(nested_signature) do
+    with {:ok, [type]} <- Signature.parse(nested_signature) do
+      validate_unix_fd_value(type, value, fd_count)
+    else
+      _ -> {:error, :invalid_unix_fds}
+    end
+  end
+
+  defp validate_unix_fd_value({kind, _}, _value, _fd_count)
+       when kind in [
+              :byte,
+              :boolean,
+              :int16,
+              :uint16,
+              :int32,
+              :uint32,
+              :int64,
+              :uint64,
+              :double,
+              :string,
+              :object_path,
+              :signature
+            ],
+       do: :ok
+
+  defp validate_unix_fd_value(_type, _value, _fd_count), do: {:error, :invalid_unix_fds}
 
   defp validate_required_fields(type, header_fields) do
     required = Map.get(@required_fields, type, [])

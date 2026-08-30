@@ -5,6 +5,7 @@ defmodule Rebus.Connection do
 
   alias Rebus.SignalHandler
   alias Rebus.Message
+  alias Rebus.UnixFD
   require Logger
 
   @default_write_timeout 5_000
@@ -15,6 +16,18 @@ defmodule Rebus.Connection do
   @max_read_attempts 1
   @max_inbound_segments 64
   @max_serial 4_294_967_295
+  @max_unix_fd_control_size 256
+  # A reply carrying descriptors is first acknowledged through a small
+  # connection-owned claim.  This deliberately avoids treating delivery to a
+  # GenServer.call alias as ownership transfer: aliases can be deactivated
+  # while their process remains alive after a caller-side timeout.
+  # FD delivery starts in a short extension of the request's original absolute
+  # deadline. It exists solely to close or hand off a descriptor safely after
+  # a reply reaches the boundary of that deadline; it is not a second public
+  # request timeout. A definitive resolver may wait longer if a live connection
+  # has an acknowledgement queued ahead of it; see resolve_fd_claim/3.
+  @fd_claim_handoff_grace 100
+  @fd_claim_cleanup_grace 250
 
   @spec call(pid(), Message.t(), non_neg_integer()) ::
           Message.t() | {:error, Rebus.error_reason()}
@@ -25,7 +38,9 @@ defmodule Rebus.Connection do
       deadline = System.monotonic_time(:millisecond) + timeout
 
       try do
-        GenServer.call(pid, {:call, msg, deadline, request_ref}, timeout)
+        pid
+        |> GenServer.call({:call, msg, deadline, request_ref}, timeout)
+        |> receive_fd_reply_claim(pid, deadline, request_ref)
       catch
         :exit, {:timeout, _call} ->
           GenServer.cast(pid, {:cancel, request_ref})
@@ -96,6 +111,12 @@ defmodule Rebus.Connection do
     field :inbound_size, non_neg_integer(), default: 0
     field :inbound_expected_size, pos_integer() | nil, default: nil
     field :inbound_flatten_count, non_neg_integer(), default: 0
+    field :inbound_unix_fds, [UnixFD.t()], default: []
+    # Ancillary data rejected before a complete D-Bus frame is known belongs
+    # to that frame, not to a later coalesced frame. The descriptors themselves
+    # are closed immediately; this bit makes the eventual frame a recoverable
+    # drop once its byte boundary is available.
+    field :inbound_fd_tainted?, boolean(), default: false
     field :name, binary() | nil, default: nil
     field :serial, non_neg_integer(), default: 1
     field :hello_serial, non_neg_integer() | nil, default: nil
@@ -111,15 +132,25 @@ defmodule Rebus.Connection do
     field :connect_accepted?, boolean(), default: false
     field :auth_id_runner, function() | nil, default: nil
     field :partial_frame_timer, {reference(), reference()} | nil, default: nil
+    field :unix_fd_transport?, boolean(), default: false
+    field :unix_fd_negotiated?, boolean(), default: false
 
     field :pending,
           %{
-            non_neg_integer() => {:gen_statem.from(), reference(), reference(), reference()}
+            non_neg_integer() =>
+              {:gen_statem.from(), reference(), reference(), reference(), integer()}
           },
           default: %{}
 
     field :request_index, %{reference() => non_neg_integer()}, default: %{}
     field :monitor_index, %{reference() => non_neg_integer()}, default: %{}
+    field :fd_claims, %{reference() => map()}, default: %{}
+    field :fd_claim_request_index, %{reference() => reference()}, default: %{}
+    field :fd_claim_monitor_index, %{reference() => reference()}, default: %{}
+
+    field :fd_claim_outcomes, %{reference() => {:acknowledged | :closed, reference()}},
+      default: %{}
+
     field :active_write, map() | nil, default: nil
     field :write_queue, :queue.queue(), default: :queue.new()
     field :queued_requests, MapSet.t(reference()), default: MapSet.new()
@@ -127,7 +158,17 @@ defmodule Rebus.Connection do
     field :outbound_monitor_index, %{reference() => reference()}, default: %{}
     field :signal_handler_monitor_index, %{reference() => reference()}, default: %{}
     field :send_fun, function(), default: &:socket.send/4
+    field :sendmsg_fun, function(), default: &:socket.sendmsg/4
+    field :recvmsg_fun, function(), default: &:socket.recvmsg/5
     field :cancel_fun, function(), default: &:socket.cancel/2
+    field :fd_claim_handoff_fun, function() | nil, default: nil
+    # Deterministic transition seams used only by the FD lifecycle tests.
+    field :fd_claim_delivery_fun, function() | nil, default: nil
+    field :fd_claim_ack_fun, function() | nil, default: nil
+    # Narrow deterministic-test seam. Production requests retain their public
+    # deadline exactly; tests can hold the internal timer long enough to order
+    # a caller-side alias timeout before a queued late reply.
+    field :request_timeout_slack, non_neg_integer(), default: 0
   end
 
   @impl true
@@ -173,6 +214,12 @@ defmodule Rebus.Connection do
         {:stop, :invalid_auth_id_fun}
 
       true ->
+        # DynamicSupervisor stops children with an exit signal. Trap it so the
+        # GenServer loop can return :stop and therefore invoke terminate/2,
+        # which closes raw SCM_RIGHTS descriptors retained in partial frames or
+        # reply claims. The EXIT clauses below preserve normal link semantics.
+        Process.flag(:trap_exit, true)
+
         case :socket.open(family, :stream, :default) do
           {:ok, sock} ->
             _ = configure_receive_buffer(sock)
@@ -188,7 +235,8 @@ defmodule Rebus.Connection do
                precomputed_auth_id: precomputed_auth_id,
                connect_waiter: connect_waiter,
                connect_waiter_monitor: monitor_connect_waiter(connect_waiter),
-               auth_id_runner: auth_id_runner
+               auth_id_runner: auth_id_runner,
+               unix_fd_transport?: unix_fd_transport_supported?(family)
              }, {:continue, {:setup, addr}}}
 
           {:error, reason} ->
@@ -198,8 +246,18 @@ defmodule Rebus.Connection do
   end
 
   @impl true
-  def terminate(_reason, %__MODULE__{sock: sock, partial_frame_timer: timer_ref}) do
+  def terminate(
+        _reason,
+        %__MODULE__{
+          sock: sock,
+          partial_frame_timer: timer_ref,
+          inbound_unix_fds: inbound_unix_fds,
+          fd_claims: fd_claims
+        }
+      ) do
     cancel_partial_frame_timer(timer_ref)
+    _ = UnixFD.close_all(inbound_unix_fds)
+    close_fd_claims(fd_claims)
     _ = :socket.close(sock)
     :ok
   end
@@ -286,7 +344,7 @@ defmodule Rebus.Connection do
 
   def handle_info({:request_timeout, serial, request_ref}, %__MODULE__{} = state) do
     case Map.fetch(state.pending, serial) do
-      {:ok, {from, _timer_ref, ^request_ref, monitor_ref}} ->
+      {:ok, {from, _timer_ref, ^request_ref, monitor_ref, _deadline}} ->
         {_pending_entry, pending} = Map.pop(state.pending, serial)
         Process.demonitor(monitor_ref, [:flush])
         GenServer.reply(from, {:error, :timeout})
@@ -294,6 +352,24 @@ defmodule Rebus.Connection do
 
       _ ->
         {:noreply, state}
+    end
+  end
+
+  def handle_info({:fd_claim_timeout, claim_ref}, %__MODULE__{} = state) do
+    case Map.fetch(state.fd_claims, claim_ref) do
+      {:ok, _claim} ->
+        Logger.warning("D-Bus FD reply claim dropped: :claim_timeout")
+        {:noreply, drop_fd_claim(state, claim_ref, close?: true)}
+
+      :error ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:fd_claim_outcome_timeout, claim_ref}, %__MODULE__{} = state) do
+    case Map.pop(state.fd_claim_outcomes, claim_ref) do
+      {nil, _outcomes} -> {:noreply, state}
+      {_outcome, outcomes} -> {:noreply, %{state | fd_claim_outcomes: outcomes}}
     end
   end
 
@@ -331,6 +407,15 @@ defmodule Rebus.Connection do
       ),
       do: stop_for_transport_error(reason, state)
 
+  # With :trap_exit enabled, preserve the process-link behavior that would
+  # otherwise terminate this GenServer. In particular, supervisor shutdown
+  # reaches terminate/2 instead of bypassing descriptor cleanup. :kill remains
+  # untrappable by the BEAM and is documented as outside that guarantee.
+  def handle_info({:EXIT, _pid, :normal}, %__MODULE__{} = state), do: {:noreply, state}
+
+  def handle_info({:EXIT, _pid, reason}, %__MODULE__{} = state),
+    do: {:stop, reason, state}
+
   def handle_info(_message, %__MODULE__{} = state), do: {:noreply, state}
 
   defp handle_down_for_request(ref, %__MODULE__{} = state) do
@@ -338,7 +423,13 @@ defmodule Rebus.Connection do
       {nil, _index} ->
         case Map.pop(state.outbound_monitor_index, ref) do
           {nil, _outbound_index} ->
-            {:noreply, state}
+            case Map.fetch(state.fd_claim_monitor_index, ref) do
+              {:ok, claim_ref} ->
+                {:noreply, drop_fd_claim(state, claim_ref, close?: true, monitor_down?: true)}
+
+              :error ->
+                {:noreply, state}
+            end
 
           {request_ref, outbound_monitor_index} ->
             state = %{state | outbound_monitor_index: outbound_monitor_index}
@@ -347,7 +438,7 @@ defmodule Rebus.Connection do
 
       {serial, monitor_index} ->
         {entry, pending} = Map.pop(state.pending, serial)
-        {_from, timer_ref, request_ref, _monitor_ref} = entry
+        {_from, timer_ref, request_ref, _monitor_ref, _deadline} = entry
         _ = Process.cancel_timer(timer_ref)
 
         {:noreply,
@@ -426,7 +517,28 @@ defmodule Rebus.Connection do
   end
 
   def handle_continue(:recv, %__MODULE__{rref: nil} = state) do
-    handle_receive_result(:socket.recv(state.sock, 0, [], :nowait), state)
+    cond do
+      state.unix_fd_negotiated? ->
+        state.recvmsg_fun.(
+          state.sock,
+          inbound_receive_size(state),
+          @max_unix_fd_control_size,
+          [],
+          :nowait
+        )
+        |> handle_receive_result(state)
+
+      # OTP documents CtrlSz=0 as its default control-buffer size, not as a
+      # request to discard ancillary data. Keep the normal coalescing byte
+      # path, but receive a bounded cmsg and close any illicit rights before a
+      # partial frame can retain them.
+      state.unix_fd_transport? ->
+        state.recvmsg_fun.(state.sock, 0, @max_unix_fd_control_size, [], :nowait)
+        |> handle_receive_result(state)
+
+      true ->
+        handle_receive_result(:socket.recv(state.sock, 0, [], :nowait), state)
+    end
   end
 
   # A pending socket operation owns the receive continuation. Keeping this
@@ -440,8 +552,19 @@ defmodule Rebus.Connection do
     append_inbound(data, state, :recv)
   end
 
+  def handle_receive_result({:ok, message}, %__MODULE__{} = state) when is_map(message) do
+    append_recvmsg(message, state, :recv)
+  end
+
   def handle_receive_result(
         {:select, {:select_info, :recv, handle}},
+        %__MODULE__{} = state
+      ) do
+    {:noreply, %{state | rref: handle}}
+  end
+
+  def handle_receive_result(
+        {:select, {:select_info, :recvmsg, handle}},
         %__MODULE__{} = state
       ) do
     {:noreply, %{state | rref: handle}}
@@ -456,7 +579,22 @@ defmodule Rebus.Connection do
   end
 
   def handle_receive_result(
+        {:select, {{:select_info, :recvmsg, handle}, message}},
+        %__MODULE__{} = state
+      )
+      when is_map(message) do
+    append_recvmsg(message, %{state | rref: handle}, :recv)
+  end
+
+  def handle_receive_result(
         {:completion, {:completion_info, :recv, handle}},
+        %__MODULE__{} = state
+      ) do
+    {:noreply, %{state | rref: {:completion, handle}}}
+  end
+
+  def handle_receive_result(
+        {:completion, {:completion_info, :recvmsg, handle}},
         %__MODULE__{} = state
       ) do
     {:noreply, %{state | rref: {:completion, handle}}}
@@ -481,23 +619,60 @@ defmodule Rebus.Connection do
   end
 
   defp receive_hello_reply(%__MODULE__{} = state, deadline, timeout) do
-    case :socket.recv(state.sock, 0, [], timeout) do
-      {:ok, data} ->
-        continue_hello_reply(data, state, deadline)
+    if state.unix_fd_transport? do
+      receive_hello_reply_recvmsg(state, deadline, timeout)
+    else
+      case :socket.recv(state.sock, 0, [], timeout) do
+        {:ok, data} ->
+          continue_hello_reply(data, state, deadline)
 
-      {:error, {:timeout, data}} when is_binary(data) and byte_size(data) > 0 ->
-        continue_hello_reply(data, state, deadline)
+        {:error, {:timeout, data}} when is_binary(data) and byte_size(data) > 0 ->
+          continue_hello_reply(data, state, deadline)
+
+        {:error, :timeout} ->
+          stop_for_protocol_error(:read_timeout, state)
+
+        {:error, {:timeout, _data}} ->
+          stop_for_protocol_error(:read_timeout, state)
+
+        {:error, reason} ->
+          stop_for_transport_error(reason, state)
+      end
+    end
+  end
+
+  # After local transport negotiation, every peer read—including the initial
+  # Hello reply—must observe SCM_RIGHTS. A plain recv/4 here could discard
+  # ancillary metadata outside the single close-or-deliver ownership path.
+  defp receive_hello_reply_recvmsg(%__MODULE__{} = state, deadline, timeout) do
+    case state.recvmsg_fun.(
+           state.sock,
+           inbound_receive_size(state),
+           recvmsg_control_size(state),
+           [],
+           timeout
+         ) do
+      {:ok, message} when is_map(message) ->
+        continue_hello_reply_recvmsg(message, state, deadline)
+
+      {:error, {:timeout, message}} when is_map(message) ->
+        continue_hello_reply_recvmsg(message, state, deadline)
 
       {:error, :timeout} ->
         stop_for_protocol_error(:read_timeout, state)
 
-      {:error, {:timeout, _data}} ->
+      {:error, {:timeout, _message}} ->
         stop_for_protocol_error(:read_timeout, state)
 
       {:error, reason} ->
         stop_for_transport_error(reason, state)
+
+      _unexpected ->
+        stop_for_transport_error(:receive_failed, state)
     end
   end
+
+  defp recvmsg_control_size(%__MODULE__{}), do: @max_unix_fd_control_size
 
   defp continue_hello_reply(data, %__MODULE__{} = state, deadline) do
     case append_inbound(data, state, {:hello_reply, deadline}) do
@@ -509,8 +684,22 @@ defmodule Rebus.Connection do
     end
   end
 
+  defp continue_hello_reply_recvmsg(message, %__MODULE__{} = state, deadline) do
+    case append_recvmsg(message, state, {:hello_reply, deadline}) do
+      {:noreply, %__MODULE__{} = state, {:continue, {:hello_reply, _deadline}}} ->
+        receive_hello_reply(state, deadline)
+
+      result ->
+        result
+    end
+  end
+
   defp handle_read_completion({:ok, data}, %__MODULE__{} = state) when is_binary(data) do
     append_inbound(data, state, :recv)
+  end
+
+  defp handle_read_completion({:ok, message}, %__MODULE__{} = state) when is_map(message) do
+    append_recvmsg(message, state, :recv)
   end
 
   defp handle_read_completion({:error, reason}, %__MODULE__{} = state) do
@@ -573,6 +762,98 @@ defmodule Rebus.Connection do
     end
   end
 
+  # The public call's reply alias carries only the claim token. The
+  # descriptor-bearing message uses a caller-created one-shot alias, which is
+  # explicitly unaliased on every timeout path. That prevents a late internal
+  # delivery from reaching application `handle_info/2` after Connection.call/3
+  # has returned.
+  def handle_call(
+        {:claim_fd_reply, claim_ref, delivery_ref, delivery_alias},
+        {pid, _tag},
+        %__MODULE__{} = state
+      ) do
+    case Map.fetch(state.fd_claims, claim_ref) do
+      {:ok, %{pid: ^pid, delivery_ref: nil, msg: msg} = claim}
+      when is_reference(delivery_ref) and is_reference(delivery_alias) ->
+        if fd_claim_live?(claim) and Process.alive?(pid) do
+          claim = rearm_fd_claim(claim_ref, claim)
+          run_fd_claim_hook(state.fd_claim_delivery_fun)
+
+          if fd_claim_live?(claim) and Process.alive?(pid) do
+            Kernel.send(delivery_alias, {:rebus_fd_reply, claim_ref, delivery_ref, msg})
+
+            {:reply, :ok,
+             %{
+               state
+               | fd_claims:
+                   Map.put(state.fd_claims, claim_ref, %{
+                     claim
+                     | delivery_ref: delivery_ref,
+                       delivery_alias: delivery_alias
+                   })
+             }}
+          else
+            {:reply, {:error, :fd_claim_expired},
+             drop_fd_claim(state, claim_ref, close?: true, outcome: :closed)}
+          end
+        else
+          {:reply, {:error, :fd_claim_expired},
+           drop_fd_claim(state, claim_ref, close?: true, outcome: :closed)}
+        end
+
+      _ ->
+        {:reply, {:error, :fd_claim_expired}, state}
+    end
+  end
+
+  def handle_call({:ack_fd_reply, claim_ref, delivery_ref}, {pid, _tag}, %__MODULE__{} = state) do
+    case Map.fetch(state.fd_claims, claim_ref) do
+      {:ok, %{pid: ^pid, delivery_ref: ^delivery_ref} = claim} ->
+        run_fd_claim_ack_hook(state.fd_claim_ack_fun, claim)
+
+        # A call alias timing out does not revoke a queued acknowledgement. It
+        # is the resolver's FIFO position after this message that makes its
+        # outcome definitive. Never acknowledge after the claim deadline,
+        # though: at that point the connection must retain and close the FD.
+        if fd_claim_live?(claim) and Process.alive?(pid) do
+          {:reply, :ok, drop_fd_claim(state, claim_ref, close?: false, outcome: :acknowledged)}
+        else
+          {:reply, {:error, :fd_claim_expired},
+           drop_fd_claim(state, claim_ref, close?: true, outcome: :closed)}
+        end
+
+      _ ->
+        {:reply, {:error, :fd_claim_expired}, state}
+    end
+  end
+
+  # This ordered descriptor-free barrier is used only if the bounded ack call
+  # times out. It serializes behind a queued acknowledgement: either that ack
+  # transferred ownership (and we report it), or this handler closes the claim.
+  # Connection.call/3 waits for this handler without another finite timeout so
+  # it never reports a closed claim while an earlier acknowledgement can still
+  # transfer ownership.
+  def handle_call({:resolve_fd_claim, claim_ref, delivery_ref}, _from, %__MODULE__{} = state) do
+    case Map.fetch(state.fd_claims, claim_ref) do
+      {:ok, %{delivery_ref: ^delivery_ref}} ->
+        {:reply, :closed, drop_fd_claim(state, claim_ref, close?: true, outcome: :closed)}
+
+      _ ->
+        {outcome, state} = take_fd_claim_outcome(state, claim_ref)
+        {:reply, outcome || :fd_claim_expired, state}
+    end
+  end
+
+  def handle_call({:discard_fd_claim, claim_ref}, {pid, _tag}, %__MODULE__{} = state) do
+    case Map.fetch(state.fd_claims, claim_ref) do
+      {:ok, %{pid: ^pid}} ->
+        {:reply, :ok, drop_fd_claim(state, claim_ref, close?: true, outcome: :closed)}
+
+      _ ->
+        {:reply, :ok, state}
+    end
+  end
+
   def handle_call(
         {:add_signal_handler, _pid, _handler_ref},
         _from,
@@ -611,26 +892,35 @@ defmodule Rebus.Connection do
   def handle_cast({:cancel, request_ref}, %__MODULE__{} = state) do
     case Map.pop(state.request_index, request_ref) do
       {nil, _index} ->
-        case state.active_write do
-          %{request_ref: ^request_ref, partial?: false} ->
-            advance_writes(drop_active(state, cancel?: true))
+        case Map.fetch(state.fd_claim_request_index, request_ref) do
+          {:ok, claim_ref} ->
+            {:noreply, drop_fd_claim(state, claim_ref, close?: true)}
 
-          %{request_ref: ^request_ref} ->
-            {:noreply,
-             %{state | cancelled_requests: MapSet.put(state.cancelled_requests, request_ref)}}
+          :error ->
+            case state.active_write do
+              %{request_ref: ^request_ref, partial?: false} ->
+                advance_writes(drop_active(state, cancel?: true))
 
-          _ ->
-            if MapSet.member?(state.queued_requests, request_ref) do
-              {:noreply,
-               %{state | cancelled_requests: MapSet.put(state.cancelled_requests, request_ref)}}
-            else
-              {:noreply, state}
+              %{request_ref: ^request_ref} ->
+                {:noreply,
+                 %{state | cancelled_requests: MapSet.put(state.cancelled_requests, request_ref)}}
+
+              _ ->
+                if MapSet.member?(state.queued_requests, request_ref) do
+                  {:noreply,
+                   %{
+                     state
+                     | cancelled_requests: MapSet.put(state.cancelled_requests, request_ref)
+                   }}
+                else
+                  {:noreply, state}
+                end
             end
         end
 
       {serial, request_index} ->
         {entry, pending} = Map.pop(state.pending, serial)
-        {_from, timer_ref, _request_ref, monitor_ref} = entry
+        {_from, timer_ref, _request_ref, monitor_ref, _deadline} = entry
         _ = Process.cancel_timer(timer_ref)
         Process.demonitor(monitor_ref, [:flush])
 
@@ -676,46 +966,14 @@ defmodule Rebus.Connection do
 
   defp parse_flat_messages(data, %__MODULE__{} = state, continuation, source) do
     case Message.parse_inbound(data) do
-      {:ok, %Message{} = msg, rest} when not is_nil(state.hello_serial) ->
-        state = finish_frame(state)
+      {:ok, %Message{} = msg, rest} ->
+        case attach_inbound_fds(msg, state) do
+          {:ok, msg, state} ->
+            dispatch_inbound_message(msg, rest, state, continuation, source)
 
-        # dbus-daemon's bus/dispatch.c replies to Hello before emitting the
-        # directed NameAcquired signal. Until that reply supplies our unique
-        # name, any other frame is a protocol error rather than application
-        # traffic that can be routed safely.
-        case hello_reply_result(msg, state.hello_serial) do
-          {:ok, name} ->
-            case establish_connection(%{
-                   state
-                   | name: name,
-                     hello_serial: nil,
-                     established?: true
-                 }) do
-              {:ok, state} -> parse_flat_messages(rest, state, :recv, source)
-              {:error, :caller_gone} -> {:stop, {:shutdown, :caller_gone}, state}
-            end
-
-          {:error, reason} ->
-            stop_for_protocol_error(reason, state)
+          {:error, reason, state} ->
+            drop_recoverable_fd_frame(reason, rest, state, continuation, source)
         end
-
-      {:ok, %Message{type: type} = msg, rest} when type in [:method_return, :error] ->
-        state = finish_frame(state)
-
-        case reply(msg, state) do
-          {:ok, state} -> parse_flat_messages(rest, state, continuation, source)
-          {:error, reason} -> stop_for_protocol_error(reason, state)
-        end
-
-      {:ok, %Message{type: :signal} = msg, rest} ->
-        state = finish_frame(state)
-        parse_flat_messages(rest, notify(msg, state), continuation, source)
-
-      {:ok, %Message{type: :method_call}, rest} ->
-        parse_flat_messages(rest, finish_frame(state), continuation, source)
-
-      {:ok, %Message{}, rest} ->
-        parse_flat_messages(rest, finish_frame(state), continuation, source)
 
       nil ->
         append_inbound(retain_remainder(data, source), state, continuation)
@@ -728,11 +986,13 @@ defmodule Rebus.Connection do
 
       {:error, :resource_limit, envelope, rest} ->
         Logger.warning("D-Bus frame dropped: :resource_limit")
+        state = discard_inbound_unix_fds(state)
         {:ok, state} = drop_resource_limited_reply(envelope, state)
         parse_flat_messages(rest, finish_frame(state), continuation, source)
 
       {:error, :resource_limit} ->
         Logger.warning("D-Bus frame dropped: :resource_limit")
+        state = discard_inbound_unix_fds(state)
 
         case Message.expected_size(data) do
           {:ok, frame_size} ->
@@ -748,6 +1008,120 @@ defmodule Rebus.Connection do
     end
   end
 
+  defp attach_inbound_fds(%Message{} = msg, %__MODULE__{} = state) do
+    fds = state.inbound_unix_fds
+    tainted? = state.inbound_fd_tainted?
+    state = %{state | inbound_unix_fds: [], inbound_fd_tainted?: false}
+
+    with :ok <- inbound_fd_frame_clean?(tainted?),
+         :ok <- inbound_fd_negotiated?(msg, state),
+         {:ok, msg} <- Message.attach_unix_fds(msg, fds) do
+      {:ok, msg, state}
+    else
+      {:error, reason} ->
+        _ = UnixFD.close_all(fds)
+        {:error, reason, state}
+    end
+  end
+
+  defp inbound_fd_frame_clean?(false), do: :ok
+  defp inbound_fd_frame_clean?(true), do: {:error, :invalid_unix_fds}
+
+  # Count/index/negotiation checks run after a complete D-Bus frame and its
+  # ancillary data have been collected. The stream boundary is therefore known:
+  # close the descriptors, drop only this frame, and continue with a coalesced
+  # successor rather than letting a peer kill unrelated calls or handlers.
+  defp drop_recoverable_fd_frame(reason, rest, state, continuation, source) do
+    Logger.warning("D-Bus FD frame dropped: #{inspect(fd_drop_reason(reason))}")
+    parse_flat_messages(rest, finish_frame(state), continuation, source)
+  end
+
+  defp fd_drop_reason(reason)
+       when reason in [:invalid_unix_fds, :unix_fd_not_negotiated, :unix_fd_limit],
+       do: reason
+
+  defp fd_drop_reason(_reason), do: :invalid_unix_fds
+
+  defp inbound_fd_negotiated?(%Message{header_fields: header_fields, unix_fds: fds}, state) do
+    if state.unix_fd_negotiated? or (Map.get(header_fields, :unix_fds, 0) == 0 and fds == []) do
+      :ok
+    else
+      {:error, :unix_fd_not_negotiated}
+    end
+  end
+
+  defp dispatch_inbound_message(
+         %Message{} = msg,
+         rest,
+         %__MODULE__{hello_serial: hello_serial} = state,
+         _continuation,
+         source
+       )
+       when not is_nil(hello_serial) do
+    state = finish_frame(state)
+
+    # dbus-daemon's bus/dispatch.c replies to Hello before emitting the
+    # directed NameAcquired signal. Until that reply supplies our unique name,
+    # any other frame is a protocol error rather than application traffic.
+    if msg.unix_fds != [] do
+      close_message_fds(msg)
+      stop_for_protocol_error(:invalid_unix_fds, state)
+    else
+      case hello_reply_result(msg, hello_serial) do
+        {:ok, name} ->
+          case establish_connection(%{state | name: name, hello_serial: nil, established?: true}) do
+            {:ok, state} -> parse_flat_messages(rest, state, :recv, source)
+            {:error, :caller_gone} -> {:stop, {:shutdown, :caller_gone}, state}
+          end
+
+        {:error, reason} ->
+          stop_for_protocol_error(reason, state)
+      end
+    end
+  end
+
+  defp dispatch_inbound_message(
+         %Message{type: type} = msg,
+         rest,
+         %__MODULE__{} = state,
+         continuation,
+         source
+       )
+       when type in [:method_return, :error] do
+    state = finish_frame(state)
+
+    case reply(msg, state) do
+      {:ok, state} -> parse_flat_messages(rest, state, continuation, source)
+      {:error, reason} -> stop_for_protocol_error(reason, state)
+    end
+  end
+
+  defp dispatch_inbound_message(
+         %Message{type: :signal} = msg,
+         rest,
+         %__MODULE__{} = state,
+         continuation,
+         source
+       ) do
+    # Signals may have multiple subscribers. Without a per-subscriber dup(2)
+    # primitive, one raw descriptor cannot be transferred safely to all of
+    # them, so FD-bearing signals are rejected and closed.
+    if msg.unix_fds == [] do
+      parse_flat_messages(rest, notify(msg, finish_frame(state)), continuation, source)
+    else
+      close_message_fds(msg)
+      Logger.warning("D-Bus FD frame dropped: :signal_ownership")
+      parse_flat_messages(rest, finish_frame(state), continuation, source)
+    end
+  end
+
+  defp dispatch_inbound_message(%Message{} = msg, rest, state, continuation, source) do
+    close_message_fds(msg)
+    parse_flat_messages(rest, finish_frame(state), continuation, source)
+  end
+
+  defp close_message_fds(%Message{unix_fds: fds}), do: UnixFD.close_all(fds)
+
   defp initialize(%__MODULE__{aggregate_setup_timeout?: true} = state, addr) do
     sock = state.sock
     deadline = read_deadline(state.setup_timeout)
@@ -760,8 +1134,10 @@ defmodule Rebus.Connection do
          {:ok, auth_line, rest} <- handshake_recv(sock, auth_timeout),
          {:ok, guid} <- parse_auth_response(auth_line),
          :ok <- verify_expected_guid(guid, state.expected_guid),
+         {:ok, unix_fd_negotiated?, rest} <-
+           negotiate_unix_fd(state, sock, rest, deadline, state.setup_timeout),
          :ok <- handshake_send(sock, "BEGIN \r\n", state.write_timeout) do
-      initialized_connection(state, guid, rest)
+      initialized_connection(%{state | unix_fd_negotiated?: unix_fd_negotiated?}, guid, rest)
     else
       {:error, reason} -> stop_and_close(sock, reason)
     end
@@ -776,8 +1152,10 @@ defmodule Rebus.Connection do
          {:ok, auth_line, rest} <- handshake_recv(sock, state.setup_timeout),
          {:ok, guid} <- parse_auth_response(auth_line),
          :ok <- verify_expected_guid(guid, state.expected_guid),
+         {:ok, unix_fd_negotiated?, rest} <-
+           negotiate_unix_fd(state, sock, rest, state.setup_timeout),
          :ok <- handshake_send(sock, "BEGIN \r\n", state.write_timeout) do
-      initialized_connection(state, guid, rest)
+      initialized_connection(%{state | unix_fd_negotiated?: unix_fd_negotiated?}, guid, rest)
     else
       {:error, reason} -> stop_and_close(sock, reason)
     end
@@ -887,6 +1265,141 @@ defmodule Rebus.Connection do
       :exit, _reason ->
         {:error, :disconnected}
     end
+  end
+
+  defp receive_fd_reply_claim({:fd_claim, claim_ref}, conn, deadline, _request_ref)
+       when is_reference(claim_ref) do
+    delivery_ref = make_ref()
+    # An alias is the delivery address, not a process mailbox convention. On
+    # timeout `unalias/1` atomically rejects in-flight sends; the small drain
+    # below merely consumes a message already enqueued before that operation.
+    delivery_alias = :erlang.alias([:reply])
+
+    try do
+      with {:ok, timeout} <- fd_claim_remaining_timeout(deadline),
+           :ok <- claim_fd_reply(conn, claim_ref, delivery_ref, delivery_alias, timeout) do
+        receive do
+          {:rebus_fd_reply, ^claim_ref, ^delivery_ref, %Message{} = msg} ->
+            # Ownership moves only after the server acknowledges the claim.
+            # The first acknowledgement is bounded by the original request
+            # deadline plus the handoff grace. If its reply races that bound,
+            # the FIFO resolver waits for the definitive transfer-or-close
+            # outcome rather than returning an ambiguous raw descriptor.
+            case acknowledge_fd_reply(conn, claim_ref, delivery_ref, deadline) do
+              :ok -> msg
+              {:error, _reason} = error -> error
+            end
+        after
+          timeout ->
+            discard_fd_claim(conn, claim_ref, deadline)
+            {:error, :timeout}
+        end
+      else
+        {:error, :timeout} ->
+          discard_fd_claim(conn, claim_ref, deadline)
+          {:error, :timeout}
+
+        {:error, _reason} = error ->
+          discard_fd_claim(conn, claim_ref, deadline)
+          error
+      end
+    after
+      :erlang.unalias(delivery_alias)
+      drain_fd_reply_delivery(claim_ref, delivery_ref)
+    end
+  end
+
+  defp receive_fd_reply_claim(result, _conn, _deadline, _request_ref), do: result
+
+  defp claim_fd_reply(conn, claim_ref, delivery_ref, delivery_alias, timeout) do
+    try do
+      case GenServer.call(
+             conn,
+             {:claim_fd_reply, claim_ref, delivery_ref, delivery_alias},
+             timeout
+           ) do
+        :ok -> :ok
+        {:error, _reason} = error -> error
+        _unexpected -> {:error, :fd_claim_expired}
+      end
+    catch
+      :exit, {:timeout, _call} -> {:error, :timeout}
+      :exit, _reason -> {:error, :disconnected}
+    end
+  end
+
+  defp acknowledge_fd_reply(conn, claim_ref, delivery_ref, deadline) do
+    case fd_claim_remaining_timeout(deadline) do
+      {:ok, timeout} ->
+        try do
+          case GenServer.call(conn, {:ack_fd_reply, claim_ref, delivery_ref}, timeout) do
+            :ok -> :ok
+            {:error, _reason} = error -> error
+            _unexpected -> {:error, :fd_claim_expired}
+          end
+        catch
+          :exit, {:timeout, _call} -> resolve_fd_claim(conn, claim_ref, delivery_ref)
+          :exit, _reason -> {:error, :disconnected}
+        end
+
+      :error ->
+        resolve_fd_claim(conn, claim_ref, delivery_ref)
+    end
+  end
+
+  defp resolve_fd_claim(conn, claim_ref, delivery_ref) do
+    # The bounded acknowledgement call may time out after its message is
+    # already queued. This call is deliberately FIFO and unbounded: every
+    # production Connection callback after setup uses :nowait socket I/O and
+    # bounded local work, so a live process will dispatch it. A test seam can
+    # stall a callback to cover that ordering; the public docs make the rare
+    # extended wait explicit. If the connection dies, its monitor makes the
+    # only indeterminate case explicit as :disconnected.
+    monitor_ref = Process.monitor(conn)
+
+    try do
+      case GenServer.call(conn, {:resolve_fd_claim, claim_ref, delivery_ref}, :infinity) do
+        :acknowledged -> :ok
+        _ -> {:error, :fd_claim_expired}
+      end
+    catch
+      :exit, _reason -> {:error, :disconnected}
+    after
+      Process.demonitor(monitor_ref, [:flush])
+    end
+  end
+
+  defp discard_fd_claim(conn, claim_ref, deadline) do
+    case fd_claim_cleanup_remaining_timeout(deadline) do
+      {:ok, timeout} ->
+        try do
+          _ = GenServer.call(conn, {:discard_fd_claim, claim_ref}, timeout)
+          :ok
+        catch
+          :exit, _reason -> :ok
+        end
+
+      :error ->
+        :ok
+    end
+  end
+
+  defp drain_fd_reply_delivery(claim_ref, delivery_ref) do
+    receive do
+      {:rebus_fd_reply, ^claim_ref, ^delivery_ref, %Message{}} -> :ok
+    after
+      0 -> :ok
+    end
+  end
+
+  defp fd_claim_remaining_timeout(deadline) do
+    remaining = deadline + @fd_claim_handoff_grace - System.monotonic_time(:millisecond)
+    if remaining > 0, do: {:ok, remaining}, else: :error
+  end
+
+  defp fd_claim_cleanup_remaining_timeout(deadline) do
+    remaining = deadline + @fd_claim_cleanup_grace - System.monotonic_time(:millisecond)
+    if remaining > 0, do: {:ok, remaining}, else: :error
   end
 
   defp monitor_connect_waiter({pid, _ref}) when is_pid(pid), do: Process.monitor(pid)
@@ -1099,6 +1612,14 @@ defmodule Rebus.Connection do
     end
   end
 
+  defp unix_fd_transport_supported?(:local) do
+    :os.type() in [{:unix, :linux}, {:unix, :darwin}] and
+      function_exported?(:socket, :sendmsg, 4) and
+      function_exported?(:socket, :recvmsg, 5)
+  end
+
+  defp unix_fd_transport_supported?(_family), do: false
+
   @doc false
   def configure_receive_buffer(
         sock,
@@ -1137,6 +1658,50 @@ defmodule Rebus.Connection do
 
   defp handshake_recv(sock, timeout) do
     receive_auth_line(sock, <<>>, read_deadline(timeout), timeout)
+  end
+
+  defp handshake_recv(sock, buffer, timeout) when is_binary(buffer) do
+    receive_auth_line(sock, buffer, read_deadline(timeout), timeout)
+  end
+
+  # Unix-FD negotiation is an optional authentication extension. A peer's
+  # ERROR leaves the ordinary D-Bus connection usable, but FD-bearing messages
+  # will be rejected before any bytes are sent. We only issue it on local Unix
+  # stream sockets where SCM_RIGHTS is available to OTP.
+  defp negotiate_unix_fd(%__MODULE__{unix_fd_transport?: false}, _sock, rest, _timeout),
+    do: {:ok, false, rest}
+
+  defp negotiate_unix_fd(%__MODULE__{} = state, sock, rest, timeout) do
+    with :ok <- handshake_send(sock, "NEGOTIATE_UNIX_FD\r\n", state.write_timeout),
+         {:ok, line, rest} <- handshake_recv(sock, rest, timeout) do
+      case line do
+        "AGREE_UNIX_FD" -> {:ok, true, rest}
+        "ERROR" <> _reason -> {:ok, false, rest}
+        _ -> {:error, :auth_failed}
+      end
+    end
+  end
+
+  defp negotiate_unix_fd(
+         %__MODULE__{unix_fd_transport?: false},
+         _sock,
+         rest,
+         _deadline,
+         _maximum
+       ),
+       do: {:ok, false, rest}
+
+  defp negotiate_unix_fd(%__MODULE__{} = state, sock, rest, deadline, maximum) do
+    with {:ok, timeout} <- remaining_setup_timeout(deadline, maximum),
+         :ok <- handshake_send(sock, "NEGOTIATE_UNIX_FD\r\n", min(timeout, state.write_timeout)),
+         {:ok, timeout} <- remaining_setup_timeout(deadline, maximum),
+         {:ok, line, rest} <- handshake_recv(sock, rest, timeout) do
+      case line do
+        "AGREE_UNIX_FD" -> {:ok, true, rest}
+        "ERROR" <> _reason -> {:ok, false, rest}
+        _ -> {:error, :auth_failed}
+      end
+    end
   end
 
   defp receive_auth_line(sock, buffer, deadline, timeout) do
@@ -1206,13 +1771,18 @@ defmodule Rebus.Connection do
   defp stop_for_transport_error(reason, %__MODULE__{} = state) do
     reason = normalize_socket_error(reason)
     Logger.warning("D-Bus connection transport stopped: #{inspect(reason)}")
-    {:stop, {:shutdown, reason}, fail_pending(state)}
+    {:stop, {:shutdown, reason}, state |> discard_inbound_unix_fds() |> fail_pending()}
   end
 
   defp stop_for_protocol_error(reason, %__MODULE__{} = state) do
     reason = sanitize_protocol_reason(reason)
     Logger.warning("D-Bus connection protocol stopped: #{inspect(reason)}")
-    {:stop, {:shutdown, reason}, fail_pending(state)}
+    {:stop, {:shutdown, reason}, state |> discard_inbound_unix_fds() |> fail_pending()}
+  end
+
+  defp discard_inbound_unix_fds(%__MODULE__{inbound_unix_fds: fds} = state) do
+    _ = UnixFD.close_all(fds)
+    %{state | inbound_unix_fds: [], inbound_fd_tainted?: false}
   end
 
   # Each zero-length receive returns data already available through the fixed
@@ -1224,6 +1794,148 @@ defmodule Rebus.Connection do
   def append_inbound_fragment(data, %__MODULE__{} = state, continuation)
       when is_binary(data) do
     append_inbound(data, state, continuation)
+  end
+
+  defp append_recvmsg(
+         %{iov: iov, ctrl: ctrl, flags: flags},
+         %__MODULE__{} = state,
+         continuation
+       )
+       when is_list(iov) and is_list(ctrl) and is_list(flags) do
+    case recvmsg_data(iov) do
+      {:ok, data} -> append_recvmsg_fds(recvmsg_fds(ctrl, flags), data, state, continuation)
+      {:error, reason} -> stop_for_protocol_error(reason, state)
+    end
+  end
+
+  defp append_recvmsg(_message, %__MODULE__{} = state, _continuation),
+    do: stop_for_protocol_error(:invalid_unix_fds, state)
+
+  defp append_recvmsg_fds({:ok, []}, data, state, continuation),
+    do: append_inbound(data, state, continuation)
+
+  defp append_recvmsg_fds({:ok, fds}, data, state, continuation) do
+    cond do
+      not state.unix_fd_negotiated? ->
+        _ = UnixFD.close_all(fds)
+        quarantine_ancillary_frame(data, state, continuation)
+
+      data == <<>> ->
+        _ = UnixFD.close_all(fds)
+        # A rights-only recvmsg result has no byte offset to associate with a
+        # D-Bus frame, so it cannot be recovered without risking later frame
+        # ownership.
+        stop_for_protocol_error(:invalid_unix_fds, state)
+
+      state.inbound_size != 0 or state.inbound_unix_fds != [] ->
+        _ = UnixFD.close_all(fds)
+        quarantine_ancillary_frame(data, state, continuation)
+
+      true ->
+        append_inbound(data, %{state | inbound_unix_fds: fds}, continuation)
+    end
+  end
+
+  defp append_recvmsg_fds({:error, :unix_fd_truncated, fds}, _data, state, _continuation) do
+    _ = UnixFD.close_all(fds)
+    # MSG_CTRUNC means the kernel may have installed descriptors omitted from
+    # the returned control data. Their identities are unknowable, so this
+    # cannot be quarantined frame-locally and must fail closed.
+    stop_for_protocol_error(:unix_fd_truncated, state)
+  end
+
+  defp append_recvmsg_fds({:error, _reason, fds}, data, state, continuation) do
+    _ = UnixFD.close_all(fds)
+    # We decoded every complete descriptor before finding the malformed or
+    # oversized tail. Close them now and drop only the byte-aligned frame.
+    quarantine_ancillary_frame(data, state, continuation)
+  end
+
+  defp append_recvmsg_fds({:error, reason}, _data, state, _continuation),
+    do: stop_for_protocol_error(reason, state)
+
+  defp recvmsg_data(iov) do
+    try do
+      data = IO.iodata_to_binary(iov)
+
+      if byte_size(data) <= @max_read_chunk,
+        do: {:ok, data},
+        else: {:error, :message_too_large}
+    rescue
+      ArgumentError -> {:error, :invalid_unix_fds}
+    end
+  end
+
+  defp recvmsg_fds(ctrl, flags) do
+    with {:ok, fds} <- extract_rights_fds(ctrl) do
+      if :ctrunc in flags do
+        {:error, :unix_fd_truncated, fds}
+      else
+        {:ok, fds}
+      end
+    end
+  end
+
+  defp quarantine_ancillary_frame(<<>>, %__MODULE__{} = state, _continuation) do
+    stop_for_protocol_error(:invalid_unix_fds, state)
+  end
+
+  defp quarantine_ancillary_frame(data, %__MODULE__{} = state, continuation) do
+    append_inbound(data, %{state | inbound_fd_tainted?: true}, continuation)
+  end
+
+  defp extract_rights_fds(ctrl) do
+    Enum.reduce_while(ctrl, {:ok, []}, fn
+      %{level: :socket, type: :rights, data: data}, {:ok, fds} when is_binary(data) ->
+        case decode_rights_data(data) do
+          {:ok, received} -> {:cont, {:ok, fds ++ received}}
+          # A malformed control payload can still contain complete descriptors
+          # before its invalid tail. Keep those descriptors in the rejection
+          # result so the caller closes them on the single error path.
+          {:error, received} -> {:halt, {:error, :invalid_unix_fds, fds ++ received}}
+        end
+
+      # An SCM_RIGHTS item with a non-binary payload must fail closed. It may
+      # accompany descriptors decoded by an earlier cmsg, all of which travel
+      # in the error tuple to the single close path above.
+      %{level: :socket, type: :rights}, {:ok, fds} ->
+        {:halt, {:error, :invalid_unix_fds, fds}}
+
+      _cmsg, acc ->
+        {:cont, acc}
+    end)
+    |> case do
+      {:ok, fds} ->
+        if length(fds) <= Message.max_unix_fds(),
+          do: {:ok, fds},
+          else: {:error, :unix_fd_limit, fds}
+
+      error ->
+        error
+    end
+  end
+
+  defp decode_rights_data(data) do
+    complete_size = div(byte_size(data), 4) * 4
+    <<complete::binary-size(complete_size), _tail::binary>> = data
+    fds = for <<fd::native-signed-32 <- complete>>, do: fd
+
+    cond do
+      Enum.any?(fds, &(&1 < 0)) -> {:error, fds}
+      complete_size == byte_size(data) -> {:ok, fds}
+      true -> {:error, fds}
+    end
+  end
+
+  defp inbound_receive_size(%__MODULE__{inbound_expected_size: nil, inbound_size: inbound_size}) do
+    max(1, min(16 - inbound_size, @max_read_chunk))
+  end
+
+  defp inbound_receive_size(%__MODULE__{
+         inbound_expected_size: expected,
+         inbound_size: inbound_size
+       }) do
+    max(1, min(expected - inbound_size, @max_read_chunk))
   end
 
   defp append_inbound(<<>>, %__MODULE__{} = state, continuation),
@@ -1435,6 +2147,8 @@ defmodule Rebus.Connection do
           | :invalid_endianness
           | :invalid_message
           | :invalid_message_type
+          | :invalid_unix_fds
+          | :unix_fd_truncated
           | :message_too_large
           | :read_timeout
           | :resource_limit
@@ -1481,6 +2195,8 @@ defmodule Rebus.Connection do
              :invalid_endianness,
              :invalid_message,
              :invalid_message_type,
+             :invalid_unix_fds,
+             :unix_fd_truncated,
              :message_too_large,
              :read_timeout,
              :resource_limit,
@@ -1562,20 +2278,172 @@ defmodule Rebus.Connection do
       {:ok, reply_serial} ->
         case Map.pop(state.pending, reply_serial) do
           {nil, _pending} ->
+            close_message_fds(msg)
             Logger.info("Ignoring late or orphaned D-Bus reply for serial #{reply_serial}")
             {:ok, state}
 
-          {{from, timer_ref, request_ref, monitor_ref}, pending} ->
+          {{from, timer_ref, request_ref, monitor_ref, deadline}, pending} ->
             _ = Process.cancel_timer(timer_ref)
-            Process.demonitor(monitor_ref, [:flush])
-            GenServer.reply(from, msg)
-            {:ok, remove_indexes(%{state | pending: pending}, request_ref, monitor_ref)}
+
+            if msg.unix_fds == [] do
+              Process.demonitor(monitor_ref, [:flush])
+
+              if live_from?(from) do
+                GenServer.reply(from, msg)
+              else
+                close_message_fds(msg)
+              end
+
+              {:ok, remove_indexes(%{state | pending: pending}, request_ref, monitor_ref)}
+            else
+              # A live PID alone cannot prove a GenServer.call alias still
+              # accepts messages. Hold FD ownership in a claimed state until
+              # Connection.call/3 has consumed the regular-process delivery.
+              claim_ref = make_ref()
+
+              claim_deadline = fd_claim_deadline(deadline)
+
+              timer_ref =
+                Process.send_after(
+                  self(),
+                  {:fd_claim_timeout, claim_ref},
+                  fd_claim_timer_timeout(claim_deadline)
+                )
+
+              {pid, _tag} = from
+
+              claim = %{
+                pid: pid,
+                msg: msg,
+                request_ref: request_ref,
+                monitor_ref: monitor_ref,
+                timer_ref: timer_ref,
+                delivery_ref: nil,
+                delivery_alias: nil,
+                deadline: claim_deadline
+              }
+
+              run_fd_claim_handoff_hook(state.fd_claim_handoff_fun)
+              GenServer.reply(from, {:fd_claim, claim_ref})
+
+              {:ok,
+               %{
+                 state
+                 | pending: pending,
+                   request_index: Map.delete(state.request_index, request_ref),
+                   monitor_index: Map.delete(state.monitor_index, monitor_ref),
+                   fd_claims: Map.put(state.fd_claims, claim_ref, claim),
+                   fd_claim_request_index:
+                     Map.put(state.fd_claim_request_index, request_ref, claim_ref),
+                   fd_claim_monitor_index:
+                     Map.put(state.fd_claim_monitor_index, monitor_ref, claim_ref)
+               }}
+            end
         end
 
       :error ->
         {:error, {:malformed_reply, :missing_reply_serial}}
     end
   end
+
+  defp live_from?({pid, _tag}) when is_pid(pid), do: Process.alive?(pid)
+  defp live_from?(_from), do: false
+
+  defp drop_fd_claim(%__MODULE__{} = state, claim_ref, opts) do
+    case Map.pop(state.fd_claims, claim_ref) do
+      {nil, _claims} ->
+        state
+
+      {%{msg: msg, request_ref: request_ref, monitor_ref: monitor_ref, timer_ref: timer_ref},
+       claims} ->
+        _ = Process.cancel_timer(timer_ref)
+
+        close? = Keyword.get(opts, :close?, false)
+        if close?, do: close_message_fds(msg)
+
+        unless Keyword.get(opts, :monitor_down?, false) do
+          Process.demonitor(monitor_ref, [:flush])
+        end
+
+        state = %{
+          state
+          | fd_claims: claims,
+            fd_claim_request_index: Map.delete(state.fd_claim_request_index, request_ref),
+            fd_claim_monitor_index: Map.delete(state.fd_claim_monitor_index, monitor_ref)
+        }
+
+        case Keyword.get(opts, :outcome, if(close?, do: :closed, else: nil)) do
+          outcome when outcome in [:acknowledged, :closed] ->
+            put_fd_claim_outcome(state, claim_ref, outcome)
+
+          _ ->
+            state
+        end
+    end
+  end
+
+  defp close_fd_claims(claims) do
+    Enum.each(claims, fn {_claim_ref, %{msg: msg, timer_ref: timer_ref}} ->
+      _ = Process.cancel_timer(timer_ref)
+      close_message_fds(msg)
+    end)
+  end
+
+  defp rearm_fd_claim(claim_ref, %{timer_ref: timer_ref, deadline: deadline} = claim) do
+    _ = Process.cancel_timer(timer_ref)
+
+    %{
+      claim
+      | timer_ref:
+          Process.send_after(
+            self(),
+            {:fd_claim_timeout, claim_ref},
+            fd_claim_timer_timeout(deadline)
+          )
+    }
+  end
+
+  defp fd_claim_deadline(request_deadline), do: request_deadline + @fd_claim_cleanup_grace
+
+  defp fd_claim_live?(%{deadline: deadline}) when is_integer(deadline) do
+    deadline > System.monotonic_time(:millisecond)
+  end
+
+  defp fd_claim_timer_timeout(deadline) do
+    max(0, deadline - System.monotonic_time(:millisecond))
+  end
+
+  defp put_fd_claim_outcome(%__MODULE__{} = state, claim_ref, outcome) do
+    {old, outcomes} = Map.pop(state.fd_claim_outcomes, claim_ref)
+
+    if old, do: Process.cancel_timer(elem(old, 1))
+
+    timer_ref =
+      Process.send_after(self(), {:fd_claim_outcome_timeout, claim_ref}, @fd_claim_cleanup_grace)
+
+    %{state | fd_claim_outcomes: Map.put(outcomes, claim_ref, {outcome, timer_ref})}
+  end
+
+  defp take_fd_claim_outcome(%__MODULE__{} = state, claim_ref) do
+    case Map.pop(state.fd_claim_outcomes, claim_ref) do
+      {nil, _outcomes} ->
+        {nil, state}
+
+      {{outcome, timer_ref}, outcomes} ->
+        _ = Process.cancel_timer(timer_ref)
+        {outcome, %{state | fd_claim_outcomes: outcomes}}
+    end
+  end
+
+  defp run_fd_claim_handoff_hook(nil), do: :ok
+  defp run_fd_claim_handoff_hook(fun) when is_function(fun, 0), do: fun.()
+
+  defp run_fd_claim_hook(nil), do: :ok
+  defp run_fd_claim_hook(fun) when is_function(fun, 0), do: fun.()
+
+  defp run_fd_claim_ack_hook(nil, _claim), do: :ok
+  defp run_fd_claim_ack_hook(fun, _claim) when is_function(fun, 0), do: fun.()
+  defp run_fd_claim_ack_hook(fun, claim) when is_function(fun, 1), do: fun.(claim)
 
   defp drop_resource_limited_reply(
          %{type: :method_return, reply_serial: reply_serial},
@@ -1601,7 +2469,7 @@ defmodule Rebus.Connection do
         Logger.info("Ignoring late or orphaned D-Bus reply for serial #{reply_serial}")
         {:ok, state}
 
-      {{from, timer_ref, request_ref, monitor_ref}, pending} ->
+      {{from, timer_ref, request_ref, monitor_ref, _deadline}, pending} ->
         _ = Process.cancel_timer(timer_ref)
         Process.demonitor(monitor_ref, [:flush])
         GenServer.reply(from, {:error, {:reply_dropped, reply_kind}})
@@ -1654,6 +2522,16 @@ defmodule Rebus.Connection do
 
   defp validate_send_message(%Message{type: type}), do: {:error, {:invalid_message_type, type}}
 
+  defp validate_outbound_fd_transport(%Message{unix_fds: []}, _state), do: :ok
+
+  defp validate_outbound_fd_transport(%Message{}, %__MODULE__{unix_fd_transport?: false}),
+    do: {:error, :unix_fd_unsupported}
+
+  defp validate_outbound_fd_transport(%Message{}, %__MODULE__{unix_fd_negotiated?: false}),
+    do: {:error, :unix_fd_not_negotiated}
+
+  defp validate_outbound_fd_transport(%Message{}, %__MODULE__{}), do: :ok
+
   defp remaining_timeout(deadline) when is_integer(deadline) do
     case deadline - System.monotonic_time(:millisecond) do
       remaining when remaining > 0 -> {:ok, remaining}
@@ -1682,11 +2560,19 @@ defmodule Rebus.Connection do
   @doc false
   defguardp is_select_info(info)
             when is_tuple(info) and tuple_size(info) == 3 and elem(info, 0) == :select_info and
-                   elem(info, 1) == :send and is_reference(elem(info, 2))
+                   elem(info, 1) in [:send, :sendmsg] and is_reference(elem(info, 2))
+
+  defguardp is_sendmsg_select_info(info)
+            when is_tuple(info) and tuple_size(info) == 3 and elem(info, 0) == :select_info and
+                   elem(info, 1) == :sendmsg and is_reference(elem(info, 2))
 
   defguardp is_completion_info(info)
             when is_tuple(info) and tuple_size(info) == 3 and elem(info, 0) == :completion_info and
-                   elem(info, 1) == :send and is_reference(elem(info, 2))
+                   elem(info, 1) in [:send, :sendmsg] and is_reference(elem(info, 2))
+
+  defguardp is_sendmsg_completion_info(info)
+            when is_tuple(info) and tuple_size(info) == 3 and elem(info, 0) == :completion_info and
+                   elem(info, 1) == :sendmsg and is_reference(elem(info, 2))
 
   @spec classify_send_result(term(), non_neg_integer()) ::
           :ok
@@ -1728,6 +2614,54 @@ defmodule Rebus.Connection do
 
   def classify_send_result(_result, _payload_length), do: {:error, {:send_fatal, :send_failed}}
 
+  defp classify_sendmsg_result(result, payload_length) do
+    case result do
+      {:ok, rest} ->
+        with {:ok, rest} <- send_rest_binary(rest),
+             do: {:continue, rest},
+             else: (_ -> {:error, {:send_fatal, :send_failed}})
+
+      {:select, {select_info, rest}} when is_sendmsg_select_info(select_info) ->
+        with {:ok, rest} <- send_rest_binary(rest),
+             do: {:select, select_info, rest},
+             else: (_ -> {:error, {:send_fatal, :send_failed}})
+
+      {:select, select_info} when is_sendmsg_select_info(select_info) ->
+        {:select, select_info, nil}
+
+      {:completion, completion_info} when is_sendmsg_completion_info(completion_info) ->
+        {:completion, completion_info}
+
+      {:select, _unexpected} ->
+        {:error, {:send_fatal, :send_failed}}
+
+      {:completion, _unexpected} ->
+        {:error, {:send_fatal, :send_failed}}
+
+      {:error, reason} when reason in [:ebadf, :einval, :eperm, :emfile, :enfile] ->
+        # A descriptor-local failure before this attempt accepted bytes is not
+        # a stream failure. The queued caller receives a bounded error and the
+        # connection can continue with independent calls.
+        {:error, :unix_fd_send_failed}
+
+      {:error, {reason, rest}} when reason in [:ebadf, :einval, :eperm, :emfile, :enfile] ->
+        if iolist?(rest) and IO.iodata_length(rest) == payload_length,
+          do: {:error, :unix_fd_send_failed},
+          else: {:error, {:send_fatal, reason}}
+
+      other ->
+        classify_send_result(other, payload_length)
+    end
+  end
+
+  defp send_rest_binary(rest) do
+    try do
+      {:ok, IO.iodata_to_binary(rest)}
+    rescue
+      ArgumentError -> :error
+    end
+  end
+
   # Writes are one-frame-at-a-time.  OTP retains the unaccepted RestData in every
   # partial result; retaining it here is what preserves D-Bus stream framing.
   defp enqueue_write(state, operation) do
@@ -1763,30 +2697,46 @@ defmodule Rebus.Connection do
             | cancelled_requests: MapSet.delete(state.cancelled_requests, operation.request_ref)
           })
         else
-          case allocate_serial(state.serial, state.pending) do
-            {:ok, serial} ->
-              case encode_message(%{operation.msg | serial: serial}) do
-                {:ok, bin} ->
-                  bin = IO.iodata_to_binary(bin)
+          case validate_outbound_fd_transport(operation.msg, state) do
+            :ok ->
+              case allocate_serial(state.serial, state.pending) do
+                {:ok, serial} ->
+                  case encode_message(%{operation.msg | serial: serial}) do
+                    {:ok, bin} ->
+                      bin = IO.iodata_to_binary(bin)
 
-                  timer_ref =
-                    Process.send_after(
-                      self(),
-                      {:write_timeout, operation.request_ref},
-                      state.write_timeout
-                    )
+                      timer_ref =
+                        Process.send_after(
+                          self(),
+                          {:write_timeout, operation.request_ref},
+                          state.write_timeout
+                        )
 
-                  write =
-                    Map.merge(operation, %{
-                      serial: serial,
-                      rest: bin,
-                      frame_size: byte_size(bin),
-                      wait: nil,
-                      timer_ref: timer_ref,
-                      partial?: false
-                    })
+                      write =
+                        Map.merge(operation, %{
+                          serial: serial,
+                          rest: bin,
+                          frame_size: byte_size(bin),
+                          wait: nil,
+                          timer_ref: timer_ref,
+                          partial?: false,
+                          unix_fds: operation.msg.unix_fds,
+                          uses_sendmsg?: operation.msg.unix_fds != [],
+                          # `:socket.sendmsg/4` retains the original encoded
+                          # control map in a select continuation. We keep this
+                          # explicit so that only a no-progress select uses
+                          # that continuation; once bytes have been accepted,
+                          # the remaining stream bytes use plain send/4.
+                          fd_control: if(operation.msg.unix_fds == [], do: :none, else: :initial)
+                        })
 
-                  advance_writes(%{state | active_write: write})
+                      advance_writes(%{state | active_write: write})
+
+                    {:error, reason} ->
+                      state = release_outbound_monitor(state, operation)
+                      GenServer.reply(operation.from, {:error, reason})
+                      advance_writes(state)
+                  end
 
                 {:error, reason} ->
                   state = release_outbound_monitor(state, operation)
@@ -1815,14 +2765,13 @@ defmodule Rebus.Connection do
         advance_writes(drop_active(state, cancel?: true))
 
       true ->
-        {rest, flags_or_cont, timeout} = socket_send_args(write.rest, write.wait)
-        result = state.send_fun.(state.sock, rest, flags_or_cont, timeout)
+        result = safe_socket_send(state, write)
         handle_write_result(result, %{state | active_write: %{write | wait: nil}})
     end
   end
 
   defp handle_write_result(result, %__MODULE__{active_write: write} = state) do
-    case classify_send_result(result, write.frame_size) do
+    case classify_write_result(result, write) do
       :ok ->
         complete_active_write(state)
 
@@ -1831,13 +2780,35 @@ defmodule Rebus.Connection do
         {:noreply, state, {:continue, :write}}
 
       {:select, continuation, rest} ->
+        partial_with_rights? = fd_control_accepted?(write, rest)
         state = if rest, do: put_active_rest(state, rest), else: state
-        {:select_info, :send, handle} = continuation
+        {:select_info, _operation, handle} = continuation
 
-        {:noreply,
-         %{state | active_write: %{state.active_write | wait: {:select, continuation, handle}}}}
+        if partial_with_rights? do
+          # OTP's Cont keeps the original encoded Msg (including ctrl); using
+          # it after a byte was sent could emit SCM_RIGHTS again. Cancel the
+          # pending select and let plain send/4 register its own continuation.
+          cancel_socket_write(state, {:select, continuation, handle})
+          {:noreply, state, {:continue, :write}}
+        else
+          # `:accepted` is sticky. A positive-progress sendmsg has already
+          # transferred SCM_RIGHTS and its tail is now a plain send/4
+          # operation. A later plain-send select must never turn it back into
+          # a sendmsg continuation (whose OTP continuation still owns ctrl).
+          state =
+            if write.uses_sendmsg? and
+                 Map.get(state.active_write, :fd_control) in [:initial, :select_continuation],
+               do: %{
+                 state
+                 | active_write: %{state.active_write | fd_control: :select_continuation}
+               },
+               else: state
 
-      {:completion, {:completion_info, :send, notification_handle} = handle} ->
+          {:noreply,
+           %{state | active_write: %{state.active_write | wait: {:select, continuation, handle}}}}
+        end
+
+      {:completion, {:completion_info, _operation, notification_handle} = handle} ->
         {:noreply,
          %{
            state
@@ -1860,10 +2831,20 @@ defmodule Rebus.Connection do
     end
   end
 
+  defp classify_write_result(
+         result,
+         %{uses_sendmsg?: true, fd_control: control, rest: rest}
+       )
+       when control in [:initial, :select_continuation],
+       do: classify_sendmsg_result(result, byte_size(rest))
+
+  defp classify_write_result(result, %{rest: rest}),
+    do: classify_send_result(result, byte_size(rest))
+
   defp handle_completion_result(:ok, state), do: complete_active_write(state)
 
   defp handle_completion_result({:ok, written}, %__MODULE__{active_write: write} = state)
-       when is_integer(written) and written >= 0 and written < byte_size(write.rest) do
+       when is_integer(written) and written > 0 and written < byte_size(write.rest) do
     <<_sent::binary-size(written), rest::binary>> = write.rest
     state = put_active_rest(state, rest)
     {:noreply, state, {:continue, :write}}
@@ -1877,8 +2858,21 @@ defmodule Rebus.Connection do
 
   defp put_active_rest(%__MODULE__{active_write: write} = state, rest) do
     partial? = write.partial? or byte_size(rest) < byte_size(write.rest)
-    %{state | active_write: %{write | rest: rest, partial?: partial?}}
+
+    fd_control =
+      if fd_control_accepted?(write, rest),
+        do: :accepted,
+        else: Map.get(write, :fd_control, :none)
+
+    %{state | active_write: %{write | rest: rest, partial?: partial?, fd_control: fd_control}}
   end
+
+  defp fd_control_accepted?(%{uses_sendmsg?: true, fd_control: control, rest: previous}, rest)
+       when control in [:initial, :select_continuation] and is_binary(rest) do
+    byte_size(rest) < byte_size(previous)
+  end
+
+  defp fd_control_accepted?(_write, _rest), do: false
 
   defp complete_active_write(%__MODULE__{active_write: write} = state) do
     live? = not cancelled_or_expired?(write, state)
@@ -1900,7 +2894,7 @@ defmodule Rebus.Connection do
                 Process.send_after(
                   self(),
                   {:request_timeout, write.serial, write.request_ref},
-                  remaining
+                  remaining + state.request_timeout_slack
                 )
 
               state = %{
@@ -1913,7 +2907,7 @@ defmodule Rebus.Connection do
                 Map.put(
                   state.pending,
                   write.serial,
-                  {write.from, timer_ref, write.request_ref, write.monitor_ref}
+                  {write.from, timer_ref, write.request_ref, write.monitor_ref, write.deadline}
                 )
 
               advance_writes(%{
@@ -1970,6 +2964,54 @@ defmodule Rebus.Connection do
   def socket_send_args(rest, {:continue, continuation}), do: {rest, continuation, :nowait}
   def socket_send_args(rest, _wait), do: {rest, [], :nowait}
 
+  # `socket.erl` in OTP 26--28 stores the encoded original Msg in a sendmsg
+  # select continuation (prim_socket:sendmsg/4's Cont is `{Msg, EMsg, EFlags}`).
+  # Therefore an IOV-only continuation is correct only when no byte has been
+  # accepted. After partial progress we cancel that continuation and send the
+  # tail without ctrl, which guarantees SCM_RIGHTS is emitted once.
+  defp socket_send(
+         %__MODULE__{} = state,
+         %{uses_sendmsg?: true, fd_control: :initial, wait: nil} = write
+       ) do
+    state.sendmsg_fun.(
+      state.sock,
+      %{
+        iov: [write.rest],
+        ctrl: [%{level: :socket, type: :rights, data: rights_data(write.unix_fds)}]
+      },
+      [],
+      :nowait
+    )
+  end
+
+  defp socket_send(
+         %__MODULE__{} = state,
+         %{uses_sendmsg?: true, fd_control: :select_continuation, wait: {:continue, continuation}} =
+           write
+       ) do
+    state.sendmsg_fun.(state.sock, [write.rest], continuation, :nowait)
+  end
+
+  defp socket_send(%__MODULE__{} = state, write) do
+    {rest, flags_or_cont, timeout} = socket_send_args(write.rest, write.wait)
+    state.send_fun.(state.sock, rest, flags_or_cont, timeout)
+  end
+
+  # Socket wrappers are injectable for deterministic state-machine coverage.
+  # Never let a malformed result or an injected exception crash the GenServer:
+  # that would make OTP log the active frame and its control state.
+  defp safe_socket_send(state, write) do
+    socket_send(state, write)
+  rescue
+    _exception -> {:error, :send_failed}
+  catch
+    _, _ -> {:error, :send_failed}
+  end
+
+  defp rights_data(fds) do
+    for fd <- fds, into: <<>>, do: <<fd::native-signed-32>>
+  end
+
   defp cancel_socket_write(state, {:select, continuation, _handle}) do
     _ = state.cancel_fun.(state.sock, continuation)
     :ok
@@ -2011,10 +3053,20 @@ defmodule Rebus.Connection do
       GenServer.reply(operation.from, {:error, :disconnected})
     end)
 
-    Enum.each(state.pending, fn {_serial, {from, timer_ref, _request_ref, monitor_ref}} ->
+    Enum.each(state.pending, fn {_serial, {from, timer_ref, _request_ref, monitor_ref, _deadline}} ->
       _ = Process.cancel_timer(timer_ref)
       Process.demonitor(monitor_ref, [:flush])
       GenServer.reply(from, {:error, :disconnected})
+    end)
+
+    close_fd_claims(state.fd_claims)
+
+    Enum.each(state.fd_claims, fn {_claim_ref, %{monitor_ref: monitor_ref}} ->
+      Process.demonitor(monitor_ref, [:flush])
+    end)
+
+    Enum.each(state.fd_claim_outcomes, fn {_claim_ref, {_outcome, timer_ref}} ->
+      _ = Process.cancel_timer(timer_ref)
     end)
 
     %{
@@ -2022,6 +3074,10 @@ defmodule Rebus.Connection do
       | pending: %{},
         request_index: %{},
         monitor_index: %{},
+        fd_claims: %{},
+        fd_claim_request_index: %{},
+        fd_claim_monitor_index: %{},
+        fd_claim_outcomes: %{},
         outbound_monitor_index: %{},
         active_write: nil,
         write_queue: :queue.new(),

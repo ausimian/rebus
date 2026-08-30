@@ -31,6 +31,10 @@ defmodule Rebus.TestServer do
     GenServer.call(svr, {:push_raw_delayed_fragments, fragments, delay})
   end
 
+  def push_with_fds(svr, %Message{} = msg, fds) when is_pid(svr) and is_list(fds) do
+    GenServer.cast(svr, {:push_with_fds, msg, fds})
+  end
+
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts)
   end
@@ -40,6 +44,7 @@ defmodule Rebus.TestServer do
     field :cli_sock, :socket.socket() | nil, default: nil
     field :handle, reference() | nil, default: nil
     field :prev, binary(), default: <<>>
+    field :received_fds, [non_neg_integer()], default: []
     field :tap, pid()
     field :serial, non_neg_integer(), default: 1
     field :family, :inet | :inet6 | :local, default: :inet
@@ -53,6 +58,7 @@ defmodule Rebus.TestServer do
     field :notify_auth, boolean(), default: false
     field :auto_hello, boolean(), default: true
     field :auto_hello_name_acquired?, boolean(), default: true
+    field :unix_fd_response, binary(), default: "AGREE_UNIX_FD\r\n"
   end
 
   @impl true
@@ -79,7 +85,8 @@ defmodule Rebus.TestServer do
            silent_auth: opts[:silent_auth] || false,
            notify_auth: opts[:notify_auth] || false,
            auto_hello: Keyword.get(opts, :auto_hello, true),
-           auto_hello_name_acquired?: Keyword.get(opts, :auto_hello_name_acquired?, true)
+           auto_hello_name_acquired?: Keyword.get(opts, :auto_hello_name_acquired?, true),
+           unix_fd_response: Keyword.get(opts, :unix_fd_response, "AGREE_UNIX_FD\r\n")
          }, {:continue, :accept}}
 
       :local ->
@@ -102,7 +109,8 @@ defmodule Rebus.TestServer do
            silent_auth: opts[:silent_auth] || false,
            notify_auth: opts[:notify_auth] || false,
            auto_hello: Keyword.get(opts, :auto_hello, true),
-           auto_hello_name_acquired?: Keyword.get(opts, :auto_hello_name_acquired?, true)
+           auto_hello_name_acquired?: Keyword.get(opts, :auto_hello_name_acquired?, true),
+           unix_fd_response: Keyword.get(opts, :unix_fd_response, "AGREE_UNIX_FD\r\n")
          }, {:continue, :accept}}
     end
   end
@@ -130,7 +138,7 @@ defmodule Rebus.TestServer do
 
             case state.auth_response do
               <<"OK ", _::binary>> ->
-                case :socket.recv(cli, 8) do
+                case receive_begin(cli, state) do
                   {:ok, "BEGIN \r\n"} ->
                     if state.close_after_begin do
                       :ok = :socket.close(cli)
@@ -161,11 +169,27 @@ defmodule Rebus.TestServer do
   end
 
   def handle_continue(:recv, %__MODULE__{cli_sock: cli, handle: nil} = state) do
-    case :socket.recv(cli, 0, [], :nowait) do
+    recv_result =
+      if state.family == :local,
+        do: :socket.recvmsg(cli, 0, 256, [], :nowait),
+        else: :socket.recv(cli, 0, [], :nowait)
+
+    case recv_result do
+      {:ok, %{iov: iov, ctrl: ctrl}} ->
+        with {:ok, data} <- iodata_to_binary(iov),
+             {:ok, fds} <- rights_fds(ctrl) do
+          parse(state.prev <> data, %{state | prev: <<>>, received_fds: fds})
+        else
+          _ -> {:stop, :parse_error, state}
+        end
+
       {:ok, data} ->
         parse(state.prev <> data, %__MODULE__{state | prev: <<>>})
 
       {:select, {:select_info, :recv, handle}} ->
+        {:noreply, %{state | handle: handle}}
+
+      {:select, {:select_info, :recvmsg, handle}} ->
         {:noreply, %{state | handle: handle}}
 
       {:error, :closed} ->
@@ -230,6 +254,25 @@ defmodule Rebus.TestServer do
     {:noreply, state}
   end
 
+  def handle_cast({:push_with_fds, %Message{} = msg, fds}, %__MODULE__{} = state) do
+    msg = %{msg | serial: state.serial}
+    {:ok, bin} = Message.encode(msg)
+    rights = for fd <- fds, into: <<>>, do: <<fd::native-signed-32>>
+
+    :ok =
+      :socket.sendmsg(
+        state.cli_sock,
+        %{
+          iov: [IO.iodata_to_binary(bin)],
+          ctrl: [%{level: :socket, type: :rights, data: rights}]
+        },
+        [],
+        1_000
+      )
+
+    {:noreply, %{state | serial: state.serial + 1}}
+  end
+
   @impl true
   def terminate(_reason, %__MODULE__{family: :local, path: <<0, _rest::binary>>} = _state) do
     :ok
@@ -272,11 +315,31 @@ defmodule Rebus.TestServer do
     end)
   end
 
+  defp receive_begin(cli, %__MODULE__{family: :local, unix_fd_response: response}) do
+    case :socket.recv(cli, 0) do
+      {:ok, "NEGOTIATE_UNIX_FD\r\n"} ->
+        :ok = :socket.send(cli, response)
+        :socket.recv(cli, 8)
+
+      result ->
+        result
+    end
+  end
+
+  defp receive_begin(cli, _state), do: :socket.recv(cli, 8)
+
   defp parse(data, %__MODULE__{} = state) do
     case Message.parse(data) do
       {:ok, %Message{} = msg, rest} ->
-        send(state.tap, {self(), msg})
-        parse(rest, maybe_reply_hello(msg, state))
+        case Message.attach_unix_fds(msg, state.received_fds) do
+          {:ok, msg} ->
+            send(state.tap, {self(), msg})
+            parse(rest, maybe_reply_hello(msg, %{state | received_fds: []}))
+
+          {:error, _reason} ->
+            Enum.each(state.received_fds, &Rebus.UnixFD.close/1)
+            {:stop, :parse_error, state}
+        end
 
       nil ->
         # Incomplete message, store data for next recv
@@ -323,4 +386,21 @@ defmodule Rebus.TestServer do
   end
 
   defp maybe_reply_hello(_msg, state), do: state
+
+  defp iodata_to_binary(iodata) do
+    try do
+      {:ok, IO.iodata_to_binary(iodata)}
+    rescue
+      ArgumentError -> :error
+    end
+  end
+
+  defp rights_fds(ctrl) do
+    fds =
+      for %{level: :socket, type: :rights, data: data} <- ctrl,
+          <<fd::native-signed-32 <- data>>,
+          do: fd
+
+    if Enum.all?(fds, &(&1 >= 0)), do: {:ok, fds}, else: :error
+  end
 end
