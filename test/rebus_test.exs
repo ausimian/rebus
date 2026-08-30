@@ -31,6 +31,213 @@ defmodule RebusTest do
       assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
     end
 
+    test "drops resource-limited frames and continues coalesced signals", %{svr: svr} do
+      cli = connect_until_ready(svr)
+      ref = make_ref()
+
+      :ok = :gen_event.add_sup_handler(SignalHandler, {SignalHandler, ref}, {cli, self(), ref})
+      on_exit(fn -> :gen_event.delete_handler(SignalHandler, {SignalHandler, ref}, nil) end)
+
+      payload_sentinel = "resource-limit-body-sentinel"
+      limited_data = raw_resource_limited_signal()
+
+      valid =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "AfterLimit"
+        )
+
+      assert {:error, :resource_limit} = Message.decode(limited_data)
+      {:ok, valid_data} = Message.encode(valid)
+
+      log =
+        capture_log(fn ->
+          :ok =
+            TestServer.push_raw(
+              svr,
+              limited_data <> IO.iodata_to_binary(valid_data)
+            )
+
+          assert_receive {^ref, %Message{header_fields: %{member: "AfterLimit"}}}, 2_000
+          assert Process.alive?(cli)
+        end)
+
+      assert log =~ "D-Bus frame dropped: :resource_limit"
+      refute log =~ "D-Bus connection protocol stopped"
+      refute log =~ payload_sentinel
+    end
+
+    test "drops a resource-limited reply, fails its caller, and keeps parsing", %{svr: svr} do
+      cli = connect_until_ready(svr)
+      signal_ref = make_ref()
+
+      :ok =
+        :gen_event.add_sup_handler(
+          SignalHandler,
+          {SignalHandler, signal_ref},
+          {cli, self(), signal_ref}
+        )
+
+      on_exit(fn ->
+        :gen_event.delete_handler(SignalHandler, {SignalHandler, signal_ref}, nil)
+      end)
+
+      method =
+        Message.new!(:method_call,
+          path: "/test",
+          interface: "test.interface",
+          member: "LimitedReply"
+        )
+
+      call_task = Task.async(fn -> Rebus.call(cli, method, 5_000) end)
+      assert_receive {^svr, %Message{header_fields: %{member: "LimitedReply"}} = request}, 1_000
+
+      [{_serial, {_from, timer_ref, _request_ref, _monitor_ref}}] =
+        :sys.get_state(cli).pending |> Map.to_list()
+
+      limited_reply = raw_resource_limited_reply(request.serial)
+
+      following_signal =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "AfterLimitedReply"
+        )
+
+      {:ok, following_signal_data} = Message.encode(following_signal)
+      started_at = System.monotonic_time(:millisecond)
+
+      log =
+        capture_log(fn ->
+          :ok =
+            TestServer.push_raw(svr, limited_reply <> IO.iodata_to_binary(following_signal_data))
+
+          assert {:error, {:reply_dropped, :method_return}} = Task.await(call_task, 2_000)
+          assert System.monotonic_time(:millisecond) - started_at < 4_000
+
+          assert_receive {^signal_ref, %Message{header_fields: %{member: "AfterLimitedReply"}}},
+                         2_000
+        end)
+
+      assert log =~ "D-Bus frame dropped: :resource_limit"
+      refute log =~ "resource-limit-body-sentinel"
+      assert Process.read_timer(timer_ref) == false
+
+      assert wait_until(fn ->
+               state = :sys.get_state(cli)
+
+               state.pending == %{} and state.request_index == %{} and state.monitor_index == %{} and
+                 map_size(state.outbound_monitor_index) == 0
+             end)
+
+      assert Process.alive?(cli)
+
+      follow_up =
+        Message.new!(:method_call,
+          path: "/test",
+          interface: "test.interface",
+          member: "AfterDroppedReply"
+        )
+
+      follow_up_task = Task.async(fn -> Rebus.call(cli, follow_up, 1_000) end)
+
+      assert_receive {^svr,
+                      %Message{header_fields: %{member: "AfterDroppedReply"}} = follow_up_request},
+                     1_000
+
+      :ok =
+        TestServer.push(svr, Message.new!(:method_return, reply_serial: follow_up_request.serial))
+
+      assert %Message{type: :method_return} = Task.await(follow_up_task, 1_000)
+    end
+
+    test "reports the validated error name when an error reply is resource-limited", %{svr: svr} do
+      cli = connect_until_ready(svr)
+
+      method =
+        Message.new!(:method_call,
+          path: "/test",
+          interface: "test.interface",
+          member: "LimitedErrorReply"
+        )
+
+      call_task = Task.async(fn -> Rebus.call(cli, method, 5_000) end)
+
+      assert_receive {^svr, %Message{header_fields: %{member: "LimitedErrorReply"}} = request},
+                     1_000
+
+      [{_serial, {_from, timer_ref, _request_ref, _monitor_ref}}] =
+        :sys.get_state(cli).pending |> Map.to_list()
+
+      error_name = "org.example.ResourceLimited"
+      limited_reply = raw_resource_limited_error_reply(request.serial, error_name)
+
+      log =
+        capture_log(fn ->
+          :ok = TestServer.push_raw(svr, limited_reply)
+
+          assert {:error, {:reply_dropped, {:error, ^error_name}}} =
+                   Task.await(call_task, 2_000)
+        end)
+
+      assert log =~ "D-Bus frame dropped: :resource_limit"
+      refute log =~ "resource-limit-body-sentinel"
+      assert Process.read_timer(timer_ref) == false
+
+      assert wait_until(fn ->
+               state = :sys.get_state(cli)
+
+               state.pending == %{} and state.request_index == %{} and state.monitor_index == %{}
+             end)
+
+      assert Process.alive?(cli)
+    end
+
+    test "drops a header-limited frame without closing the connection", %{svr: svr} do
+      cli = connect_until_ready(svr)
+      ref = make_ref()
+
+      :ok = :gen_event.add_sup_handler(SignalHandler, {SignalHandler, ref}, {cli, self(), ref})
+      on_exit(fn -> :gen_event.delete_handler(SignalHandler, {SignalHandler, ref}, nil) end)
+
+      limited_data = raw_header_resource_limited_signal()
+
+      valid =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "AfterHeaderLimit"
+        )
+
+      {:ok, valid_data} = Message.encode(valid)
+      assert {:error, :resource_limit} = Message.decode(limited_data)
+
+      log =
+        capture_log(fn ->
+          :ok = TestServer.push_raw(svr, limited_data <> IO.iodata_to_binary(valid_data))
+          assert_receive {^ref, %Message{header_fields: %{member: "AfterHeaderLimit"}}}, 2_000
+        end)
+
+      assert log =~ "D-Bus frame dropped: :resource_limit"
+      assert Process.alive?(cli)
+    end
+
+    test "treats truncated over-declared arrays as protocol errors", %{svr: svr} do
+      cli = connect_until_ready(svr)
+      ref = Process.monitor(cli)
+
+      log =
+        capture_log(fn ->
+          :ok = TestServer.push_raw(svr, raw_truncated_scalar_signal())
+
+          assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :invalid_message}}, 1_000
+        end)
+
+      assert log =~ "D-Bus connection protocol stopped: :invalid_message"
+      refute log =~ "D-Bus frame dropped: :resource_limit"
+    end
+
     test "rejects an invalid write timeout", %{svr: svr} do
       {:ok, addr} = TestServer.get_listen_addr(svr)
       assert {:error, :invalid_write_timeout} = Rebus.connect(addr, write_timeout: -1)
@@ -376,6 +583,30 @@ defmodule RebusTest do
 
       :ok = TestServer.push(svr, Message.new!(:method_return, reply_serial: request.serial))
       assert %Message{type: :method_return} = Task.await(call_task, 1_000)
+    end
+
+    test "fails a resource-limited Hello reply promptly instead of waiting for its timeout", %{
+      svr: svr
+    } do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      :ok = TestServer.set_auto_hello(svr, false)
+      read_timeout = 2_000
+      connect_task = Task.async(fn -> Rebus.connect(addr, read_timeout: read_timeout) end)
+
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      started_at = System.monotonic_time(:millisecond)
+
+      log =
+        capture_log(fn ->
+          :ok = TestServer.push_raw(svr, raw_resource_limited_reply(hello.serial))
+
+          assert {:error, {:hello_failed, :resource_limit}} = Task.await(connect_task, 500)
+        end)
+
+      assert System.monotonic_time(:millisecond) - started_at < div(read_timeout, 2)
+      assert log =~ "D-Bus connection protocol stopped: {:hello_failed, :resource_limit}"
+      refute log =~ "resource-limit-body-sentinel"
+      refute log =~ "%Rebus.Connection"
     end
 
     test "makes pre-establishment discovery timeouts safe to retry", %{svr: svr} do
@@ -1687,23 +1918,23 @@ defmodule RebusTest do
 
     test "classifies a missing error name", %{svr: svr} do
       log =
-        assert_hello_error_reason(svr, :missing_error_name, fn reply_serial ->
-          raw_error_reply(reply_serial, %{})
+        assert_hello_error_reason(svr, :invalid_message, fn reply_serial ->
+          raw_error_reply_binary(reply_serial, %{})
         end)
 
-      assert log =~ "D-Bus connection protocol stopped: {:hello_failed, :missing_error_name}"
+      assert log =~ "D-Bus connection protocol stopped: :invalid_message"
     end
 
     test "classifies an invalid error name without logging it", %{svr: svr} do
       invalid_name = "invalid error name"
 
       log =
-        assert_hello_error_reason(svr, :invalid_error_name, fn reply_serial ->
-          raw_error_reply(reply_serial, %{error_name: invalid_name})
+        assert_hello_error_reason(svr, :invalid_message, fn reply_serial ->
+          raw_error_reply_binary(reply_serial, %{error_name: invalid_name})
         end)
 
       refute log =~ invalid_name
-      assert log =~ "D-Bus connection protocol stopped: {:hello_failed, :invalid_error_name}"
+      assert log =~ "D-Bus connection protocol stopped: :invalid_message"
     end
 
     test "classifies an oversized error name without logging it", %{svr: svr} do
@@ -2417,13 +2648,19 @@ defmodule RebusTest do
       cli: cli,
       svr: svr
     } do
-      invalid_message =
-        Message.new!(:method_call,
+      invalid_message = %Message{
+        type: :method_call,
+        flags: [],
+        version: 1,
+        body_length: 0,
+        serial: 0,
+        header_fields: %{
           path: "/org/freedesktop/DBus",
           member: "BadBody",
-          signature: "s",
-          body: [42]
-        )
+          signature: "s"
+        },
+        body: [42]
+      }
 
       assert {:error, :encode_failed} = Rebus.call(cli, invalid_message)
       assert Process.alive?(cli)
@@ -2852,14 +3089,25 @@ defmodule RebusTest do
     capture_log(fn ->
       {cli, hello} = connect_until_hello(svr)
       reply = build_reply.(hello.serial)
-      {:ok, encoded} = Message.encode(reply)
+
+      encoded =
+        if is_binary(reply) do
+          reply
+        else
+          {:ok, iodata} = Message.encode(reply)
+          IO.iodata_to_binary(iodata)
+        end
+
       ref = Process.monitor(cli)
 
-      :ok = TestServer.push_raw(svr, IO.iodata_to_binary(encoded))
+      :ok = TestServer.push_raw(svr, encoded)
 
-      assert_receive {:DOWN, ^ref, :process, ^cli,
-                      {:shutdown, {:hello_failed, ^expected_reason}}},
-                     1_000
+      expected_shutdown =
+        if expected_reason == :invalid_message,
+          do: :invalid_message,
+          else: {:hello_failed, expected_reason}
+
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, ^expected_shutdown}}, 1_000
     end)
   end
 
@@ -2877,16 +3125,15 @@ defmodule RebusTest do
       capture_log(fn ->
         cli = connect_until_ready(svr)
         ref = Process.monitor(cli)
-        {:ok, encoded} = Message.encode(raw_reply(type, %{}))
+        type_code = if type == :method_return, do: 2, else: 3
+        encoded = <<?l, type_code, 0, 1, 0::little-32, 1::little-32, 0::little-32>>
 
-        :ok = TestServer.push_raw(svr, IO.iodata_to_binary(encoded))
+        :ok = TestServer.push_raw(svr, encoded)
 
-        assert_receive {:DOWN, ^ref, :process, ^cli,
-                        {:shutdown, {:malformed_reply, :missing_reply_serial}}},
-                       1_000
+        assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :invalid_message}}, 1_000
       end)
 
-    assert log =~ "D-Bus connection protocol stopped: {:malformed_reply, :missing_reply_serial}"
+    assert log =~ "D-Bus connection protocol stopped: :invalid_message"
     refute log =~ "%Rebus.Connection"
   end
 
@@ -2894,21 +3141,109 @@ defmodule RebusTest do
     raw_reply(:error, Map.put(header_fields, :reply_serial, reply_serial))
   end
 
-  defp malformed_empty_struct_array_message do
-    message =
-      Message.new!(:signal,
-        path: "/test",
-        interface: "test.interface",
-        member: "ZeroWidth",
-        signature: "a()",
-        body: [[]]
-      )
+  defp raw_error_reply_binary(reply_serial, header_fields) do
+    fields =
+      header_fields
+      |> Map.put(:reply_serial, reply_serial)
+      |> Enum.map(fn {field, value} ->
+        type = if field == :reply_serial, do: "u", else: "s"
+        code = if field == :reply_serial, do: 5, else: 4
+        [code, {type, value}]
+      end)
 
-    {:ok, encoded} = Message.encode(message)
-    encoded = IO.iodata_to_binary(encoded)
-    header_size = byte_size(encoded) - message.body_length
-    <<header::binary-size(header_size), _body::binary>> = encoded
-    header <> <<1::little-32, 0::size(4 * 8)>>
+    header =
+      Rebus.Encoder.encode_at_position("a(yv)", [fields], :little, 12) |> IO.iodata_to_binary()
+
+    padding = :binary.copy(<<0>>, rem(8 - rem(12 + byte_size(header), 8), 8))
+
+    <<?l, 3, 0, 1, 0::little-32, 1::little-32, header::binary, padding::binary>>
+  end
+
+  defp raw_resource_limited_signal do
+    raw_wire_message(
+      4,
+      [
+        [1, {"o", "/test"}],
+        [2, {"s", "test.interface"}],
+        [3, {"s", "Limited"}],
+        [8, {"g", "ay"}]
+      ],
+      scalar_limited_body()
+    )
+  end
+
+  defp raw_resource_limited_reply(reply_serial) do
+    raw_wire_message(2, [[5, {"u", reply_serial}], [8, {"g", "ay"}]], scalar_limited_body())
+  end
+
+  defp raw_resource_limited_error_reply(reply_serial, error_name) do
+    raw_wire_message(
+      3,
+      [[4, {"s", error_name}], [5, {"u", reply_serial}], [8, {"g", "ay"}]],
+      scalar_limited_body()
+    )
+  end
+
+  defp raw_header_resource_limited_signal do
+    fields =
+      [[1, {"o", "/test"}], [2, {"s", "test.interface"}], [3, {"s", "HeaderLimited"}]] ++
+        List.duplicate([10, {"ay", []}], 25_001)
+
+    raw_wire_message(4, fields, <<>>)
+  end
+
+  defp raw_truncated_scalar_signal do
+    raw_wire_message(
+      4,
+      [
+        [1, {"o", "/test"}],
+        [2, {"s", "test.interface"}],
+        [3, {"s", "Truncated"}],
+        [8, {"g", "ay"}]
+      ],
+      <<1_000_001::little-32, 1>>
+    )
+  end
+
+  defp scalar_limited_body do
+    sentinel = "resource-limit-body-sentinel"
+
+    <<1_000_001::little-32, sentinel::binary>> <>
+      :binary.copy(<<1>>, 1_000_001 - byte_size(sentinel))
+  end
+
+  defp raw_wire_message(type, fields, body) do
+    header =
+      Rebus.Encoder.encode_at_position("a(yv)", [fields], :little, 12)
+      |> IO.iodata_to_binary()
+
+    padding = :binary.copy(<<0>>, rem(8 - rem(12 + byte_size(header), 8), 8))
+
+    <<?l, type, 0, 1, byte_size(body)::little-32, 1::little-32, header::binary, padding::binary,
+      body::binary>>
+  end
+
+  defp malformed_empty_struct_array_message do
+    valid_fields = [
+      [1, {"o", "/test"}],
+      [2, {"s", "test.interface"}],
+      [3, {"s", "ZeroWidth"}]
+    ]
+
+    valid_header =
+      Rebus.Encoder.encode_at_position("a(yv)", [valid_fields], :little, 12)
+      |> IO.iodata_to_binary()
+
+    valid_data = binary_part(valid_header, 4, byte_size(valid_header) - 4)
+    signature_field = <<8, 1, "g", 0, 3, "a()", 0>>
+    field_padding = :binary.copy(<<0>>, rem(8 - rem(16 + byte_size(valid_data), 8), 8))
+    fields_data = valid_data <> field_padding <> signature_field
+    header = <<byte_size(fields_data)::little-32, fields_data::binary>>
+    padding = :binary.copy(<<0>>, rem(8 - rem(12 + byte_size(header), 8), 8))
+    body = <<1::little-32, 0::size(4 * 8)>>
+
+    <<?l, 4, 0, 1, byte_size(body)::little-32, 1::little-32, header::binary, padding::binary,
+      body::binary>>
   end
 
   defp raw_reply(type, header_fields) do

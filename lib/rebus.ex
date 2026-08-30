@@ -84,6 +84,7 @@ defmodule Rebus do
 
   @type error_reason ::
           :timeout
+          | {:reply_dropped, :method_return | {:error, binary()}}
           | :not_connected
           | :encode_failed
           | :disconnected
@@ -163,6 +164,8 @@ defmodule Rebus do
     authentication and advertised its supported mechanisms.
   - `{:error, {:hello_failed, :invalid_unique_name}}` - The peer's initial
     Hello reply did not contain a valid D-Bus unique name.
+  - `{:error, {:hello_failed, :resource_limit}}` - The peer's initial Hello
+    reply exceeded a local decoding safety cap.
   - `{:error, :invalid_timeout | :invalid_read_timeout | :invalid_write_timeout |
     :invalid_name}` - A connection option was invalid.
   - `{:error, {:name_taken, pid}}` - The requested local name is held by a
@@ -346,6 +349,14 @@ defmodule Rebus do
   was definitely not written and is safe to retry after `connect/2` succeeds.
   `{:error, :serial_exhausted}` means all valid D-Bus serials are in use.
   `{:error, :not_connected}` means setup has not yet been accepted.
+  `{:error, {:reply_dropped, :method_return}}` means the peer definitely
+  received the request and produced a successful reply, but its payload
+  exceeded a local decoding resource cap and was discarded.
+  `{:error, {:reply_dropped, {:error, error_name}}}` means the peer definitely
+  produced that D-Bus error reply; depending on the operation and error, the
+  requested operation may not have executed. Neither outcome is
+  delivery-ambiguous: decide whether to retry from the operation and error
+  semantics, never by blindly retrying.
 
   Connections must be local to the calling node; remote connection PIDs return
   `{:error, :remote_connection_unsupported}`.

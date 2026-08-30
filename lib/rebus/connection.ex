@@ -16,7 +16,8 @@ defmodule Rebus.Connection do
   @max_inbound_segments 64
   @max_serial 4_294_967_295
 
-  @spec call(pid(), Message.t(), non_neg_integer()) :: Message.t() | {:error, term()}
+  @spec call(pid(), Message.t(), non_neg_integer()) ::
+          Message.t() | {:error, Rebus.error_reason()}
   def call(pid, %Message{} = msg, timeout)
       when is_pid(pid) and is_integer(timeout) and timeout >= 0 do
     if node(pid) == node() do
@@ -653,7 +654,7 @@ defmodule Rebus.Connection do
   end
 
   defp parse_flat_messages(data, %__MODULE__{} = state, continuation, source) do
-    case Message.parse(data) do
+    case Message.parse_inbound(data) do
       {:ok, %Message{} = msg, rest} when not is_nil(state.hello_serial) ->
         state = finish_frame(state)
 
@@ -697,6 +698,29 @@ defmodule Rebus.Connection do
 
       nil ->
         append_inbound(retain_remainder(data, source), state, continuation)
+
+      {:error, :resource_limit, _envelope, _rest} when not is_nil(state.hello_serial) ->
+        stop_for_protocol_error({:hello_failed, :resource_limit}, finish_frame(state))
+
+      {:error, :resource_limit} when not is_nil(state.hello_serial) ->
+        stop_for_protocol_error({:hello_failed, :resource_limit}, finish_frame(state))
+
+      {:error, :resource_limit, envelope, rest} ->
+        Logger.warning("D-Bus frame dropped: :resource_limit")
+        {:ok, state} = drop_resource_limited_reply(envelope, state)
+        parse_flat_messages(rest, finish_frame(state), continuation, source)
+
+      {:error, :resource_limit} ->
+        Logger.warning("D-Bus frame dropped: :resource_limit")
+
+        case Message.expected_size(data) do
+          {:ok, frame_size} ->
+            <<_dropped::binary-size(frame_size), rest::binary>> = data
+            parse_flat_messages(rest, finish_frame(state), continuation, source)
+
+          _ ->
+            stop_for_protocol_error(:invalid_message, state)
+        end
 
       {:error, reason} ->
         stop_for_protocol_error(reason, state)
@@ -1325,6 +1349,7 @@ defmodule Rebus.Connection do
           | :invalid_message_type
           | :message_too_large
           | :read_timeout
+          | :resource_limit
           | :unsupported_protocol_version
           | :protocol_error
           | {:hello_failed,
@@ -1332,7 +1357,8 @@ defmodule Rebus.Connection do
              | :invalid_error_name
              | :invalid_unique_name
              | :missing_error_name
-             | :missing_unique_name}
+             | :missing_unique_name
+             | :resource_limit}
           | {:malformed_reply, :missing_reply_serial}
           | {:unexpected_handshake_message, Message.message_type()}
   def sanitize_protocol_reason(reason) do
@@ -1342,7 +1368,8 @@ defmodule Rebus.Connection do
              :missing_unique_name,
              :missing_error_name,
              :invalid_error_name,
-             :invalid_unique_name
+             :invalid_unique_name,
+             :resource_limit
            ] ->
         {:hello_failed, reason}
 
@@ -1368,6 +1395,7 @@ defmodule Rebus.Connection do
              :invalid_message_type,
              :message_too_large,
              :read_timeout,
+             :resource_limit,
              :unsupported_protocol_version
            ] ->
         reason
@@ -1461,10 +1489,58 @@ defmodule Rebus.Connection do
     end
   end
 
+  defp drop_resource_limited_reply(
+         %{type: :method_return, reply_serial: reply_serial},
+         %__MODULE__{} = state
+       )
+       when is_integer(reply_serial) and reply_serial > 0 do
+    drop_resource_limited_pending(reply_serial, :method_return, state)
+  end
+
+  defp drop_resource_limited_reply(
+         %{type: :error, reply_serial: reply_serial, error_name: error_name},
+         %__MODULE__{} = state
+       )
+       when is_integer(reply_serial) and reply_serial > 0 and is_binary(error_name) do
+    drop_resource_limited_pending(reply_serial, {:error, error_name}, state)
+  end
+
+  defp drop_resource_limited_reply(_envelope, %__MODULE__{} = state), do: {:ok, state}
+
+  defp drop_resource_limited_pending(reply_serial, reply_kind, %__MODULE__{} = state) do
+    case Map.pop(state.pending, reply_serial) do
+      {nil, _pending} ->
+        Logger.info("Ignoring late or orphaned D-Bus reply for serial #{reply_serial}")
+        {:ok, state}
+
+      {{from, timer_ref, request_ref, monitor_ref}, pending} ->
+        _ = Process.cancel_timer(timer_ref)
+        Process.demonitor(monitor_ref, [:flush])
+        GenServer.reply(from, {:error, {:reply_dropped, reply_kind}})
+        {:ok, remove_indexes(%{state | pending: pending}, request_ref, monitor_ref)}
+    end
+  end
+
   defp encode_message(%Message{} = msg) do
     try do
-      {:ok, bin} = Message.encode(msg)
-      {:ok, bin}
+      case Message.encode(msg) do
+        {:ok, bin} ->
+          {:ok, bin}
+
+        {:error, reason}
+        when reason in [
+               :invalid_body,
+               :invalid_header_fields,
+               :invalid_message,
+               :message_too_large
+             ] ->
+          Logger.warning("D-Bus message encoding failed: #{inspect(reason)}")
+          {:error, :encode_failed}
+
+        {:error, _reason} ->
+          Logger.warning("D-Bus message encoding failed: :invalid_message")
+          {:error, :encode_failed}
+      end
     rescue
       exception ->
         Logger.warning("D-Bus message encoding failed: #{inspect(exception.__struct__)}")
