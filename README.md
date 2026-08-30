@@ -74,8 +74,31 @@ Rebus is built with a modular architecture:
 
 Rebus supports connecting to different types of D-Bus endpoints:
 
-- **TCP/IP connections** - `%{family: :inet, addr: {{ip_tuple}, port}}`
+- **TCP/IP connections** - `%{family: :inet, addr: {127, 0, 0, 1}, port: 12345}`
 - **Unix domain sockets** - `%{family: :local, path: "/path/to/socket"}`
+
+## Bus addresses
+
+`Rebus.connect(:system)` reads the configured `:system_bus_address` (falling
+back to `/run/dbus/system_bus_socket`); `Rebus.connect(:session)` reads
+`DBUS_SESSION_BUS_ADDRESS`. Both use D-Bus address lists such as:
+
+```text
+unix:path=/run/user/1000/bus,guid=30313233343536373839414243444546;tcp:host=localhost,port=12345
+```
+
+Rebus supports ordered `unix:path`, Linux `unix:abstract`, and `tcp` host/port
+entries. TCP accepts `family=ipv4` or `family=ipv6`; without a family it tries
+the bounded IPv6 results first, then IPv4 results, before moving to the next
+address. Values use D-Bus percent escapes, so separators or control bytes in a
+path must be escaped. A valid `guid` is verified against the server's `AUTH OK`
+identity, while unsupported transports are skipped so a later supported entry
+can be used. Malformed supported entries are rejected rather than skipped.
+
+The list setup budget is one aggregate `:timeout` (or `:read_timeout`) budget
+for DNS and pre-Hello setup; direct socket maps keep their normal independent
+connection budgets. See `Rebus.connect/2` for the complete address, error, and
+timeout contract.
 
 ## Message Types
 

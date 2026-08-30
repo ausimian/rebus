@@ -103,6 +103,9 @@ defmodule Rebus.Connection do
     field :write_timeout, pos_integer(), default: @default_write_timeout
     field :read_timeout, pos_integer(), default: @default_read_timeout
     field :setup_timeout, pos_integer(), default: @default_read_timeout
+    field :aggregate_setup_timeout?, boolean(), default: false
+    field :expected_guid, binary() | nil, default: nil
+    field :precomputed_auth_id, binary() | nil, default: nil
     field :connect_waiter, {pid(), reference()} | nil, default: nil
     field :connect_waiter_monitor, reference() | nil, default: nil
     field :connect_accepted?, boolean(), default: false
@@ -133,7 +136,13 @@ defmodule Rebus.Connection do
     write_timeout = Keyword.get(args, :write_timeout, @default_write_timeout)
     timeout = Keyword.get(args, :timeout, @default_read_timeout)
     read_timeout = Keyword.get(args, :read_timeout, @default_read_timeout)
-    setup_timeout = Keyword.get(args, :read_timeout, timeout)
+
+    setup_timeout =
+      Keyword.get(args, :address_list_setup_timeout, Keyword.get(args, :read_timeout, timeout))
+
+    aggregate_setup_timeout? = Keyword.has_key?(args, :address_list_setup_timeout)
+    expected_guid = Keyword.get(args, :expected_guid)
+    precomputed_auth_id = Keyword.get(args, :precomputed_auth_id)
     name = Keyword.get(args, :name)
     connect_waiter = Keyword.get(args, :connect_waiter)
     auth_id_runner = Keyword.get(args, :auth_id_fun, &run_auth_id/1)
@@ -147,6 +156,15 @@ defmodule Rebus.Connection do
 
       not (is_integer(read_timeout) and read_timeout > 0) ->
         {:stop, :invalid_read_timeout}
+
+      not (is_integer(setup_timeout) and setup_timeout > 0) ->
+        {:stop, :invalid_setup_timeout}
+
+      not (is_nil(expected_guid) or valid_guid?(expected_guid)) ->
+        {:stop, :invalid_expected_guid}
+
+      not (is_nil(precomputed_auth_id) or is_binary(precomputed_auth_id)) ->
+        {:stop, :invalid_precomputed_auth_id}
 
       not (is_nil(name) or is_atom(name)) ->
         {:stop, :invalid_name}
@@ -165,6 +183,9 @@ defmodule Rebus.Connection do
                write_timeout: write_timeout,
                read_timeout: read_timeout,
                setup_timeout: setup_timeout,
+               aggregate_setup_timeout?: aggregate_setup_timeout?,
+               expected_guid: expected_guid,
+               precomputed_auth_id: precomputed_auth_id,
                connect_waiter: connect_waiter,
                connect_waiter_monitor: monitor_connect_waiter(connect_waiter),
                auth_id_runner: auth_id_runner
@@ -727,26 +748,66 @@ defmodule Rebus.Connection do
     end
   end
 
-  defp initialize(%__MODULE__{} = state, addr) do
+  defp initialize(%__MODULE__{aggregate_setup_timeout?: true} = state, addr) do
     sock = state.sock
+    deadline = read_deadline(state.setup_timeout)
 
-    with {:ok, auth_id} <- get_auth_id(state.setup_timeout, state.auth_id_runner),
-         :ok <- connect_socket(sock, addr, state.setup_timeout),
+    with {:ok, auth_id} <- aggregate_setup_auth_id(state, deadline),
+         {:ok, connect_timeout} <- remaining_setup_timeout(deadline, state.setup_timeout),
+         :ok <- connect_socket(sock, addr, connect_timeout),
          :ok <- handshake_send(sock, [0, "AUTH EXTERNAL ", auth_id, "\r\n"], state.write_timeout),
-         {:ok, auth_line, rest} <- handshake_recv(sock, state.setup_timeout),
+         {:ok, auth_timeout} <- remaining_setup_timeout(deadline, state.setup_timeout),
+         {:ok, auth_line, rest} <- handshake_recv(sock, auth_timeout),
          {:ok, guid} <- parse_auth_response(auth_line),
+         :ok <- verify_expected_guid(guid, state.expected_guid),
          :ok <- handshake_send(sock, "BEGIN \r\n", state.write_timeout) do
-      {:ok,
-       %{
-         state
-         | guid: guid,
-           inbound_segments: if(rest == <<>>, do: [], else: [{byte_size(rest), rest}]),
-           inbound_size: byte_size(rest)
-       }, {:continue, :hello}}
+      initialized_connection(state, guid, rest)
     else
       {:error, reason} -> stop_and_close(sock, reason)
     end
   end
+
+  defp initialize(%__MODULE__{} = state, addr) do
+    sock = state.sock
+
+    with {:ok, auth_id} <- setup_auth_id(state, state.setup_timeout),
+         :ok <- connect_socket(sock, addr, state.setup_timeout),
+         :ok <- handshake_send(sock, [0, "AUTH EXTERNAL ", auth_id, "\r\n"], state.write_timeout),
+         {:ok, auth_line, rest} <- handshake_recv(sock, state.setup_timeout),
+         {:ok, guid} <- parse_auth_response(auth_line),
+         :ok <- verify_expected_guid(guid, state.expected_guid),
+         :ok <- handshake_send(sock, "BEGIN \r\n", state.write_timeout) do
+      initialized_connection(state, guid, rest)
+    else
+      {:error, reason} -> stop_and_close(sock, reason)
+    end
+  end
+
+  defp initialized_connection(state, guid, rest) do
+    {:ok,
+     %{
+       state
+       | guid: guid,
+         inbound_segments: if(rest == <<>>, do: [], else: [{byte_size(rest), rest}]),
+         inbound_size: byte_size(rest)
+     }, {:continue, :hello}}
+  end
+
+  defp aggregate_setup_auth_id(%__MODULE__{precomputed_auth_id: auth_id}, _deadline)
+       when is_binary(auth_id),
+       do: {:ok, auth_id}
+
+  defp aggregate_setup_auth_id(%__MODULE__{} = state, deadline) do
+    with {:ok, auth_id_timeout} <- remaining_setup_timeout(deadline, state.setup_timeout) do
+      get_auth_id(auth_id_timeout, state.auth_id_runner)
+    end
+  end
+
+  defp setup_auth_id(%__MODULE__{precomputed_auth_id: auth_id}, _timeout) when is_binary(auth_id),
+    do: {:ok, auth_id}
+
+  defp setup_auth_id(%__MODULE__{} = state, timeout),
+    do: get_auth_id(timeout, state.auth_id_runner)
 
   defp parse_auth_response(<<"OK ", guid::binary-size(32)>>), do: {:ok, :binary.copy(guid)}
 
@@ -762,6 +823,33 @@ defmodule Rebus.Connection do
   end
 
   defp parse_auth_response(_line), do: {:error, :auth_failed}
+
+  defp verify_expected_guid(_guid, nil), do: :ok
+
+  defp verify_expected_guid(guid, expected_guid) do
+    if guid_equal?(guid, expected_guid), do: :ok, else: {:error, :guid_mismatch}
+  end
+
+  defp valid_guid?(guid) when is_binary(guid) and byte_size(guid) == 32, do: hex_guid?(guid)
+  defp valid_guid?(_guid), do: false
+
+  defp hex_guid?(guid) do
+    for <<byte <- guid>>, reduce: true do
+      true when byte in ?0..?9 or byte in ?a..?f or byte in ?A..?F -> true
+      _ -> false
+    end
+  end
+
+  defp guid_equal?(<<>>, <<>>), do: true
+
+  defp guid_equal?(<<left, left_rest::binary>>, <<right, right_rest::binary>>) do
+    ascii_lower(left) == ascii_lower(right) and guid_equal?(left_rest, right_rest)
+  end
+
+  defp guid_equal?(_left, _right), do: false
+
+  defp ascii_lower(byte) when byte in ?A..?Z, do: byte + 32
+  defp ascii_lower(byte), do: byte
 
   defp notify_connect_waiter({pid, ref}, result) when is_pid(pid) and is_reference(ref),
     do: Kernel.send(pid, {ref, result})
@@ -1581,6 +1669,13 @@ defmodule Rebus.Connection do
     case deadline - System.monotonic_time(:millisecond) do
       remaining when remaining > 0 -> {:ok, min(remaining, maximum)}
       _ -> :expired
+    end
+  end
+
+  defp remaining_setup_timeout(deadline, maximum) do
+    case remaining_timeout(deadline, maximum) do
+      {:ok, timeout} -> {:ok, timeout}
+      :expired -> {:error, :read_timeout}
     end
   end
 
