@@ -68,6 +68,21 @@ defmodule Rebus do
   `send/3` return `:ok`. Public operation failures are returned as
   `{:error, reason}` tuples.
 
+  ## Unix file descriptors
+
+  On Linux and macOS local Unix sockets, Rebus requests D-Bus's optional
+  `NEGOTIATE_UNIX_FD` extension during authentication. Pass outbound raw Unix
+  descriptors as `fds: [...]` to `Rebus.Message.new/2`; they are borrowed and
+  never closed by Rebus. A successfully delivered `call/3` reply can expose
+  owned inbound descriptors in `message.unix_fds`, which the receiving caller
+  must close exactly once with `Rebus.UnixFD.close/1` or adopt with an OTP/OS
+  API. FD transfer is rejected over TCP or without peer agreement.
+
+  Rebus closes and drops inbound FD-bearing signals: one raw descriptor cannot
+  be safely shared across multiple signal subscribers. It keeps the connection
+  alive after that complete-frame rejection. Outbound signals and method calls,
+  and inbound method-call replies, are supported.
+
   ## Examples
 
       # Connect to session bus with default options
@@ -99,6 +114,10 @@ defmodule Rebus do
           | :no_reply_expected
           | :serial_exhausted
           | :remote_connection_unsupported
+          | :unix_fd_not_negotiated
+          | :unix_fd_unsupported
+          | :unix_fd_send_failed
+          | :fd_claim_expired
           | {:invalid_message_type, Rebus.Message.message_type()}
 
   @default_system_bus_address "unix:path=/run/dbus/system_bus_socket"
@@ -267,6 +286,20 @@ defmodule Rebus do
   The returned PID is for the connection process, which is the main interface for
   sending and receiving D-Bus messages. Connections are supervisor-owned; close
   them with `close/1` when they are no longer needed.
+
+  ## Unix file descriptors
+
+  On Linux and macOS, local Unix-domain connections request the optional
+  `NEGOTIATE_UNIX_FD` authentication extension. Construct a message with
+  `fds: [fd, ...]` and use zero-based `h` body indexes. These outbound raw
+  descriptors are borrowed: Rebus neither duplicates nor closes them. A live
+  method reply may expose received descriptors in `message.unix_fds`; its
+  receiving process owns and must close each raw descriptor exactly once with
+  `Rebus.UnixFD.close/1` or adopt it using a suitable OTP/OS API. FD-bearing
+  messages are rejected before writing over TCP or when the peer did not agree
+  to negotiation. FD-bearing signals are closed and dropped because a
+  descriptor cannot safely have multiple subscribers without a platform-level
+  duplicate; this complete-frame rejection does not stop the connection.
 
   """
   @spec connect(address(), keyword()) :: {:ok, pid()} | {:error, term()}
@@ -1042,6 +1075,17 @@ defmodule Rebus do
   was definitely not written and is safe to retry after `connect/2` succeeds.
   `{:error, :serial_exhausted}` means all valid D-Bus serials are in use.
   `{:error, :not_connected}` means setup has not yet been accepted.
+  `{:error, :unix_fd_send_failed}` means an outbound borrowed descriptor could
+  not be passed before any bytes of that frame were accepted; the connection
+  remains usable and the descriptor remains owned by its sender.
+  A Unix-FD reply that reaches its private ownership handoff has a 100ms
+  initial acknowledgement grace after the reply deadline. If that
+  acknowledgement is already queued when the grace expires, `call/3` waits for
+  the live connection to resolve it FIFO instead of returning an ambiguous
+  ownership result; that wait has no separate fixed wall-clock limit.
+  `{:error, :fd_claim_expired}` means Rebus definitively closed the still-owned
+  received descriptors rather than exposing them after the claim deadline. A
+  connection that stops during this resolution returns `{:error, :disconnected}`.
   `{:error, {:reply_dropped, :method_return}}` means the peer definitely
   received the request and produced a successful reply, but its payload
   exceeded a local decoding resource cap and was discarded.

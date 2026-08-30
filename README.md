@@ -6,7 +6,8 @@ Rebus provides a clean, Elixir-native interface for communicating over D-Bus, th
 
 ## Features
 
-- **D-Bus Wire Protocol Compliance** - Full implementation of the D-Bus specification including 8-byte struct alignment
+- **D-Bus Wire Format** - Bounded message encoding/decoding for the supported
+  wire types, including 8-byte struct alignment
 - **Multiple Connection Types** - Support for TCP/IP and Unix domain socket connections
 - **Signal Handling** - Register handlers to receive D-Bus signals  
 - **Message Encoding/Decoding** - Robust serialization of D-Bus messages with proper type handling
@@ -109,9 +110,68 @@ Rebus supports all D-Bus message types:
 - **`:error`** - Error responses
 - **`:signal`** - Signal emissions
 
-## D-Bus Compliance
+## Unix file descriptors
 
-Rebus implements the D-Bus specification including:
+On Linux and macOS, a local Unix-domain connection requests the
+optional D-Bus `NEGOTIATE_UNIX_FD` authentication extension. When the peer
+agrees, a message can borrow raw OS descriptors through `:fds`; `h` values in
+the body are zero-based indexes into that list:
+
+```elixir
+message = Rebus.Message.new!(:signal,
+  path: "/com/example/Object",
+  interface: "com.example.Interface",
+  member: "DescriptorReady",
+  signature: "h",
+  body: [0],
+  fds: [fd]
+)
+```
+
+Rebus does not duplicate or close outbound descriptors: the sender retains
+ownership. A successfully delivered method reply can contain received raw
+descriptors in `message.unix_fds`; the receiving process owns them and must
+close each descriptor exactly once (for example, in an `after` block) with
+`Rebus.UnixFD.close/1`, or adopt it with an appropriate OTP/OS API. Do not call
+`close/1` twice: descriptor numbers can be reused by the OS.
+
+For a reply that carries descriptors, Rebus retains ownership through a
+caller-local, one-shot delivery alias. The initial private delivery and
+acknowledgement use a 100 ms grace after the original reply deadline; a claim
+is refused and closed after its 250 ms claim deadline when the connection
+process dispatches it. If that initial acknowledgement times out after it was
+already queued, Rebus waits for a FIFO resolver rather than reporting failure
+while the queued acknowledgement could still transfer ownership. Therefore an
+FD-bearing `call/3` that has reached handoff can return later than its supplied
+timeout and has no separate fixed wall-clock maximum while a live connection is
+dispatching the resolver. It returns `{:error, :fd_claim_expired}` only after
+the connection has definitively closed the retained descriptors, or
+`{:error, :disconnected}` if the connection stops. A late internal
+FD-delivery tuple is never sent to the caller's ordinary mailbox.
+
+`Rebus.close/1` performs this retained-descriptor cleanup for ordinary
+supervisor shutdown. An untrappable BEAM `:kill` bypasses `terminate/2`, so it
+cannot provide the same raw-descriptor cleanup guarantee.
+
+FD transfer is never attempted over TCP and is rejected before a frame is
+written when the peer did not agree to the extension. A stale borrowed
+descriptor that fails before any frame byte is accepted returns
+`{:error, :unix_fd_send_failed}` and leaves the connection usable. Rebus
+validates the header count and every `h` index before delivery, bounds a
+message to 16 descriptors, and closes descriptors on rejected, orphaned, or
+undelivered frames. FD-bearing inbound signals are closed and dropped—not
+distributed—because one raw descriptor cannot safely be transferred to
+multiple subscribers; a complete dropped frame does not terminate the
+connection. On a peer that declined FD negotiation Rebus still uses a bounded
+ancillary receive buffer, immediately closes illicit rights, and quarantines
+only the associated complete frame; `MSG_CTRUNC` remains a fail-closed
+connection error because the kernel may have omitted uncloseable descriptors.
+Other Unix and BSD variants are not currently supported for FD passing.
+
+## D-Bus wire-format scope
+
+Rebus does not claim to implement the entire D-Bus specification. Its supported
+wire-format and connection scope includes:
 
 - Proper 8-byte struct alignment in arrays
 - Header field encoding at correct positions
@@ -123,6 +183,7 @@ Rebus implements the D-Bus specification including:
   total levels
 - Array boundary tracking for consecutive arrays
 - Position-aware encoding and decoding
+- Optional Unix FD passing over negotiated local Unix sockets only
 
 ## Testing
 

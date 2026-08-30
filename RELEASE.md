@@ -4,6 +4,31 @@
 
 ### Added
 
+- Add negotiated Unix file-descriptor passing for Linux and macOS local Unix
+  sockets.
+  `Rebus.Message.new/2` accepts borrowed `:fds`, validates `h` indexes and the
+  D-Bus `unix_fds` count, and delivers validated inbound descriptors with live
+  method replies in `message.unix_fds`. `Rebus.UnixFD.close/1` closes an owned
+  inbound raw descriptor exactly once. TCP and peers that reject
+  `NEGOTIATE_UNIX_FD` reject FD-bearing frames before any frame bytes are sent.
+  A stale borrowed descriptor fails as `:unix_fd_send_failed` before framing
+  and leaves the connection usable. Inbound FD-bearing signals and complete
+  frames with invalid FD count/index/negotiation metadata are closed and
+  dropped without stopping unrelated calls or signal handlers. Rebus retains
+  reply descriptors until public call delivery is internally acknowledged via a
+  caller-local one-shot alias. The initial handoff has a 100 ms grace and a
+  250 ms claim deadline, but a queued acknowledgement is resolved FIFO without
+  a second wall-clock limit so Rebus never reports failure while it could still
+  transfer ownership. An FD-bearing call can therefore complete after its
+  reply timeout while a live connection dispatches that resolver;
+  `:fd_claim_expired` means descriptors were definitively closed and a stopped
+  connection reports `:disconnected`. Late timeouts, cancellation, caller
+  death, and ordinary `Rebus.close/1` teardown close descriptors safely;
+  untrappable `:kill` remains outside that cleanup guarantee.
+  Declined negotiation receives a bounded ancillary buffer and quarantines an
+  illicit complete frame while preserving coalesced successors; `MSG_CTRUNC`
+  remains fail-closed because omitted descriptors cannot be closed.
+  Other Unix and BSD variants remain out of scope for FD passing.
 - Parse D-Bus system and session address lists, including percent-escaped
   `unix:path`, Linux `unix:abstract`, and `tcp` host/port entries. Address
   selection follows the listed fallback order, tries all IPv6 then IPv4 TCP

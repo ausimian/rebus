@@ -94,7 +94,7 @@ defmodule RebusTest do
       call_task = Task.async(fn -> Rebus.call(cli, method, 5_000) end)
       assert_receive {^svr, %Message{header_fields: %{member: "LimitedReply"}} = request}, 1_000
 
-      [{_serial, {_from, timer_ref, _request_ref, _monitor_ref}}] =
+      [{_serial, {_from, timer_ref, _request_ref, _monitor_ref, _deadline}}] =
         :sys.get_state(cli).pending |> Map.to_list()
 
       limited_reply = raw_resource_limited_reply(request.serial)
@@ -168,7 +168,7 @@ defmodule RebusTest do
       assert_receive {^svr, %Message{header_fields: %{member: "LimitedErrorReply"}} = request},
                      1_000
 
-      [{_serial, {_from, timer_ref, _request_ref, _monitor_ref}}] =
+      [{_serial, {_from, timer_ref, _request_ref, _monitor_ref, _deadline}}] =
         :sys.get_state(cli).pending |> Map.to_list()
 
       error_name = "org.example.ResourceLimited"
@@ -3287,7 +3287,7 @@ defmodule RebusTest do
       task = Task.async(fn -> Rebus.call(cli, method, 500) end)
       assert_receive {^svr, %Message{header_fields: %{member: "NeverReplies"}}}
 
-      [{serial, {_from, _timer_ref, request_ref, _monitor_ref}}] =
+      [{serial, {_from, _timer_ref, request_ref, _monitor_ref, _deadline}}] =
         :sys.get_state(cli).pending |> Map.to_list()
 
       send(cli, {:request_timeout, serial, request_ref})
