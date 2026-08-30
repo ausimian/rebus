@@ -4,6 +4,22 @@
 
 ### Added
 
+- Negotiate D-Bus authentication mechanisms after `EXTERNAL` is rejected.
+  Rebus supports `DBUS_COOKIE_SHA1` using a bounded, private per-user
+  `~/.dbus-keyrings` cookie read and cryptographically strong client
+  challenges, including TCP endpoints where Unix credentials cannot be passed.
+  `ANONYMOUS` is available only with `allow_anonymous: true`; it provides no
+  authentication, confidentiality, or integrity and is intended only for
+  deliberately unauthenticated peer-to-peer use. Authentication failures return
+  bounded payload-free errors and never log cookie material, challenges,
+  authorization identities, GUIDs, or peer authentication text.
+  `:auth_cookie_unavailable` stops bus-address fallback, avoiding disclosure to
+  later candidates or IPs. When a username is unavailable before cookie `AUTH`
+  starts, an explicitly opted-in, peer-advertised `ANONYMOUS` attempt is sent
+  directly; after cookie `AUTH` begins, cookie failures are terminal and never
+  fall back to `ANONYMOUS`. A final `$HOME` symlink is supported after target
+  ownership/permission validation; keyring directories and cookie files remain
+  non-symlink-only.
 - Add negotiated Unix file-descriptor passing for Linux and macOS local Unix
   sockets.
   `Rebus.Message.new/2` accepts borrowed `:fds`, validates `h` indexes and the

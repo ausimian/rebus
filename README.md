@@ -101,6 +101,51 @@ for DNS and pre-Hello setup; direct socket maps keep their normal independent
 connection budgets. See `Rebus.connect/2` for the complete address, error, and
 timeout contract.
 
+## Authentication
+
+Rebus always tries D-Bus `EXTERNAL` first, preserving the normal local Unix
+credential flow. If the peer rejects it with a valid, bounded `REJECTED`
+mechanism list, Rebus deterministically prefers `DBUS_COOKIE_SHA1`. It reads
+the effective Unix username with `id -un`, then reads only that user's
+`$HOME/.dbus-keyrings/<context>` cookie file. A final `$HOME` symlink is
+followed only after its resolved directory is validated; the keyring directory
+and cookie file themselves must be owned non-symlink entries. The resolved home
+cannot be group/other writable, and the keyring directory and cookie file must
+be private from group and other users and within local size and 256-line limits.
+Contexts, IDs, challenges, and cookie records are validated before use. Cookie
+contents, challenges, authorization identities, server GUIDs, and peer
+authentication text are never returned in errors or logged.
+
+For interoperability, Rebus accepts upper- or lower-case hexadecimal cookie
+input, but always emits the lower-case form required by the D-Bus specification.
+Cookie contexts follow the specification and therefore cannot contain `.` (or a
+path separator or whitespace). Rebus deliberately limits an advertised
+`REJECTED` list to 64 mechanism names and rejects larger lists as malformed;
+this avoids retaining an unbounded peer-controlled list.
+
+Cookie authentication is useful for local TCP and peer-to-peer endpoints where
+Unix credentials cannot be transported. It authenticates possession of the
+private cookie file; it does not add encryption or message integrity, so TCP
+connections should normally be loopback or otherwise protected by an external
+secure transport. Rebus fails with `:auth_cookie_unavailable` if it cannot read
+a safe matching local credential, `:auth_failed` for malformed authentication
+protocol data, and `{:auth_rejected, mechanisms}` when no usable advertised
+mechanism remains. All of these use the same bounded setup deadline as socket
+authentication and initial setup. `:auth_cookie_unavailable` is terminal for a
+bus address list, so Rebus does not disclose the missing local credential to
+later candidate addresses or IPs.
+
+`ANONYMOUS` is disabled by default. It can be enabled only with
+`allow_anonymous: true`, and only after the peer advertised it. Anonymous D-Bus
+performs no authentication, confidentiality, or integrity check; use it only
+for intentionally unauthenticated peer-to-peer services, never as trust for a
+message bus or an unprotected network endpoint. Rebus never downgrades to it
+after a DBUS_COOKIE_SHA1 protocol or authentication failure. It is selected
+directly only when the peer did not advertise `DBUS_COOKIE_SHA1`, or when the
+local username cannot be obtained before cookie `AUTH` starts. Once cookie
+`AUTH` has started or a challenge has been received, every cookie failure is
+terminal: Rebus sends neither `CANCEL` nor `AUTH ANONYMOUS`.
+
 ## Message Types
 
 Rebus supports all D-Bus message types:
