@@ -122,6 +122,7 @@ defmodule Rebus.Connection do
     safe_setup_call(conn, {:delete_signal_handler, ref}, nil, timeout)
   end
 
+  @doc false
   @spec start_link(keyword()) :: :ignore | {:error, any()} | {:ok, pid()}
   def start_link(args) do
     case Keyword.get(args, :name) do
@@ -129,46 +130,6 @@ defmodule Rebus.Connection do
       name when is_atom(name) -> GenServer.start_link(__MODULE__, args, name: name)
       _name -> {:error, :invalid_name}
     end
-  end
-
-  @doc false
-  @spec shutdown_unmanaged(pid(), non_neg_integer()) ::
-          :ok | {:error, :not_connection | :not_alive | :remote_connection_unsupported | :timeout}
-  def shutdown_unmanaged(conn, timeout \\ 1_000)
-      when is_pid(conn) and is_integer(timeout) and timeout >= 0 do
-    cond do
-      node(conn) != node() ->
-        {:error, :remote_connection_unsupported}
-
-      not Process.alive?(conn) ->
-        {:error, :not_alive}
-
-      not connection_process?(conn, timeout) ->
-        {:error, :not_connection}
-
-      true ->
-        monitor_ref = Process.monitor(conn)
-        true = Process.exit(conn, :shutdown)
-
-        receive do
-          {:DOWN, ^monitor_ref, :process, ^conn, _reason} -> :ok
-        after
-          timeout ->
-            Process.demonitor(monitor_ref, [:flush])
-            {:error, :timeout}
-        end
-    end
-  catch
-    :exit, _reason -> {:error, :not_alive}
-  end
-
-  defp connection_process?(conn, timeout) do
-    case :sys.get_state(conn, timeout) do
-      %{__struct__: module} when module == __MODULE__ -> true
-      _state -> false
-    end
-  catch
-    :exit, _reason -> false
   end
 
   typedstruct enforce: true do

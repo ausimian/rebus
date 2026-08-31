@@ -60,6 +60,13 @@ blindly retry it. `{:error, :serial_exhausted}` means all D-Bus serials are in
 use. Connections must be local to the caller's node; remote PIDs return
 `{:error, :remote_connection_unsupported}`.
 
+## Connection lifecycle
+
+`Rebus.connect/2` is the sole supported way to create a connection. It returns
+a supervisor-owned PID; pass that PID to Rebus APIs and release it with
+`Rebus.close/1` when it is no longer needed. Starting or managing connection
+processes directly is unsupported.
+
 ## Routed signal subscriptions
 
 Use `Rebus.MatchRule` and `Rebus.add_match/3` to receive broadcast signals
@@ -120,7 +127,6 @@ handlers together.
 Rebus is built with a modular architecture:
 
 - **`Rebus`** - Main API module for establishing connections and managing signal handlers
-- **`Rebus.Connection`** - Supervised connection processes that handle D-Bus protocol communication
 - **`Rebus.Message`** - Message creation, encoding, decoding, and validation
 - **`Rebus.Encoder`** - D-Bus wire format encoding with proper alignment
 - **`Rebus.Decoder`** - D-Bus wire format decoding with struct boundary tracking

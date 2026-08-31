@@ -155,7 +155,10 @@ defmodule Rebus do
 
   Creates a supervised connection process that handles D-Bus protocol communication.
   The connection automatically handles authentication and maintains the persistent
-  connection to the specified D-Bus endpoint.
+  connection to the specified D-Bus endpoint. This is the sole supported way to
+  create a Rebus connection: do not start or manage a connection process
+  directly. Release the returned PID with `close/1` when its lifecycle is
+  complete.
 
   ## Parameters
 

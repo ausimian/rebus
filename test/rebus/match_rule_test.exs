@@ -744,7 +744,19 @@ defmodule Rebus.MatchRuleTest do
       send(owner, :stop)
     end
 
-    test "resets a directly started connection when subscription state is lost" do
+    test "resets a supervisor-owned connection when subscription state is lost", %{
+      connection: connection
+    } do
+      {:ok, worker} = Worker.start_link(connection)
+
+      send(worker, :reset_state_lost)
+
+      assert wait_until(fn -> not Process.alive?(connection) end)
+      assert wait_until(fn -> not Process.alive?(worker) end)
+      refute Rebus.MatchSubscription.persisted?(connection)
+    end
+
+    test "keeps state loss explicit for a directly started connection" do
       {:ok, server} = TestServer.start_link(tap: self())
 
       on_exit(fn ->
@@ -762,32 +774,14 @@ defmodule Rebus.MatchRuleTest do
       send(worker, :reset_state_lost)
 
       assert wait_until(fn ->
-               not Process.alive?(direct_connection)
-             end)
-
-      assert wait_until(fn -> not Process.alive?(worker) end)
-      refute Rebus.MatchSubscription.persisted?(direct_connection)
-    end
-
-    test "keeps failed direct reset state explicit without stopping a non-connection" do
-      {:ok, conn} = Agent.start_link(fn -> :not_a_connection end)
-      {:ok, worker} = Worker.start_link(conn)
-
-      on_exit(fn ->
-        stop_worker(worker)
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
-      end)
-
-      send(worker, :reset_state_lost)
-
-      assert wait_until(fn ->
                state = :sys.get_state(worker)
                state.state_lost? and not state.resetting?
              end)
 
-      assert Process.alive?(conn)
-      assert {:error, :match_subscription_state_lost} = Rebus.remove_match(conn, make_ref(), 100)
+      assert Process.alive?(direct_connection)
+
+      assert {:error, :match_subscription_state_lost} =
+               Rebus.remove_match(direct_connection, make_ref(), 100)
     end
 
     test "rehydrates persisted removal state and prunes missing rows" do
