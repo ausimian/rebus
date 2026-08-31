@@ -4,6 +4,20 @@
 
 ### Added
 
+- Add `Rebus.MatchRule` and `Rebus.add_match/3`/`remove_match/3` for bounded,
+  validated D-Bus signal subscriptions. Canonical rules share bus registrations
+  across independent handler references, filter only supported criteria
+  locally, and clean up on handler or connection teardown. Ambiguous cleanup
+  retries with bounded backoff, queues same-rule callers by their deadlines,
+  and safely resets a connection at a bounded recovery capacity; sender routing
+  remains bus-owned when a well-known name is forwarded as a unique name.
+  Worker restarts preserve stable subscriptions; a restart during an in-flight
+  operation returns an explicit state-loss error until teardown rather than
+  silently acknowledging an unknown reference.
+- Keep ordinary owner-exit removals separate from ambiguous recovery capacity,
+  queueing excess initial cleanup safely. Reject overlapping subscriptions with
+  incompatible sender predicates rather than cross-delivering a signal whose
+  well-known sender cannot be safely recovered from its forwarded unique name.
 - Negotiate D-Bus authentication mechanisms after `EXTERNAL` is rejected.
   Rebus supports `DBUS_COOKIE_SHA1` using a bounded, private per-user
   `~/.dbus-keyrings` cookie read and cryptographically strong client

@@ -4,6 +4,7 @@ defmodule Rebus.Connection do
   use TypedStruct
 
   alias Rebus.SignalHandler
+  alias Rebus.MatchRule
   alias Rebus.Message
   alias Rebus.UnixFD
   alias Rebus.Auth
@@ -89,10 +90,36 @@ defmodule Rebus.Connection do
     )
   end
 
+  # Match subscriptions install the local handler before their AddMatch method
+  # call. That ordering closes the otherwise unavoidable race where the bus
+  # accepts a rule and immediately forwards its first signal. This narrow
+  # internal API preserves the existing all-signal public handler API.
+  @doc false
+  @spec add_signal_handler(pid(), pid(), reference(), MatchRule.t(), non_neg_integer()) ::
+          reference() | {:error, :timeout | :disconnected | :not_connected}
+  def add_signal_handler(conn, subscriber, handler_ref, %MatchRule{} = rule, timeout)
+      when is_pid(conn) and is_pid(subscriber) and is_reference(handler_ref) and
+             is_integer(timeout) and timeout >= 0 do
+    safe_setup_call(
+      conn,
+      {:add_signal_handler, subscriber, handler_ref, rule},
+      {:cancel_signal_handler, handler_ref},
+      timeout
+    )
+  end
+
   @spec delete_signal_handler(pid(), reference()) ::
           :ok | {:error, :timeout | :disconnected | :not_connected}
   def delete_signal_handler(conn, ref) when is_pid(conn) and is_reference(ref) do
     safe_setup_call(conn, {:delete_signal_handler, ref})
+  end
+
+  @doc false
+  @spec delete_signal_handler(pid(), reference(), non_neg_integer()) ::
+          :ok | {:error, :timeout | :disconnected | :not_connected}
+  def delete_signal_handler(conn, ref, timeout)
+      when is_pid(conn) and is_reference(ref) and is_integer(timeout) and timeout >= 0 do
+    safe_setup_call(conn, {:delete_signal_handler, ref}, nil, timeout)
   end
 
   @spec start_link(keyword()) :: :ignore | {:error, any()} | {:ok, pid()}
@@ -102,6 +129,46 @@ defmodule Rebus.Connection do
       name when is_atom(name) -> GenServer.start_link(__MODULE__, args, name: name)
       _name -> {:error, :invalid_name}
     end
+  end
+
+  @doc false
+  @spec shutdown_unmanaged(pid(), non_neg_integer()) ::
+          :ok | {:error, :not_connection | :not_alive | :remote_connection_unsupported | :timeout}
+  def shutdown_unmanaged(conn, timeout \\ 1_000)
+      when is_pid(conn) and is_integer(timeout) and timeout >= 0 do
+    cond do
+      node(conn) != node() ->
+        {:error, :remote_connection_unsupported}
+
+      not Process.alive?(conn) ->
+        {:error, :not_alive}
+
+      not connection_process?(conn, timeout) ->
+        {:error, :not_connection}
+
+      true ->
+        monitor_ref = Process.monitor(conn)
+        true = Process.exit(conn, :shutdown)
+
+        receive do
+          {:DOWN, ^monitor_ref, :process, ^conn, _reason} -> :ok
+        after
+          timeout ->
+            Process.demonitor(monitor_ref, [:flush])
+            {:error, :timeout}
+        end
+    end
+  catch
+    :exit, _reason -> {:error, :not_alive}
+  end
+
+  defp connection_process?(conn, timeout) do
+    case :sys.get_state(conn, timeout) do
+      %{__struct__: module} when module == __MODULE__ -> true
+      _state -> false
+    end
+  catch
+    :exit, _reason -> false
   end
 
   typedstruct enforce: true do
@@ -160,6 +227,7 @@ defmodule Rebus.Connection do
     field :cancelled_requests, MapSet.t(reference()), default: MapSet.new()
     field :outbound_monitor_index, %{reference() => reference()}, default: %{}
     field :signal_handler_monitor_index, %{reference() => reference()}, default: %{}
+    field :signal_handler_ref_index, %{reference() => reference()}, default: %{}
     field :send_fun, function(), default: &:socket.send/4
     field :sendmsg_fun, function(), default: &:socket.sendmsg/4
     field :recvmsg_fun, function(), default: &:socket.recvmsg/5
@@ -341,7 +409,13 @@ defmodule Rebus.Connection do
     case Map.pop(state.signal_handler_monitor_index, ref) do
       {handler_ref, signal_handler_monitor_index} when is_reference(handler_ref) ->
         :gen_event.delete_handler(SignalHandler, {SignalHandler, handler_ref}, nil)
-        {:noreply, %{state | signal_handler_monitor_index: signal_handler_monitor_index}}
+
+        {:noreply,
+         %{
+           state
+           | signal_handler_monitor_index: signal_handler_monitor_index,
+             signal_handler_ref_index: Map.delete(state.signal_handler_ref_index, handler_ref)
+         }}
 
       {nil, _signal_handler_monitor_index} ->
         handle_down_for_request(ref, state)
@@ -875,22 +949,24 @@ defmodule Rebus.Connection do
     {:reply, {:error, :not_connected}, state}
   end
 
+  def handle_call(
+        {:add_signal_handler, _pid, _handler_ref, %MatchRule{}},
+        _from,
+        %__MODULE__{established?: false} = state
+      ) do
+    {:reply, {:error, :not_connected}, state}
+  end
+
   def handle_call({:add_signal_handler, pid, handler_ref}, _from, %__MODULE__{} = state) do
-    monitor_ref = Process.monitor(pid)
+    add_signal_handler(state, pid, handler_ref, nil)
+  end
 
-    :ok =
-      :gen_event.add_sup_handler(
-        SignalHandler,
-        {SignalHandler, handler_ref},
-        {self(), pid, handler_ref}
-      )
-
-    {:reply, handler_ref,
-     %{
-       state
-       | signal_handler_monitor_index:
-           Map.put(state.signal_handler_monitor_index, monitor_ref, handler_ref)
-     }}
+  def handle_call(
+        {:add_signal_handler, pid, handler_ref, %MatchRule{} = rule},
+        _from,
+        %__MODULE__{} = state
+      ) do
+    add_signal_handler(state, pid, handler_ref, rule)
   end
 
   def handle_call({:delete_signal_handler, _ref}, _from, %__MODULE__{established?: false} = state) do
@@ -899,6 +975,31 @@ defmodule Rebus.Connection do
 
   def handle_call({:delete_signal_handler, ref}, _from, %__MODULE__{} = state) do
     {:reply, :ok, remove_signal_handler(state, ref)}
+  end
+
+  defp add_signal_handler(%__MODULE__{} = state, pid, handler_ref, rule) do
+    monitor_ref = Process.monitor(pid)
+
+    handler_state =
+      if is_nil(rule),
+        do: {self(), pid, handler_ref},
+        else: {self(), pid, handler_ref, rule}
+
+    :ok =
+      :gen_event.add_sup_handler(
+        SignalHandler,
+        {SignalHandler, handler_ref},
+        handler_state
+      )
+
+    {:reply, handler_ref,
+     %{
+       state
+       | signal_handler_monitor_index:
+           Map.put(state.signal_handler_monitor_index, monitor_ref, handler_ref),
+         signal_handler_ref_index:
+           Map.put(state.signal_handler_ref_index, handler_ref, monitor_ref)
+     }}
   end
 
   @impl true
@@ -1453,9 +1554,9 @@ defmodule Rebus.Connection do
 
   defp establish_connection(%__MODULE__{} = state), do: {:ok, state}
 
-  defp safe_setup_call(conn, message, cancellation \\ nil) do
+  defp safe_setup_call(conn, message, cancellation \\ nil, timeout \\ @default_read_timeout) do
     try do
-      GenServer.call(conn, message, @default_read_timeout)
+      GenServer.call(conn, message, timeout)
     catch
       :exit, {:timeout, _call} ->
         if cancellation, do: GenServer.cast(conn, cancellation)
@@ -1650,20 +1751,19 @@ defmodule Rebus.Connection do
   end
 
   defp pop_signal_handler_monitor(%__MODULE__{} = state, handler_ref) do
-    case Enum.find(state.signal_handler_monitor_index, fn {_monitor_ref, ref} ->
-           ref == handler_ref
-         end) do
-      {monitor_ref, ^handler_ref} ->
+    case Map.pop(state.signal_handler_ref_index, handler_ref) do
+      {monitor_ref, signal_handler_ref_index} when is_reference(monitor_ref) ->
         Process.demonitor(monitor_ref, [:flush])
 
         {:ok,
          %{
            state
            | signal_handler_monitor_index:
-               Map.delete(state.signal_handler_monitor_index, monitor_ref)
+               Map.delete(state.signal_handler_monitor_index, monitor_ref),
+             signal_handler_ref_index: signal_handler_ref_index
          }}
 
-      nil ->
+      {nil, _signal_handler_ref_index} ->
         :error
     end
   end
