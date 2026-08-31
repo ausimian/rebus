@@ -3035,7 +3035,11 @@ defmodule RebusTest do
                  [{:tcp, "example", 12_345, :inet, expected_guid}],
                  [timeout: 100],
                  resolver: resolver,
-                 connector: connector
+                 connector: connector,
+                 # This test controls both resolver and connector outcomes;
+                 # keep its address-budget assertion independent of runner
+                 # scheduling before the first deterministic attempt.
+                 monotonic_time: fn -> 0 end
                )
 
       assert_receive {:attempted, %{family: :inet, addr: {127, 0, 0, 1}}, ^expected_guid}
@@ -3953,7 +3957,7 @@ defmodule RebusTest do
     {:ok, cli} =
       DynamicSupervisor.start_child(Rebus.ConnectionSupervisor, {Rebus.Connection, args})
 
-    assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+    assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}, 1_000
     assert hello.serial == 1
     {cli, hello}
   end
