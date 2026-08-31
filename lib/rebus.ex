@@ -31,6 +31,16 @@ defmodule Rebus do
 
       %Rebus.Message{type: :method_return, body: [names]} = Rebus.call(conn, message)
 
+      signal = Rebus.Message.new!(:signal,
+        path: "/org/example/Status",
+        interface: "org.example.Status",
+        member: "Changed",
+        signature: "s",
+        body: ["ready"]
+      )
+
+      :ok = Rebus.send(conn, signal)
+
       # Add a signal handler to receive all signals.
       case Rebus.add_signal_handler(conn) do
         ref when is_reference(ref) -> Rebus.delete_signal_handler(conn, ref)
@@ -46,7 +56,9 @@ defmodule Rebus do
   - `:session` - Connects to the session bus using the address specified in
      the `DBUS_SESSION_BUS_ADDRESS` environment variable.
   - `%{family: :local, path: path}` - Unix domain socket connection to a local D-Bus daemon
-  - `%{family: :inet | :inet6, addr: ip, port: port}` - TCP/IP connection to a remote D-Bus daemon
+  - `:socket.sockaddr_in()` or `:socket.sockaddr_in6()` - TCP/IP connection to a
+    remote D-Bus daemon; for example,
+    `%{family: :inet, addr: {127, 0, 0, 1}, port: 12345}`
 
   ## Configuration
 
@@ -168,7 +180,9 @@ defmodule Rebus do
     - `:session` - Connects to the session bus using the address specified in
        the `DBUS_SESSION_BUS_ADDRESS` environment variable.
     - `%{family: :local, path: path}` - Unix domain socket connection to a local D-Bus daemon
-    - `%{family: :inet | :inet6, addr: ip, port: port}` - TCP/IP connection to a remote D-Bus daemon
+    - `:socket.sockaddr_in()` or `:socket.sockaddr_in6()` - TCP/IP connection to
+      a remote D-Bus daemon; for example,
+      `%{family: :inet, addr: {127, 0, 0, 1}, port: 12345}`
 
   - `opts` - Optional keyword list of connection options:
     - `:timeout` - Positive maximum time in milliseconds for the auth-ID lookup,

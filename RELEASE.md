@@ -86,6 +86,8 @@
 
 ### Changed
 
+- Clarify the public Quick Start with `send/2`, document exact TCP
+  socket-address maps, and remove the stale test-count claim.
 - CI now runs the ordinary Unix-FD lifecycle suite on every valid combination
   in the current Elixir 1.18--1.20 and OTP 27--29 matrix for both Linux and
   macOS. Other Unix and BSD variants, and Windows, remain outside the

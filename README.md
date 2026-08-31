@@ -12,7 +12,7 @@ Rebus provides a clean, Elixir-native interface for communicating over D-Bus, th
 - **Signal Handling** - Register handlers to receive D-Bus signals  
 - **Message Encoding/Decoding** - Robust serialization of D-Bus messages with proper type handling
 - **Supervised Connections** - Fault-tolerant connection management with automatic supervision
-- **Comprehensive Testing** - Extensive test suite with 200+ tests ensuring reliability
+- **Comprehensive Testing** - Extensive test suite covering protocol and edge cases
 
 ## Quick Start
 
@@ -139,7 +139,8 @@ Rebus is built with a modular architecture:
 
 Rebus supports connecting to different types of D-Bus endpoints:
 
-- **TCP/IP connections** - `%{family: :inet, addr: {127, 0, 0, 1}, port: 12345}`
+- **IPv4 TCP/IP connections** - `%{family: :inet, addr: {127, 0, 0, 1}, port: 12345}`
+- **IPv6 TCP/IP connections** - `%{family: :inet6, addr: {0, 0, 0, 0, 0, 0, 0, 1}, port: 12345}`
 - **Unix domain sockets** - `%{family: :local, path: "/path/to/socket"}`
 
 ## Bus addresses
