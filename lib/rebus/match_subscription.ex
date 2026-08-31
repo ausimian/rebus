@@ -1042,12 +1042,7 @@ defmodule Rebus.MatchSubscription.Worker do
       conn = state.conn
 
       case Task.Supervisor.start_child(Rebus.MatchSubscription.TaskSupervisor, fn ->
-             result =
-               case Rebus.close(conn) do
-                 :ok -> :ok
-                 {:error, :not_found} -> Connection.shutdown_unmanaged(conn, @cleanup_timeout)
-                 {:error, _reason} = error -> error
-               end
+             result = Rebus.close(conn)
 
              send(worker, {:connection_reset_result, token, result})
            end) do

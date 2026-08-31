@@ -18,6 +18,7 @@
   queueing excess initial cleanup safely. Reject overlapping subscriptions with
   incompatible sender predicates rather than cross-delivering a signal whose
   well-known sender cannot be safely recovered from its forwarded unique name.
+
 - Negotiate D-Bus authentication mechanisms after `EXTERNAL` is rejected.
   Rebus supports `DBUS_COOKIE_SHA1` using a bounded, private per-user
   `~/.dbus-keyrings` cookie read and cryptographically strong client
@@ -85,6 +86,9 @@
 
 ### Changed
 
+- Document `Rebus.connect/2` as the sole supported connection construction API.
+  Connection internals are excluded from generated documentation, and
+  match-subscription recovery now resets only supervisor-owned connections.
 - `Rebus.Message.new/2` now returns `{:error, :invalid_body}` and `new!/2`
   raises when a body cannot be encoded for its signature, including out-of-range
   D-Bus integers. `encode/2` now also returns `:invalid_header_fields` for
