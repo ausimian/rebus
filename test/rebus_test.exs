@@ -1201,7 +1201,11 @@ defmodule RebusTest do
         end)
 
       assert log =~ "D-Bus connection protocol stopped: :read_timeout"
-      refute log =~ "D-Bus connection transport stopped"
+      # Test-server teardown from an earlier test can asynchronously log an
+      # unrelated transport close while this capture is active. The contract
+      # under test is that this connection classifies its elapsed Hello
+      # deadline as a protocol error, not a transport read-timeout.
+      refute log =~ "D-Bus connection transport stopped: :read_timeout"
       refute log =~ "%Rebus.Connection"
     end
 
