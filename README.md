@@ -60,6 +60,61 @@ blindly retry it. `{:error, :serial_exhausted}` means all D-Bus serials are in
 use. Connections must be local to the caller's node; remote PIDs return
 `{:error, :remote_connection_unsupported}`.
 
+## Routed signal subscriptions
+
+Use `Rebus.MatchRule` and `Rebus.add_match/3` to receive broadcast signals
+through a D-Bus bus without constructing `AddMatch` and `RemoveMatch` method
+calls yourself:
+
+```elixir
+rule = Rebus.MatchRule.new!(
+  sender: "org.freedesktop.DBus",
+  interface: "org.freedesktop.DBus",
+  member: "NameOwnerChanged",
+  args: %{0 => "org.example.Service"}
+)
+
+{:ok, ref} = Rebus.add_match(conn, rule, 1_000)
+
+receive do
+  {^ref, %Rebus.Message{body: [name, old_owner, new_owner]}} ->
+    # Handle the matching signal.
+end
+
+:ok = Rebus.remove_match(conn, ref)
+```
+
+Rules are structured, canonical, and capped at D-Bus's 1024-byte match-rule
+limit. Supported criteria are `sender`, `interface`, `member`, `path`,
+`path_namespace`, `destination`, exact string `argN` matches, `argNpath`, and
+`arg0namespace`; `path` and `path_namespace` cannot be combined. Rules always
+match signals, and raw rules or `eavesdrop` are deliberately unsupported.
+Equivalent subscriptions share one remote rule but receive independent
+references. Rebus removes the remote rule only after the last reference is
+removed or its owner exits. Local filtering compares only criteria that remain
+meaningful after routing; in particular, `sender` stays bus-owned because a
+well-known name can arrive as its current unique sender. If AddMatch has an
+ambiguous outcome, Rebus performs bounded cleanup with capped exponential
+backoff while the connection remains live. Same-rule subscriptions queue behind
+that recovery and retain their individual deadlines; an AddMatch result is not
+committed after its caller's deadline. Removing a final reference stops its
+local handler before `RemoveMatch`; a timed-out removal stays locally stopped
+while recovery continues. To bound distinct uncertain rules, Rebus closes a
+connection once 64 are recovering (and the bus then discards its rules).
+Ordinary first owner-exit removals use a separate 16-operation queue and do
+not consume that ambiguity budget. Rebus rejects an overlapping rule with a
+different sender predicate (`:sender_routing_ambiguous`): D-Bus does not mark
+which AddMatch rule admitted an incoming signal, so allowing the combination
+could cross-deliver a signal to a well-known-sender subscription. Unique
+sender names are locally checked.
+Definitive RemoveMatch errors are recorded distinctly but remain in that
+bounded cleanup path because they cannot prove the outcome of an earlier
+removal. If the subscription worker restarts during an in-flight operation,
+calls return `{:error, :match_subscription_state_lost}` until connection
+teardown; an unknown reference is never acknowledged merely because worker
+state disappeared. Closing a connection removes its bus rules and local
+handlers together.
+
 ## Architecture
 
 Rebus is built with a modular architecture:

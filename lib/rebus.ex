@@ -120,6 +120,21 @@ defmodule Rebus do
           | :fd_claim_expired
           | {:invalid_message_type, Rebus.Message.message_type()}
 
+  @type match_error_reason ::
+          :timeout
+          | :not_connected
+          | :disconnected
+          | :remote_connection_unsupported
+          | :encode_failed
+          | :serial_exhausted
+          | :fd_claim_expired
+          | :invalid_bus_reply
+          | :match_rule_cleanup_pending
+          | :match_subscription_state_lost
+          | :sender_routing_ambiguous
+          | {:reply_dropped, :method_return | {:error, binary()}}
+          | {:bus_error, binary()}
+
   @default_system_bus_address "unix:path=/run/dbus/system_bus_socket"
   @default_connection_timeout 5_000
   @max_tcp_addresses_per_family 4
@@ -1196,6 +1211,101 @@ defmodule Rebus do
   def send(conn, %Rebus.Message{} = message, timeout)
       when is_pid(conn) and is_integer(timeout) and timeout >= 0 do
     Rebus.Connection.send(conn, message, timeout)
+  end
+
+  @doc """
+  Subscribes the calling process to signals selected by a validated match rule.
+
+  This registers the rule with `org.freedesktop.DBus.AddMatch` and returns a
+  subscription reference. The process receives matching signals as
+  `{reference, %Rebus.Message{}}`, just like `add_signal_handler/1`.
+
+  Build the rule with `Rebus.MatchRule.new/1`; raw match strings are not
+  accepted. Rules are canonical and connection-scoped: equivalent rules share
+  one remote AddMatch registration, while each successful call returns an
+  independent reference. The bus rule remains active until the last reference
+  is removed or its owning process exits.
+
+  The supplied timeout is a single budget for local handler installation and
+  the AddMatch reply. `{:error, :timeout}` is delivery-ambiguous: no local
+  subscription reference is returned, but the bus might already have installed
+  the rule. Rebus starts bounded cleanup and retries transport-ambiguous
+  removal with capped exponential backoff while the connection remains alive.
+  Later subscriptions for the same rule wait behind that cleanup, subject to
+  their own timeout; a completed AddMatch is committed only if its caller is
+  still alive and within its deadline. D-Bus error replies become
+  `{:error, {:bus_error, error_name}}`; reply bodies are intentionally not
+  exposed. A well-known `sender` remains bus-owned because its forwarded
+  header is normally the current unique owner. Because D-Bus does not identify
+  the AddMatch rule that admitted a signal, Rebus rejects an overlapping rule
+  with a different sender predicate as
+  `{:error, :sender_routing_ambiguous}` rather than cross-delivering a signal
+  to a sender-pinned subscription. Unique sender names are locally verified.
+
+  Recovery tracks at most 64 distinct ambiguous rules per connection. Reaching
+  that capacity closes the connection, which makes the bus discard its match
+  rules, rather than retaining unbounded uncertain state. The first normal
+  cleanup after an owner exits is separate from that ambiguity budget: up to
+  16 initial removals run concurrently and the remainder queue safely.
+  Definitive
+  RemoveMatch errors are classified separately but still retry bounded cleanup:
+  they cannot prove whether an earlier removal took effect. If a subscription
+  worker restarts while an operation is in flight, Rebus returns
+  `{:error, :match_subscription_state_lost}` until connection teardown clears
+  the unresolved local and remote state; it never treats the reference as
+  successfully removed based only on an absent worker map.
+
+  Client-side filtering is applied only for the criteria accepted by
+  `Rebus.MatchRule`: interface/member/path/destination headers, `argN`,
+  `argNpath`, and `arg0namespace`. Sender matching is owned by the bus, since
+  a well-known sender can be forwarded under its unique name. Rebus does not
+  emulate eavesdropping or bus access policy.
+
+  ## Example
+
+      rule = Rebus.MatchRule.new!(
+        sender: "org.freedesktop.DBus",
+        interface: "org.freedesktop.DBus",
+        member: "NameOwnerChanged",
+        args: %{0 => "org.example.Service"}
+      )
+
+      {:ok, ref} = Rebus.add_match(conn, rule)
+      assert_receive {^ref, %Rebus.Message{type: :signal}}
+  """
+  @spec add_match(pid(), Rebus.MatchRule.t(), non_neg_integer()) ::
+          {:ok, reference()} | {:error, match_error_reason()}
+  def add_match(conn, %Rebus.MatchRule{} = rule, timeout \\ 5_000)
+      when is_pid(conn) and is_integer(timeout) and timeout >= 0 do
+    Rebus.MatchSubscription.add(conn, rule, timeout)
+  end
+
+  @doc """
+  Removes a match-rule subscription reference.
+
+  Removing a reference is idempotent and scoped to the connection on which it
+  was created. The final reference issues
+  `org.freedesktop.DBus.RemoveMatch`; earlier references only stop their local
+  handler before it asks the bus to remove the final rule, so a successfully
+  removed reference cannot receive a later signal. A handler-delete failure or
+  timeout retains the reference for retry. If the final RemoveMatch returns a
+  D-Bus error, the stopped reference is retained and can be retried. If it
+  times out or disconnects, Rebus keeps the local handler stopped and retries
+  bounded cleanup in the background. New subscriptions for that rule queue
+  behind recovery and retain their own deadlines. A definitive D-Bus error
+  keeps the stopped reference for an explicit retry; if its owner exits, Rebus
+  keeps bounded background cleanup rather than treating remote state as absent.
+
+  When the owner process exits, Rebus removes its local handler and performs a
+  bounded best-effort RemoveMatch if it held the final reference. Closing the
+  connection stops all local handlers and the bus discards every match rule for
+  that connection; no RemoveMatch is attempted after teardown.
+  """
+  @spec remove_match(pid(), reference(), non_neg_integer()) ::
+          :ok | {:error, match_error_reason()}
+  def remove_match(conn, ref, timeout \\ 5_000)
+      when is_pid(conn) and is_reference(ref) and is_integer(timeout) and timeout >= 0 do
+    Rebus.MatchSubscription.remove(conn, ref, timeout)
   end
 
   @doc """

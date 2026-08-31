@@ -21,9 +21,19 @@ defmodule Rebus.SignalHandler do
     {:ok, state}
   end
 
+  def init({src, sub, ref, %Rebus.MatchRule{}} = state)
+      when is_pid(src) and is_pid(sub) and is_reference(ref) do
+    {:ok, state}
+  end
+
   @impl true
   def handle_event({%Message{} = msg, from}, {from, sub, ref} = state) do
     send(sub, {ref, msg})
+    {:ok, state}
+  end
+
+  def handle_event({%Message{} = msg, from}, {from, sub, ref, rule} = state) do
+    if Rebus.MatchRule.matches?(rule, msg), do: send(sub, {ref, msg})
     {:ok, state}
   end
 

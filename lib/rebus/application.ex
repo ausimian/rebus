@@ -9,7 +9,10 @@ defmodule Rebus.Application do
   def start(_type, _args) do
     children = [
       {Rebus.SignalHandler, []},
-      {DynamicSupervisor, strategy: :one_for_one, name: Rebus.ConnectionSupervisor}
+      {DynamicSupervisor, strategy: :one_for_one, name: Rebus.ConnectionSupervisor},
+      {Registry, keys: :unique, name: Rebus.MatchSubscription.Registry},
+      {Task.Supervisor, name: Rebus.MatchSubscription.TaskSupervisor},
+      {Rebus.MatchSubscription, []}
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
