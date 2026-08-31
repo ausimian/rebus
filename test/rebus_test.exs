@@ -3125,7 +3125,10 @@ defmodule RebusTest do
                Rebus.connect_address_candidates(
                  [{:tcp, sentinel, 12_345, :unspec, nil}],
                  [timeout: 100],
-                 resolver: resolver
+                 resolver: resolver,
+                 # This test controls the resolver result; make its reason
+                 # assertion independent of scheduler time before resolution.
+                 monotonic_time: fn -> 0 end
                )
     end
 
