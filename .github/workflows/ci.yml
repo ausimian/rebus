@@ -57,22 +57,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Keep this valid-combination matrix in step with Castle. The newest
+        # pair is the sole coverage canary: coverage line attribution varies
+        # between Elixir releases, while repeated readings add noise rather
+        # than compatibility confidence.
+        elixir: ['1.18', '1.19', '1.20']
+        otp: ['27', '28', '29']
+        exclude:
+          # Elixir 1.18 supports Erlang/OTP 25-27.
+          - elixir: '1.18'
+            otp: '28'
+          - elixir: '1.18'
+            otp: '29'
+          # Elixir 1.19 supports Erlang/OTP 26-28.
+          - elixir: '1.19'
+            otp: '29'
         include:
-          # These are the valid Elixir/OTP pairings in Rebus's declared
-          # support range. Keep the newest pair as the sole coverage canary:
-          # coverage line attribution varies between Elixir releases, while
-          # repeated readings add noise rather than compatibility confidence.
-          - elixir: '1.17.3'
-            otp: '26.2'
-            cover: false
-          - elixir: '1.18.2'
-            otp: '27.1'
-            cover: false
-          - elixir: '1.19.1'
-            otp: '27.1'
-            cover: false
-          - elixir: '1.19.5'
-            otp: '28.3'
+          - elixir: '1.20'
+            otp: '29'
             cover: true
 
     steps:
@@ -122,15 +124,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - elixir: '1.17.3'
-            otp: '26.2'
-          - elixir: '1.18.2'
-            otp: '27.1'
-          - elixir: '1.19.1'
-            otp: '27.1'
-          - elixir: '1.19.5'
-            otp: '28.3'
+        # Match the Linux compatibility matrix exactly. Coverage remains a
+        # single Linux canary; macOS establishes runtime/FD compatibility.
+        elixir: ['1.18', '1.19', '1.20']
+        otp: ['27', '28', '29']
+        exclude:
+          - elixir: '1.18'
+            otp: '28'
+          - elixir: '1.18'
+            otp: '29'
+          - elixir: '1.19'
+            otp: '29'
 
     steps:
       - name: Checkout code
