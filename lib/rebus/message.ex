@@ -487,7 +487,7 @@ defmodule Rebus.Message do
   def parse_inbound(binary) when is_binary(binary) do
     case expected_size(binary) do
       {:ok, total_message_size} when byte_size(binary) >= total_message_size ->
-        <<message_binary::binary-size(total_message_size), remaining_data::binary>> = binary
+        <<message_binary::binary-size(^total_message_size), remaining_data::binary>> = binary
 
         case decode_frame(message_binary) do
           {:ok, message} ->
@@ -548,7 +548,7 @@ defmodule Rebus.Message do
       body_start = header_padded_length - 12
 
       if byte_size(rest) == body_start + body_length do
-        <<_::binary-size(body_start), body_binary::binary-size(body_length), _::binary>> =
+        <<_::binary-size(^body_start), body_binary::binary-size(^body_length), _::binary>> =
           rest
 
         # Decode body if present
@@ -883,7 +883,6 @@ defmodule Rebus.Message do
   end
 
   defp validate_unix_fd_list(fds) when is_list(fds), do: {:error, :unix_fd_limit}
-  defp validate_unix_fd_list(_fds), do: {:error, :invalid_unix_fds}
 
   defp validate_unix_fd_indices(signature, body, fds)
        when is_binary(signature) and is_list(body) do

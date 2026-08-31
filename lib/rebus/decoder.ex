@@ -326,7 +326,7 @@ defmodule Rebus.Decoder do
     total_array_size = alignment_padding + array_length
 
     # Extract exactly the data for this array
-    <<array_binary::binary-size(total_array_size), remaining_data::binary>> = length_state.data
+    <<array_binary::binary-size(^total_array_size), remaining_data::binary>> = length_state.data
 
     scalar_state = charge_scalar_array!(length_state, element_type, array_length)
 
@@ -488,7 +488,7 @@ defmodule Rebus.Decoder do
   end
 
   defp read_bytes(state, size) do
-    <<value::binary-size(size), rest::binary>> = state.data
+    <<value::binary-size(^size), rest::binary>> = state.data
     new_state = %{state | position: state.position + size, data: rest}
     {value, new_state}
   end
