@@ -641,8 +641,8 @@ defmodule Rebus.MatchSubscription.Worker do
       {:ok, request, state} ->
         state = put_active_rule(state, key)
         state = put_subscription(state, request.owner, key, handler_ref)
-        state = reply_request(state, request_id, {:ok, handler_ref})
-        dispatch_rule(state, key)
+        state = dispatch_rule(state, key)
+        reply_request_after_persist(state, request_id, {:ok, handler_ref})
 
       {:expired, state} ->
         state
@@ -677,8 +677,8 @@ defmodule Rebus.MatchSubscription.Worker do
     case accept_add_request(state, request_id) do
       {:ok, request, state} ->
         state = put_subscription(state, request.owner, key, handler_ref)
-        state = reply_request(state, request_id, {:ok, handler_ref})
-        dispatch_rule(state, key)
+        state = dispatch_rule(state, key)
+        reply_request_after_persist(state, request_id, {:ok, handler_ref})
 
       {:expired, state} ->
         state = put_pending_handler(state, key, handler_ref)
@@ -710,14 +710,14 @@ defmodule Rebus.MatchSubscription.Worker do
 
   defp complete_remove(state, key, request_id, {:removed, ref, :nonfinal}) do
     state = drop_subscription(state, ref)
-    state = reply_request_if_live(state, request_id, :ok)
-    dispatch_rule(state, key)
+    state = dispatch_rule(state, key)
+    reply_request_if_live_after_persist(state, request_id, :ok)
   end
 
   defp complete_remove(state, key, request_id, {:removed, ref, :final}) do
     state = drop_subscription(state, ref)
-    state = reply_request_if_live(state, request_id, :ok)
-    clear_rule_and_resume(state, key)
+    state = clear_rule_and_resume(state, key)
+    reply_request_if_live_after_persist(state, request_id, :ok)
   end
 
   defp complete_remove(state, key, request_id, {:remove_definitive_error, ref, error}) do
@@ -1271,6 +1271,24 @@ defmodule Rebus.MatchSubscription.Worker do
     end
   end
 
+  defp reply_request_if_live_after_persist(state, request_id, reply) do
+    case Map.get(state.requests, request_id) do
+      nil ->
+        state
+
+      request ->
+        if before_deadline?(request.deadline) and Process.alive?(request.owner) do
+          reply_request_after_persist(state, request_id, reply)
+        else
+          reply_request_after_persist(
+            state,
+            request_id,
+            {:error, if(Process.alive?(request.owner), do: :timeout, else: :disconnected)}
+          )
+        end
+    end
+  end
+
   defp accept_add_request(state, request_id) do
     case Map.get(state.requests, request_id) do
       nil ->
@@ -1296,6 +1314,32 @@ defmodule Rebus.MatchSubscription.Worker do
 
   defp reply_request_if_present(state, request_id, reply),
     do: reply_request(state, request_id, reply)
+
+  defp reply_request_after_persist(state, request_id, reply) do
+    case Map.pop(state.requests, request_id) do
+      {nil, _requests} ->
+        state
+
+      {%{from: from, timer: timer, monitor: monitor_ref}, requests} ->
+        _ = Process.cancel_timer(timer, async: true, info: false)
+        Process.demonitor(monitor_ref, [:flush])
+
+        state = %{
+          state
+          | requests: requests,
+            request_monitors: Map.delete(state.request_monitors, monitor_ref),
+            request_owner_index: Map.delete(state.request_owner_index, request_id)
+        }
+
+        # A completed operation may be observed immediately by its caller,
+        # including by stopping this worker. Persist its final state before
+        # replying so restart recovery never mistakes an acknowledged stable
+        # subscription for an uncertain in-flight operation.
+        state = persist_state(state)
+        GenServer.reply(from, reply)
+        state
+    end
+  end
 
   defp reply_request(state, request_id, reply) do
     case Map.pop(state.requests, request_id) do
