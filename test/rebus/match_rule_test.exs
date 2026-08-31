@@ -754,7 +754,7 @@ defmodule Rebus.MatchRuleTest do
       {direct_connection, worker} = start_direct_connection(server)
 
       on_exit(fn ->
-        if Process.alive?(worker), do: GenServer.stop(worker)
+        stop_worker(worker)
         if Process.alive?(direct_connection), do: Process.exit(direct_connection, :shutdown)
         _ = Rebus.MatchSubscription.delete_state(direct_connection)
       end)
@@ -774,7 +774,7 @@ defmodule Rebus.MatchRuleTest do
       {:ok, worker} = Worker.start_link(conn)
 
       on_exit(fn ->
-        if Process.alive?(worker), do: GenServer.stop(worker)
+        stop_worker(worker)
         if Process.alive?(conn), do: Agent.stop(conn)
         _ = Rebus.MatchSubscription.delete_state(conn)
       end)
@@ -796,7 +796,7 @@ defmodule Rebus.MatchRuleTest do
 
       on_exit(fn ->
         case Registry.lookup(Rebus.MatchSubscription.Registry, conn) do
-          [{worker, _value}] when is_pid(worker) -> GenServer.stop(worker)
+          [{worker, _value}] when is_pid(worker) -> stop_worker(worker)
           [] -> :ok
         end
 
@@ -1634,6 +1634,18 @@ defmodule Rebus.MatchRuleTest do
   defp subscription_worker(connection) do
     [{worker, _value}] = Registry.lookup(Rebus.MatchSubscription.Registry, connection)
     worker
+  end
+
+  # `Registry.lookup/2` and `GenServer.stop/1` are necessarily separate
+  # operations. The worker can observe its connection monitor and terminate
+  # normally in that gap, especially on older OTP schedulers. Cleanup must not
+  # turn that successful shutdown into a test failure.
+  defp stop_worker(worker) when is_pid(worker) do
+    try do
+      GenServer.stop(worker)
+    catch
+      :exit, {:noproc, _} -> :ok
+    end
   end
 
   defp start_direct_connection(server) do
