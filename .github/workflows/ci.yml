@@ -2,228 +2,260 @@ name: CI
 
 on:
   push:
-    branches: [ main, github ]
+    branches: [main, github]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        elixir-version: ['1.18.2']
-        otp-version: ['27.1']
-        include:
-          - elixir-version: '1.17.3'
-            otp-version: '26.2'
-          - elixir-version: '1.19.1'
-            otp-version: '27.1'
-          - elixir-version: '1.19.5'
-            otp-version: '28.3'
+  precommit:
+    name: Precommit (Elixir 1.19.5 / OTP 28.3)
+    runs-on: ubuntu-24.04
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v5
 
-    - name: Set up Elixir
-      uses: erlef/setup-beam@v1
-      with:
-        elixir-version: ${{ matrix.elixir-version }}
-        otp-version: ${{ matrix.otp-version }}
-        # Fall back when setup-beam cannot fetch artifacts from builds.hex.pm.
-        hexpm-mirrors: |
-          https://builds.hex.pm
-          https://cdn.jsdelivr.net/hex
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: '1.19.5'
+          otp-version: '28.3'
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
 
-    - name: Cache deps
-      uses: actions/cache@v3
-      id: cache-deps
-      env:
-        cache-name: cache-elixir-deps
-      with:
-        path: deps
-        key: ${{ runner.os }}-mix-${{ env.cache-name }}-${{ hashFiles('**/mix.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-mix-${{ env.cache-name }}-
+      - name: Restore dependencies and build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-${{ runner.arch }}-mix-precommit-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-mix-precommit-
 
-    - name: Cache compiled build
-      uses: actions/cache@v3
-      id: cache-build
-      env:
-        cache-name: cache-compiled-build
-      with:
-        path: _build
-        key: ${{ runner.os }}-mix-${{ env.cache-name }}-${{ matrix.elixir-version }}-${{ matrix.otp-version }}-${{ hashFiles('**/mix.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-mix-${{ env.cache-name }}-${{ matrix.elixir-version }}-${{ matrix.otp-version }}-
-          ${{ runner.os }}-mix-${{ env.cache-name }}-
+      - name: Install dependencies
+        run: mix deps.get
 
-    - name: Install dependencies
-      run: mix deps.get
+      # Rebus has not defined a `mix precommit` alias yet. Keep this pinned
+      # gate equivalent to its local convention until it does.
+      - name: Check for unused dependencies
+        run: mix deps.unlock --unused
 
-    - name: Check Formatting
-      run: mix format --check-formatted
+      - name: Check formatting
+        run: mix format --check-formatted
 
-    - name: Compile
-      run: mix compile --warnings-as-errors
+      - name: Compile
+        run: mix compile --warnings-as-errors
 
-    - name: Run tests
-      run: mix test
+      - name: Run tests
+        run: mix test
 
-    - name: Run tests with coverage
-      run: mix test --cover
-      if: matrix.elixir-version == '1.19.5' && matrix.otp-version == '28.3'
+  test:
+    name: Test (Linux, Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }})${{ matrix.cover && ' + coverage' || '' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # These are the valid Elixir/OTP pairings in Rebus's declared
+          # support range. Keep the newest pair as the sole coverage canary:
+          # coverage line attribution varies between Elixir releases, while
+          # repeated readings add noise rather than compatibility confidence.
+          - elixir: '1.17.3'
+            otp: '26.2'
+            cover: false
+          - elixir: '1.18.2'
+            otp: '27.1'
+            cover: false
+          - elixir: '1.19.1'
+            otp: '27.1'
+            cover: false
+          - elixir: '1.19.5'
+            otp: '28.3'
+            cover: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
+
+      - name: Restore dependencies and build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-${{ runner.arch }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Compile
+        run: mix compile --warnings-as-errors
+
+      - name: Run tests
+        if: ${{ !matrix.cover }}
+        run: mix test
+
+      - name: Run tests with coverage
+        if: ${{ matrix.cover }}
+        run: mix test --cover
 
   unix-fd-macos:
-    name: Unix FD (macOS)
-    runs-on: macos-latest
+    name: Unix FD lifecycle (macOS, Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }})
+    # Unix FD passing is intentionally supported only on Linux and macOS.
+    # Linux runs the same ordinary ExUnit suite in `test` above; this separate
+    # macOS matrix makes the platform-specific lifecycle coverage visible. BSD,
+    # other Unix variants, and Windows are deliberately out of scope.
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - elixir: '1.17.3'
+            otp: '26.2'
+          - elixir: '1.18.2'
+            otp: '27.1'
+          - elixir: '1.19.1'
+            otp: '27.1'
+          - elixir: '1.19.5'
+            otp: '28.3'
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v5
 
-    - name: Set up Elixir
-      uses: erlef/setup-beam@v1
-      with:
-        elixir-version: '1.19.5'
-        otp-version: '28.3'
-        hexpm-mirrors: |
-          https://builds.hex.pm
-          https://cdn.jsdelivr.net/hex
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
 
-    - name: Install dependencies
-      run: mix deps.get
+      - name: Restore dependencies and build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-${{ runner.arch }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-
 
-    - name: Run Unix FD integration tests
-      run: mix test test/rebus/unix_fd_test.exs
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Compile
+        run: mix compile --warnings-as-errors
+
+      - name: Run tests
+        # This intentionally runs the ordinary suite, including
+        # test/rebus/unix_fd_test.exs. It is not a separate FD-only harness.
+        run: mix test
 
   dialyzer:
-    name: Dialyzer
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        elixir-version: ['1.19.5']
-        otp-version: ['28.3']
+    name: Dialyzer (Elixir 1.19.5 / OTP 28.3)
+    runs-on: ubuntu-24.04
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v5
 
-    - name: Set up Elixir
-      id: beam
-      uses: erlef/setup-beam@v1
-      with:
-        elixir-version: ${{ matrix.elixir-version }}
-        otp-version: ${{ matrix.otp-version }}
-        # Fall back when setup-beam cannot fetch artifacts from builds.hex.pm.
-        hexpm-mirrors: |
-          https://builds.hex.pm
-          https://cdn.jsdelivr.net/hex
+      - name: Set up Elixir
+        id: beam
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: '1.19.5'
+          otp-version: '28.3'
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
 
-    - name: Cache deps
-      uses: actions/cache@v3
-      id: cache-deps
-      env:
-        cache-name: cache-elixir-deps
-      with:
-        path: deps
-        key: ${{ runner.os }}-mix-${{ env.cache-name }}-${{ hashFiles('**/mix.lock') }}
+      - name: Restore dependencies and build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-${{ runner.arch }}-mix-dialyzer-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-mix-dialyzer-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
 
-    - name: Cache compiled build
-      uses: actions/cache@v3
-      id: cache-build
-      env:
-        cache-name: cache-compiled-build
-      with:
-        path: _build
-        key: ${{ runner.os }}-mix-${{ env.cache-name }}-${{ matrix.elixir-version }}-${{ matrix.otp-version }}-${{ hashFiles('**/mix.lock') }}
+      - name: Restore PLT cache
+        id: cache-plt
+        uses: actions/cache/restore@v5
+        with:
+          path: _build/plts
+          key: plt-${{ runner.os }}-${{ runner.arch }}-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('**/mix.lock') }}
 
-    # Cache key based on Erlang/Elixir version and the mix.lock hash
-    - name: Restore PLT cache
-      uses: actions/cache/restore@v3
-      id: cache-plt
-      env:
-        cache-name: cache-plt
-      with:
-        key: |
-          plt-${{ runner.os }}-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('**/mix.lock') }}
-        path: |
-          _build/plts
+      - name: Install dependencies
+        run: mix deps.get
 
-    - name: Install dependencies
-      if: steps.cache-deps.outputs.cache-hit != 'true'
-      run: mix deps.get
+      - name: Compile
+        run: mix compile --warnings-as-errors
 
-    - name: Compile
-      if: steps.cache-build.outputs.cache-hit != 'true'
-      run: mix compile --warnings-as-errors
+      - name: Create PLTs
+        if: steps.cache-plt.outputs.cache-hit != 'true'
+        run: mix dialyzer --plt
 
-    # Create PLTs if no cache was found
-    - name: Create PLTs
-      if: steps.cache-plt.outputs.cache-hit != 'true'
-      run: mix dialyzer --plt
-      
-    # By default, the GitHub Cache action will only save the cache if all steps in the job succeed,
-    # so we separate the cache restore and save steps in case running dialyzer fails.
-    - name: Save PLT cache
-      id: plt_cache_save
-      uses: actions/cache/save@v3
-      if: steps.cache-plt.outputs.cache-hit != 'true'
-      with:
-        key: |
-          plt-${{ runner.os }}-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('**/mix.lock') }}
-        path: |
-          _build/plts
+      - name: Save PLT cache
+        if: steps.cache-plt.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: _build/plts
+          key: plt-${{ runner.os }}-${{ runner.arch }}-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('**/mix.lock') }}
 
-    - name: Run dialyzer
-      # Two formats are included for ease of debugging and it is lightly recommended to use both, see https://github.com/jeremyjh/dialyxir/issues/530 for reasoning
-      # --format github is helpful to print the warnings in a way that GitHub understands and can place on the /files page of a PR
-      # --format dialyxir allows the raw GitHub actions logs to be useful because they have the full warning printed
-      run: mix dialyzer --format github --format dialyxir
+      - name: Run dialyzer
+        run: mix dialyzer --format github --format dialyxir
 
   docs:
-    name: Documentation
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        elixir-version: ['1.18.2']
-        otp-version: ['27.1']
+    name: Documentation (Elixir 1.19.5 / OTP 28.3)
+    runs-on: ubuntu-24.04
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v5
 
-    - name: Set up Elixir
-      uses: erlef/setup-beam@v1
-      with:
-        elixir-version: ${{ matrix.elixir-version }}
-        otp-version: ${{ matrix.otp-version }}
-        # Fall back when setup-beam cannot fetch artifacts from builds.hex.pm.
-        hexpm-mirrors: |
-          https://builds.hex.pm
-          https://cdn.jsdelivr.net/hex
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: '1.19.5'
+          otp-version: '28.3'
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
 
-    - name: Cache deps
-      uses: actions/cache@v3
-      id: cache-deps
-      env:
-        cache-name: cache-elixir-deps
-      with:
-        path: deps
-        key: ${{ runner.os }}-mix-${{ env.cache-name }}-${{ hashFiles('**/mix.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-mix-${{ env.cache-name }}-
+      - name: Restore dependencies and build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-${{ runner.arch }}-mix-docs-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-mix-docs-
 
-    - name: Install dependencies
-      run: mix deps.get
+      - name: Install dependencies
+        run: mix deps.get
 
-    - name: Generate docs
-      run: mix docs
+      - name: Generate docs
+        run: mix docs
 
-    - name: Upload documentation
-      uses: actions/upload-artifact@v4
-      with:
-        name: documentation
-        path: doc/
-      if: matrix.elixir-version == '1.18.2' && matrix.otp-version == '27.1'
+      - name: Upload documentation
+        uses: actions/upload-artifact@v4
+        with:
+          name: documentation
+          path: doc/

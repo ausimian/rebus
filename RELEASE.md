@@ -86,6 +86,9 @@
 
 ### Changed
 
+- CI now runs the ordinary Unix-FD lifecycle suite on every supported
+  Elixir/OTP pairing for both Linux and macOS. Other Unix and BSD variants,
+  and Windows, remain outside the supported FD-passing scope.
 - Treat `MSG_CTRUNC` as a fail-closed `:unix_fd_truncated` connection error
   even when SCM_RIGHTS decoding also finds malformed or over-limit control
   data. Rebus closes every descriptor decoded from the received control list
