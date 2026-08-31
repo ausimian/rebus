@@ -639,7 +639,7 @@ defmodule RebusTest do
       read_timeout = 2_000
       connect_task = Task.async(fn -> Rebus.connect(addr, read_timeout: read_timeout) end)
 
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}, 1_000
       started_at = System.monotonic_time(:millisecond)
 
       log =
