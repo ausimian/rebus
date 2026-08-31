@@ -99,8 +99,11 @@ match signals, and raw rules or `eavesdrop` are deliberately unsupported.
 Equivalent subscriptions share one remote rule but receive independent
 references. Rebus removes the remote rule only after the last reference is
 removed or its owner exits. Local filtering compares only criteria that remain
-meaningful after routing; in particular, `sender` stays bus-owned because a
-well-known name can arrive as its current unique sender. If AddMatch has an
+meaningful after routing; in particular, a well-known `sender` stays bus-owned
+for broadcast signals because it can arrive as its current unique sender. A
+directed signal matches a well-known `sender` only when its sender header is
+that exact name, preserving trusted bus-driver signals without accepting a
+peer's unique sender. If AddMatch has an
 ambiguous outcome, Rebus performs bounded cleanup with capped exponential
 backoff while the connection remains live. Same-rule subscriptions queue behind
 that recovery and retain their individual deadlines; an AddMatch result is not
