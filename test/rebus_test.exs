@@ -639,7 +639,7 @@ defmodule RebusTest do
       read_timeout = 2_000
       connect_task = Task.async(fn -> Rebus.connect(addr, read_timeout: read_timeout) end)
 
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}, 1_000
       started_at = System.monotonic_time(:millisecond)
 
       log =
@@ -3125,7 +3125,10 @@ defmodule RebusTest do
                Rebus.connect_address_candidates(
                  [{:tcp, sentinel, 12_345, :unspec, nil}],
                  [timeout: 100],
-                 resolver: resolver
+                 resolver: resolver,
+                 # This test controls the resolver result; make its reason
+                 # assertion independent of scheduler time before resolution.
+                 monotonic_time: fn -> 0 end
                )
     end
 
