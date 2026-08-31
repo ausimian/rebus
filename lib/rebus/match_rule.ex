@@ -6,7 +6,9 @@ defmodule Rebus.MatchRule do
   Rebus deliberately accepts structured criteria instead of raw rule strings,
   so every outbound rule is bounded, correctly quoted, and safe to use for
   client-side filtering when several subscriptions share a connection. Unique
-  sender names are locally checked; well-known sender names remain bus-owned.
+  sender names are locally checked; well-known sender names remain bus-owned
+  for broadcast signals. A directed signal matches a well-known sender rule
+  only when its sender header names that sender exactly.
 
   The generated rule always contains `type='signal'`. Supported criteria are
   `:sender`, `:interface`, `:member`, `:path`, `:path_namespace`,
@@ -92,15 +94,20 @@ defmodule Rebus.MatchRule do
   Rebus compares unique-name `:sender` values, `:interface`, `:member`, `:path`, `:destination`,
   `:path_namespace`, `:args`, `:arg_paths`, and `:arg0namespace`. It
   compares unique-name `:sender` values. A well-known sender remains bus-owned
-  because the bus may forward it under the current unique owner. Subscription
-  setup rejects an overlapping rule that would make that well-known sender
-  ambiguous locally. This does not emulate bus access policy or eavesdropping.
+  for broadcast signals because the bus may forward it under the current unique
+  owner. A directed signal bypasses bus match routing, so Rebus accepts it for
+  a well-known sender only when its sender header equals that well-known name;
+  this preserves bus-driver signals while rejecting a peer's unique sender.
+  Subscription setup rejects an overlapping rule that would make that
+  well-known sender ambiguous locally. This does not emulate bus access policy
+  or eavesdropping.
   """
   @spec matches?(t(), Message.t()) :: boolean()
   def matches?(%__MODULE__{criteria: criteria}, %Message{type: :signal} = message) do
     headers = message.header_fields
 
-    header_matches?(criteria, headers) and
+    well_known_sender_matches?(criteria, headers) and
+      header_matches?(criteria, headers) and
       argument_matches?(criteria, message)
   end
 
@@ -292,6 +299,19 @@ defmodule Rebus.MatchRule do
       end
     ) and path_namespace_matches?(criteria, headers)
   end
+
+  # A well-known sender is safely enforced by bus routing only for broadcast
+  # signals. Directed signals bypass that routing, so they need an exact sender
+  # header match. That permits trusted bus-driver signals without treating a
+  # peer's unique sender as the named service.
+  defp well_known_sender_matches?(%{sender: <<":", _::binary>>}, _headers), do: true
+
+  defp well_known_sender_matches?(%{sender: sender}, %{destination: _destination} = headers),
+    do: Map.get(headers, :sender) == sender
+
+  defp well_known_sender_matches?(%{sender: _sender}, _headers), do: true
+
+  defp well_known_sender_matches?(_criteria, _headers), do: true
 
   defp path_namespace_matches?(criteria, headers) do
     case Map.fetch(criteria, :path_namespace) do

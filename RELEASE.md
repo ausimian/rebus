@@ -132,6 +132,9 @@
 
 ### Fixed
 
+- Filter directed signals for a well-known match `sender` by exact sender
+  header, preventing a peer's unique name from satisfying that predicate while
+  preserving legitimate bus-driver signals.
 - Return `:invalid_body` when a message body cannot be encoded for its
   signature, rather than silently declaring an empty body.
 - Reject duplicate or trailing body data in decoded D-Bus messages, and accept

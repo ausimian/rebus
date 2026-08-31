@@ -89,6 +89,48 @@ defmodule Rebus.MatchRuleTest do
                )
              )
     end
+
+    test "filters directed signals by an exact well-known sender" do
+      rule = MatchRule.new!(sender: "org.example.Service", member: "Changed")
+
+      broadcast =
+        Message.new!(:signal,
+          sender: ":1.42",
+          path: "/org/example",
+          interface: "org.example.Interface",
+          member: "Changed"
+        )
+
+      assert MatchRule.matches?(rule, broadcast)
+
+      refute MatchRule.matches?(rule, %{
+               broadcast
+               | header_fields: Map.put(broadcast.header_fields, :destination, ":1.100")
+             })
+
+      assert MatchRule.matches?(rule, %{
+               broadcast
+               | header_fields:
+                   broadcast.header_fields
+                   |> Map.put(:sender, "org.example.Service")
+                   |> Map.put(:destination, ":1.100")
+             })
+    end
+
+    test "matches a directed signal for a unique sender" do
+      rule = MatchRule.new!(sender: ":1.42", member: "Changed")
+
+      assert MatchRule.matches?(
+               rule,
+               Message.new!(:signal,
+                 sender: ":1.42",
+                 destination: ":1.100",
+                 path: "/org/example",
+                 interface: "org.example.Interface",
+                 member: "Changed"
+               )
+             )
+    end
   end
 
   describe "bus match subscriptions" do
@@ -142,6 +184,72 @@ defmodule Rebus.MatchRuleTest do
 
       send(owner_a, :stop)
       send(owner_b, :stop)
+    end
+
+    test "filters directed signals by an exact well-known sender subscription", %{
+      server: server,
+      connection: connection
+    } do
+      rule = test_rule()
+      owner = subscribe_owner(self(), connection, rule)
+
+      add = assert_add_match(server, rule)
+      :ok = TestServer.push(server, method_return(add.serial))
+      ref = assert_subscription(owner)
+
+      :ok =
+        TestServer.push(server, test_signal("changed", sender: ":1.99", destination: ":1.100"))
+
+      refute_receive {:matched, ^owner, ^ref, _message}, 100
+
+      :ok =
+        TestServer.push(
+          server,
+          test_signal("changed", sender: "org.example.Service", destination: ":1.100")
+        )
+
+      assert_receive {:matched, ^owner, ^ref, %Message{body: ["changed"]}}, 1_000
+
+      send(owner, :stop)
+      remove = assert_remove_match(server, rule)
+      :ok = TestServer.push(server, method_return(remove.serial))
+    end
+
+    test "delivers a directed bus-driver signal with an exact sender", %{
+      server: server,
+      connection: connection
+    } do
+      rule =
+        MatchRule.new!(
+          sender: "org.freedesktop.DBus",
+          interface: "org.freedesktop.DBus",
+          member: "NameLost",
+          path: "/org/freedesktop/DBus"
+        )
+
+      owner = subscribe_owner(self(), connection, rule)
+      add = assert_add_match(server, rule)
+      :ok = TestServer.push(server, method_return(add.serial))
+      ref = assert_subscription(owner)
+
+      signal =
+        Message.new!(:signal,
+          sender: "org.freedesktop.DBus",
+          destination: ":1.100",
+          path: "/org/freedesktop/DBus",
+          interface: "org.freedesktop.DBus",
+          member: "NameLost",
+          signature: "s",
+          body: [":1.100"]
+        )
+
+      assert MatchRule.matches?(rule, signal)
+      :ok = TestServer.push(server, signal)
+      assert_receive {:matched, ^owner, ^ref, %Message{body: [":1.100"]}}, 1_000
+
+      send(owner, :stop)
+      remove = assert_remove_match(server, rule)
+      :ok = TestServer.push(server, method_return(remove.serial))
     end
 
     test "rejects a broad overlapping rule that would bypass a well-known sender", %{
@@ -1515,15 +1623,17 @@ defmodule Rebus.MatchRuleTest do
     )
   end
 
-  defp test_signal(argument) do
-    Message.new!(:signal,
+  defp test_signal(argument, opts \\ []) do
+    signal_opts = [
       sender: "org.example.Service",
       path: "/org/example/child",
       interface: "org.example.Interface",
       member: "Changed",
       signature: "s",
       body: [argument]
-    )
+    ]
+
+    Message.new!(:signal, Keyword.merge(signal_opts, opts))
   end
 
   defp subscribe_owner(parent, connection, rule) do

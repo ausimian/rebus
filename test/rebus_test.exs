@@ -3878,6 +3878,7 @@ defmodule RebusTest do
       signal =
         Rebus.Message.new!(
           :signal,
+          sender: "org.freedesktop.DBus",
           path: "/org/freedesktop/DBus",
           interface: "org.freedesktop.DBus",
           member: "FakeSignal",
@@ -3925,6 +3926,7 @@ defmodule RebusTest do
       signal =
         Rebus.Message.new!(
           :signal,
+          sender: "org.freedesktop.DBus",
           path: "/org/freedesktop/DBus",
           interface: "org.freedesktop.DBus",
           member: "NameAcquired",

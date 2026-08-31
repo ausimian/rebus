@@ -368,6 +368,7 @@ defmodule Rebus.TestServer do
     if state.auto_hello_name_acquired? do
       signal =
         Message.new!(:signal,
+          sender: "org.freedesktop.DBus",
           path: "/org/freedesktop/DBus",
           interface: "org.freedesktop.DBus",
           member: "NameAcquired",
