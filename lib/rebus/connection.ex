@@ -1071,7 +1071,7 @@ defmodule Rebus.Connection do
 
         case Message.expected_size(data) do
           {:ok, frame_size} ->
-            <<_dropped::binary-size(frame_size), rest::binary>> = data
+            <<_dropped::binary-size(^frame_size), rest::binary>> = data
             parse_flat_messages(rest, finish_frame(state), continuation, source)
 
           _ ->
@@ -2364,7 +2364,7 @@ defmodule Rebus.Connection do
 
   defp decode_rights_data(data) do
     complete_size = div(byte_size(data), 4) * 4
-    <<complete::binary-size(complete_size), _tail::binary>> = data
+    <<complete::binary-size(^complete_size), _tail::binary>> = data
     fds = for <<fd::native-signed-32 <- complete>>, do: fd
 
     cond do
@@ -3292,7 +3292,7 @@ defmodule Rebus.Connection do
 
   defp handle_completion_result({:ok, written}, %__MODULE__{active_write: write} = state)
        when is_integer(written) and written > 0 and written < byte_size(write.rest) do
-    <<_sent::binary-size(written), rest::binary>> = write.rest
+    <<_sent::binary-size(^written), rest::binary>> = write.rest
     state = put_active_rest(state, rest)
     {:noreply, state, {:continue, :write}}
   end
