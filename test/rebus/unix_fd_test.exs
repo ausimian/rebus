@@ -1324,6 +1324,83 @@ defmodule Rebus.UnixFDTest do
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
   end
 
+  test "CTRUNC closes descriptors after malformed control data", %{connection: connection} do
+    {sender, receiver, listener, path} = local_socket_pair!()
+
+    on_exit(fn ->
+      _ = :socket.close(sender)
+      _ = :socket.close(receiver)
+      _ = :socket.close(listener)
+      _ = File.rm(path)
+    end)
+
+    {:ok, fd} = :socket.getopt(sender, {:otp, :fd})
+    before_fds = fd_set!()
+
+    assert {:ok,
+            %{
+              iov: ["ignored"],
+              ctrl: [%{level: :socket, type: :rights, data: <<received::native-signed-32>>}]
+            } = recvmsg} = receive_rights_message!(sender, receiver, fd)
+
+    assert {:stop, {:shutdown, :unix_fd_truncated}, _state} =
+             Rebus.Connection.handle_receive_result(
+               {:ok,
+                %{
+                  recvmsg
+                  | ctrl: [%{level: :socket, type: :rights, data: <<1>>} | recvmsg.ctrl],
+                    flags: [:ctrunc]
+                }},
+               :sys.get_state(connection)
+             )
+
+    # The malformed first cmsg must not prevent the later, kernel-created
+    # descriptor from being found and closed on the fail-closed path.
+    assert {:error, :ebadf} = UnixFD.close(received)
+    assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
+  end
+
+  test "invalid recvmsg shapes close decoded descriptors", %{connection: connection} do
+    {sender, receiver, listener, path} = local_socket_pair!()
+
+    on_exit(fn ->
+      _ = :socket.close(sender)
+      _ = :socket.close(receiver)
+      _ = :socket.close(listener)
+      _ = File.rm(path)
+    end)
+
+    {:ok, fd} = :socket.getopt(sender, {:otp, :fd})
+    before_fds = fd_set!()
+
+    assert {:ok,
+            %{
+              ctrl: [%{level: :socket, type: :rights, data: <<invalid_iov_fd::native-signed-32>>}]
+            } = recvmsg} = receive_rights_message!(sender, receiver, fd)
+
+    assert {:stop, {:shutdown, :invalid_unix_fds}, _state} =
+             Rebus.Connection.handle_receive_result(
+               {:ok, %{recvmsg | iov: [:not_iodata]}},
+               :sys.get_state(connection)
+             )
+
+    assert {:error, :ebadf} = UnixFD.close(invalid_iov_fd)
+
+    assert {:ok,
+            %{
+              ctrl: [%{level: :socket, type: :rights, data: <<missing_iov_fd::native-signed-32>>}]
+            } = recvmsg} = receive_rights_message!(sender, receiver, fd)
+
+    assert {:stop, {:shutdown, :invalid_unix_fds}, _state} =
+             Rebus.Connection.handle_receive_result(
+               {:ok, Map.drop(recvmsg, [:iov])},
+               :sys.get_state(connection)
+             )
+
+    assert {:error, :ebadf} = UnixFD.close(missing_iov_fd)
+    assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
+  end
+
   test "handles recvmsg select, completion, and malformed-control transitions", %{
     connection: connection
   } do
@@ -1425,6 +1502,27 @@ defmodule Rebus.UnixFDTest do
                %{state | inbound_size: 1}
              )
 
+    # Even when SCM_RIGHTS decoding finds a malformed tail, CTRUNC wins: the
+    # kernel may have installed descriptors absent from the reported control
+    # payload, so the connection must fail closed rather than quarantine a
+    # frame locally.
+    assert {:stop, {:shutdown, :unix_fd_truncated}, _state} =
+             Rebus.Connection.handle_receive_result(
+               {:ok,
+                %{
+                  iov: ["ignored"],
+                  ctrl: [
+                    %{
+                      level: :socket,
+                      type: :rights,
+                      data: <<1_000_000::native-signed-32, 1>>
+                    }
+                  ],
+                  flags: [:ctrunc]
+                }},
+               state
+             )
+
     assert {:stop, {:shutdown, :message_too_large}, _state} =
              Rebus.Connection.handle_receive_result(
                {:ok, %{iov: [:binary.copy(<<0>>, 65_537)], ctrl: [], flags: []}},
@@ -1441,6 +1539,20 @@ defmodule Rebus.UnixFDTest do
                   iov: [],
                   ctrl: [%{level: :socket, type: :rights, data: too_many_rights}],
                   flags: []
+                }},
+               state
+             )
+
+    # The same precedence applies when the complete decoded descriptor list
+    # exceeds the local limit; the descriptors travel with the truncation
+    # result and are closed before protocol shutdown.
+    assert {:stop, {:shutdown, :unix_fd_truncated}, _state} =
+             Rebus.Connection.handle_receive_result(
+               {:ok,
+                %{
+                  iov: ["ignored"],
+                  ctrl: [%{level: :socket, type: :rights, data: too_many_rights}],
+                  flags: [:ctrunc]
                 }},
                state
              )
@@ -1488,6 +1600,33 @@ defmodule Rebus.UnixFDTest do
       _ ->
         flunk("Unix FD leak test ran on an unsupported platform")
     end
+  end
+
+  defp local_socket_pair! do
+    path = Path.join("/tmp", "rebus-unix-fd-pair-#{System.unique_integer([:positive])}")
+    {:ok, listener} = :socket.open(:local, :stream, :default)
+    :ok = :socket.bind(listener, %{family: :local, path: path})
+    :ok = :socket.listen(listener, 1)
+    {:ok, sender} = :socket.open(:local, :stream, :default)
+    {:ok, address} = :socket.sockname(listener)
+    :ok = :socket.connect(sender, address)
+    {:ok, receiver} = :socket.accept(listener, 1_000)
+    {sender, receiver, listener, path}
+  end
+
+  defp receive_rights_message!(sender, receiver, fd) do
+    :ok =
+      :socket.sendmsg(
+        sender,
+        %{
+          iov: ["ignored"],
+          ctrl: [%{level: :socket, type: :rights, data: <<fd::native-signed-32>>}]
+        },
+        [],
+        1_000
+      )
+
+    :socket.recvmsg(receiver, 0, 256, [], 1_000)
   end
 
   defp linux_pipe_fd?(fd) do

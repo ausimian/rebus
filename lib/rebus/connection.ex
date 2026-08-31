@@ -2213,11 +2213,30 @@ defmodule Rebus.Connection do
          %__MODULE__{} = state,
          continuation
        )
-       when is_list(iov) and is_list(ctrl) and is_list(flags) do
+       when is_list(ctrl) and is_list(flags) do
+    fds = recvmsg_fds(ctrl, flags)
+
     case recvmsg_data(iov) do
-      {:ok, data} -> append_recvmsg_fds(recvmsg_fds(ctrl, flags), data, state, continuation)
-      {:error, reason} -> stop_for_protocol_error(reason, state)
+      {:ok, data} ->
+        append_recvmsg_fds(fds, data, state, continuation)
+
+      {:error, reason} ->
+        # Validate control data before iodata so descriptors cannot leak when
+        # the recvmsg shape is invalid. No frame bytes are usable in this case.
+        _ = close_recvmsg_fds(fds)
+        stop_for_protocol_error(reason, state)
     end
+  end
+
+  defp append_recvmsg(%{ctrl: ctrl, flags: flags}, %__MODULE__{} = state, _continuation)
+       when is_list(ctrl) and is_list(flags) do
+    _ = close_recvmsg_fds(recvmsg_fds(ctrl, flags))
+    stop_for_protocol_error(:invalid_unix_fds, state)
+  end
+
+  defp append_recvmsg(%{ctrl: ctrl}, %__MODULE__{} = state, _continuation) when is_list(ctrl) do
+    _ = close_recvmsg_fds(recvmsg_fds(ctrl, []))
+    stop_for_protocol_error(:invalid_unix_fds, state)
   end
 
   defp append_recvmsg(_message, %__MODULE__{} = state, _continuation),
@@ -2263,8 +2282,8 @@ defmodule Rebus.Connection do
     quarantine_ancillary_frame(data, state, continuation)
   end
 
-  defp append_recvmsg_fds({:error, reason}, _data, state, _continuation),
-    do: stop_for_protocol_error(reason, state)
+  defp close_recvmsg_fds({:ok, fds}), do: UnixFD.close_all(fds)
+  defp close_recvmsg_fds({:error, _reason, fds}), do: UnixFD.close_all(fds)
 
   defp recvmsg_data(iov) do
     try do
@@ -2279,12 +2298,19 @@ defmodule Rebus.Connection do
   end
 
   defp recvmsg_fds(ctrl, flags) do
-    with {:ok, fds} <- extract_rights_fds(ctrl) do
-      if :ctrunc in flags do
+    case {extract_rights_fds(ctrl), :ctrunc in flags} do
+      {{:ok, fds}, true} ->
         {:error, :unix_fd_truncated, fds}
-      else
-        {:ok, fds}
-      end
+
+      {{:error, _reason, fds}, true} ->
+        # Preserve every complete descriptor decoded before the malformed or
+        # oversized tail so the single fail-closed path can close it. CTRUNC
+        # takes precedence because the kernel may have omitted more descriptors
+        # whose identities are unknowable.
+        {:error, :unix_fd_truncated, fds}
+
+      {result, _ctrunc?} ->
+        result
     end
   end
 
@@ -2297,34 +2323,43 @@ defmodule Rebus.Connection do
   end
 
   defp extract_rights_fds(ctrl) do
-    Enum.reduce_while(ctrl, {:ok, []}, fn
-      %{level: :socket, type: :rights, data: data}, {:ok, fds} when is_binary(data) ->
-        case decode_rights_data(data) do
-          {:ok, received} -> {:cont, {:ok, fds ++ received}}
-          # A malformed control payload can still contain complete descriptors
-          # before its invalid tail. Keep those descriptors in the rejection
-          # result so the caller closes them on the single error path.
-          {:error, received} -> {:halt, {:error, :invalid_unix_fds, fds ++ received}}
-        end
+    {fds, reason} =
+      Enum.reduce(ctrl, {[], nil}, fn
+        %{level: :socket, type: :rights, data: data}, {fds, reason} when is_binary(data) ->
+          case decode_rights_data(data) do
+            {:ok, received} ->
+              append_received_fds(fds, received, reason)
 
-      # An SCM_RIGHTS item with a non-binary payload must fail closed. It may
-      # accompany descriptors decoded by an earlier cmsg, all of which travel
-      # in the error tuple to the single close path above.
-      %{level: :socket, type: :rights}, {:ok, fds} ->
-        {:halt, {:error, :invalid_unix_fds, fds}}
+            # A malformed control payload can still contain complete
+            # descriptors before its invalid tail. Continue scanning later
+            # cmsgs too, retaining every descriptor for the single close path.
+            {:error, received} ->
+              append_received_fds(fds, received, reason || :invalid_unix_fds)
+          end
 
-      _cmsg, acc ->
-        {:cont, acc}
-    end)
-    |> case do
-      {:ok, fds} ->
-        if length(fds) <= Message.max_unix_fds(),
-          do: {:ok, fds},
-          else: {:error, :unix_fd_limit, fds}
+        # An SCM_RIGHTS item with a non-binary payload must fail closed, but
+        # later rights cmsgs can still carry descriptors which must be closed.
+        %{level: :socket, type: :rights}, {fds, reason} ->
+          {fds, reason || :invalid_unix_fds}
 
-      error ->
-        error
+        _cmsg, acc ->
+          acc
+      end)
+
+    case reason do
+      nil -> {:ok, fds}
+      reason -> {:error, reason, fds}
     end
+  end
+
+  defp append_received_fds(fds, received, reason) do
+    fds = fds ++ received
+
+    reason =
+      reason ||
+        if length(fds) > Message.max_unix_fds(), do: :unix_fd_limit
+
+    {fds, reason}
   end
 
   defp decode_rights_data(data) do
