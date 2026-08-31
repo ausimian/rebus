@@ -86,6 +86,10 @@
 
 ### Changed
 
+- Treat `MSG_CTRUNC` as a fail-closed `:unix_fd_truncated` connection error
+  even when SCM_RIGHTS decoding also finds malformed or over-limit control
+  data. Rebus closes every descriptor decoded from the received control list
+  before stopping.
 - Document `Rebus.connect/2` as the sole supported connection construction API.
   Connection internals are excluded from generated documentation, and
   match-subscription recovery now resets only supervisor-owned connections.
