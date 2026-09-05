@@ -82,6 +82,21 @@
 
 ### Changed
 
+- **Breaking:** `Rebus.call/3` no longer returns a bare `%Rebus.Message{}`. A
+  successful reply is `{:ok, %Rebus.Message{type: :method_return}}` and a D-Bus
+  error reply is `{:error, %Rebus.Message{type: :error}}`; both carry the
+  complete message, including any received descriptors the caller owns.
+- **Breaking:** `Rebus.add_signal_handler/1` returns `{:ok, reference()}`
+  instead of a bare `reference()`.
+- **Breaking:** `Rebus.Message.new/2` and `Rebus.Message.validate/1` return
+  pattern-matchable reasons instead of strings: `:invalid_type`,
+  `:invalid_flags`, `:invalid_version`, `:invalid_body`, `:invalid_signature`,
+  `:invalid_header_fields`, `{:invalid_header_field, field}`,
+  `{:missing_header_field, field}` and `{:unknown_header_field, field}`. No
+  caller-supplied value appears in a reason.
+- **Breaking:** `Rebus.connect!/2` raises `ArgumentError` instead of
+  `RuntimeError`, matching `Rebus.Message.new!/2` and `Rebus.MatchRule.new!/1`.
+
 - Rebus now requires Elixir 1.18 or later.
 - Connection log entries now carry their drop or stop reason as `reason:`
   Logger metadata, so handlers can filter on it. The message text is unchanged.
