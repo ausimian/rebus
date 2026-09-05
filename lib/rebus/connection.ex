@@ -50,10 +50,10 @@ defmodule Rebus.Connection do
   # as if their reply had expired before it could be written.
   @max_queued_replies 64
 
-  @default_impl %{transport: Rebus.Transport.Socket}
+  @default_impl %{transport: Rebus.Transport.Socket, identity: Rebus.Identity.Posix}
 
   @typedoc false
-  @type impl :: %{transport: module()}
+  @type impl :: %{transport: module(), identity: module()}
 
   @spec call(pid(), Message.t(), non_neg_integer()) ::
           {:ok, Message.t()} | {:error, Rebus.call_error()}
@@ -201,8 +201,6 @@ defmodule Rebus.Connection do
     field :connect_waiter, {pid(), reference()} | nil, default: nil
     field :connect_waiter_monitor, reference() | nil, default: nil
     field :connect_accepted?, boolean(), default: false
-    field :auth_id_runner, function() | nil, default: nil
-    field :auth_username_runner, function() | nil, default: nil
     field :partial_frame_timer, {reference(), reference()} | nil, default: nil
     field :unix_fd_transport?, boolean(), default: false
     field :unix_fd_negotiated?, boolean(), default: false
@@ -269,8 +267,6 @@ defmodule Rebus.Connection do
     bus? = Keyword.get(args, :bus, true)
     name = Keyword.get(args, :name)
     connect_waiter = Keyword.get(args, :connect_waiter)
-    auth_id_runner = Keyword.get(args, :auth_id_fun, &run_auth_id/1)
-    auth_username_runner = Keyword.get(args, :auth_username_fun, &run_auth_username/1)
     impl = build_impl(Keyword.get(args, :__impl__, []))
 
     cond do
@@ -301,12 +297,6 @@ defmodule Rebus.Connection do
       not (is_nil(name) or is_atom(name)) ->
         {:stop, :invalid_name}
 
-      not is_function(auth_id_runner, 1) ->
-        {:stop, :invalid_auth_id_fun}
-
-      not is_function(auth_username_runner, 1) ->
-        {:stop, :invalid_auth_username_fun}
-
       true ->
         # DynamicSupervisor stops children with an exit signal. Trap it so the
         # GenServer loop can return :stop and therefore invoke terminate/2,
@@ -332,8 +322,6 @@ defmodule Rebus.Connection do
                bus?: bus?,
                connect_waiter: connect_waiter,
                connect_waiter_monitor: monitor_connect_waiter(connect_waiter),
-               auth_id_runner: auth_id_runner,
-               auth_username_runner: auth_username_runner,
                unix_fd_transport?: unix_fd_transport_supported?(family)
              }, {:continue, {:setup, addr}}}
 
@@ -1480,7 +1468,7 @@ defmodule Rebus.Connection do
 
   defp aggregate_setup_auth_id(%__MODULE__{} = state, deadline) do
     with {:ok, auth_id_timeout} <- remaining_setup_timeout(deadline, state.setup_timeout) do
-      get_auth_id(auth_id_timeout, state.auth_id_runner)
+      get_auth_id(auth_id_timeout, state.impl.identity)
     end
   end
 
@@ -1488,7 +1476,7 @@ defmodule Rebus.Connection do
     do: {:ok, auth_id}
 
   defp setup_auth_id(%__MODULE__{} = state, timeout),
-    do: get_auth_id(timeout, state.auth_id_runner)
+    do: get_auth_id(timeout, state.impl.identity)
 
   # EXTERNAL remains the first authentication mechanism. If it is rejected the
   # advertised list determines a bounded, deterministic retry: cookie first,
@@ -1533,7 +1521,7 @@ defmodule Rebus.Connection do
 
   defp authenticate_cookie(state, sock, auth_id, mechanisms, rest, deadline, maximum) do
     with {:ok, timeout} <- remaining_setup_timeout(deadline, maximum) do
-      case get_auth_username(timeout, state.auth_username_runner) do
+      case get_auth_username(timeout, state.impl.identity) do
         {:ok, username} ->
           authenticate_cookie_with_username(
             state,
@@ -1971,10 +1959,11 @@ defmodule Rebus.Connection do
   end
 
   @doc false
-  @spec get_auth_id(pos_integer(), (pos_integer() -> {:ok, binary()} | {:error, term()})) ::
+  @spec get_auth_id(pos_integer(), module()) ::
           {:ok, binary()} | {:error, :auth_id_unavailable | :read_timeout}
-  def get_auth_id(timeout, runner \\ &run_auth_id/1) when is_integer(timeout) and timeout > 0 do
-    case safely_run_auth_id(runner, timeout) do
+  def get_auth_id(timeout, identity \\ Rebus.Identity.Posix)
+      when is_integer(timeout) and timeout > 0 and is_atom(identity) do
+    case safely_lookup_identity(identity, :auth_id, timeout) do
       {:ok, output} when is_binary(output) and byte_size(output) <= @max_auth_id_output ->
         case String.trim(output) do
           uid when uid != <<>> ->
@@ -1995,11 +1984,11 @@ defmodule Rebus.Connection do
   end
 
   @doc false
-  @spec get_auth_username(pos_integer(), (pos_integer() -> {:ok, binary()} | {:error, term()})) ::
+  @spec get_auth_username(pos_integer(), module()) ::
           {:ok, binary()} | {:error, :auth_cookie_unavailable | :read_timeout}
-  def get_auth_username(timeout, runner \\ &run_auth_username/1)
-      when is_integer(timeout) and timeout > 0 do
-    case safely_run_auth_id(runner, timeout) do
+  def get_auth_username(timeout, identity \\ Rebus.Identity.Posix)
+      when is_integer(timeout) and timeout > 0 and is_atom(identity) do
+    case safely_lookup_identity(identity, :username, timeout) do
       {:ok, output} when is_binary(output) and byte_size(output) <= @max_auth_id_output ->
         username = String.trim(output)
 
@@ -2013,40 +2002,6 @@ defmodule Rebus.Connection do
       _ ->
         {:error, :auth_cookie_unavailable}
     end
-  end
-
-  @doc false
-  @spec run_auth_username(
-          pos_integer(),
-          (String.t() -> String.t() | nil),
-          ({:spawn_executable, charlist()}, keyword() -> port())
-        ) :: {:ok, binary()} | {:error, term()}
-  def run_auth_username(
-        timeout,
-        executable_finder \\ &System.find_executable/1,
-        port_opener \\ &Port.open/2
-      )
-      when is_integer(timeout) and timeout > 0 and is_function(executable_finder, 1) and
-             is_function(port_opener, 2) do
-    case safely_find_executable(executable_finder) do
-      nil -> {:error, :enoent}
-      executable -> safely_open_auth_username_port(executable, port_opener, timeout)
-    end
-  end
-
-  defp safely_open_auth_username_port(executable, port_opener, timeout) do
-    port =
-      port_opener.({:spawn_executable, String.to_charlist(executable)}, [
-        :binary,
-        :exit_status,
-        args: ["-un"]
-      ])
-
-    collect_auth_id_output(port, <<>>, read_deadline(timeout), timeout)
-  rescue
-    _exception -> {:error, :port_open_failed}
-  catch
-    _kind, _reason -> {:error, :port_open_failed}
   end
 
   defp valid_auth_username?(username) when byte_size(username) in 1..64,
@@ -2122,95 +2077,12 @@ defmodule Rebus.Connection do
     end
   end
 
-  @doc false
-  @spec run_auth_id(
-          pos_integer(),
-          (String.t() -> String.t() | nil),
-          ({:spawn_executable, charlist()}, keyword() -> port())
-        ) :: {:ok, binary()} | {:error, term()}
-  def run_auth_id(
-        timeout,
-        executable_finder \\ &System.find_executable/1,
-        port_opener \\ &Port.open/2
-      )
-      when is_integer(timeout) and timeout > 0 and is_function(executable_finder, 1) and
-             is_function(port_opener, 2) do
-    case safely_find_executable(executable_finder) do
-      nil ->
-        {:error, :enoent}
-
-      executable ->
-        safely_open_auth_id_port(executable, port_opener, timeout)
-    end
-  end
-
-  defp safely_run_auth_id(runner, timeout) do
-    runner.(timeout)
+  defp safely_lookup_identity(identity, function, timeout) do
+    apply(identity, function, [timeout])
   rescue
-    _exception -> {:error, :runner_failed}
+    _exception -> {:error, :lookup_failed}
   catch
-    _kind, _reason -> {:error, :runner_failed}
-  end
-
-  defp safely_find_executable(executable_finder) do
-    executable_finder.("id")
-  rescue
-    _exception -> nil
-  catch
-    _kind, _reason -> nil
-  end
-
-  defp safely_open_auth_id_port(executable, port_opener, timeout) do
-    port =
-      port_opener.({:spawn_executable, String.to_charlist(executable)}, [
-        :binary,
-        :exit_status,
-        args: ["-u"]
-      ])
-
-    collect_auth_id_output(port, <<>>, read_deadline(timeout), timeout)
-  rescue
-    _exception -> {:error, :port_open_failed}
-  catch
-    _kind, _reason -> {:error, :port_open_failed}
-  end
-
-  defp collect_auth_id_output(port, output, deadline, maximum) do
-    case remaining_timeout(deadline, maximum) do
-      :expired ->
-        safe_close_port(port)
-        {:error, :timeout}
-
-      {:ok, timeout} ->
-        receive do
-          {^port, {:data, data}}
-          when is_binary(data) and byte_size(output) + byte_size(data) <= @max_auth_id_output ->
-            collect_auth_id_output(port, output <> data, deadline, maximum)
-
-          {^port, {:data, _data}} ->
-            safe_close_port(port)
-            {:error, :output_too_large}
-
-          {^port, {:exit_status, 0}} ->
-            {:ok, output}
-
-          {^port, {:exit_status, _status}} ->
-            {:error, :exit_status}
-
-          {:EXIT, ^port, _reason} ->
-            {:error, :port_exit}
-        after
-          timeout ->
-            safe_close_port(port)
-            {:error, :timeout}
-        end
-    end
-  end
-
-  defp safe_close_port(port) do
-    Port.close(port)
-  catch
-    _kind, _reason -> :ok
+    _kind, _reason -> {:error, :lookup_failed}
   end
 
   defp uid_bytes?(uid), do: all_bytes?(uid, &digit_byte?/1)

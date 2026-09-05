@@ -175,8 +175,6 @@ defmodule Rebus do
 
   @publicly_ignored_connection_options [
     :auth_id,
-    :auth_id_fun,
-    :auth_username_fun,
     :address_list_auth_id,
     :address_list_setup_timeout,
     :expected_guid,
@@ -496,13 +494,8 @@ defmodule Rebus do
          {:ok, resolver} <- implementation_function(implementation, :resolver, 3, &resolve_tcp/3),
          {:ok, connector} <-
            implementation_function(implementation, :connector, 2, &connect_address_candidate/2),
-         {:ok, auth_id_runner} <-
-           implementation_function(
-             implementation,
-             :auth_id_runner,
-             1,
-             &Rebus.Connection.run_auth_id/1
-           ),
+         {:ok, identity} <-
+           implementation_module(implementation, :identity, Rebus.Identity.Posix),
          {:ok, monotonic_time} <-
            implementation_function(
              implementation,
@@ -512,7 +505,7 @@ defmodule Rebus do
            ) do
       deadline = monotonic_time.() + timeout
 
-      case resolve_list_auth_id(candidates, deadline, auth_id_runner, monotonic_time) do
+      case resolve_list_auth_id(candidates, deadline, identity, monotonic_time) do
         {:ok, auth_id} ->
           connect_bus_candidates(
             candidates,
@@ -541,10 +534,17 @@ defmodule Rebus do
     end
   end
 
-  defp resolve_list_auth_id([], _deadline, _auth_id_runner, _monotonic_time),
+  defp implementation_module(implementation, key, default) do
+    case Keyword.get(implementation, key, default) do
+      module when is_atom(module) and not is_nil(module) -> {:ok, module}
+      _module -> {:error, :invalid_bus_address_implementation}
+    end
+  end
+
+  defp resolve_list_auth_id([], _deadline, _identity, _monotonic_time),
     do: {:error, :unsupported_bus_transport}
 
-  defp resolve_list_auth_id(candidates, deadline, auth_id_runner, monotonic_time) do
+  defp resolve_list_auth_id(candidates, deadline, identity, monotonic_time) do
     candidate_count = connectable_candidate_count(candidates)
 
     if candidate_count == 0 do
@@ -552,7 +552,7 @@ defmodule Rebus do
     else
       with {:ok, timeout} <-
              address_attempt_timeout(deadline, candidate_count + 1, monotonic_time, nil) do
-        Rebus.Connection.get_auth_id(timeout, auth_id_runner)
+        Rebus.Connection.get_auth_id(timeout, identity)
       end
     end
   end

@@ -6,6 +6,7 @@ defmodule Rebus.AuthTest do
   alias Rebus.Auth
   alias Rebus.Connection
   alias Rebus.Message
+  alias Rebus.TestImpl
 
   @guid "30313233343536373839414243444546"
 
@@ -319,7 +320,11 @@ defmodule Rebus.AuthTest do
 
     test "uses anonymous directly only when username lookup fails before cookie AUTH" do
       parent = self()
-      unavailable_username = fn _timeout -> {:error, :exit_status} end
+      anonymous_name = :rebus_anonymous_username_connection
+      rejecting_name = :rebus_rejecting_username_connection
+
+      unavailable_username =
+        TestImpl.identity(anonymous_name, username: fn _timeout -> {:error, :exit_status} end)
 
       {anonymous_server, anonymous_addr} =
         start_auth_server(fn peer ->
@@ -338,8 +343,9 @@ defmodule Rebus.AuthTest do
                  Rebus.ConnectionSupervisor,
                  {Connection,
                   addr: anonymous_addr,
+                  name: anonymous_name,
                   allow_anonymous: true,
-                  auth_username_fun: unavailable_username}
+                  __impl__: %{identity: unavailable_username}}
                )
 
       assert_receive :anonymous_established, 1_000
@@ -355,18 +361,24 @@ defmodule Rebus.AuthTest do
           :ok
         end)
 
-      blocked_username = fn _timeout ->
-        send(parent, :rejecting_username_lookup)
+      blocked_username =
+        TestImpl.identity(rejecting_name,
+          username: fn _timeout ->
+            send(parent, :rejecting_username_lookup)
 
-        receive do
-          :fail_username_lookup -> {:error, :exit_status}
-        end
-      end
+            receive do
+              :fail_username_lookup -> {:error, :exit_status}
+            end
+          end
+        )
 
       assert {:ok, rejected_connection} =
                DynamicSupervisor.start_child(
                  Rebus.ConnectionSupervisor,
-                 {Connection, addr: rejecting_addr, auth_username_fun: blocked_username}
+                 {Connection,
+                  addr: rejecting_addr,
+                  name: rejecting_name,
+                  __impl__: %{identity: blocked_username}}
                )
 
       monitor_ref = Process.monitor(rejected_connection)
