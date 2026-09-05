@@ -56,16 +56,9 @@ defmodule Rebus do
 
   ## Connection Types
 
-  Rebus supports connecting to different types of D-Bus endpoints:
-
-  - `:system` - Connects to the system bus using the address specified in
-     application config (see below) or the `/run/dbus/system_bus_socket` by default.
-  - `:session` - Connects to the session bus using the address specified in
-     the `DBUS_SESSION_BUS_ADDRESS` environment variable.
-  - `%{family: :local, path: path}` - Unix domain socket connection to a local D-Bus daemon
-  - `:socket.sockaddr_in()` or `:socket.sockaddr_in6()` - TCP/IP connection to a
-    remote D-Bus daemon; for example,
-    `%{family: :inet, addr: {127, 0, 0, 1}, port: 12345}`
+  Rebus connects to the system bus, the session bus, a Unix domain socket, or
+  a TCP endpoint. See `connect/2` for the accepted address forms, the
+  connection options, and the errors each can return.
 
   ## Configuration
 
@@ -170,191 +163,83 @@ defmodule Rebus do
   @default_system_bus_address "unix:path=/run/dbus/system_bus_socket"
 
   @doc """
-  Establishes a connection to a D-Bus message bus.
+  Connects to a D-Bus endpoint and returns its connection process.
 
-  Creates a supervised connection process that handles D-Bus protocol communication.
-  The connection automatically handles authentication and maintains the persistent
-  connection to the specified D-Bus endpoint. This is the sole supported way to
-  create a Rebus connection: do not start or manage a connection process
-  directly. Release the returned PID with `close/1` when its lifecycle is
-  complete.
+  The call blocks until the connection is usable: authenticated and, on a
+  message bus, holding its unique name. The returned PID is supervised and
+  outlives the process that connected it, so release it with `close/1`.
 
-  ## Parameters
+  ## Addresses
 
-  - `address` - The D-Bus endpoint to connect to:
-    - `:system` - Connects to the system bus using the address specified in
-       application config (see below) or the `/run/dbus/system_bus_socket` by default.
-    - `:session` - Connects to the session bus using the address specified in
-       the `DBUS_SESSION_BUS_ADDRESS` environment variable.
-    - `%{family: :local, path: path}` - Unix domain socket connection to a local D-Bus daemon
-    - `:socket.sockaddr_in()` or `:socket.sockaddr_in6()` - TCP/IP connection to
-      a remote D-Bus daemon; for example,
-      `%{family: :inet, addr: {127, 0, 0, 1}, port: 12345}`
+  - `:system` - the system bus.
+  - `:session` - the session bus.
+  - `%{family: :local, path: "/tmp/my-dbus"}` - a Unix domain socket.
+  - `%{family: :inet, addr: {127, 0, 0, 1}, port: 12345}` - a TCP endpoint,
+    with `:inet6` and an eight-element address for IPv6.
 
-  - `opts` - Optional keyword list of connection options:
-    - `:timeout` - Positive maximum time in milliseconds for the auth-ID lookup,
-      each socket connect, and authentication read (default: 5000). This is the original
-      public connection-timeout option. It has no effect after authentication.
-      `:read_timeout`, when supplied, takes precedence for setup as well.
-      Direct socket addresses retain independent auth-ID lookup and socket
-      connect budgets. After connecting, all D-Bus authentication exchanges and
-      `BEGIN` share one setup budget; each authentication write is also capped
-      by `:write_timeout`. The validated initial Hello reply separately uses
-      `:read_timeout`.
-    - `:name` - Optional local atom used to register the connection process.
-      It is intended for local discovery and lifecycle management; pass the
-      returned PID to `call/3`, `send/2`, `send/3`, and signal-handler APIs. The
-      name is held from process start through setup and is released if setup fails
-      or the connection stops. Established connections are supervisor-owned and
-      outlive the process that connected them; call `close/1` when their local
-      lifecycle is complete. A PID discovered with `Process.whereis/1` before
-      its corresponding `connect/2` returns is still establishing; operations
-      issued to it can time out before they reach the connection and are safe to
-      retry after `connect/2` succeeds.
-    - `:write_timeout` - Positive maximum time for each authentication write
-      (default: 5000). Once connected it bounds how long an outbound frame may
-      await socket readiness. If no bytes were accepted, only that caller times
-      out; after a partial frame, the temporary connection is terminated and
-      inflight callers receive `{:error, :disconnected}` (it does not restart).
-    - `:read_timeout` - Positive maximum time in milliseconds for the complete
-      initial Hello reply and gaps between inbound fragments after connection
-      (default: 5000). When supplied, it also overrides `:timeout` for socket
-      setup and the complete, line-framed authentication response before
-      `connect/2` returns. Each setup operation has one
-      total budget, so peer progress cannot extend an authentication response
-      indefinitely. Expiry makes `connect/2` return
-      `{:error, :read_timeout}`. For bus connections, `connect/2` waits for the
-      validated initial
-      Hello reply before returning `{:ok, pid}`; that reply is bounded from the
-      time Hello is sent and peer progress cannot extend the setup budget. Once
-      established, it bounds
-      gaps between inbound fragments, is reset whenever a peer makes progress,
-      and is inactive while no frame is buffered. Expiry then terminates the
-      temporary connection; inflight callers receive `{:error, :disconnected}`.
-    - `:allow_anonymous` - Boolean, default `false`. When `true`, Rebus may
-      use the peer-advertised `ANONYMOUS` mechanism, which authenticates
-      nothing and also requires `bus: false`. See
-      [Authentication](authentication.html).
-    - `:bus` - Boolean, default `true`. Pass `false` for a peer-to-peer
-      endpoint that is not a message bus. Rebus then sends no Hello, the
-      connection has no unique name, and `add_match/3` returns
-      `{:error, :not_a_bus}`. It is not allowed with `:system` or `:session`,
-      which are message buses by definition.
+  `:system` reads the `:system_bus_address` config key, which defaults to
+  `#{@default_system_bus_address}`; `:session` reads
+  `DBUS_SESSION_BUS_ADDRESS`. Both hold a D-Bus address list whose supported
+  entries are tried in the order they are listed, and a `guid=` on the entry
+  that answers must match the server's identity. See
+  [Authentication](authentication.html) for the rest.
 
-  ## Return Values
+  ## Options
 
-  - `{:ok, pid}` - Returns the PID of the connection process
-  - `{:error, :read_timeout}` - Socket setup or authentication did not finish
-    within its configured per-operation budget.
-  - `{:error, :auth_id_unavailable}` - The local numeric identity required for
-    `EXTERNAL` authentication could not be obtained.
-  - `{:error, :auth_cookie_unavailable}` - The peer offered
-    `DBUS_COOKIE_SHA1`, but its local username or matching local cookie could
-    not be read safely. For a bus address list this is terminal and no later
-    candidate address or IP is attempted.
-  - `{:error, :auth_failed}` - The peer sent malformed authentication data or
-    rejected a DBUS_COOKIE_SHA1 response. Neither error includes peer data.
-  - `{:error, :guid_mismatch}` - A configured bus-address GUID did not match
-    the server's `AUTH OK` GUID. Rebus does not try another address or IP after
-    this identity failure.
-  - `{:error, {:auth_rejected, mechanisms}}` - The peer rejected an attempted
-    mechanism and no safe advertised fallback remains. `mechanisms` is bounded
-    and contains only validated mechanism names.
-  - `{:error, {:hello_failed, :invalid_unique_name}}` - The peer's initial
-    Hello reply did not contain a valid D-Bus unique name.
-  - `{:error, {:hello_failed, :resource_limit}}` - The peer's initial Hello
-    reply exceeded a local decoding safety cap.
-  - `{:error, :invalid_timeout | :invalid_read_timeout | :invalid_write_timeout |
-    :invalid_allow_anonymous | :invalid_bus_option | :invalid_name}` - A
-    connection option was invalid.
-  - `{:error, {:name_taken, pid}}` - The requested local name is held by a
-    setup or established connection process. The PID can be adopted or passed to
-    `close/1` when it is no longer needed.
-  - `{:error, {:name_registered, pid}}` - The requested local name belongs to
-    another process, not a supervised Rebus connection.
-  - `{:error, {:invalid_bus_address, reason}}` - The configured system or
-    session address was malformed. `reason` is a stable atom and never includes
-    the address value.
-  - `{:error, :unsupported_bus_transport}` - The configured address list did
-    not contain a transport Rebus supports.
-  - `{:error, {:tcp_resolution_failed, reason}}` - A TCP address resolved to
-    no usable IP address. `reason` is a stable atom and never includes the
-    configured host name.
-  - `{:error, {:read_timeout, reason}}` - An address-list deadline elapsed
-    after at least one setup attempt. `reason` is a stable, payload-free atom
-    describing the last failed attempt. Before any attempt, expiry remains
-    `{:error, :read_timeout}`.
-  - `{:error, reason}` - Another socket or setup failure occurred.
-
-  ## Bus address lists
-
-  System and session address strings use the D-Bus
-  `transport:key=value;next-transport:key=value` format. Rebus supports
-  `unix:path=...`, `unix:abstract=...`, and `tcp:host=...,port=...` (with an
-  optional `family=ipv4` or `family=ipv6`). Without `family`, Rebus resolves
-  IPv6 addresses first and IPv4 addresses second, preserving each resolver
-  result order and duplicates, trying at most the first four results per family
-  before the next D-Bus entry. Values are percent-decoded; literal non-NUL bytes
-  are accepted where they are not address separators. A 32-hex-digit `guid` is
-  ignored for socket selection but compared case-insensitively with the server's
-  `AUTH OK` GUID before `BEGIN` or Hello. A mismatch is `:guid_mismatch` and is
-  never retried. Other syntactically valid transport parameters are ignored for
-  forward compatibility. Parameterless unknown transports (for example
-  `autolaunch:`) are skipped, while `unix:`, `unix:path=`, `unix:guid=...`, and
-  `tcp:`/`tcp:family=...` return their missing-required-field errors. Rebus tries
-  supported entries in their listed order until one establishes a connection;
-  syntactically valid unsupported entries are skipped. A malformed entry rejects
-  the whole list, and if every supported attempt fails the final attempt's error
-  is returned.
-
-  Rebus obtains the local `EXTERNAL` auth ID once in the calling process before
-  it begins a supported address list, then privately supplies that value to all
-  candidate connections. That value, and the per-candidate setup budget and
-  expected GUID, reach each candidate outside the caller's options, so they
-  cannot be supplied or overridden by the caller.
-  For an address list only, `:timeout` (or `:read_timeout` when supplied) is
-  one aggregate budget for DNS lookup and pre-Hello socket/authentication setup
-  across all candidates. Each resolver and pre-Hello setup attempt gets
-  `min(remaining, max(floor, floor(remaining / outstanding_attempts)))`
-  milliseconds. The floor is 50 ms when the remaining budget can grant every
-  outstanding attempt 50 ms; otherwise it is 1 ms, and it never exceeds the
-  remaining time. Before DNS completes, outstanding attempts are resolver
-  families plus later D-Bus entries; afterward they are the capped resolved IPs
-  plus later entries. This does not change the independent `:write_timeout` or
-  the normal `:read_timeout` budget for an initial Hello reply after a candidate
-  has authenticated. Address-list failure diagnostics are emitted only at debug
-  level and contain candidate/IP ordinals, transport, slice, and a bounded
-  reason—never an address, host, path, or GUID.
-
-  ## Authentication mechanisms
-
-  Rebus tries `EXTERNAL` first, then `DBUS_COOKIE_SHA1`, and `ANONYMOUS` only
-  with `allow_anonymous: true`. See [Authentication](authentication.html).
-
-  ## Examples
-
-      # Connect to a custom Unix socket
-      {:ok, conn} = Rebus.connect(%{family: :local, path: "/tmp/my-dbus"})
-
-      # Connect to a TCP endpoint
-      address = %{family: :inet, addr: {127, 0, 0, 1}, port: 12345}
-      {:ok, conn} = Rebus.connect(address)
-
-      # Explicitly release a named connection when its lifecycle is complete.
-      {:ok, conn} = Rebus.connect(address, name: :local_bus)
-      :ok = Rebus.close(conn)
+  | Option | Default | Bounds / meaning |
+  | --- | --- | --- |
+  | `:timeout` | `5000` | Positive milliseconds for setup: the identity lookup, any DNS lookup, the socket connect and authentication. It bounds nothing after that. |
+  | `:read_timeout` | `5000` | Positive milliseconds for the initial `Hello` reply, and afterwards for gaps between inbound fragments. When given it also replaces `:timeout` for setup. |
+  | `:write_timeout` | `5000` | Positive milliseconds an outbound frame, including every authentication write, may wait for the socket to accept it. |
+  | `:name` | `nil` | Atom to register the connection process under, for local discovery only. |
+  | `:allow_anonymous` | `false` | Allow the `ANONYMOUS` mechanism, which authenticates nothing and also requires `bus: false`. |
+  | `:bus` | `true` | Pass `false` for a peer-to-peer endpoint, which sends no `Hello` and has no unique name. |
 
   ## Notes
 
-  The returned PID is for the connection process, which is the main interface for
-  sending and receiving D-Bus messages. Connections are supervisor-owned; close
-  them with `close/1` when they are no longer needed.
+  - A PID found by name before its `connect/2` returns is still being
+    established. Operations sent to it may time out, and are safe to retry
+    once `connect/2` succeeds.
+  - A write timeout that accepted no bytes fails only that caller. After a
+    partial frame the connection terminates and inflight callers receive
+    `{:error, :disconnected}`.
+  - For an address list, setup shares one budget across every candidate, so a
+    slow candidate leaves less time for the entries after it.
+  - Failed address-list attempts are logged at debug level, without any
+    address, host, path or GUID.
 
-  ## Unix file descriptors
+  ## Return values
 
-  A local Unix-socket connection negotiates descriptor passing with the peer
-  during authentication. See
-  [Unix file descriptor passing](unix_fds.html).
+  Success is `{:ok, pid}`. Every failure is `{:error, reason}`:
+
+  - Invalid option: `:invalid_timeout`, `:invalid_read_timeout`,
+    `:invalid_write_timeout`, `:invalid_allow_anonymous`,
+    `:invalid_bus_option`, `:invalid_name`.
+  - Unusable address: `{:invalid_bus_address, reason}`,
+    `:unsupported_bus_transport`, `{:tcp_resolution_failed, reason}`,
+    `:no_system_bus_address`, `:no_session_bus_address`.
+  - Refused authentication: `:auth_id_unavailable`, `:auth_cookie_unavailable`,
+    `:auth_failed`, `{:auth_rejected, mechanisms}`, `:guid_mismatch`. See
+    [Authentication](authentication.html).
+  - Expired setup budget: `:read_timeout`, or `{:read_timeout, reason}` once an
+    address-list attempt has already failed.
+  - Refused or unusable `Hello` reply: `{:hello_failed, reason}`.
+  - Taken `:name`: `{:name_taken, pid}` for another Rebus connection, or
+    `{:name_registered, pid}` for any other process.
+  - Any other socket or setup failure: the failure's own atom.
+
+  ## Examples
+
+      # A custom Unix socket
+      {:ok, conn} = Rebus.connect(%{family: :local, path: "/tmp/my-dbus"})
+
+      # A TCP endpoint
+      address = %{family: :inet, addr: {127, 0, 0, 1}, port: 12345}
+      {:ok, conn} = Rebus.connect(address)
+
+      # Release a named connection when its lifecycle is complete
+      {:ok, conn} = Rebus.connect(address, name: :local_bus)
+      :ok = Rebus.close(conn)
   """
   @spec connect(address(), keyword()) :: {:ok, pid()} | {:error, term()}
   def connect(address, opts \\ [])
