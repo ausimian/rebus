@@ -74,6 +74,22 @@ defmodule Rebus.BusAddress do
 
   def parse(_address), do: error(:not_binary)
 
+  # Percent-escapes a value for an address entry Rebus builds itself, such as
+  # the `$XDG_RUNTIME_DIR/bus` session fallback. Every byte outside the
+  # optionally-escaped set `[-0-9A-Za-z_/.\\]` becomes `%XX`, which is what
+  # libdbus escapes, so a directory holding `%`, `;`, `,` or `=` still parses.
+  @doc false
+  @spec escape_value(binary()) :: binary()
+  def escape_value(value) when is_binary(value) do
+    for <<byte <- value>>, into: "", do: escape_byte(byte)
+  end
+
+  defp escape_byte(byte)
+       when byte in ?0..?9 or byte in ?A..?Z or byte in ?a..?z or byte in [?-, ?_, ?/, ?., ?\\],
+       do: <<byte>>
+
+  defp escape_byte(byte), do: "%" <> Base.encode16(<<byte>>, case: :upper)
+
   defp drop_trailing_empty_entry(entries) do
     case Enum.reverse(entries) do
       [<<>> | reversed_entries] when reversed_entries != [] -> Enum.reverse(reversed_entries)

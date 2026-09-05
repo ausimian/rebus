@@ -141,4 +141,21 @@ defmodule Rebus.BusAddressTest do
                BusAddress.parse("unix:" <> parameters)
     end
   end
+
+  describe "escape_value/1" do
+    test "keeps the optionally-escaped set and escapes every other byte" do
+      assert BusAddress.escape_value("/run/user/1000/bus-1.sock_a") ==
+               "/run/user/1000/bus-1.sock_a"
+
+      assert BusAddress.escape_value("/tmp/a%b;c,d=e f") == "/tmp/a%25b%3Bc%2Cd%3De%20f"
+      assert BusAddress.escape_value(<<"/tmp/", 0xC3, 0xA9>>) == "/tmp/%C3%A9"
+    end
+
+    test "produces a value parse/1 decodes back to the original path" do
+      path = "/tmp/odd %;,=dir/bus"
+
+      assert {:ok, [{:local, ^path, nil}]} =
+               BusAddress.parse("unix:path=" <> BusAddress.escape_value(path))
+    end
+  end
 end

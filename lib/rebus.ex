@@ -66,6 +66,9 @@ defmodule Rebus do
 
       config :rebus, :system_bus_address, "unix:path=/run/dbus/system_bus_socket"
 
+  The `DBUS_SYSTEM_BUS_ADDRESS` environment variable, when set and non-empty,
+  overrides this config key.
+
   `:match_recovery_max_rules` caps how many distinct match rules a single
   connection may hold whose bus-side state is uncertain. The default is 64, and
   a connection that reaches the cap is closed. See
@@ -195,9 +198,11 @@ defmodule Rebus do
   - `%{family: :inet, addr: {127, 0, 0, 1}, port: 12345}` - a TCP endpoint,
     with `:inet6` and an eight-element address for IPv6.
 
-  `:system` reads the `:system_bus_address` config key, which defaults to
-  `#{@default_system_bus_address}`; `:session` reads
-  `DBUS_SESSION_BUS_ADDRESS`. Both hold a D-Bus address list whose supported
+  `:system` reads `DBUS_SYSTEM_BUS_ADDRESS`, then the `:system_bus_address`
+  config key, then the default `#{@default_system_bus_address}`.
+  `:session` reads `DBUS_SESSION_BUS_ADDRESS`, then falls back to
+  `unix:path=$XDG_RUNTIME_DIR/bus` when `XDG_RUNTIME_DIR` is set.
+  An empty variable counts as unset. Both hold a D-Bus address list whose supported
   entries are tried in the order they are listed, and a `guid=` on the entry
   that answers must match the server's identity. See
   [Authentication](authentication.html) for the rest.
@@ -264,7 +269,7 @@ defmodule Rebus do
 
   def connect(:system, opts) do
     with :ok <- validate_bus_alias_option(opts) do
-      case Application.get_env(:rebus, :system_bus_address, @default_system_bus_address) do
+      case system_bus_address() do
         nil -> {:error, :no_system_bus_address}
         address -> connect_bus_address(address, opts)
       end
@@ -273,7 +278,7 @@ defmodule Rebus do
 
   def connect(:session, opts) do
     with :ok <- validate_bus_alias_option(opts) do
-      case System.get_env("DBUS_SESSION_BUS_ADDRESS") do
+      case session_bus_address() do
         nil -> {:error, :no_session_bus_address}
         address -> connect_bus_address(address, opts)
       end
@@ -297,6 +302,41 @@ defmodule Rebus do
     case Keyword.get(opts, :bus, true) do
       true -> :ok
       _bus -> {:error, :invalid_bus_option}
+    end
+  end
+
+  # The environment variable wins over the compiled-in configuration, as it
+  # does for libdbus, GDBus and sd-bus.
+  defp system_bus_address do
+    case bus_env("DBUS_SYSTEM_BUS_ADDRESS") do
+      nil -> Application.get_env(:rebus, :system_bus_address, @default_system_bus_address)
+      address -> address
+    end
+  end
+
+  # `DBUS_SESSION_BUS_ADDRESS` first, then the systemd user-session socket at
+  # `$XDG_RUNTIME_DIR/bus`, which is where the session bus normally lives when
+  # the variable was never exported.
+  defp session_bus_address do
+    case bus_env("DBUS_SESSION_BUS_ADDRESS") do
+      nil -> runtime_dir_bus_address()
+      address -> address
+    end
+  end
+
+  defp runtime_dir_bus_address do
+    case bus_env("XDG_RUNTIME_DIR") do
+      nil -> nil
+      dir -> "unix:path=" <> Rebus.BusAddress.escape_value(Path.join(dir, "bus"))
+    end
+  end
+
+  # An empty variable counts as unset, as it does for libdbus.
+  defp bus_env(name) do
+    case System.get_env(name) do
+      nil -> nil
+      "" -> nil
+      value -> value
     end
   end
 
