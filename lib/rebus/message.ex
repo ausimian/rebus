@@ -85,6 +85,7 @@ defmodule Rebus.Message do
 
   alias Rebus.Decoder
   alias Rebus.Encoder
+  alias Rebus.Message.UnixFDs
   alias Rebus.ResourceLimitError
   alias Rebus.Signature
   alias Rebus.WireValue
@@ -319,14 +320,14 @@ defmodule Rebus.Message do
          {:ok, body} <- validate_body(Keyword.get(opts, :body, [])),
          {:ok, signature} <- get_or_generate_signature(opts, body),
          :ok <- validate_signature_format(signature),
-         {:ok, unix_fds} <- extract_unix_fds(opts),
+         {:ok, unix_fds} <- UnixFDs.extract_unix_fds(opts),
          {:ok, header_fields} <- extract_header_fields(opts),
          {:ok, validated_fields} <- validate_header_fields(header_fields),
          :ok <- validate_required_fields(type, header_fields),
          {:ok, body_length} <- calculate_body_length(body, signature),
-         :ok <- validate_unix_fd_indices(signature, body, unix_fds),
+         :ok <- UnixFDs.validate_unix_fd_indices(signature, body, unix_fds),
          {:ok, validated_fields} <- put_signature_field(validated_fields, signature),
-         {:ok, validated_fields} <- put_unix_fd_count(validated_fields, unix_fds),
+         {:ok, validated_fields} <- UnixFDs.put_unix_fd_count(validated_fields, unix_fds),
          {:ok, header_fields_data} <- encode_header_fields(validated_fields, :little),
          :ok <- validate_encoded_size(IO.iodata_length(header_fields_data), body_length) do
       {:ok,
@@ -425,7 +426,7 @@ defmodule Rebus.Message do
          {:ok, header_fields_encoded} <- encode_header_fields(message.header_fields, endianness),
          {:ok, body_data} <-
            encode_body(message.body, Map.get(message.header_fields, :signature, ""), endianness),
-         :ok <- validate_unix_fds(message),
+         :ok <- UnixFDs.validate_unix_fds(message),
          :ok <-
            validate_encoded_size(
              IO.iodata_length(header_fields_encoded),
@@ -710,7 +711,7 @@ defmodule Rebus.Message do
          :ok <- validate_required_fields(message.type, message.header_fields),
          :ok <- validate_signature_format(signature),
          :ok <- validate_body_signature(message.body, signature) do
-      validate_unix_fds(message)
+      UnixFDs.validate_unix_fds(message)
     end
   end
 
@@ -771,7 +772,7 @@ defmodule Rebus.Message do
   def attach_unix_fds(%__MODULE__{} = message, fds) when is_list(fds) do
     message = %{message | unix_fds: fds}
 
-    case validate_unix_fds(message) do
+    case UnixFDs.validate_unix_fds(message) do
       :ok -> {:ok, message}
       {:error, reason} -> {:error, reason}
     end
@@ -841,113 +842,6 @@ defmodule Rebus.Message do
 
     {:ok, fields}
   end
-
-  defp extract_unix_fds(opts) do
-    case Keyword.get(opts, :fds, []) do
-      fds when is_list(fds) -> validate_unix_fd_list(fds)
-      _fds -> {:error, :invalid_unix_fds}
-    end
-  end
-
-  defp put_unix_fd_count(header_fields, fds) do
-    count = length(fds)
-
-    case Map.fetch(header_fields, :unix_fds) do
-      :error when count == 0 -> {:ok, header_fields}
-      :error -> {:ok, Map.put(header_fields, :unix_fds, count)}
-      {:ok, ^count} -> {:ok, header_fields}
-      {:ok, _count} -> {:error, :invalid_unix_fds}
-    end
-  end
-
-  defp validate_unix_fds(%__MODULE__{header_fields: header_fields, unix_fds: fds} = message)
-       when is_map(header_fields) and is_list(fds) do
-    with {:ok, fds} <- validate_unix_fd_list(fds),
-         count <- length(fds),
-         ^count <- Map.get(header_fields, :unix_fds, 0),
-         :ok <- validate_unix_fd_indices(signature(message), message.body, fds) do
-      :ok
-    else
-      _ -> {:error, :invalid_unix_fds}
-    end
-  end
-
-  defp validate_unix_fds(_message), do: {:error, :invalid_unix_fds}
-
-  defp validate_unix_fd_list(fds) when length(fds) <= @max_unix_fds do
-    if Enum.all?(fds, &(is_integer(&1) and &1 >= 0)) do
-      {:ok, fds}
-    else
-      {:error, :invalid_unix_fds}
-    end
-  end
-
-  defp validate_unix_fd_list(fds) when is_list(fds), do: {:error, :unix_fd_limit}
-
-  defp validate_unix_fd_indices(signature, body, fds)
-       when is_binary(signature) and is_list(body) do
-    with {:ok, types} <- Signature.parse(signature),
-         :ok <- validate_unix_fd_values(types, body, length(fds)) do
-      :ok
-    else
-      _ -> {:error, :invalid_unix_fds}
-    end
-  end
-
-  defp validate_unix_fd_indices(_signature, _body, _fds), do: {:error, :invalid_unix_fds}
-
-  defp validate_unix_fd_values([], [], _fd_count), do: :ok
-
-  defp validate_unix_fd_values([type | types], [value | values], fd_count) do
-    with :ok <- validate_unix_fd_value(type, value, fd_count) do
-      validate_unix_fd_values(types, values, fd_count)
-    end
-  end
-
-  defp validate_unix_fd_values(_types, _values, _fd_count), do: {:error, :invalid_unix_fds}
-
-  defp validate_unix_fd_value({:unix_fd, _}, index, fd_count)
-       when is_integer(index) and index >= 0 and index < fd_count,
-       do: :ok
-
-  defp validate_unix_fd_value({:unix_fd, _}, _index, _fd_count), do: {:error, :invalid_unix_fds}
-
-  defp validate_unix_fd_value({:array, type}, values, fd_count) when is_list(values) do
-    Enum.reduce_while(values, :ok, fn value, :ok ->
-      case validate_unix_fd_value(type, value, fd_count) do
-        :ok -> {:cont, :ok}
-        error -> {:halt, error}
-      end
-    end)
-  end
-
-  defp validate_unix_fd_value({:struct, types}, values, fd_count) when is_list(values),
-    do: validate_unix_fd_values(types, values, fd_count)
-
-  defp validate_unix_fd_value({:dict_entry, key_type, value_type}, {key, value}, fd_count) do
-    with :ok <- validate_unix_fd_value(key_type, key, fd_count) do
-      validate_unix_fd_value(value_type, value, fd_count)
-    end
-  end
-
-  defp validate_unix_fd_value({:variant, _}, {nested_signature, value}, fd_count)
-       when is_binary(nested_signature) do
-    case Signature.parse(nested_signature) do
-      {:ok, [type]} -> validate_unix_fd_value(type, value, fd_count)
-      _ -> {:error, :invalid_unix_fds}
-    end
-  end
-
-  defp validate_unix_fd_value({kind, _}, _value, _fd_count)
-       when kind in [:string, :object_path, :signature],
-       do: :ok
-
-  # Every other fixed-width basic type is fd-free; :unix_fd is matched above.
-  defp validate_unix_fd_value({_kind, _} = type, _value, _fd_count) do
-    if Signature.fixed_width(type), do: :ok, else: {:error, :invalid_unix_fds}
-  end
-
-  defp validate_unix_fd_value(_type, _value, _fd_count), do: {:error, :invalid_unix_fds}
 
   defp put_signature_field(header_fields, ""), do: {:ok, header_fields}
 
