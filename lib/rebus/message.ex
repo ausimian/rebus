@@ -117,12 +117,19 @@ defmodule Rebus.Message do
           | :unix_fds
 
   @type construction_error ::
-          String.t()
-          | :invalid_body
+          :invalid_body
+          | :invalid_flags
+          | :invalid_header_fields
+          | :invalid_signature
+          | :invalid_type
           | :invalid_unix_fds
+          | :invalid_version
           | :message_too_large
           | :resource_limit
           | :unix_fd_limit
+          | {:invalid_header_field, header_field()}
+          | {:missing_header_field, header_field()}
+          | {:unknown_header_field, term()}
   @type encoding_error ::
           :invalid_body
           | :invalid_header_fields
@@ -285,19 +292,27 @@ defmodule Rebus.Message do
       ...>   path: "/com/example/Object",
       ...>   member: "TestMethod"
       ...> )
-      %Rebus.Message{type: :method_call, ...}
+      {:ok, %Rebus.Message{type: :method_call, ...}}
 
   ## Errors
 
-  Returns `{:error, reason}` if:
-  - Invalid message type
-  - Missing required header fields
-  - Invalid header field types
-  - Invalid signature
-  - Body values cannot be encoded by the signature (`:invalid_body`)
-  - Encoded message exceeds the D-Bus size limit (`:message_too_large`)
-  - Local structural, nesting, or scalar materialization caps are exceeded
-    (`:resource_limit`)
+  Returns `{:error, reason}` where `reason` is one of:
+  - `:invalid_type` - the message type is not a D-Bus message type
+  - `:invalid_flags` - the flags are not a list, or include an unknown flag
+  - `:invalid_version` - the protocol version is unsupported
+  - `:invalid_body` - the body is not a list, or its values cannot be encoded
+    by the signature
+  - `:invalid_signature` - the signature is not a binary, or is not a valid
+    D-Bus type expression
+  - `{:invalid_header_field, field}` - the value given for that header field
+    is not valid
+  - `{:missing_header_field, field}` - a header field required for the message
+    type was not given
+  - `:invalid_unix_fds` - the descriptors do not match the body
+  - `:unix_fd_limit` - the message exceeds the Unix file descriptor limit
+  - `:message_too_large` - the encoded message exceeds the D-Bus size limit
+  - `:resource_limit` - a local structural, nesting, or scalar materialization
+    cap is exceeded
   """
   @spec new(message_type(), keyword()) :: {:ok, t()} | {:error, construction_error()}
   def new(type, opts \\ []) do
@@ -366,8 +381,29 @@ defmodule Rebus.Message do
       {:error, :invalid_unix_fds} ->
         raise ArgumentError, "Unix file descriptors do not match the message body"
 
-      {:error, reason} when is_binary(reason) ->
-        raise ArgumentError, reason
+      {:error, :invalid_type} ->
+        raise ArgumentError, "invalid message type"
+
+      {:error, :invalid_flags} ->
+        raise ArgumentError, "invalid message flags"
+
+      {:error, :invalid_version} ->
+        raise ArgumentError, "unsupported D-Bus protocol version"
+
+      {:error, :invalid_signature} ->
+        raise ArgumentError, "invalid message signature"
+
+      {:error, :invalid_header_fields} ->
+        raise ArgumentError, "invalid header fields"
+
+      {:error, {:invalid_header_field, field}} ->
+        raise ArgumentError, "invalid value for header field #{inspect(field)}"
+
+      {:error, {:missing_header_field, field}} ->
+        raise ArgumentError, "missing required header field #{inspect(field)}"
+
+      {:error, {:unknown_header_field, field}} ->
+        raise ArgumentError, "unknown header field #{inspect(field)}"
     end
   end
 
@@ -765,9 +801,7 @@ defmodule Rebus.Message do
     {:ok, type}
   end
 
-  defp validate_type(type) do
-    {:error, "Invalid message type: #{inspect(type)}"}
-  end
+  defp validate_type(_type), do: {:error, :invalid_type}
 
   defp validate_flags(flags) when is_list(flags) do
     valid_flags = Map.values(@flags)
@@ -776,31 +810,25 @@ defmodule Rebus.Message do
     if invalid == [] do
       {:ok, flags}
     else
-      {:error, "Invalid flags: #{inspect(invalid)}"}
+      {:error, :invalid_flags}
     end
   end
 
-  defp validate_flags(flags) do
-    {:error, "Flags must be a list, got: #{inspect(flags)}"}
-  end
+  defp validate_flags(_flags), do: {:error, :invalid_flags}
 
   defp validate_version(1), do: {:ok, 1}
 
-  defp validate_version(version) do
-    {:error, "Unsupported protocol version: #{version}"}
-  end
+  defp validate_version(_version), do: {:error, :invalid_version}
 
   defp validate_body(body) when is_list(body), do: {:ok, body}
 
-  defp validate_body(body) do
-    {:error, "Body must be a list, got: #{inspect(body)}"}
-  end
+  defp validate_body(_body), do: {:error, :invalid_body}
 
   defp get_or_generate_signature(opts, body) do
     case Keyword.get(opts, :signature) do
       nil -> {:ok, generate_signature(body)}
       signature when is_binary(signature) -> {:ok, signature}
-      signature -> {:error, "Signature must be a string, got: #{inspect(signature)}"}
+      _signature -> {:error, :invalid_signature}
     end
   end
 
@@ -961,7 +989,7 @@ defmodule Rebus.Message do
     if missing == [] do
       :ok
     else
-      {:error, "Missing required field: #{hd(missing)}"}
+      {:error, {:missing_header_field, hd(missing)}}
     end
   end
 
@@ -976,58 +1004,37 @@ defmodule Rebus.Message do
   end
 
   defp validate_header_field(field, value) do
-    expected_type = Map.get(@field_types, field)
-
     case {field, value} do
       {:path, path} when is_binary(path) ->
-        if valid_object_path?(path) do
-          {:ok, path}
-        else
-          {:error, "Invalid object path: #{path}"}
-        end
+        validated_field(:path, path, valid_object_path?(path))
 
       {:interface, interface} when is_binary(interface) ->
-        if WireValue.valid_interface_name?(interface) do
-          {:ok, interface}
-        else
-          {:error, "Invalid interface name: #{interface}"}
-        end
+        validated_field(:interface, interface, WireValue.valid_interface_name?(interface))
 
       {:member, member} when is_binary(member) ->
-        if WireValue.valid_member_name?(member) do
-          {:ok, member}
-        else
-          {:error, "Invalid member name: #{member}"}
-        end
+        validated_field(:member, member, WireValue.valid_member_name?(member))
 
       {:error_name, error_name} when is_binary(error_name) ->
         # Error names follow interface naming rules
-        if WireValue.valid_error_name?(error_name) do
-          {:ok, error_name}
-        else
-          {:error, "Invalid error name: #{error_name}"}
-        end
+        validated_field(:error_name, error_name, WireValue.valid_error_name?(error_name))
 
       {:destination, dest} when is_binary(dest) ->
-        if WireValue.valid_bus_name?(dest) do
-          {:ok, dest}
-        else
-          {:error, "Invalid destination: #{dest}"}
-        end
+        validated_field(:destination, dest, WireValue.valid_bus_name?(dest))
 
       {:sender, sender} when is_binary(sender) ->
-        if WireValue.valid_bus_name?(sender) do
-          {:ok, sender}
-        else
-          {:error, "Invalid sender: #{sender}"}
-        end
+        validated_field(:sender, sender, WireValue.valid_bus_name?(sender))
 
       {:signature, signature} when is_binary(signature) ->
         case Signature.parse(signature) do
           {:ok, _types} -> {:ok, signature}
           {:error, :resource_limit} -> {:error, :resource_limit}
-          {:error, :invalid_signature} -> {:error, "Invalid signature format: #{signature}"}
+          {:error, :invalid_signature} -> {:error, :invalid_signature}
         end
+
+      # A malformed signature is reported the same way wherever it is supplied,
+      # rather than as a generic header-field failure.
+      {:signature, _signature} ->
+        {:error, :invalid_signature}
 
       {:reply_serial, serial}
       when is_integer(serial) and serial > 0 and serial <= 4_294_967_295 ->
@@ -1036,11 +1043,13 @@ defmodule Rebus.Message do
       {:unix_fds, count} when is_integer(count) and count >= 0 and count <= 4_294_967_295 ->
         {:ok, count}
 
-      {field, value} ->
-        {:error,
-         "Invalid value for field #{field} (expected #{expected_type}): #{inspect(value)}"}
+      {field, _value} ->
+        {:error, {:invalid_header_field, field}}
     end
   end
+
+  defp validated_field(_field, value, true), do: {:ok, value}
+  defp validated_field(field, _value, false), do: {:error, {:invalid_header_field, field}}
 
   # Validation helpers for D-Bus naming rules
   defp valid_object_path?(path), do: WireValue.valid_object_path?(path)
@@ -1232,9 +1241,7 @@ defmodule Rebus.Message do
     :ok
   end
 
-  defp validate_message_type(type) do
-    {:error, "Invalid message type: #{inspect(type)}"}
-  end
+  defp validate_message_type(_type), do: {:error, :invalid_type}
 
   defp validate_header_field_types(header_fields) when is_map(header_fields) do
     Enum.reduce_while(header_fields, :ok, fn
@@ -1244,12 +1251,12 @@ defmodule Rebus.Message do
           {:error, reason} -> {:halt, {:error, reason}}
         end
 
-      {_field, _value}, :ok ->
-        {:halt, {:error, "Invalid header field"}}
+      {field, _value}, :ok ->
+        {:halt, {:error, {:unknown_header_field, field}}}
     end)
   end
 
-  defp validate_header_field_types(_header_fields), do: {:error, "Invalid header fields"}
+  defp validate_header_field_types(_header_fields), do: {:error, :invalid_header_fields}
 
   defp validate_encodable_header_fields(header_fields) do
     case validate_header_field_types(header_fields) do
@@ -1296,7 +1303,7 @@ defmodule Rebus.Message do
     case Signature.parse(signature) do
       {:ok, _types} -> :ok
       {:error, :resource_limit} -> {:error, :resource_limit}
-      {:error, :invalid_signature} -> {:error, "Invalid signature format: #{signature}"}
+      {:error, :invalid_signature} -> {:error, :invalid_signature}
     end
   end
 end
