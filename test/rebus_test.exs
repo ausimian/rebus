@@ -4139,6 +4139,108 @@ defmodule RebusTest do
       assert_method_call_round_trip(svr, cli)
     end
 
+    test "answer Peer.Ping with an empty method return", %{svr: svr} do
+      {:ok, serial} =
+        TestServer.push_call(
+          svr,
+          Message.new!(:method_call,
+            path: "/org/example/Object",
+            interface: "org.freedesktop.DBus.Peer",
+            member: "Ping",
+            sender: ":1.99"
+          )
+        )
+
+      assert_receive {^svr, %Message{type: :method_return, header_fields: fields, body: []}},
+                     1_000
+
+      assert fields.reply_serial == serial
+      assert fields.destination == ":1.99"
+      refute Map.has_key?(fields, :signature)
+    end
+
+    test "answer Peer.Ping sent without an interface header", %{svr: svr} do
+      {:ok, serial} =
+        TestServer.push_call(
+          svr,
+          Message.new!(:method_call,
+            path: "/org/example/Object",
+            member: "Ping",
+            sender: ":1.99"
+          )
+        )
+
+      assert_receive {^svr, %Message{type: :method_return, header_fields: fields, body: []}},
+                     1_000
+
+      assert fields.reply_serial == serial
+    end
+
+    test "answer Peer.GetMachineId from the host machine id", %{svr: svr} do
+      {:ok, serial} =
+        TestServer.push_call(
+          svr,
+          Message.new!(:method_call,
+            path: "/org/example/Object",
+            interface: "org.freedesktop.DBus.Peer",
+            member: "GetMachineId",
+            sender: ":1.99"
+          )
+        )
+
+      # The reply depends on whether the runner has a machine id at all, so the
+      # expectation is branched rather than skipped.
+      case Rebus.MachineId.read() do
+        {:ok, machine_id} ->
+          assert_receive {^svr,
+                          %Message{
+                            type: :method_return,
+                            header_fields: %{reply_serial: ^serial, signature: "s"},
+                            body: [^machine_id]
+                          }},
+                         1_000
+
+        {:error, :unavailable} ->
+          assert_receive {^svr,
+                          %Message{
+                            type: :error,
+                            header_fields: %{
+                              reply_serial: ^serial,
+                              error_name: "org.freedesktop.DBus.Error.Failed",
+                              signature: "s"
+                            },
+                            body: [detail]
+                          }},
+                         1_000
+
+          assert is_binary(detail)
+      end
+    end
+
+    test "answer Peer.GetMachineId from the cached machine id", %{svr: svr, cli: cli} do
+      machine_id = "0123456789abcdef0123456789abcdef"
+      :sys.replace_state(cli, &%{&1 | machine_id: machine_id})
+
+      {:ok, serial} =
+        TestServer.push_call(
+          svr,
+          Message.new!(:method_call,
+            path: "/org/example/Object",
+            interface: "org.freedesktop.DBus.Peer",
+            member: "GetMachineId",
+            sender: ":1.99"
+          )
+        )
+
+      assert_receive {^svr,
+                      %Message{
+                        type: :method_return,
+                        header_fields: %{reply_serial: ^serial, signature: "s"},
+                        body: [^machine_id]
+                      }},
+                     1_000
+    end
+
     test "stop being queued once the writer stalls", %{svr: svr, cli: cli} do
       # A stalled transport must not let a flood of inbound calls grow the
       # write queue without bound: the queue settles at its cap (one reply is
@@ -4218,6 +4320,28 @@ defmodule RebusTest do
       assert_receive {^svr, %Message{type: :error, header_fields: fields}}, 1_000
 
       assert fields.error_name == "org.freedesktop.DBus.Error.UnknownMethod"
+      assert fields.reply_serial == serial
+      refute Map.has_key?(fields, :destination)
+
+      assert :ok = Rebus.close(cli)
+    end
+
+    test "answer Peer.Ping without a destination header", %{svr: svr} do
+      cli = connect_peer(svr)
+
+      {:ok, serial} =
+        TestServer.push_call(
+          svr,
+          Message.new!(:method_call,
+            path: "/org/example/Object",
+            interface: "org.freedesktop.DBus.Peer",
+            member: "Ping"
+          )
+        )
+
+      assert_receive {^svr, %Message{type: :method_return, header_fields: fields, body: []}},
+                     1_000
+
       assert fields.reply_serial == serial
       refute Map.has_key?(fields, :destination)
 

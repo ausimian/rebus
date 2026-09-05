@@ -4,6 +4,7 @@ defmodule Rebus.Connection do
   use TypedStruct
 
   alias Rebus.Auth
+  alias Rebus.MachineId
   alias Rebus.MatchRule
   alias Rebus.Message
   alias Rebus.SignalHandler
@@ -32,10 +33,15 @@ defmodule Rebus.Connection do
   @fd_claim_handoff_grace 100
   @fd_claim_cleanup_grace 250
 
-  # Rebus serves no methods, so an inbound method call is refused rather than
-  # dropped: a caller fails immediately instead of waiting for its own timeout.
+  # Every D-Bus connection is expected to implement org.freedesktop.DBus.Peer;
+  # dbus-daemon, busctl and d-feet all call it. Every other inbound method call
+  # is refused so a caller fails immediately instead of waiting for its own
+  # timeout.
+  @peer_interface "org.freedesktop.DBus.Peer"
   @unknown_method_error "org.freedesktop.DBus.Error.UnknownMethod"
+  @failed_error "org.freedesktop.DBus.Error.Failed"
   @unknown_method_message "Method not handled by this connection"
+  @machine_id_unavailable_message "Machine ID unavailable"
 
   # A peer that floods method calls without reading its socket would otherwise
   # grow the write queue without bound: replies are produced per inbound frame
@@ -195,6 +201,9 @@ defmodule Rebus.Connection do
     field :partial_frame_timer, {reference(), reference()} | nil, default: nil
     field :unix_fd_transport?, boolean(), default: false
     field :unix_fd_negotiated?, boolean(), default: false
+    # `nil` until org.freedesktop.DBus.Peer.GetMachineId is first served;
+    # `:unavailable` caches a definitive negative lookup.
+    field :machine_id, binary() | :unavailable | nil, default: nil
     # Connection-originated replies waiting behind the active write.
     field :queued_replies, non_neg_integer(), default: 0
 
@@ -1268,8 +1277,9 @@ defmodule Rebus.Connection do
     parse_flat_messages(rest, finish_frame(state), continuation, source)
   end
 
-  # Rebus has no service-side API, so every inbound method call is refused
-  # with `UnknownMethod`. A caller that asked for no reply gets none.
+  # Rebus has no service-side API, so every inbound method call is answered
+  # here: `org.freedesktop.DBus.Peer` is implemented, everything else is
+  # refused with `UnknownMethod`. A caller that asked for no reply gets none.
   defp answer_method_call(%Message{flags: flags} = msg, %__MODULE__{} = state) do
     cond do
       :no_reply_expected in flags ->
@@ -1283,7 +1293,39 @@ defmodule Rebus.Connection do
         state
 
       true ->
-        queue_method_call_reply(unknown_method_reply(), msg, state)
+        {reply_opts, state} = method_call_reply(msg, state)
+        queue_method_call_reply(reply_opts, msg, state)
+    end
+  end
+
+  defp method_call_reply(%Message{header_fields: header_fields}, %__MODULE__{} = state) do
+    interface = Map.get(header_fields, :interface)
+    member = Map.get(header_fields, :member)
+
+    case {interface, member} do
+      {interface, "Ping"} when interface in [nil, @peer_interface] ->
+        {[type: :method_return], state}
+
+      {interface, "GetMachineId"} when interface in [nil, @peer_interface] ->
+        machine_id_reply(state)
+
+      _other ->
+        {unknown_method_reply(), state}
+    end
+  end
+
+  defp machine_id_reply(%__MODULE__{} = state) do
+    case machine_id(state) do
+      {{:ok, id}, state} ->
+        {[type: :method_return, signature: "s", body: [id]], state}
+
+      {{:error, :unavailable}, state} ->
+        {[
+           type: :error,
+           error_name: @failed_error,
+           signature: "s",
+           body: [@machine_id_unavailable_message]
+         ], state}
     end
   end
 
@@ -1291,16 +1333,33 @@ defmodule Rebus.Connection do
   # peer-controlled bytes out of the frames this connection emits.
   defp unknown_method_reply do
     [
+      type: :error,
       error_name: @unknown_method_error,
       signature: "s",
       body: [@unknown_method_message]
     ]
   end
 
+  # The machine id is read on first use and then cached for the connection's
+  # life, including a negative result: a peer that floods GetMachineId must not
+  # turn into a stream of file reads.
+  defp machine_id(%__MODULE__{machine_id: nil} = state) do
+    case MachineId.read() do
+      {:ok, id} -> {{:ok, id}, %{state | machine_id: id}}
+      {:error, :unavailable} -> {{:error, :unavailable}, %{state | machine_id: :unavailable}}
+    end
+  end
+
+  defp machine_id(%__MODULE__{machine_id: :unavailable} = state),
+    do: {{:error, :unavailable}, state}
+
+  defp machine_id(%__MODULE__{machine_id: id} = state), do: {{:ok, id}, state}
+
   defp queue_method_call_reply(reply_opts, %Message{} = msg, %__MODULE__{} = state) do
+    {type, reply_opts} = Keyword.pop!(reply_opts, :type)
     reply_opts = reply_opts ++ [reply_serial: msg.serial] ++ reply_destination(msg)
 
-    case Message.new(:error, reply_opts) do
+    case Message.new(type, reply_opts) do
       {:ok, reply} ->
         state =
           queue_write(%{state | queued_replies: state.queued_replies + 1}, %{
