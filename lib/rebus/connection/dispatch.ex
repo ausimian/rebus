@@ -101,11 +101,8 @@ defmodule Rebus.Connection.Dispatch do
     append_recvmsg(message, state, :recv)
   end
 
-  def receive_result({:select, {:select_info, :recv, handle}}, %Connection{} = state) do
-    {:ok, %{state | rref: handle}}
-  end
-
-  def receive_result({:select, {:select_info, :recvmsg, handle}}, %Connection{} = state) do
+  def receive_result({:select, {:select_info, op, handle}}, %Connection{} = state)
+      when op in [:recv, :recvmsg] do
     {:ok, %{state | rref: handle}}
   end
 
@@ -546,16 +543,15 @@ defmodule Rebus.Connection.Dispatch do
     state
   end
 
-  defp notify(%Message{} = msg, %Connection{name: name} = state) do
-    case msg do
-      %Message{header_fields: %{member: "NameAcquired", destination: ^name}, body: [^name]} ->
-        # Ignore our own NameAcquired signals
-        :ok
+  # Ignore our own NameAcquired signals.
+  defp notify(
+         %Message{header_fields: %{member: "NameAcquired", destination: name}, body: [name]},
+         %Connection{name: name} = state
+       ),
+       do: state
 
-      _ ->
-        dispatch_signal(msg, state)
-    end
-
+  defp notify(%Message{} = msg, %Connection{} = state) do
+    dispatch_signal(msg, state)
     state
   end
 
@@ -584,7 +580,7 @@ defmodule Rebus.Connection.Dispatch do
     case Pending.pop_by_serial(state.pending, reply_serial) do
       {nil, _pending} ->
         close_message_fds(msg)
-        Logger.info("Ignoring late or orphaned D-Bus reply for serial #{reply_serial}")
+        log_orphaned_reply(reply_serial)
         state
 
       {entry, pending} ->
@@ -652,13 +648,18 @@ defmodule Rebus.Connection.Dispatch do
   defp drop_resource_limited_pending(reply_serial, reply_kind, %Connection{} = state) do
     case Pending.pop_by_serial(state.pending, reply_serial) do
       {nil, _pending} ->
-        Logger.info("Ignoring late or orphaned D-Bus reply for serial #{reply_serial}")
+        log_orphaned_reply(reply_serial)
         {:ok, state}
 
       {entry, pending} ->
         Pending.fail(entry, {:error, {:reply_dropped, reply_kind}})
         {:ok, %{state | pending: pending}}
     end
+  end
+
+  # The call timed out, its caller went down, or the peer answered twice.
+  defp log_orphaned_reply(reply_serial) do
+    Logger.info("Ignoring late or orphaned D-Bus reply for serial #{reply_serial}")
   end
 
   defp transport(%Connection{impl: %{transport: transport}}), do: transport
