@@ -158,7 +158,7 @@ defmodule Rebus.MatchRuleTest do
       {:ok, server} = start_supervised({TestServer, tap: self()})
       {:ok, address} = TestServer.get_listen_addr(server)
       {:ok, connection} = Rebus.connect(address)
-      assert_receive {^server, %Message{header_fields: %{member: "Hello"}}}
+      assert_receive {^server, %Message{header_fields: %{member: "Hello"}}}, 1_000
 
       on_exit(fn ->
         _ = Rebus.close(connection)
@@ -532,7 +532,7 @@ defmodule Rebus.MatchRuleTest do
 
       {:ok, healthy_address} = TestServer.get_listen_addr(healthy_server)
       {:ok, healthy_connection} = Rebus.connect(healthy_address)
-      assert_receive {^healthy_server, %Message{header_fields: %{member: "Hello"}}}
+      assert_receive {^healthy_server, %Message{header_fields: %{member: "Hello"}}}, 1_000
 
       on_exit(fn ->
         _ = Rebus.close(healthy_connection)
@@ -1779,10 +1779,10 @@ defmodule Rebus.MatchRuleTest do
 
     Process.unlink(connection)
 
-    assert_receive {^connect_ref, {:ok, ^connection}}
+    assert_receive {^connect_ref, {:ok, ^connection}}, 1_000
     send(connection, {connect_ref, :accepted})
-    assert_receive {^connect_ref, :accepted}
-    assert_receive {^server, %Message{header_fields: %{member: "Hello"}}}
+    assert_receive {^connect_ref, :accepted}, 1_000
+    assert_receive {^server, %Message{header_fields: %{member: "Hello"}}}, 1_000
 
     {:ok, worker} = Worker.start_link(connection)
     {connection, worker}
