@@ -206,7 +206,7 @@ defmodule Rebus.Integration.SessionBusTest do
       # listener, so the only peer-mode endpoint available is the test server.
       # It is a real socket speaking the real handshake, which is what
       # `bus: false` needs to be exercised end to end.
-      path = "/tmp/rebus-integration-peer-#{System.unique_integer([:positive])}.sock"
+      path = Rebus.TestTmp.path("int-peer")
 
       {:ok, server} =
         start_supervised(
@@ -285,7 +285,7 @@ defmodule Rebus.Integration.SessionBusTest do
   # A descriptor the VM keeps open for the life of the test. Rebus borrows
   # outbound descriptors and never closes them, so the listener stays valid.
   defp borrowed_fd! do
-    path = "/tmp/rebus-integration-fd-#{System.unique_integer([:positive])}.sock"
+    path = Rebus.TestTmp.path("int-fd")
     {:ok, listener} = :socket.open(:local, :stream, :default)
     :ok = :socket.bind(listener, %{family: :local, path: path})
     :ok = :socket.listen(listener, 1)

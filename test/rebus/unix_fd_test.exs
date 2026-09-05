@@ -15,7 +15,7 @@ defmodule Rebus.UnixFDTest do
                )
 
   setup do
-    path = Path.join("/tmp", "rebus-unix-fd-#{System.system_time(:nanosecond)}")
+    path = Rebus.TestTmp.path("ufd")
 
     {:ok, server} =
       start_supervised(%{
@@ -1024,7 +1024,7 @@ defmodule Rebus.UnixFDTest do
 
   test "rejects FD writes after an optional negotiation error and retains recv coalescing" do
     parent = self()
-    path = Path.join("/tmp", "rebus-unix-fd-error-#{System.system_time(:nanosecond)}")
+    path = Rebus.TestTmp.path("ufd-err")
 
     {:ok, server} =
       start_supervised(%{
@@ -1631,7 +1631,7 @@ defmodule Rebus.UnixFDTest do
   end
 
   defp local_socket_pair! do
-    path = Path.join("/tmp", "rebus-unix-fd-pair-#{System.unique_integer([:positive])}")
+    path = Rebus.TestTmp.path("ufd-pair")
     {:ok, listener} = :socket.open(:local, :stream, :default)
     :ok = :socket.bind(listener, %{family: :local, path: path})
     :ok = :socket.listen(listener, 1)

@@ -4785,11 +4785,11 @@ defmodule RebusTest do
   end
 
   defp socket_path do
-    "/tmp/rebus_test_#{System.os_time(:nanosecond)}_#{:erlang.unique_integer([:positive])}.sock"
+    Rebus.TestTmp.path("s")
   end
 
   defp runtime_dir(name) do
-    dir = Path.join(System.tmp_dir!(), "#{name}_#{:erlang.unique_integer([:positive])}")
+    dir = Rebus.TestTmp.path(name)
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf(dir) end)
     dir

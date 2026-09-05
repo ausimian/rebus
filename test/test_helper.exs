@@ -1,5 +1,8 @@
 :ok = Rebus.TestImpl.setup!()
 
+# One scratch directory per run, holding every path the fixtures create.
+_ = Rebus.TestTmp.setup!()
+
 # The integration suite in `test/integration` needs a real `dbus-daemon` and is
 # excluded from the ordinary run. Include it with
 # `dbus-run-session -- mix test --only integration`, or `mix test.integration`

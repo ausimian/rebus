@@ -612,11 +612,7 @@ defmodule Rebus.AuthTest do
   end
 
   defp with_private_keyring(context, cookie, fun) do
-    home =
-      Path.join(
-        System.tmp_dir!(),
-        "rebus-auth-#{System.unique_integer([:positive, :monotonic])}"
-      )
+    home = Rebus.TestTmp.path("auth")
 
     keyring = Path.join(home, ".dbus-keyrings")
     previous_home = System.get_env("HOME")
