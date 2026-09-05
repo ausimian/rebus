@@ -125,8 +125,7 @@
           {Credo.Check.Refactor.CyclomaticComplexity, false},
           {Credo.Check.Refactor.FilterCount, []},
           {Credo.Check.Refactor.FilterFilter, []},
-          # Re-enable when #80 lands.
-          {Credo.Check.Refactor.FunctionArity, false},
+          {Credo.Check.Refactor.FunctionArity, []},
           {Credo.Check.Refactor.LongQuoteBlocks, []},
           {Credo.Check.Refactor.MapJoin, []},
           {Credo.Check.Refactor.MatchInCondition, []},
