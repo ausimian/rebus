@@ -12,7 +12,6 @@ Rebus provides a clean, Elixir-native interface for communicating over D-Bus, th
 - **Signal Handling** - Register handlers to receive D-Bus signals  
 - **Message Encoding/Decoding** - Robust serialization of D-Bus messages with proper type handling
 - **Supervised Connections** - Fault-tolerant connection management with automatic supervision
-- **Comprehensive Testing** - Extensive test suite covering protocol and edge cases
 
 ## Quick Start
 
@@ -228,12 +227,8 @@ wire-format and connection scope includes:
 
 ## Testing
 
-Rebus includes comprehensive testing infrastructure:
-
-- **200+ test cases** covering encoding, decoding, message handling, and edge cases
-- **Test server infrastructure** for integration testing
-- **Code coverage reporting** with test utilities excluded from metrics
-- **Property-based testing** for robust validation
+Run the unit suite with `mix test`. It uses an in-process test server, so it
+needs no D-Bus daemon.
 
 ### Integration tests
 
@@ -253,7 +248,7 @@ Add `rebus` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:rebus, "~> 0.1.0"}
+    {:rebus, "~> 0.2"}
   ]
 end
 ```
@@ -266,7 +261,7 @@ Documentation can be generated with [ExDoc](https://github.com/elixir-lang/ex_do
 mix docs
 ```
 
-The generated documentation includes comprehensive API references, examples, and implementation details.
+The published documentation is at [hexdocs.pm/rebus](https://hexdocs.pm/rebus).
 
 ## License
 
@@ -280,9 +275,4 @@ This project is licensed under the MIT License.
 4. Push to the branch (`git push origin feature/my-new-feature`)
 5. Create a new Pull Request
 
-Make sure to run the test suite before submitting:
-
-```bash
-mix test
-mix test --cover  # With coverage reporting
-```
+Run `mix precommit` before submitting a pull request.
