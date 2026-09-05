@@ -143,29 +143,17 @@ defmodule Rebus.Encoder do
 
   defp encode_single({:int16, _}, value, state)
        when is_integer(value) and value >= @min_int16 and value <= @max_int16 do
-    data =
-      case state.endianness do
-        :little -> <<value::little-signed-16>>
-        :big -> <<value::big-signed-16>>
-      end
-
-    add_aligned_data(state, data, 2)
+    encode_integer(state, value, 2)
   end
 
   defp encode_single({:uint16, _}, value, state)
        when is_integer(value) and value >= 0 and value <= @max_uint16 do
-    data =
-      case state.endianness do
-        :little -> <<value::little-16>>
-        :big -> <<value::big-16>>
-      end
-
-    add_aligned_data(state, data, 2)
+    encode_integer(state, value, 2)
   end
 
   defp encode_single({:int32, _}, value, state)
        when is_integer(value) and value >= @min_int32 and value <= @max_int32 do
-    encode_int32(value, state)
+    encode_integer(state, value, 4)
   end
 
   defp encode_single({:uint32, _}, value, state)
@@ -175,34 +163,16 @@ defmodule Rebus.Encoder do
 
   defp encode_single({:int64, _}, value, state)
        when is_integer(value) and value >= @min_int64 and value <= @max_int64 do
-    data =
-      case state.endianness do
-        :little -> <<value::little-signed-64>>
-        :big -> <<value::big-signed-64>>
-      end
-
-    add_aligned_data(state, data, 8)
+    encode_integer(state, value, 8)
   end
 
   defp encode_single({:uint64, _}, value, state)
        when is_integer(value) and value >= 0 and value <= @max_uint64 do
-    data =
-      case state.endianness do
-        :little -> <<value::little-64>>
-        :big -> <<value::big-64>>
-      end
-
-    add_aligned_data(state, data, 8)
+    encode_integer(state, value, 8)
   end
 
   defp encode_single({:double, _}, value, state) when is_number(value) do
-    data =
-      case state.endianness do
-        :little -> <<value::little-float-64>>
-        :big -> <<value::big-float-64>>
-      end
-
-    add_aligned_data(state, data, 8)
+    add_aligned_data(state, double_data(state.endianness, value), 8)
   end
 
   defp encode_single({:double, _}, value, state)
@@ -214,13 +184,7 @@ defmodule Rebus.Encoder do
         :nan -> 0x7FF8_0000_0000_0000
       end
 
-    data =
-      case state.endianness do
-        :little -> <<bits::little-64>>
-        :big -> <<bits::big-64>>
-      end
-
-    add_aligned_data(state, data, 8)
+    encode_integer(state, bits, 8)
   end
 
   defp encode_single({:string, _}, value, state) when is_binary(value) do
@@ -249,7 +213,7 @@ defmodule Rebus.Encoder do
 
   defp encode_single({:array, element_type}, values, state) when is_list(values) do
     scalar_state = charge_scalar_array!(state, element_type, length(values))
-    element_alignment = get_alignment(element_type)
+    element_alignment = Signature.alignment(element_type)
 
     # Reserve the aligned uint32 length field so elements are encoded at their
     # actual stream position. Their padding can depend on that position.
@@ -265,11 +229,7 @@ defmodule Rebus.Encoder do
       raise ArgumentError, "D-Bus array size limit exceeded"
     end
 
-    length_data =
-      case state.endianness do
-        :little -> <<data_length::little-32>>
-        :big -> <<data_length::big-32>>
-      end
+    length_data = integer_data(4, state.endianness, data_length)
 
     # The encoder stores chunks in reverse order. Keep the elements as one
     # iodata chunk so the finalized output places the length before them.
@@ -322,25 +282,24 @@ defmodule Rebus.Encoder do
 
   # Helper functions
 
-  defp encode_int32(value, state) do
-    data =
-      case state.endianness do
-        :little -> <<value::little-signed-32>>
-        :big -> <<value::big-signed-32>>
-      end
+  defp encode_uint32(value, state), do: encode_integer(state, value, 4)
 
-    add_aligned_data(state, data, 4)
+  # Fixed-width integers are written at their natural alignment. Two's
+  # complement makes the emitted bytes independent of signedness, so the
+  # in-range guards on the callers are what keep signed values distinct.
+  defp encode_integer(state, value, size) do
+    add_aligned_data(state, integer_data(size, state.endianness, value), size)
   end
 
-  defp encode_uint32(value, state) do
-    data =
-      case state.endianness do
-        :little -> <<value::little-32>>
-        :big -> <<value::big-32>>
-      end
+  defp integer_data(2, :little, value), do: <<value::little-16>>
+  defp integer_data(2, :big, value), do: <<value::big-16>>
+  defp integer_data(4, :little, value), do: <<value::little-32>>
+  defp integer_data(4, :big, value), do: <<value::big-32>>
+  defp integer_data(8, :little, value), do: <<value::little-64>>
+  defp integer_data(8, :big, value), do: <<value::big-64>>
 
-    add_aligned_data(state, data, 4)
-  end
+  defp double_data(:little, value), do: <<value::little-float-64>>
+  defp double_data(:big, value), do: <<value::big-float-64>>
 
   defp encode_string_like(string, state, length_size) do
     string_bytes = :unicode.characters_to_binary(string, :utf8)
@@ -397,24 +356,6 @@ defmodule Rebus.Encoder do
 
   # Array-specific helper functions
 
-  defp get_alignment({:byte, _}), do: 1
-  defp get_alignment({:boolean, _}), do: 4
-  defp get_alignment({:int16, _}), do: 2
-  defp get_alignment({:uint16, _}), do: 2
-  defp get_alignment({:int32, _}), do: 4
-  defp get_alignment({:uint32, _}), do: 4
-  defp get_alignment({:int64, _}), do: 8
-  defp get_alignment({:uint64, _}), do: 8
-  defp get_alignment({:double, _}), do: 8
-  defp get_alignment({:string, _}), do: 4
-  defp get_alignment({:object_path, _}), do: 4
-  defp get_alignment({:signature, _}), do: 1
-  defp get_alignment({:variant, _}), do: 1
-  defp get_alignment({:unix_fd, _}), do: 4
-  defp get_alignment({:array, _}), do: 4
-  defp get_alignment({:struct, _}), do: 8
-  defp get_alignment({:dict_entry, _, _}), do: 8
-
   defp encode_array_elements(_element_type, [], state), do: state
 
   defp encode_array_elements(element_type, [value | rest], state) do
@@ -432,7 +373,7 @@ defmodule Rebus.Encoder do
   end
 
   defp charge_scalar_array!(state, element_type, count) do
-    if scalar_width(element_type) do
+    if Signature.fixed_width(element_type) do
       if state.scalar_budget >= count do
         %{state | scalar_budget: state.scalar_budget - count}
       else
@@ -442,13 +383,4 @@ defmodule Rebus.Encoder do
       state
     end
   end
-
-  defp scalar_width({:byte, _}), do: true
-  defp scalar_width({:boolean, _}), do: true
-
-  defp scalar_width({type, _})
-       when type in [:int16, :uint16, :int32, :uint32, :int64, :uint64, :double, :unix_fd],
-       do: true
-
-  defp scalar_width(_), do: false
 end

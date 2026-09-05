@@ -962,21 +962,13 @@ defmodule Rebus.Message do
   end
 
   defp validate_unix_fd_value({kind, _}, _value, _fd_count)
-       when kind in [
-              :byte,
-              :boolean,
-              :int16,
-              :uint16,
-              :int32,
-              :uint32,
-              :int64,
-              :uint64,
-              :double,
-              :string,
-              :object_path,
-              :signature
-            ],
+       when kind in [:string, :object_path, :signature],
        do: :ok
+
+  # Every other fixed-width basic type is fd-free; :unix_fd is matched above.
+  defp validate_unix_fd_value({_kind, _} = type, _value, _fd_count) do
+    if Signature.fixed_width(type), do: :ok, else: {:error, :invalid_unix_fds}
+  end
 
   defp validate_unix_fd_value(_type, _value, _fd_count), do: {:error, :invalid_unix_fds}
 
