@@ -654,6 +654,12 @@ defmodule Rebus do
     )
   end
 
+  # Dialyzer analyses the dev build, where the implementation gate is closed and
+  # the resolver is always `Rebus.Resolver.Inet`; from that alone it proves the
+  # out-of-contract result clause and the non-atom reason clause unreachable.
+  # The behaviour admits any error term, and the test build reaches both.
+  @dialyzer {:no_match, [resolve_tcp_families: 9, safe_resolver_reason: 1]}
+
   defp resolve_tcp_families(
          _host,
          [],
