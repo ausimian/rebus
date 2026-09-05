@@ -36,12 +36,43 @@ defmodule Rebus.Connection.Writer do
   # stream itself.
   @fd_send_errors [:ebadf, :einval, :eperm, :emfile, :enfile]
 
+  defmodule Active do
+    @moduledoc false
+
+    use TypedStruct
+
+    # The one frame currently being written: the operation it came from, the
+    # serial it was encoded with, the bytes the socket has yet to accept, and
+    # the state of the descriptor-passing handshake.
+
+    typedstruct enforce: true do
+      field :kind, :call | :send | :reply
+      field :from, GenServer.from() | nil
+      field :msg, Message.t()
+      field :deadline, integer()
+      field :request_ref, reference()
+      field :monitor_ref, reference() | nil
+      field :serial, pos_integer()
+      field :rest, binary()
+      # `nil` when the socket is free to be written, `{:continue, cont}` when a
+      # registered continuation is ready to resume, and `{:select, cont, handle}`
+      # while waiting on a select notification.
+      field :wait, nil | {:continue, tuple()} | {:select, tuple(), reference()}
+      field :timer_ref, reference()
+      field :partial?, boolean()
+      field :unix_fds, [Rebus.UnixFD.t()]
+      field :uses_sendmsg?, boolean()
+      # `:socket.sendmsg/4` retains the original encoded control map in a select
+      # continuation. We keep this explicit so that only a no-progress select
+      # uses that continuation; once bytes have been accepted, the remaining
+      # stream bytes use plain send/4.
+      field :fd_control, :none | :initial | :select_continuation | :accepted
+    end
+  end
+
   typedstruct enforce: true do
     field :queue, :queue.queue(), default: :queue.new()
-    # `wait` is `nil` when the socket is free to be written, `{:continue, cont}`
-    # when a registered continuation is ready to resume, and
-    # `{:select, cont, handle}` while waiting on a select notification.
-    field :active, map() | nil, default: nil
+    field :active, Active.t() | nil, default: nil
     # Request references, spelled `%MapSet{}` rather than `MapSet.t(reference())`
     # because an empty set does not inhabit that opaque type and every spec
     # naming `t/0` would then be reported as violating it.
@@ -58,16 +89,29 @@ defmodule Rebus.Connection.Writer do
   end
 
   @typedoc """
-  A frame queued for writing. `from` is `nil` for connection-originated
-  replies, which have no caller to answer, monitor or cancel.
+  A frame handed to `queue/2` for writing. `from` is `nil` for
+  connection-originated replies, which have no caller to answer, monitor or
+  cancel.
   """
   @type operation :: %{
           required(:kind) => :call | :send | :reply,
           required(:from) => GenServer.from() | nil,
           required(:msg) => Message.t(),
           required(:deadline) => integer(),
+          required(:request_ref) => reference()
+        }
+
+  @typedoc """
+  An operation once it is on the queue. `queue/2` attaches the caller monitor
+  (`nil` when there is no caller), so a dequeued frame always carries one.
+  """
+  @type queued_operation :: %{
+          required(:kind) => :call | :send | :reply,
+          required(:from) => GenServer.from() | nil,
+          required(:msg) => Message.t(),
+          required(:deadline) => integer(),
           required(:request_ref) => reference(),
-          optional(:monitor_ref) => reference() | nil
+          required(:monitor_ref) => reference() | nil
         }
 
   @typedoc """
@@ -117,7 +161,7 @@ defmodule Rebus.Connection.Writer do
     do: %{writer | serial: next_serial(serial)}
 
   @doc false
-  @spec active(t()) :: map() | nil
+  @spec active(t()) :: Active.t() | nil
   def active(%__MODULE__{active: active}), do: active
 
   # Connection-originated frames (`kind: :reply`) have no caller: no `from` to
@@ -185,7 +229,7 @@ defmodule Rebus.Connection.Writer do
     end
   end
 
-  def advance(%__MODULE__{active: %{wait: {:select, _cont, _handle}}} = writer, _ctx),
+  def advance(%__MODULE__{active: %Active{wait: {:select, _cont, _handle}}} = writer, _ctx),
     do: {:ok, writer}
 
   def advance(%__MODULE__{active: write} = writer, ctx) do
@@ -206,25 +250,17 @@ defmodule Rebus.Connection.Writer do
   # The write-timeout timer of the active write fired. Only the caller of the
   # matching operation is affected while nothing has entered the stream.
   @spec write_timeout(t(), context()) :: result()
-  def write_timeout(%__MODULE__{active: write} = writer, ctx) do
-    if write.partial? do
-      {:stop, :timeout, writer}
-    else
-      # No bytes have entered the stream, so this frame can be safely abandoned.
-      reply_if_live(write, {:error, :timeout}, writer)
-      advance(drop_active(writer, ctx, cancel?: true), ctx)
-    end
-  end
+  def write_timeout(%__MODULE__{} = writer, ctx), do: fail_active(writer, :timeout, ctx)
 
   @spec cancel(t(), reference(), context()) :: result()
   def cancel(
-        %__MODULE__{active: %{request_ref: request_ref, partial?: false}} = writer,
+        %__MODULE__{active: %Active{request_ref: request_ref, partial?: false}} = writer,
         request_ref,
         ctx
       ),
       do: advance(drop_active(writer, ctx, cancel?: true), ctx)
 
-  def cancel(%__MODULE__{active: %{request_ref: request_ref}} = writer, request_ref, _ctx),
+  def cancel(%__MODULE__{active: %Active{request_ref: request_ref}} = writer, request_ref, _ctx),
     do: {:ok, mark_cancelled(writer, request_ref)}
 
   def cancel(%__MODULE__{} = writer, request_ref, _ctx) do
@@ -237,12 +273,13 @@ defmodule Rebus.Connection.Writer do
   # taken out of the index by `pop_monitor/2`, so the request is known to be
   # queued or active and needs no membership test.
   @spec cancel_monitored(t(), reference(), context()) :: result()
+  # Same head as `cancel/3`'s first clause, so this lands there and nowhere else.
   def cancel_monitored(
-        %__MODULE__{active: %{request_ref: request_ref, partial?: false}} = writer,
+        %__MODULE__{active: %Active{request_ref: request_ref, partial?: false}} = writer,
         request_ref,
         ctx
       ),
-      do: advance(drop_active(writer, ctx, cancel?: true), ctx)
+      do: cancel(writer, request_ref, ctx)
 
   def cancel_monitored(%__MODULE__{} = writer, request_ref, _ctx),
     do: {:ok, mark_cancelled(writer, request_ref)}
@@ -283,6 +320,7 @@ defmodule Rebus.Connection.Writer do
     }
   end
 
+  @spec start_write(t(), queued_operation(), context()) :: result()
   defp start_write(writer, operation, ctx) do
     with :ok <- ctx.validate.(operation.msg),
          {:ok, serial} <- allocate_serial(writer.serial, ctx.pending),
@@ -292,22 +330,22 @@ defmodule Rebus.Connection.Writer do
       timer_ref =
         Process.send_after(self(), {:write_timeout, operation.request_ref}, ctx.write_timeout)
 
-      write =
-        Map.merge(operation, %{
-          serial: serial,
-          rest: bin,
-          frame_size: byte_size(bin),
-          wait: nil,
-          timer_ref: timer_ref,
-          partial?: false,
-          unix_fds: operation.msg.unix_fds,
-          uses_sendmsg?: operation.msg.unix_fds != [],
-          # `:socket.sendmsg/4` retains the original encoded control map in a
-          # select continuation. We keep this explicit so that only a
-          # no-progress select uses that continuation; once bytes have been
-          # accepted, the remaining stream bytes use plain send/4.
-          fd_control: if(operation.msg.unix_fds == [], do: :none, else: :initial)
-        })
+      write = %Active{
+        kind: operation.kind,
+        from: operation.from,
+        msg: operation.msg,
+        deadline: operation.deadline,
+        request_ref: operation.request_ref,
+        monitor_ref: operation.monitor_ref,
+        serial: serial,
+        rest: bin,
+        wait: nil,
+        timer_ref: timer_ref,
+        partial?: false,
+        unix_fds: operation.msg.unix_fds,
+        uses_sendmsg?: operation.msg.unix_fds != [],
+        fd_control: if(operation.msg.unix_fds == [], do: :none, else: :initial)
+      }
 
       advance(%{writer | active: write}, ctx)
     else
@@ -344,12 +382,19 @@ defmodule Rebus.Connection.Writer do
         {:stop, reason, writer}
 
       {:error, reason} ->
-        if write.partial? do
-          {:stop, reason, writer}
-        else
-          reply_if_live(write, {:error, reason}, writer)
-          advance(drop_active(writer, ctx, cancel?: true), ctx)
-        end
+        fail_active(writer, reason, ctx)
+    end
+  end
+
+  # The active frame failed before reaching the peer. Once bytes have entered
+  # the stream the framing is lost and only the connection can be torn down;
+  # otherwise the frame is abandoned, its caller told, and the queue advanced.
+  defp fail_active(%__MODULE__{active: write} = writer, reason, ctx) do
+    if write.partial? do
+      {:stop, reason, writer}
+    else
+      reply_if_live(write, {:error, reason}, writer)
+      advance(drop_active(writer, ctx, cancel?: true), ctx)
     end
   end
 
@@ -376,31 +421,29 @@ defmodule Rebus.Connection.Writer do
   end
 
   defp retain_sendmsg_continuation(%__MODULE__{} = writer, write) do
-    if write.uses_sendmsg? and
-         Map.get(writer.active, :fd_control) in [:initial, :select_continuation],
-       do: %{writer | active: %{writer.active | fd_control: :select_continuation}},
-       else: writer
+    if write.uses_sendmsg? and writer.active.fd_control in [:initial, :select_continuation],
+      do: %{writer | active: %{writer.active | fd_control: :select_continuation}},
+      else: writer
   end
 
-  defp classify_write_result(result, %{uses_sendmsg?: true, fd_control: control, rest: rest})
+  defp classify_write_result(result, %Active{uses_sendmsg?: true, fd_control: control, rest: rest})
        when control in [:initial, :select_continuation],
        do: classify_sendmsg_result(result, byte_size(rest))
 
-  defp classify_write_result(result, %{rest: rest}),
+  defp classify_write_result(result, %Active{rest: rest}),
     do: classify_send_result(result, byte_size(rest))
 
   defp put_active_rest(%__MODULE__{active: write} = writer, rest) do
     partial? = write.partial? or byte_size(rest) < byte_size(write.rest)
-
-    fd_control =
-      if fd_control_accepted?(write, rest),
-        do: :accepted,
-        else: Map.get(write, :fd_control, :none)
+    fd_control = if fd_control_accepted?(write, rest), do: :accepted, else: write.fd_control
 
     %{writer | active: %{write | rest: rest, partial?: partial?, fd_control: fd_control}}
   end
 
-  defp fd_control_accepted?(%{uses_sendmsg?: true, fd_control: control, rest: previous}, rest)
+  defp fd_control_accepted?(
+         %Active{uses_sendmsg?: true, fd_control: control, rest: previous},
+         rest
+       )
        when control in [:initial, :select_continuation] and is_binary(rest) do
     byte_size(rest) < byte_size(previous)
   end
@@ -558,7 +601,7 @@ defmodule Rebus.Connection.Writer do
       do: {:select, select_info, nil}
 
   def classify_send_result({:error, {:timeout, rest}}, payload_length) do
-    if SocketError.iolist?(rest) and IO.iodata_length(rest) == payload_length,
+    if nothing_accepted?(rest, payload_length),
       do: {:error, :timeout},
       else: {:error, {:send_fatal, :timeout}}
   end
@@ -605,13 +648,19 @@ defmodule Rebus.Connection.Writer do
 
   defp classify_sendmsg_result({:error, {reason, rest}}, payload_length)
        when reason in @fd_send_errors do
-    if SocketError.iolist?(rest) and IO.iodata_length(rest) == payload_length,
+    if nothing_accepted?(rest, payload_length),
       do: {:error, :unix_fd_send_failed},
       else: {:error, {:send_fatal, reason}}
   end
 
   defp classify_sendmsg_result(other, payload_length),
     do: classify_send_result(other, payload_length)
+
+  # OTP returns the unaccepted tail alongside the error. Only when the whole
+  # payload is still unaccepted did the attempt leave the stream untouched, and
+  # only then can the frame be failed without breaking D-Bus framing.
+  defp nothing_accepted?(rest, payload_length),
+    do: SocketError.iolist?(rest) and IO.iodata_length(rest) == payload_length
 
   defp send_rest_binary(rest) do
     {:ok, IO.iodata_to_binary(rest)}
@@ -630,7 +679,7 @@ defmodule Rebus.Connection.Writer do
   # Therefore an IOV-only continuation is correct only when no byte has been
   # accepted. After partial progress we cancel that continuation and send the
   # tail without ctrl, which guarantees SCM_RIGHTS is emitted once.
-  defp socket_send(ctx, %{uses_sendmsg?: true, fd_control: :initial, wait: nil} = write) do
+  defp socket_send(ctx, %Active{uses_sendmsg?: true, fd_control: :initial, wait: nil} = write) do
     ctx.transport.sendmsg(
       ctx.sock,
       %{
@@ -644,8 +693,11 @@ defmodule Rebus.Connection.Writer do
 
   defp socket_send(
          ctx,
-         %{uses_sendmsg?: true, fd_control: :select_continuation, wait: {:continue, continuation}} =
-           write
+         %Active{
+           uses_sendmsg?: true,
+           fd_control: :select_continuation,
+           wait: {:continue, continuation}
+         } = write
        ) do
     ctx.transport.sendmsg(ctx.sock, [write.rest], continuation, :nowait)
   end
@@ -681,26 +733,17 @@ defmodule Rebus.Connection.Writer do
 
   defp cancel_socket_write(_ctx, _wait), do: :ok
 
+  # `Message.encode/2` is total: it rescues its encoder internally and its
+  # encode-path validators only return `{:error, _}`. This is belt-and-braces,
+  # so a defect there degrades to `:encode_failed` instead of crashing the
+  # connection.
   defp encode_message(%Message{} = msg) do
     case Message.encode(msg) do
       {:ok, bin} ->
         {:ok, bin}
 
-      {:error, reason}
-      when reason in [
-             :invalid_body,
-             :invalid_header_fields,
-             :invalid_message,
-             :message_too_large
-           ] ->
+      {:error, reason} ->
         Logger.warning("D-Bus message encoding failed: #{inspect(reason)}", reason: reason)
-        {:error, :encode_failed}
-
-      {:error, _reason} ->
-        Logger.warning("D-Bus message encoding failed: :invalid_message",
-          reason: :invalid_message
-        )
-
         {:error, :encode_failed}
     end
   rescue
@@ -736,8 +779,8 @@ defmodule Rebus.Connection.Writer do
     end
   end
 
-  defp next_serial(@max_serial), do: 1
-  defp next_serial(serial), do: serial + 1
+  defp next_serial(serial), do: next_serial(serial, @max_serial)
+
   defp next_serial(max_serial, max_serial), do: 1
   defp next_serial(serial, _max_serial), do: serial + 1
 end
