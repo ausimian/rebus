@@ -429,9 +429,10 @@ defmodule Rebus.MatchSubscription.Worker do
         {:noreply, persist_state(state)}
 
       token = Map.get(state.operation_monitors, monitor_ref) ->
-        # Normal task completion sends its result first. Reaching this branch
-        # means an operation died before reporting a safe outcome, so reset the
-        # connection rather than guessing about a handler or bus-rule state.
+        # A task that finishes normally sends its result first. Reaching this
+        # branch means an operation died before reporting a safe outcome, so
+        # reset the connection rather than guessing about a handler or
+        # bus-rule state.
         case take_operation(state, token) do
           {nil, state} ->
             {:noreply, state}

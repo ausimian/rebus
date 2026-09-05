@@ -165,6 +165,11 @@
 - Treat any frame other than a valid Hello reply as a protocol error before a
   connection is established.
 
+### Removed
+
+- Remove the Windows completion-socket I/O path. Rebus supports Linux and
+  macOS; Windows was never tested or documented as supported.
+
 ### Fixed
 
 - Validate D-Bus interface, member, error and bus names consistently against
