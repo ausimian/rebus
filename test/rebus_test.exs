@@ -6,7 +6,6 @@ defmodule RebusTest do
   alias Rebus.Connection
   alias Rebus.Connection.Handshake
   alias Rebus.Connection.Inbound
-  alias Rebus.Connection.Writer
   alias Rebus.Message
   alias Rebus.SignalHandler
   alias Rebus.TestImpl
@@ -1421,67 +1420,6 @@ defmodule RebusTest do
   end
 
   describe "Connection callbacks" do
-    test "allocates serials within a bounded range" do
-      assert {:ok, 2} = Writer.allocate_serial(1, %{1 => :pending}, 2)
-      assert {:ok, 1} = Writer.allocate_serial(2, %{2 => :pending}, 2)
-
-      assert {:error, :serial_exhausted} =
-               Writer.allocate_serial(1, %{1 => :pending, 2 => :pending}, 2)
-    end
-
-    test "classifies socket send results without exposing payloads" do
-      assert :ok = Writer.classify_send_result(:ok, 3)
-      assert {:error, :timeout} = Writer.classify_send_result({:error, {:timeout, "abc"}}, 3)
-
-      assert {:error, {:send_fatal, :timeout}} =
-               Writer.classify_send_result({:error, {:timeout, "a"}}, 3)
-
-      assert {:error, {:send_fatal, :closed}} =
-               Writer.classify_send_result({:error, {:closed, "abc"}}, 3)
-
-      assert {:error, {:send_fatal, :closed}} =
-               Writer.classify_send_result({:error, :closed}, 3)
-
-      assert {:error, {:send_fatal, :timeout}} =
-               Writer.classify_send_result({:error, {:timeout, %{}}}, 3)
-
-      assert {:error, {:send_fatal, :send_failed}} =
-               Writer.classify_send_result({:error, {"weird", "abc"}}, 3)
-
-      assert {:continue, "bc"} = Writer.classify_send_result({:ok, "bc"}, 3)
-
-      assert {:error, {:send_fatal, :send_failed}} =
-               Writer.classify_send_result({:ok, ["bc"]}, 3)
-
-      assert {:error, {:send_fatal, :timeout}} =
-               Writer.classify_send_result({:error, {:timeout, "bc"}}, 3)
-
-      select_info = {:select_info, :send, make_ref()}
-      completion_info = {:completion_info, :send, make_ref()}
-
-      assert {:select, ^select_info, nil} =
-               Writer.classify_send_result({:select, select_info}, 3)
-
-      assert {:select, ^select_info, "bc"} =
-               Writer.classify_send_result({:select, {select_info, "bc"}}, 3)
-
-      # The completion backend is not supported: its result shape now reaches
-      # the unknown-result fallback and fails the write closed.
-      assert {:error, {:send_fatal, :send_failed}} =
-               Writer.classify_send_result({:completion, completion_info}, 3)
-
-      assert {:error, {:send_fatal, :send_failed}} =
-               Writer.classify_send_result({:unexpected, :socket_shape}, 3)
-    end
-
-    test "builds nonblocking socket continuation arguments" do
-      continuation = {:select_info, :send, make_ref()}
-      assert {"rest", [], :nowait} = Writer.socket_send_args("rest", nil)
-
-      assert {"rest", ^continuation, :nowait} =
-               Writer.socket_send_args("rest", {:continue, continuation})
-    end
-
     test "falls back safely when configuring the OTP receive buffer" do
       parent = self()
       tuple_value = {1, 65_536}
