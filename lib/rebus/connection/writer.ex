@@ -31,6 +31,10 @@ defmodule Rebus.Connection.Writer do
   # as if their reply had expired before it could be written.
   @max_queued_replies 64
 
+  # `sendmsg` errors that describe the descriptors being passed rather than the
+  # stream itself.
+  @fd_send_errors [:ebadf, :einval, :eperm, :emfile, :enfile]
+
   typedstruct enforce: true do
     field :queue, :queue.queue(), default: :queue.new()
     # `wait` is `nil` when the socket is free to be written, `{:continue, cont}`
@@ -342,29 +346,7 @@ defmodule Rebus.Connection.Writer do
         {:continue, put_active_rest(writer, rest)}
 
       {:select, continuation, rest} ->
-        partial_with_rights? = fd_control_accepted?(write, rest)
-        writer = if rest, do: put_active_rest(writer, rest), else: writer
-        {:select_info, _operation, handle} = continuation
-
-        if partial_with_rights? do
-          # OTP's Cont keeps the original encoded Msg (including ctrl); using
-          # it after a byte was sent could emit SCM_RIGHTS again. Cancel the
-          # pending select and let plain send/4 register its own continuation.
-          cancel_socket_write(ctx, {:select, continuation, handle})
-          {:continue, writer}
-        else
-          # `:accepted` is sticky. A positive-progress sendmsg has already
-          # transferred SCM_RIGHTS and its tail is now a plain send/4
-          # operation. A later plain-send select must never turn it back into
-          # a sendmsg continuation (whose OTP continuation still owns ctrl).
-          writer =
-            if write.uses_sendmsg? and
-                 Map.get(writer.active, :fd_control) in [:initial, :select_continuation],
-               do: %{writer | active: %{writer.active | fd_control: :select_continuation}},
-               else: writer
-
-          {:ok, %{writer | active: %{writer.active | wait: {:select, continuation, handle}}}}
-        end
+        handle_write_select(writer, ctx, write, continuation, rest)
 
       {:error, {:send_fatal, reason}} ->
         {:stop, reason, writer}
@@ -377,6 +359,35 @@ defmodule Rebus.Connection.Writer do
           advance(drop_active(writer, ctx, cancel?: true), ctx)
         end
     end
+  end
+
+  defp handle_write_select(writer, ctx, write, continuation, rest) do
+    partial_with_rights? = fd_control_accepted?(write, rest)
+    writer = if rest, do: put_active_rest(writer, rest), else: writer
+    {:select_info, _operation, handle} = continuation
+
+    if partial_with_rights? do
+      # OTP's Cont keeps the original encoded Msg (including ctrl); using
+      # it after a byte was sent could emit SCM_RIGHTS again. Cancel the
+      # pending select and let plain send/4 register its own continuation.
+      cancel_socket_write(ctx, {:select, continuation, handle})
+      {:continue, writer}
+    else
+      # `:accepted` is sticky. A positive-progress sendmsg has already
+      # transferred SCM_RIGHTS and its tail is now a plain send/4
+      # operation. A later plain-send select must never turn it back into
+      # a sendmsg continuation (whose OTP continuation still owns ctrl).
+      writer = retain_sendmsg_continuation(writer, write)
+
+      {:ok, %{writer | active: %{writer.active | wait: {:select, continuation, handle}}}}
+    end
+  end
+
+  defp retain_sendmsg_continuation(%__MODULE__{} = writer, write) do
+    if write.uses_sendmsg? and
+         Map.get(writer.active, :fd_control) in [:initial, :select_continuation],
+       do: %{writer | active: %{writer.active | fd_control: :select_continuation}},
+       else: writer
   end
 
   defp classify_write_result(result, %{uses_sendmsg?: true, fd_control: control, rest: rest})
@@ -571,41 +582,44 @@ defmodule Rebus.Connection.Writer do
 
   def classify_send_result(_result, _payload_length), do: {:error, {:send_fatal, :send_failed}}
 
-  defp classify_sendmsg_result(result, payload_length) do
-    case result do
-      {:ok, rest} ->
-        case send_rest_binary(rest) do
-          {:ok, rest} -> {:continue, rest}
-          _ -> {:error, {:send_fatal, :send_failed}}
-        end
-
-      {:select, {select_info, rest}} when is_sendmsg_select_info(select_info) ->
-        case send_rest_binary(rest) do
-          {:ok, rest} -> {:select, select_info, rest}
-          _ -> {:error, {:send_fatal, :send_failed}}
-        end
-
-      {:select, select_info} when is_sendmsg_select_info(select_info) ->
-        {:select, select_info, nil}
-
-      {:select, _unexpected} ->
-        {:error, {:send_fatal, :send_failed}}
-
-      {:error, reason} when reason in [:ebadf, :einval, :eperm, :emfile, :enfile] ->
-        # A descriptor-local failure before this attempt accepted bytes is not
-        # a stream failure. The queued caller receives a bounded error and the
-        # connection can continue with independent calls.
-        {:error, :unix_fd_send_failed}
-
-      {:error, {reason, rest}} when reason in [:ebadf, :einval, :eperm, :emfile, :enfile] ->
-        if SocketError.iolist?(rest) and IO.iodata_length(rest) == payload_length,
-          do: {:error, :unix_fd_send_failed},
-          else: {:error, {:send_fatal, reason}}
-
-      other ->
-        classify_send_result(other, payload_length)
+  defp classify_sendmsg_result({:ok, rest}, _payload_length) do
+    case send_rest_binary(rest) do
+      {:ok, rest} -> {:continue, rest}
+      _ -> {:error, {:send_fatal, :send_failed}}
     end
   end
+
+  defp classify_sendmsg_result({:select, {select_info, rest}}, _payload_length)
+       when is_sendmsg_select_info(select_info) do
+    case send_rest_binary(rest) do
+      {:ok, rest} -> {:select, select_info, rest}
+      _ -> {:error, {:send_fatal, :send_failed}}
+    end
+  end
+
+  defp classify_sendmsg_result({:select, select_info}, _payload_length)
+       when is_sendmsg_select_info(select_info),
+       do: {:select, select_info, nil}
+
+  defp classify_sendmsg_result({:select, _unexpected}, _payload_length),
+    do: {:error, {:send_fatal, :send_failed}}
+
+  # A descriptor-local failure before this attempt accepted bytes is not a
+  # stream failure. The queued caller receives a bounded error and the
+  # connection can continue with independent calls.
+  defp classify_sendmsg_result({:error, reason}, _payload_length)
+       when reason in @fd_send_errors,
+       do: {:error, :unix_fd_send_failed}
+
+  defp classify_sendmsg_result({:error, {reason, rest}}, payload_length)
+       when reason in @fd_send_errors do
+    if SocketError.iolist?(rest) and IO.iodata_length(rest) == payload_length,
+      do: {:error, :unix_fd_send_failed},
+      else: {:error, {:send_fatal, reason}}
+  end
+
+  defp classify_sendmsg_result(other, payload_length),
+    do: classify_send_result(other, payload_length)
 
   defp send_rest_binary(rest) do
     {:ok, IO.iodata_to_binary(rest)}

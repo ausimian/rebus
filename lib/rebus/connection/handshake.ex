@@ -167,12 +167,7 @@ defmodule Rebus.Connection.Handshake do
           )
 
         "REJECTED" <> _rest ->
-          # A mechanism rejection is terminal: do not silently lower the
-          # authentication level after starting DBUS_COOKIE_SHA1.
-          case parse_auth_response(line) do
-            {:rejected, advertised} -> {:error, {:auth_rejected, advertised}}
-            {:error, reason} -> {:error, reason}
-          end
+          rejected_cookie_auth(line)
 
         _ ->
           {:error, :auth_failed}
@@ -182,6 +177,15 @@ defmodule Rebus.Connection.Handshake do
       # failure is terminal. A peer must not be able to steer a client toward
       # ANONYMOUS by offering an unavailable context or cookie ID.
       {:error, :auth_cookie_unavailable} -> {:error, :auth_cookie_unavailable}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # A mechanism rejection is terminal: do not silently lower the
+  # authentication level after starting DBUS_COOKIE_SHA1.
+  defp rejected_cookie_auth(line) do
+    case parse_auth_response(line) do
+      {:rejected, advertised} -> {:error, {:auth_rejected, advertised}}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -285,15 +289,7 @@ defmodule Rebus.Connection.Handshake do
       when is_integer(timeout) and timeout > 0 and is_atom(identity) do
     case safely_lookup_identity(identity, :auth_id, timeout) do
       {:ok, output} when is_binary(output) and byte_size(output) <= @max_auth_id_output ->
-        case String.trim(output) do
-          uid when uid != <<>> ->
-            if uid_bytes?(uid),
-              do: {:ok, :binary.encode_hex(uid)},
-              else: {:error, :auth_id_unavailable}
-
-          _ ->
-            {:error, :auth_id_unavailable}
-        end
+        encode_auth_id(String.trim(output))
 
       {:error, :timeout} ->
         {:error, :read_timeout}
@@ -301,6 +297,14 @@ defmodule Rebus.Connection.Handshake do
       _ ->
         {:error, :auth_id_unavailable}
     end
+  end
+
+  defp encode_auth_id(<<>>), do: {:error, :auth_id_unavailable}
+
+  defp encode_auth_id(uid) do
+    if uid_bytes?(uid),
+      do: {:ok, :binary.encode_hex(uid)},
+      else: {:error, :auth_id_unavailable}
   end
 
   @doc false

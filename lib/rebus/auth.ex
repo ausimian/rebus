@@ -161,39 +161,46 @@ defmodule Rebus.Auth do
     lines = keyring_lines(contents)
 
     if length(lines) <= @max_cookie_lines do
-      Enum.reduce_while(lines, {:ok, nil}, fn line, {:ok, found} ->
-        case parse_cookie_line(line) do
-          {:ok, {^wanted_id, _timestamp, cookie}} when is_nil(found) ->
-            {:cont, {:ok, cookie}}
-
-          {:ok, {^wanted_id, _timestamp, _cookie}} ->
-            {:halt, {:error, :auth_cookie_unavailable}}
-
-          {:ok, _other} ->
-            {:cont, {:ok, found}}
-
-          :empty ->
-            {:cont, {:ok, found}}
-
-          :error ->
-            if malformed_target_cookie_line?(line, wanted_id) do
-              {:halt, {:error, :auth_cookie_unavailable}}
-            else
-              # Cookie files are shared per context and may contain unrelated
-              # stale or malformed records. Ignore those bounded lines, while
-              # preserving fail-closed handling for a malformed target record.
-              {:cont, {:ok, found}}
-            end
-        end
-      end)
-      |> case do
-        {:ok, cookie} when is_binary(cookie) -> {:ok, cookie}
-        _ -> {:error, :auth_cookie_unavailable}
-      end
+      lines
+      |> Enum.reduce_while({:ok, nil}, &scan_cookie_line(&1, &2, wanted_id))
+      |> found_cookie()
     else
       {:error, :auth_cookie_unavailable}
     end
   end
+
+  defp scan_cookie_line(line, {:ok, found}, wanted_id) do
+    case parse_cookie_line(line) do
+      {:ok, {^wanted_id, _timestamp, cookie}} when is_nil(found) ->
+        {:cont, {:ok, cookie}}
+
+      {:ok, {^wanted_id, _timestamp, _cookie}} ->
+        {:halt, {:error, :auth_cookie_unavailable}}
+
+      {:ok, _other} ->
+        {:cont, {:ok, found}}
+
+      :empty ->
+        {:cont, {:ok, found}}
+
+      :error ->
+        skip_unparsable_cookie_line(line, wanted_id, found)
+    end
+  end
+
+  # Cookie files are shared per context and may contain unrelated stale or
+  # malformed records. Ignore those bounded lines, while preserving
+  # fail-closed handling for a malformed target record.
+  defp skip_unparsable_cookie_line(line, wanted_id, found) do
+    if malformed_target_cookie_line?(line, wanted_id) do
+      {:halt, {:error, :auth_cookie_unavailable}}
+    else
+      {:cont, {:ok, found}}
+    end
+  end
+
+  defp found_cookie({:ok, cookie}) when is_binary(cookie), do: {:ok, cookie}
+  defp found_cookie(_result), do: {:error, :auth_cookie_unavailable}
 
   defp keyring_lines(contents) do
     lines = :binary.split(contents, "\n", [:global])
