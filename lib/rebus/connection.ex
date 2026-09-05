@@ -6,6 +6,7 @@ defmodule Rebus.Connection do
   alias Rebus.Connection.Handshake
   alias Rebus.Connection.Inbound
   alias Rebus.Connection.SocketError
+  alias Rebus.Connection.Writer
   alias Rebus.MachineId
   alias Rebus.MatchRule
   alias Rebus.Message
@@ -18,7 +19,6 @@ defmodule Rebus.Connection do
   @default_read_timeout 5_000
   @max_read_chunk 65_536
   @max_read_attempts 1
-  @max_serial 4_294_967_295
   @max_unix_fd_control_size 256
   # A reply carrying descriptors is first acknowledged through a small
   # connection-owned claim.  This deliberately avoids treating delivery to a
@@ -41,13 +41,6 @@ defmodule Rebus.Connection do
   @failed_error "org.freedesktop.DBus.Error.Failed"
   @unknown_method_message "Method not handled by this connection"
   @machine_id_unavailable_message "Machine ID unavailable"
-
-  # A peer that floods method calls without reading its socket would otherwise
-  # grow the write queue without bound: replies are produced per inbound frame
-  # but drain only as fast as the transport accepts them. Beyond this many
-  # queued connection-originated replies, further calls go unanswered, exactly
-  # as if their reply had expired before it could be written.
-  @max_queued_replies 64
 
   @spec call(pid(), Message.t(), non_neg_integer()) ::
           {:ok, Message.t()} | {:error, Rebus.call_error()}
@@ -185,7 +178,6 @@ defmodule Rebus.Connection do
     # drop once its byte boundary is available.
     field :inbound_fd_tainted?, boolean(), default: false
     field :name, binary() | nil, default: nil
-    field :serial, non_neg_integer(), default: 1
     field :hello_serial, non_neg_integer() | nil, default: nil
     field :established?, boolean(), default: false
     field :write_timeout, pos_integer(), default: @default_write_timeout
@@ -205,11 +197,9 @@ defmodule Rebus.Connection do
     # `nil` until org.freedesktop.DBus.Peer.GetMachineId is first served;
     # `:unavailable` caches a definitive negative lookup.
     field :machine_id, binary() | :unavailable | nil, default: nil
-    # Connection-originated replies waiting behind the active write, and
-    # whether the cap was hit since the queue last drained below it (so the
-    # refusal is logged once per saturation episode, not once per call).
-    field :queued_replies, non_neg_integer(), default: 0
-    field :reply_queue_saturated?, boolean(), default: false
+    # The outbound write queue, the frame currently being written, and the
+    # serial counter that numbers them.
+    field :writer, Writer.t(), default: Writer.new()
 
     field :pending,
           %{
@@ -227,14 +217,6 @@ defmodule Rebus.Connection do
     field :fd_claim_outcomes, %{reference() => {:acknowledged | :closed, reference()}},
       default: %{}
 
-    # `wait` is `nil` when the socket is free to be written, `{:continue, cont}`
-    # when a registered continuation is ready to resume, and
-    # `{:select, cont, handle}` while waiting on a select notification.
-    field :active_write, map() | nil, default: nil
-    field :write_queue, :queue.queue(), default: :queue.new()
-    field :queued_requests, MapSet.t(reference()), default: MapSet.new()
-    field :cancelled_requests, MapSet.t(reference()), default: MapSet.new()
-    field :outbound_monitor_index, %{reference() => reference()}, default: %{}
     field :signal_handler_monitor_index, %{reference() => reference()}, default: %{}
     field :signal_handler_ref_index, %{reference() => reference()}, default: %{}
     # Implementation modules behind the connection's side effects. Production
@@ -375,12 +357,11 @@ defmodule Rebus.Connection do
   # A writable socket must not prevent us from continuing to drain inbound replies.
   def handle_info(
         {:"$socket", s, :select, h},
-        %__MODULE__{sock: s, active_write: %{wait: {:select, continuation, h}}} = state
+        %__MODULE__{sock: s, writer: %Writer{active: %{wait: {:select, continuation, h}}}} = state
       ) do
-    advance_writes(%{
-      state
-      | active_write: %{state.active_write | wait: {:continue, continuation}}
-    })
+    state.writer
+    |> Writer.resume_select(continuation, writer_context(state))
+    |> writer_result(state)
   end
 
   def handle_info(
@@ -456,20 +437,15 @@ defmodule Rebus.Connection do
 
   def handle_info(
         {:write_timeout, request_ref},
-        %__MODULE__{active_write: %{request_ref: request_ref} = write} = state
+        %__MODULE__{writer: %Writer{active: %{request_ref: request_ref}}} = state
       ) do
-    if write.partial? do
-      stop_for_transport_error(:timeout, state)
-    else
-      # No bytes have entered the stream, so this frame can be safely abandoned.
-      reply_if_live(write, {:error, :timeout}, state)
-      advance_writes(drop_active(state, cancel?: true))
-    end
+    state.writer |> Writer.write_timeout(writer_context(state)) |> writer_result(state)
   end
 
   def handle_info(
         {:"$socket", s, :abort, {h, reason}},
-        %__MODULE__{sock: s, active_write: %{wait: {:select, _continuation, h}}} = state
+        %__MODULE__{sock: s, writer: %Writer{active: %{wait: {:select, _continuation, h}}}} =
+          state
       ),
       do: stop_for_transport_error(reason, state)
 
@@ -487,8 +463,8 @@ defmodule Rebus.Connection do
   defp handle_down_for_request(ref, %__MODULE__{} = state) do
     case Map.pop(state.monitor_index, ref) do
       {nil, _index} ->
-        case Map.pop(state.outbound_monitor_index, ref) do
-          {nil, _outbound_index} ->
+        case Writer.pop_monitor(state.writer, ref) do
+          :error ->
             case Map.fetch(state.fd_claim_monitor_index, ref) do
               {:ok, claim_ref} ->
                 {:noreply, drop_fd_claim(state, claim_ref, close?: true, monitor_down?: true)}
@@ -497,9 +473,12 @@ defmodule Rebus.Connection do
                 {:noreply, state}
             end
 
-          {request_ref, outbound_monitor_index} ->
-            state = %{state | outbound_monitor_index: outbound_monitor_index}
-            cancel_outbound_request(state, request_ref)
+          {request_ref, writer} ->
+            state = %{state | writer: writer}
+
+            writer
+            |> Writer.cancel_monitored(request_ref, writer_context(state))
+            |> writer_result(state)
         end
 
       {serial, monitor_index} ->
@@ -552,11 +531,15 @@ defmodule Rebus.Connection do
              destination: "org.freedesktop.DBus",
              member: "Hello"
            ),
-         {:ok, bin} <- Message.encode(%{method | serial: state.serial}) do
+         {:ok, bin} <- Message.encode(%{method | serial: Writer.serial(state.writer)}) do
       case transport(state).send(state.sock, bin, [], state.write_timeout) do
         :ok ->
-          {:noreply, %{state | hello_serial: state.serial, serial: next_serial(state.serial)},
-           {:continue, :hello_reply_buffer}}
+          {:noreply,
+           %{
+             state
+             | hello_serial: Writer.serial(state.writer),
+               writer: Writer.consume_serial(state.writer)
+           }, {:continue, :hello_reply_buffer}}
 
         {:error, reason} ->
           stop_for_transport_error(reason, state)
@@ -973,25 +956,9 @@ defmodule Rebus.Connection do
             {:noreply, drop_fd_claim(state, claim_ref, close?: true)}
 
           :error ->
-            case state.active_write do
-              %{request_ref: ^request_ref, partial?: false} ->
-                advance_writes(drop_active(state, cancel?: true))
-
-              %{request_ref: ^request_ref} ->
-                {:noreply,
-                 %{state | cancelled_requests: MapSet.put(state.cancelled_requests, request_ref)}}
-
-              _ ->
-                if MapSet.member?(state.queued_requests, request_ref) do
-                  {:noreply,
-                   %{
-                     state
-                     | cancelled_requests: MapSet.put(state.cancelled_requests, request_ref)
-                   }}
-                else
-                  {:noreply, state}
-                end
-            end
+            state.writer
+            |> Writer.cancel(request_ref, writer_context(state))
+            |> writer_result(state)
         end
 
       {serial, request_index} ->
@@ -1012,21 +979,6 @@ defmodule Rebus.Connection do
 
   def handle_cast({:cancel_signal_handler, handler_ref}, %__MODULE__{} = state) do
     {:noreply, remove_signal_handler(state, handler_ref)}
-  end
-
-  defp cancel_outbound_request(state, request_ref) do
-    case state.active_write do
-      %{request_ref: ^request_ref, partial?: false} ->
-        advance_writes(drop_active(state, cancel?: true))
-
-      %{request_ref: ^request_ref} ->
-        {:noreply,
-         %{state | cancelled_requests: MapSet.put(state.cancelled_requests, request_ref)}}
-
-      _ ->
-        {:noreply,
-         %{state | cancelled_requests: MapSet.put(state.cancelled_requests, request_ref)}}
-    end
   end
 
   defp parse_complete_message(data, %__MODULE__{} = state, continuation) do
@@ -1219,23 +1171,13 @@ defmodule Rebus.Connection do
       :no_reply_expected in flags ->
         state
 
-      state.queued_replies >= @max_queued_replies ->
-        refuse_saturated_reply(state)
+      Writer.replies_saturated?(state.writer) ->
+        %{state | writer: Writer.refuse_reply(state.writer)}
 
       true ->
         {reply_opts, state} = method_call_reply(msg, state)
         queue_method_call_reply(reply_opts, msg, state)
     end
-  end
-
-  # A peer flooding calls into a stalled transport must not also flood the
-  # log: warn when the cap is first hit, then stay quiet until the queue has
-  # drained below it again.
-  defp refuse_saturated_reply(%__MODULE__{reply_queue_saturated?: true} = state), do: state
-
-  defp refuse_saturated_reply(%__MODULE__{} = state) do
-    Logger.warning("D-Bus internal reply dropped: :reply_queue_full", reason: :reply_queue_full)
-    %{state | reply_queue_saturated?: true}
   end
 
   defp method_call_reply(%Message{header_fields: header_fields}, %__MODULE__{} = state) do
@@ -1301,8 +1243,8 @@ defmodule Rebus.Connection do
 
     case Message.new(type, reply_opts) do
       {:ok, reply} ->
-        state =
-          queue_write(%{state | queued_replies: state.queued_replies + 1}, %{
+        writer =
+          Writer.queue(state.writer, %{
             kind: :reply,
             from: nil,
             msg: reply,
@@ -1310,7 +1252,7 @@ defmodule Rebus.Connection do
             request_ref: make_ref()
           })
 
-        kick_writes(state)
+        kick_writes(%{state | writer: writer})
 
       {:error, reason} ->
         Logger.warning("D-Bus internal reply dropped: #{inspect(reason)}", reason: reason)
@@ -2098,8 +2040,6 @@ defmodule Rebus.Connection do
     end
   end
 
-  defp iolist?(data), do: SocketError.iolist?(data)
-
   # A non-bus connection has no unique name, so nothing can be its own
   # NameAcquired signal. Match the absent name explicitly rather than letting
   # `nil` participate in the header comparison below.
@@ -2315,41 +2255,6 @@ defmodule Rebus.Connection do
     end
   end
 
-  defp encode_message(%Message{} = msg) do
-    case Message.encode(msg) do
-      {:ok, bin} ->
-        {:ok, bin}
-
-      {:error, reason}
-      when reason in [
-             :invalid_body,
-             :invalid_header_fields,
-             :invalid_message,
-             :message_too_large
-           ] ->
-        Logger.warning("D-Bus message encoding failed: #{inspect(reason)}", reason: reason)
-        {:error, :encode_failed}
-
-      {:error, _reason} ->
-        Logger.warning("D-Bus message encoding failed: :invalid_message",
-          reason: :invalid_message
-        )
-
-        {:error, :encode_failed}
-    end
-  rescue
-    exception ->
-      Logger.warning("D-Bus message encoding failed: #{inspect(exception.__struct__)}",
-        reason: exception.__struct__
-      )
-
-      {:error, :encode_failed}
-  catch
-    kind, _reason ->
-      Logger.warning("D-Bus message encoding failed: #{inspect(kind)}", reason: kind)
-      {:error, :encode_failed}
-  end
-
   defp validate_call_message(%Message{type: :method_call, flags: flags}) do
     if :no_reply_expected in flags, do: {:error, :no_reply_expected}, else: :ok
   end
@@ -2374,13 +2279,6 @@ defmodule Rebus.Connection do
 
   defp validate_outbound_fd_transport(%Message{}, %__MODULE__{}), do: :ok
 
-  defp remaining_timeout(deadline) when is_integer(deadline) do
-    case deadline - System.monotonic_time(:millisecond) do
-      remaining when remaining > 0 -> {:ok, remaining}
-      _ -> {:error, :timeout}
-    end
-  end
-
   defp read_deadline(timeout) when is_integer(timeout) and timeout > 0 do
     System.monotonic_time(:millisecond) + timeout
   end
@@ -2399,472 +2297,61 @@ defmodule Rebus.Connection do
     end
   end
 
-  @doc false
-  defguardp is_select_info(info)
-            when is_tuple(info) and tuple_size(info) == 3 and elem(info, 0) == :select_info and
-                   elem(info, 1) in [:send, :sendmsg] and is_reference(elem(info, 2))
-
-  defguardp is_sendmsg_select_info(info)
-            when is_tuple(info) and tuple_size(info) == 3 and elem(info, 0) == :select_info and
-                   elem(info, 1) == :sendmsg and is_reference(elem(info, 2))
-
-  @spec classify_send_result(term(), non_neg_integer()) ::
-          :ok
-          | {:continue, iodata()}
-          | {:select, tuple(), binary() | nil}
-          | {:error, term()}
-  def classify_send_result(:ok, _payload_length), do: :ok
-
-  def classify_send_result({:ok, rest}, _payload_length) when is_binary(rest),
-    do: {:continue, rest}
-
-  def classify_send_result({:select, {select_info, rest}}, _payload_length)
-      when is_select_info(select_info) and is_binary(rest),
-      do: {:select, select_info, rest}
-
-  def classify_send_result({:select, select_info}, _payload_length)
-      when is_select_info(select_info),
-      do: {:select, select_info, nil}
-
-  def classify_send_result({:error, {:timeout, rest}}, payload_length) do
-    if iolist?(rest) and IO.iodata_length(rest) == payload_length,
-      do: {:error, :timeout},
-      else: {:error, {:send_fatal, :timeout}}
+  # Everything the writer borrows from the connection for one call. Building it
+  # per call keeps the writer free of connection state, and means substituting
+  # an implementation module on a running connection needs no writer update.
+  defp writer_context(%__MODULE__{} = state) do
+    %{
+      sock: state.sock,
+      transport: state.impl.transport,
+      hooks: state.impl.hooks,
+      write_timeout: state.write_timeout,
+      pending: state.pending,
+      validate: &validate_outbound_fd_transport(&1, state)
+    }
   end
 
-  def classify_send_result({:error, {reason, _rest}}, _payload_length) when is_atom(reason),
-    do: {:error, {:send_fatal, reason}}
-
-  def classify_send_result({:error, reason}, _payload_length) when is_atom(reason),
-    do: {:error, {:send_fatal, reason}}
-
-  def classify_send_result({:error, _reason}, _payload_length),
-    do: {:error, {:send_fatal, :send_failed}}
-
-  def classify_send_result(_result, _payload_length), do: {:error, {:send_fatal, :send_failed}}
-
-  defp classify_sendmsg_result(result, payload_length) do
-    case result do
-      {:ok, rest} ->
-        case send_rest_binary(rest) do
-          {:ok, rest} -> {:continue, rest}
-          _ -> {:error, {:send_fatal, :send_failed}}
-        end
-
-      {:select, {select_info, rest}} when is_sendmsg_select_info(select_info) ->
-        case send_rest_binary(rest) do
-          {:ok, rest} -> {:select, select_info, rest}
-          _ -> {:error, {:send_fatal, :send_failed}}
-        end
-
-      {:select, select_info} when is_sendmsg_select_info(select_info) ->
-        {:select, select_info, nil}
-
-      {:select, _unexpected} ->
-        {:error, {:send_fatal, :send_failed}}
-
-      {:error, reason} when reason in [:ebadf, :einval, :eperm, :emfile, :enfile] ->
-        # A descriptor-local failure before this attempt accepted bytes is not
-        # a stream failure. The queued caller receives a bounded error and the
-        # connection can continue with independent calls.
-        {:error, :unix_fd_send_failed}
-
-      {:error, {reason, rest}} when reason in [:ebadf, :einval, :eperm, :emfile, :enfile] ->
-        if iolist?(rest) and IO.iodata_length(rest) == payload_length,
-          do: {:error, :unix_fd_send_failed},
-          else: {:error, {:send_fatal, reason}}
-
-      other ->
-        classify_send_result(other, payload_length)
-    end
+  defp enqueue_write(%__MODULE__{} = state, operation) do
+    state.writer |> Writer.enqueue(operation, writer_context(state)) |> writer_result(state)
   end
 
-  defp send_rest_binary(rest) do
-    {:ok, IO.iodata_to_binary(rest)}
-  rescue
-    ArgumentError -> :error
+  defp advance_writes(%__MODULE__{} = state) do
+    state.writer |> Writer.advance(writer_context(state)) |> writer_result(state)
   end
 
-  # Writes are one-frame-at-a-time.  OTP retains the unaccepted RestData in every
-  # partial result; retaining it here is what preserves D-Bus stream framing.
-  defp enqueue_write(state, operation), do: advance_writes(queue_write(state, operation))
+  defp writer_result({:ok, writer}, %__MODULE__{} = state),
+    do: {:noreply, %{state | writer: writer}}
 
-  # Connection-originated frames (`kind: :reply`) have no caller: no `from` to
-  # reply to, no monitor to release, and no cancellation. They share the FIFO
-  # write queue so a reply can never overtake or starve caller traffic.
-  defp queue_write(state, operation) do
-    monitor_ref = monitor_operation(operation)
-    operation = Map.put(operation, :monitor_ref, monitor_ref)
+  defp writer_result({:continue, writer}, %__MODULE__{} = state),
+    do: {:noreply, %{state | writer: writer}, {:continue, :write}}
 
+  # A `:call` frame has reached the peer. The writer has started its request
+  # timer and handed back the correlation entry, which only the connection can
+  # index; the next frame waits until that entry is registered, because serial
+  # allocation reads it.
+  defp writer_result({:call_written, entry, writer}, %__MODULE__{} = state) do
+    %{state | writer: writer} |> register_pending(entry) |> advance_writes()
+  end
+
+  defp writer_result({:stop, reason, writer}, %__MODULE__{} = state),
+    do: stop_for_transport_error(reason, %{state | writer: writer})
+
+  defp register_pending(%__MODULE__{} = state, entry) do
     %{
       state
-      | write_queue: :queue.in(operation, state.write_queue),
-        queued_requests: MapSet.put(state.queued_requests, operation.request_ref),
-        outbound_monitor_index:
-          index_outbound_monitor(state.outbound_monitor_index, monitor_ref, operation.request_ref)
+      | pending:
+          Map.put(
+            state.pending,
+            entry.serial,
+            {entry.from, entry.timer_ref, entry.request_ref, entry.monitor_ref, entry.deadline}
+          ),
+        request_index: Map.put(state.request_index, entry.request_ref, entry.serial),
+        monitor_index: Map.put(state.monitor_index, entry.monitor_ref, entry.serial)
     }
-  end
-
-  defp release_reply_slot(%__MODULE__{} = state, %{kind: :reply}),
-    do: %{state | queued_replies: state.queued_replies - 1, reply_queue_saturated?: false}
-
-  defp release_reply_slot(%__MODULE__{} = state, _operation), do: state
-
-  defp monitor_operation(%{from: nil}), do: nil
-  defp monitor_operation(%{from: from}), do: Process.monitor(elem(from, 0))
-
-  defp index_outbound_monitor(index, nil, _request_ref), do: index
-
-  defp index_outbound_monitor(index, monitor_ref, request_ref),
-    do: Map.put(index, monitor_ref, request_ref)
-
-  defp advance_writes(%__MODULE__{active_write: nil} = state) do
-    case :queue.out(state.write_queue) do
-      {:empty, _} ->
-        {:noreply, state}
-
-      {{:value, operation}, queue} ->
-        state = %{
-          release_reply_slot(state, operation)
-          | write_queue: queue,
-            queued_requests: MapSet.delete(state.queued_requests, operation.request_ref)
-        }
-
-        if cancelled_or_expired?(operation, state) do
-          state = release_outbound_monitor(state, operation)
-
-          advance_writes(%{
-            state
-            | cancelled_requests: MapSet.delete(state.cancelled_requests, operation.request_ref)
-          })
-        else
-          case validate_outbound_fd_transport(operation.msg, state) do
-            :ok ->
-              case allocate_serial(state.serial, state.pending) do
-                {:ok, serial} ->
-                  case encode_message(%{operation.msg | serial: serial}) do
-                    {:ok, bin} ->
-                      bin = IO.iodata_to_binary(bin)
-
-                      timer_ref =
-                        Process.send_after(
-                          self(),
-                          {:write_timeout, operation.request_ref},
-                          state.write_timeout
-                        )
-
-                      write =
-                        Map.merge(operation, %{
-                          serial: serial,
-                          rest: bin,
-                          frame_size: byte_size(bin),
-                          wait: nil,
-                          timer_ref: timer_ref,
-                          partial?: false,
-                          unix_fds: operation.msg.unix_fds,
-                          uses_sendmsg?: operation.msg.unix_fds != [],
-                          # `:socket.sendmsg/4` retains the original encoded
-                          # control map in a select continuation. We keep this
-                          # explicit so that only a no-progress select uses
-                          # that continuation; once bytes have been accepted,
-                          # the remaining stream bytes use plain send/4.
-                          fd_control: if(operation.msg.unix_fds == [], do: :none, else: :initial)
-                        })
-
-                      advance_writes(%{state | active_write: write})
-
-                    {:error, reason} ->
-                      advance_writes(fail_operation(state, operation, reason))
-                  end
-
-                {:error, reason} ->
-                  advance_writes(fail_operation(state, operation, reason))
-              end
-
-            {:error, reason} ->
-              advance_writes(fail_operation(state, operation, reason))
-          end
-        end
-    end
-  end
-
-  defp advance_writes(%__MODULE__{active_write: %{wait: {:select, _, _}}} = state),
-    do: {:noreply, state}
-
-  defp advance_writes(%__MODULE__{active_write: write} = state) do
-    if (expired?(write) or cancelled?(write, state)) and not write.partial? do
-      advance_writes(drop_active(state, cancel?: true))
-    else
-      result = safe_socket_send(state, write)
-      handle_write_result(result, %{state | active_write: %{write | wait: nil}})
-    end
-  end
-
-  # A connection-originated reply has no caller to inform. Failing to encode,
-  # serialize or transport one is a defect in this library rather than a caller
-  # error, so it is logged and the frame is dropped; the connection continues.
-  defp fail_operation(state, %{kind: :reply} = operation, reason) do
-    Logger.warning("D-Bus internal reply dropped: #{inspect(reason)}", reason: reason)
-    release_outbound_monitor(state, operation)
-  end
-
-  defp fail_operation(state, operation, reason) do
-    state = release_outbound_monitor(state, operation)
-    GenServer.reply(operation.from, {:error, reason})
-    state
-  end
-
-  defp handle_write_result(result, %__MODULE__{active_write: write} = state) do
-    case classify_write_result(result, write) do
-      :ok ->
-        complete_active_write(state)
-
-      {:continue, rest} ->
-        state = put_active_rest(state, rest)
-        {:noreply, state, {:continue, :write}}
-
-      {:select, continuation, rest} ->
-        partial_with_rights? = fd_control_accepted?(write, rest)
-        state = if rest, do: put_active_rest(state, rest), else: state
-        {:select_info, _operation, handle} = continuation
-
-        if partial_with_rights? do
-          # OTP's Cont keeps the original encoded Msg (including ctrl); using
-          # it after a byte was sent could emit SCM_RIGHTS again. Cancel the
-          # pending select and let plain send/4 register its own continuation.
-          cancel_socket_write(state, {:select, continuation, handle})
-          {:noreply, state, {:continue, :write}}
-        else
-          # `:accepted` is sticky. A positive-progress sendmsg has already
-          # transferred SCM_RIGHTS and its tail is now a plain send/4
-          # operation. A later plain-send select must never turn it back into
-          # a sendmsg continuation (whose OTP continuation still owns ctrl).
-          state =
-            if write.uses_sendmsg? and
-                 Map.get(state.active_write, :fd_control) in [:initial, :select_continuation],
-               do: %{
-                 state
-                 | active_write: %{state.active_write | fd_control: :select_continuation}
-               },
-               else: state
-
-          {:noreply,
-           %{state | active_write: %{state.active_write | wait: {:select, continuation, handle}}}}
-        end
-
-      {:error, {:send_fatal, reason}} ->
-        stop_for_transport_error(reason, state)
-
-      {:error, reason} ->
-        if write.partial? do
-          stop_for_transport_error(reason, state)
-        else
-          reply_if_live(write, {:error, reason}, state)
-          advance_writes(drop_active(state, cancel?: true))
-        end
-    end
-  end
-
-  defp classify_write_result(
-         result,
-         %{uses_sendmsg?: true, fd_control: control, rest: rest}
-       )
-       when control in [:initial, :select_continuation],
-       do: classify_sendmsg_result(result, byte_size(rest))
-
-  defp classify_write_result(result, %{rest: rest}),
-    do: classify_send_result(result, byte_size(rest))
-
-  defp put_active_rest(%__MODULE__{active_write: write} = state, rest) do
-    partial? = write.partial? or byte_size(rest) < byte_size(write.rest)
-
-    fd_control =
-      if fd_control_accepted?(write, rest),
-        do: :accepted,
-        else: Map.get(write, :fd_control, :none)
-
-    %{state | active_write: %{write | rest: rest, partial?: partial?, fd_control: fd_control}}
-  end
-
-  defp fd_control_accepted?(%{uses_sendmsg?: true, fd_control: control, rest: previous}, rest)
-       when control in [:initial, :select_continuation] and is_binary(rest) do
-    byte_size(rest) < byte_size(previous)
-  end
-
-  defp fd_control_accepted?(_write, _rest), do: false
-
-  defp complete_active_write(%__MODULE__{active_write: write} = state) do
-    live? = not cancelled_or_expired?(write, state)
-    state = drop_active(state, retain_monitor?: live? and write.kind == :call)
-    state = %{state | serial: next_serial(write.serial)}
-
-    if live? do
-      case write.kind do
-        :reply ->
-          advance_writes(state)
-
-        :send ->
-          GenServer.reply(write.from, :ok)
-          advance_writes(state)
-
-        :call ->
-          case remaining_timeout(write.deadline) do
-            {:ok, remaining} ->
-              timer_ref =
-                Process.send_after(
-                  self(),
-                  {:request_timeout, write.serial, write.request_ref},
-                  remaining + state.impl.hooks.request_timeout_slack()
-                )
-
-              state = %{
-                state
-                | outbound_monitor_index:
-                    Map.delete(state.outbound_monitor_index, write.monitor_ref)
-              }
-
-              pending =
-                Map.put(
-                  state.pending,
-                  write.serial,
-                  {write.from, timer_ref, write.request_ref, write.monitor_ref, write.deadline}
-                )
-
-              advance_writes(%{
-                state
-                | pending: pending,
-                  request_index: Map.put(state.request_index, write.request_ref, write.serial),
-                  monitor_index: Map.put(state.monitor_index, write.monitor_ref, write.serial)
-              })
-
-            {:error, :timeout} ->
-              advance_writes(release_outbound_monitor(state, write))
-          end
-      end
-    else
-      advance_writes(state)
-    end
-  end
-
-  defp drop_active(%__MODULE__{active_write: write} = state, opts) do
-    _ = Process.cancel_timer(write.timer_ref)
-
-    if Keyword.get(opts, :cancel?, false), do: cancel_socket_write(state, write.wait)
-
-    state = %{
-      state
-      | active_write: nil,
-        cancelled_requests: MapSet.delete(state.cancelled_requests, write.request_ref)
-    }
-
-    if Keyword.get(opts, :retain_monitor?, false),
-      do: state,
-      else: release_outbound_monitor(state, write)
-  end
-
-  defp release_outbound_monitor(state, %{monitor_ref: nil}), do: state
-
-  defp release_outbound_monitor(state, operation) do
-    Process.demonitor(operation.monitor_ref, [:flush])
-
-    %{
-      state
-      | outbound_monitor_index: Map.delete(state.outbound_monitor_index, operation.monitor_ref)
-    }
-  end
-
-  defp cancelled_or_expired?(operation, state) do
-    cancelled?(operation, state) or expired?(operation)
-  end
-
-  defp cancelled?(operation, state),
-    do: MapSet.member?(state.cancelled_requests, operation.request_ref)
-
-  defp expired?(operation), do: match?({:error, :timeout}, remaining_timeout(operation.deadline))
-
-  @doc false
-  @spec socket_send_args(binary(), nil | {:continue, tuple()}) ::
-          {binary(), [] | tuple(), :nowait}
-  def socket_send_args(rest, {:continue, continuation}), do: {rest, continuation, :nowait}
-  def socket_send_args(rest, _wait), do: {rest, [], :nowait}
-
-  # `socket.erl` in OTP 26--28 stores the encoded original Msg in a sendmsg
-  # select continuation (prim_socket:sendmsg/4's Cont is `{Msg, EMsg, EFlags}`).
-  # Therefore an IOV-only continuation is correct only when no byte has been
-  # accepted. After partial progress we cancel that continuation and send the
-  # tail without ctrl, which guarantees SCM_RIGHTS is emitted once.
-  defp socket_send(
-         %__MODULE__{} = state,
-         %{uses_sendmsg?: true, fd_control: :initial, wait: nil} = write
-       ) do
-    transport(state).sendmsg(
-      state.sock,
-      %{
-        iov: [write.rest],
-        ctrl: [%{level: :socket, type: :rights, data: rights_data(write.unix_fds)}]
-      },
-      [],
-      :nowait
-    )
-  end
-
-  defp socket_send(
-         %__MODULE__{} = state,
-         %{uses_sendmsg?: true, fd_control: :select_continuation, wait: {:continue, continuation}} =
-           write
-       ) do
-    transport(state).sendmsg(state.sock, [write.rest], continuation, :nowait)
-  end
-
-  defp socket_send(%__MODULE__{} = state, write) do
-    {rest, flags_or_cont, timeout} = socket_send_args(write.rest, write.wait)
-    transport(state).send(state.sock, rest, flags_or_cont, timeout)
-  end
-
-  # Socket wrappers are injectable for deterministic state-machine coverage.
-  # Never let a malformed result or an injected exception crash the GenServer:
-  # that would make OTP log the active frame and its control state.
-  defp safe_socket_send(state, write) do
-    socket_send(state, write)
-  rescue
-    _exception -> {:error, :send_failed}
-  catch
-    _, _ -> {:error, :send_failed}
-  end
-
-  defp rights_data(fds) do
-    for fd <- fds, into: <<>>, do: <<fd::native-signed-32>>
-  end
-
-  defp cancel_socket_write(state, {:select, continuation, _handle}) do
-    _ = transport(state).cancel(state.sock, continuation)
-    :ok
-  rescue
-    _ -> :ok
-  catch
-    _, _ -> :ok
-  end
-
-  defp cancel_socket_write(_state, _wait), do: :ok
-
-  defp reply_if_live(%{from: nil}, _reply, _state), do: :ok
-
-  defp reply_if_live(operation, reply, state) do
-    if not cancelled_or_expired?(operation, state), do: GenServer.reply(operation.from, reply)
   end
 
   defp fail_pending(%__MODULE__{} = state) do
-    case state.active_write do
-      nil ->
-        :ok
-
-      write ->
-        _ = Process.cancel_timer(write.timer_ref)
-        abandon_outbound_operation(write)
-    end
-
-    :queue.to_list(state.write_queue)
-    |> Enum.each(&abandon_outbound_operation/1)
+    writer = Writer.abandon_all(state.writer)
 
     Enum.each(state.pending, fn {_serial, {from, timer_ref, _request_ref, monitor_ref, _deadline}} ->
       _ = Process.cancel_timer(timer_ref)
@@ -2891,22 +2378,8 @@ defmodule Rebus.Connection do
         fd_claim_request_index: %{},
         fd_claim_monitor_index: %{},
         fd_claim_outcomes: %{},
-        outbound_monitor_index: %{},
-        active_write: nil,
-        write_queue: :queue.new(),
-        queued_requests: MapSet.new(),
-        cancelled_requests: MapSet.new(),
-        queued_replies: 0,
-        reply_queue_saturated?: false
+        writer: writer
     }
-  end
-
-  # A queued connection-originated reply is simply discarded on teardown.
-  defp abandon_outbound_operation(%{from: nil}), do: :ok
-
-  defp abandon_outbound_operation(operation) do
-    Process.demonitor(operation.monitor_ref, [:flush])
-    GenServer.reply(operation.from, {:error, :disconnected})
   end
 
   defp remove_indexes(state, request_ref, monitor_ref) do
@@ -2916,29 +2389,4 @@ defmodule Rebus.Connection do
         monitor_index: Map.delete(state.monitor_index, monitor_ref)
     }
   end
-
-  defp allocate_serial(serial, pending), do: allocate_serial(serial, pending, @max_serial)
-
-  @doc false
-  @spec allocate_serial(non_neg_integer(), map(), pos_integer()) ::
-          {:ok, pos_integer()} | {:error, :serial_exhausted}
-  def allocate_serial(serial, pending, max_serial)
-      when is_integer(serial) and is_map(pending) and is_integer(max_serial) and max_serial > 0 do
-    allocate_serial(serial, pending, max_serial, max_serial)
-  end
-
-  defp allocate_serial(_serial, _pending, _max_serial, 0), do: {:error, :serial_exhausted}
-
-  defp allocate_serial(serial, pending, max_serial, attempts) do
-    if Map.has_key?(pending, serial) do
-      allocate_serial(next_serial(serial, max_serial), pending, max_serial, attempts - 1)
-    else
-      {:ok, serial}
-    end
-  end
-
-  defp next_serial(@max_serial), do: 1
-  defp next_serial(serial), do: serial + 1
-  defp next_serial(max_serial, max_serial), do: 1
-  defp next_serial(serial, _max_serial), do: serial + 1
 end
