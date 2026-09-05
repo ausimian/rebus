@@ -86,6 +86,7 @@
 
 ### Changed
 
+- Rebus now requires Elixir 1.18 or later.
 - Clarify the public Quick Start with `send/2`, document exact TCP
   socket-address maps, and remove the stale test-count claim.
 - CI now runs the ordinary Unix-FD lifecycle suite on every valid combination
