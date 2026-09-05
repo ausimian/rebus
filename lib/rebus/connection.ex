@@ -37,6 +37,37 @@ defmodule Rebus.Connection do
     :connect_waiter
   ]
 
+  # The peer-supplied reasons a connection reports verbatim. Each list is
+  # spelled once and serves both the type below it and the guard in
+  # `sanitize_protocol_reason/1` that admits it; every other reason becomes
+  # `:protocol_error` or `:invalid_error_name`.
+  @protocol_reasons [
+    :insufficient_data,
+    :invalid_endianness,
+    :invalid_message,
+    :invalid_message_type,
+    :invalid_unix_fds,
+    :unix_fd_truncated,
+    :message_too_large,
+    :read_timeout,
+    :resource_limit,
+    :unsupported_protocol_version
+  ]
+
+  @hello_failed_reasons [
+    :missing_unique_name,
+    :missing_error_name,
+    :invalid_error_name,
+    :invalid_unique_name,
+    :resource_limit
+  ]
+
+  @type protocol_reason ::
+          unquote(Enum.reduce(Enum.reverse(@protocol_reasons), &{:|, [], [&1, &2]}))
+
+  @type hello_failed_reason ::
+          unquote(Enum.reduce(Enum.reverse(@hello_failed_reasons), &{:|, [], [&1, &2]}))
+
   @spec call(pid(), Message.t(), non_neg_integer()) ::
           {:ok, Message.t()} | {:error, Rebus.call_error()}
   def call(pid, %Message{} = msg, timeout)
@@ -731,36 +762,14 @@ defmodule Rebus.Connection do
 
   @doc false
   @spec sanitize_protocol_reason(term()) ::
-          :insufficient_data
-          | :invalid_endianness
-          | :invalid_message
-          | :invalid_message_type
-          | :invalid_unix_fds
-          | :unix_fd_truncated
-          | :message_too_large
-          | :read_timeout
-          | :resource_limit
-          | :unsupported_protocol_version
+          protocol_reason()
           | :protocol_error
-          | {:hello_failed,
-             binary()
-             | :invalid_error_name
-             | :invalid_unique_name
-             | :missing_error_name
-             | :missing_unique_name
-             | :resource_limit}
+          | {:hello_failed, binary() | hello_failed_reason()}
           | {:malformed_reply, :missing_reply_serial}
           | {:unexpected_handshake_message, Message.message_type()}
   def sanitize_protocol_reason(reason) do
     case reason do
-      {:hello_failed, reason}
-      when reason in [
-             :missing_unique_name,
-             :missing_error_name,
-             :invalid_error_name,
-             :invalid_unique_name,
-             :resource_limit
-           ] ->
+      {:hello_failed, reason} when reason in @hello_failed_reasons ->
         {:hello_failed, reason}
 
       {:hello_failed, error_name} when is_binary(error_name) ->
@@ -777,19 +786,7 @@ defmodule Rebus.Connection do
       {:malformed_reply, :missing_reply_serial} ->
         {:malformed_reply, :missing_reply_serial}
 
-      reason
-      when reason in [
-             :insufficient_data,
-             :invalid_endianness,
-             :invalid_message,
-             :invalid_message_type,
-             :invalid_unix_fds,
-             :unix_fd_truncated,
-             :message_too_large,
-             :read_timeout,
-             :resource_limit,
-             :unsupported_protocol_version
-           ] ->
+      reason when reason in @protocol_reasons ->
         reason
 
       _reason ->
