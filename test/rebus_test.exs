@@ -4070,6 +4070,18 @@ defmodule RebusTest do
       assert :ok = Rebus.close(cli)
     end
 
+    test "reject match subscriptions without contacting the peer", %{svr: svr} do
+      cli = connect_peer(svr)
+
+      rule = Rebus.MatchRule.new!(interface: "org.example.Peer", member: "Changed")
+
+      assert {:error, :not_a_bus} = Rebus.add_match(cli, rule, 1_000)
+      assert :ok = Rebus.remove_match(cli, make_ref(), 1_000)
+
+      refute_receive {^svr, %Message{header_fields: %{member: "AddMatch"}}}, 300
+      assert :ok = Rebus.close(cli)
+    end
+
     test "reject a non-boolean bus option" do
       assert {:error, :invalid_bus_option} =
                Rebus.connect(%{family: :inet, addr: {127, 0, 0, 1}, port: 1}, bus: :yes)

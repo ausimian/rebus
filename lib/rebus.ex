@@ -155,6 +155,7 @@ defmodule Rebus do
           | :match_rule_cleanup_pending
           | :match_subscription_state_lost
           | :sender_routing_ambiguous
+          | :not_a_bus
           | {:reply_dropped, :method_return | {:error, binary()}}
           | {:bus_error, binary()}
 
