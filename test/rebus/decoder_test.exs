@@ -245,6 +245,26 @@ defmodule Rebus.DecoderTest do
         Decoder.decode("ab", <<8::little-32, 1::little-32, 2::little-32>>)
       end
     end
+
+    test "rejects non-zero struct alignment padding" do
+      # (yi): the byte at offset 0 is followed by three padding bytes before
+      # the 4-aligned int32.
+      assert [[7, 42]] = Decoder.decode("(yi)", <<7, 0, 0, 0, 42::little-32>>)
+
+      assert_raise ArgumentError, "D-Bus alignment padding must be zero", fn ->
+        Decoder.decode("(yi)", <<7, 0, 1, 0, 42::little-32>>)
+      end
+    end
+
+    test "rejects non-zero padding before an 8-aligned value" do
+      # yx: the byte at offset 0 is followed by seven padding bytes before the
+      # 8-aligned int64.
+      assert [7, 42] = Decoder.decode("yx", <<7, 0, 0, 0, 0, 0, 0, 0, 42::little-64>>)
+
+      assert_raise ArgumentError, "D-Bus alignment padding must be zero", fn ->
+        Decoder.decode("yx", <<7, 0, 0, 0, 0, 0, 0, 0xFF, 42::little-64>>)
+      end
+    end
   end
 
   describe "endianness" do

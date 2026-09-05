@@ -497,7 +497,20 @@ defmodule Rebus.Decoder do
 
     # Skip padding bytes in the data
     padded_data = binary_part(state.data, padding_size, byte_size(state.data) - padding_size)
+    check_zero_padding!(state.data, padding_size)
     %{state | position: aligned_pos, data: padded_data}
+  end
+
+  # The specification requires alignment padding to be NUL bytes.
+  defp check_zero_padding!(_data, 0), do: :ok
+
+  defp check_zero_padding!(data, padding_size) do
+    padding_bits = padding_size * 8
+
+    case data do
+      <<0::size(^padding_bits), _rest::binary>> -> :ok
+      _ -> raise ArgumentError, "D-Bus alignment padding must be zero"
+    end
   end
 
   defp align_position(position, alignment) do
