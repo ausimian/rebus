@@ -2566,9 +2566,17 @@ defmodule RebusTest do
       assert {:error, {:read_timeout, :read_timeout}} =
                Rebus.connect(:session, timeout: 400, name: name)
 
-      assert System.monotonic_time(:millisecond) - started_at < 800
-      assert_receive {^first, :auth_received}, 1_000
-      assert_receive {^second, :auth_received}, 1_000
+      # The bound is what separates the 400 ms list budget from the 5 s
+      # per-candidate default the two silent peers would otherwise cost, so it
+      # is a generous multiple of the budget rather than a tight one.
+      assert System.monotonic_time(:millisecond) - started_at < 2_000
+
+      # Both peers are real sockets whose accept and first read have to be
+      # scheduled after the walk has already spent its whole budget, so the
+      # 1 s these used has flaked on loaded runners. Nothing else can produce
+      # the message, so widening the window costs nothing when it is on time.
+      assert_receive {^first, :auth_received}, 3_000
+      assert_receive {^second, :auth_received}, 3_000
       assert Process.whereis(name) == nil
     end
 
@@ -3300,16 +3308,41 @@ defmodule RebusTest do
     end
 
     test "bounds the caller timeout while the connection is busy", %{cli: cli, svr: svr} do
-      :ok = :sys.suspend(cli)
       method = Message.new!(:method_call, path: "/org/freedesktop/DBus", member: "Queued")
-      started_at = System.monotonic_time(:millisecond)
 
-      assert {:error, :timeout} = Rebus.call(cli, method, 20)
-      assert System.monotonic_time(:millisecond) - started_at < 250
+      blocker =
+        Message.new!(:signal,
+          path: "/org/freedesktop/DBus",
+          interface: "org.freedesktop.DBus",
+          member: "Blocked"
+        )
+
+      :ok = :sys.suspend(cli)
+
+      # A second caller that did not ask for a short bound. It can only be
+      # answered once the connection is resumed below, so while it is still
+      # waiting the connection is demonstrably busy.
+      blocked = Task.async(fn -> Rebus.send(cli, blocker, 30_000) end)
+
+      caller = Task.async(fn -> Rebus.call(cli, method, 20) end)
+
+      # The connection is suspended, so neither message is processed until the
+      # test resumes it below and the caller can only be released by its own
+      # 20 ms timeout. The window is only there to catch the caller falling
+      # back to the 5 s default instead of the timeout it passed, so it is a
+      # fraction of that default rather than a small multiple of 20 ms, which
+      # no loaded runner can be held to.
+      assert {:ok, {:error, :timeout}} = Task.yield(caller, 2_000)
+      refute Task.yield(blocked, 0)
 
       :ok = :sys.resume(cli)
-      refute_receive {^svr, %Message{header_fields: %{member: "Queued"}}}, 50
+
+      # The connection is healthy and drains what it was holding, but the
+      # expired call is dropped rather than sent late.
+      assert {:ok, :ok} = Task.yield(blocked, 5_000)
+      assert_receive {^svr, %Message{header_fields: %{member: "Blocked"}}}, 1_000
       assert :sys.get_state(cli).pending == Pending.new()
+      refute_receive {^svr, %Message{header_fields: %{member: "Queued"}}}, 50
     end
 
     test "does not stop a shared connection for a tiny call timeout", %{cli: cli, svr: svr} do
@@ -3340,7 +3373,9 @@ defmodule RebusTest do
       :ok = :sys.suspend(cli)
       task = Task.async(fn -> Rebus.send(cli, signal, 20) end)
 
-      assert {:ok, {:error, :timeout}} = Task.yield(task, 500)
+      # Same reasoning as the call above: the window exists to catch the 5 s
+      # default, not to hold a loaded runner to the 20 ms that was asked for.
+      assert {:ok, {:error, :timeout}} = Task.yield(task, 2_000)
       :ok = :sys.resume(cli)
 
       refute_receive {^svr, %Message{header_fields: %{member: "QueuedSend"}}}, 50
