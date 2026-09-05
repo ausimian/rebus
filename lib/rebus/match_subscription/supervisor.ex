@@ -17,6 +17,7 @@ defmodule Rebus.MatchSubscription.Supervisor do
     # short of an external `Process.exit(pid, :kill)` against the registry
     # itself, and is deliberately not worked around here.
     children = [
+      {Rebus.MatchSubscription.Store, []},
       {Registry, keys: :unique, name: Rebus.MatchSubscription.Registry},
       {Task.Supervisor, name: Rebus.MatchSubscription.TaskSupervisor},
       {Rebus.MatchSubscription, []}
@@ -26,6 +27,8 @@ defmodule Rebus.MatchSubscription.Supervisor do
     # consistent: if the registry restarts, the worker supervisor restarts too,
     # so no worker can survive unregistered and be duplicated by a later
     # `worker_for/1`. Connections are supervised elsewhere and are unaffected.
+    # The state table is owned by `Rebus.MatchSubscription.Store`, started
+    # ahead of the other children.
     Supervisor.init(children, strategy: :rest_for_one)
   end
 end

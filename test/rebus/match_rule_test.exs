@@ -1,7 +1,10 @@
 defmodule Rebus.MatchRuleTest do
   use ExUnit.Case
 
+  import ExUnit.CaptureLog
+
   alias Rebus.MatchRule
+  alias Rebus.MatchSubscription.Store
   alias Rebus.MatchSubscription.Worker
   alias Rebus.Message
   alias Rebus.TestServer
@@ -869,6 +872,93 @@ defmodule Rebus.MatchRuleTest do
       :ok = TestServer.push(server, method_return(remove.serial))
       assert :ok = Task.await(removal, 1_000)
       assert wait_until(fn -> rule_status(connection, rule) == nil end)
+      send(owner, :stop)
+    end
+
+    test "keeps persisted rows when the match-subscription supervisor restarts", %{
+      server: server,
+      connection: connection
+    } do
+      rule = test_rule()
+      owner = subscribe_owner(self(), connection, rule)
+      add = assert_add_match(server, rule)
+      :ok = TestServer.push(server, method_return(add.serial))
+      ref = assert_subscription(owner)
+
+      table = :ets.whereis(state_table())
+      table_owner = :ets.info(table, :owner)
+      size = :ets.info(table, :size)
+      assert size > 0
+      assert {:ok, persisted} = Rebus.MatchSubscription.load_state(connection)
+
+      worker = subscription_worker(connection)
+      supervisor = Process.whereis(Rebus.MatchSubscription)
+
+      kill_and_await_restart(supervisor, [worker], [{Rebus.MatchSubscription, supervisor}])
+
+      # Same table, same owner, same rows: the worker supervisor no longer
+      # takes the persisted state down with it.
+      assert :ets.whereis(state_table()) == table
+      assert :ets.info(table, :owner) == table_owner
+      assert table_owner == Process.whereis(Store)
+      assert :ets.info(table, :size) == size
+      assert Rebus.MatchSubscription.load_state(connection) == {:ok, persisted}
+
+      # A worker started afterwards restores them, so the reference is still
+      # honoured and the bus rule is removed rather than left behind.
+      removal = Task.async(fn -> Rebus.remove_match(connection, ref, 1_000) end)
+      remove = assert_remove_match(server, rule)
+      :ok = TestServer.push(server, method_return(remove.serial))
+      assert :ok = Task.await(removal, 1_000)
+      assert wait_until(fn -> not Rebus.MatchSubscription.persisted?(connection) end)
+      send(owner, :stop)
+    end
+
+    test "keeps an active subscription usable across a task-supervisor restart", %{
+      server: server,
+      connection: connection
+    } do
+      # No `arg0` criterion, so each signal below can carry its own body.
+      rule =
+        MatchRule.new!(
+          sender: "org.example.Service",
+          interface: "org.example.Interface",
+          member: "Changed",
+          path_namespace: "/org/example"
+        )
+
+      owner = subscribe_owner(self(), connection, rule)
+      add = assert_add_match(server, rule)
+      :ok = TestServer.push(server, method_return(add.serial))
+      ref = assert_subscription(owner)
+
+      :ok = TestServer.push(server, test_signal("before the restart"))
+      assert_receive {:matched, ^owner, ^ref, %Message{body: ["before the restart"]}}, 1_000
+
+      table = :ets.whereis(state_table())
+      size = :ets.info(table, :size)
+      worker = subscription_worker(connection)
+      task_supervisor = Process.whereis(Rebus.MatchSubscription.TaskSupervisor)
+      worker_supervisor = Process.whereis(Rebus.MatchSubscription)
+
+      # `rest_for_one` restarts the worker supervisor behind the task
+      # supervisor, so the worker goes with it.
+      kill_and_await_restart(task_supervisor, [worker], [
+        {Rebus.MatchSubscription.TaskSupervisor, task_supervisor},
+        {Rebus.MatchSubscription, worker_supervisor}
+      ])
+
+      assert :ets.whereis(state_table()) == table
+      assert :ets.info(table, :size) == size
+
+      :ok = TestServer.push(server, test_signal("after the restart"))
+      assert_receive {:matched, ^owner, ^ref, %Message{body: ["after the restart"]}}, 1_000
+
+      removal = Task.async(fn -> Rebus.remove_match(connection, ref, 1_000) end)
+      remove = assert_remove_match(server, rule)
+      :ok = TestServer.push(server, method_return(remove.serial))
+      assert :ok = Task.await(removal, 1_000)
+      assert wait_until(fn -> not Rebus.MatchSubscription.persisted?(connection) end)
       send(owner, :stop)
     end
 
@@ -1753,6 +1843,31 @@ defmodule Rebus.MatchRuleTest do
       [] ->
         0
     end
+  end
+
+  defp state_table, do: Store.table()
+
+  # Kills `pid`, waits for the processes in `dead` that `rest_for_one` takes
+  # with it, and for every `{name, pid}` in `replaced` to be re-registered
+  # under a new pid.
+  defp kill_and_await_restart(pid, dead, replaced) do
+    monitors = Enum.map([pid | dead], &{&1, Process.monitor(&1)})
+    capture_log(fn -> await_restart(pid, monitors, replaced) end)
+  end
+
+  defp await_restart(pid, monitors, replaced) do
+    Process.exit(pid, :kill)
+    Enum.each(monitors, &assert_down/1)
+    assert wait_until(fn -> Enum.all?(replaced, &replaced?/1) end)
+  end
+
+  defp assert_down({target, monitor}) do
+    assert_receive {:DOWN, ^monitor, :process, ^target, _reason}, 1_000
+  end
+
+  defp replaced?({name, previous}) do
+    current = Process.whereis(name)
+    is_pid(current) and current != previous
   end
 
   defp subscription_worker(connection) do

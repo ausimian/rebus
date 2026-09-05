@@ -3,6 +3,7 @@ defmodule Rebus.MatchSubscription do
   use DynamicSupervisor
 
   alias Rebus.MatchRule
+  alias Rebus.MatchSubscription.Store
   alias Rebus.MatchSubscription.Worker
 
   # The caller's timeout is one budget for the whole operation: installing or
@@ -10,7 +11,7 @@ defmodule Rebus.MatchSubscription do
   # worker is given a slightly longer bound so its own deadline reply wins the
   # race against the caller giving up.
   @call_overhead 100
-  @state_table Rebus.MatchSubscription.State
+  @state_table Store.table()
 
   def start_link(_args) do
     DynamicSupervisor.start_link(__MODULE__, :ok, name: __MODULE__)
@@ -18,17 +19,8 @@ defmodule Rebus.MatchSubscription do
 
   @impl true
   def init(:ok) do
-    if :ets.whereis(@state_table) == :undefined do
-      _ =
-        :ets.new(@state_table, [
-          :named_table,
-          :set,
-          :public,
-          read_concurrency: true,
-          write_concurrency: true
-        ])
-    end
-
+    # The state table is owned by `Rebus.MatchSubscription.Store`, started
+    # ahead of this supervisor.
     DynamicSupervisor.init(strategy: :one_for_one)
   end
 
