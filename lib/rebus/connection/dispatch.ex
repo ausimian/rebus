@@ -276,26 +276,52 @@ defmodule Rebus.Connection.Dispatch do
 
   defp parse_flat_messages(data, %Connection{} = state, continuation, source) do
     case Message.parse_inbound(data) do
-      {:ok, %Message{} = msg, rest} ->
-        parse_attached_message(msg, rest, state, continuation, source)
-
       nil ->
         append_inbound(Inbound.retain_remainder(data, source), state, continuation)
 
-      {:error, :resource_limit, _envelope, _rest} when not is_nil(state.hello_serial) ->
-        {:protocol_error, {:hello_failed, :resource_limit}, finish_frame(state)}
-
-      # `parse_inbound/1` knows the frame boundary, so the remainder is always
-      # supplied and this frame can be dropped without rescanning the buffer.
-      {:error, :resource_limit, envelope, rest} ->
-        Logger.warning("D-Bus frame dropped: :resource_limit", reason: :resource_limit)
-        state = discard_inbound_unix_fds(state)
-        {:ok, state} = drop_resource_limited_reply(envelope, state)
-        parse_flat_messages(rest, finish_frame(state), continuation, source)
-
-      {:error, reason} ->
-        {:protocol_error, reason, state}
+      # Anything but nil either consumed a frame or ends the connection, so
+      # the partial-frame timer is cancelled once here rather than on every
+      # way out.
+      parsed ->
+        parse_complete_frame(parsed, finish_frame(state), continuation, source)
     end
+  end
+
+  defp parse_complete_frame(
+         {:ok, %Message{} = msg, rest},
+         %Connection{} = state,
+         continuation,
+         source
+       ) do
+    parse_attached_message(msg, rest, state, continuation, source)
+  end
+
+  defp parse_complete_frame(
+         {:error, :resource_limit, _envelope, _rest},
+         %Connection{hello_serial: hello_serial} = state,
+         _continuation,
+         _source
+       )
+       when not is_nil(hello_serial) do
+    {:protocol_error, {:hello_failed, :resource_limit}, state}
+  end
+
+  # `parse_inbound/1` knows the frame boundary, so the remainder is always
+  # supplied and this frame can be dropped without rescanning the buffer.
+  defp parse_complete_frame(
+         {:error, :resource_limit, envelope, rest},
+         %Connection{} = state,
+         continuation,
+         source
+       ) do
+    Logger.warning("D-Bus frame dropped: :resource_limit", reason: :resource_limit)
+    state = discard_inbound_unix_fds(state)
+    {:ok, state} = drop_resource_limited_reply(envelope, state)
+    parse_flat_messages(rest, state, continuation, source)
+  end
+
+  defp parse_complete_frame({:error, reason}, %Connection{} = state, _continuation, _source) do
+    {:protocol_error, reason, state}
   end
 
   defp parse_attached_message(%Message{} = msg, rest, %Connection{} = state, continuation, source) do
@@ -326,7 +352,7 @@ defmodule Rebus.Connection.Dispatch do
   defp drop_recoverable_fd_frame(reason, rest, state, continuation, source) do
     reason = Rights.drop_reason(reason)
     Logger.warning("D-Bus FD frame dropped: #{inspect(reason)}", reason: reason)
-    parse_flat_messages(rest, finish_frame(state), continuation, source)
+    parse_flat_messages(rest, state, continuation, source)
   end
 
   defp dispatch_inbound_message(
@@ -337,8 +363,6 @@ defmodule Rebus.Connection.Dispatch do
          source
        )
        when not is_nil(hello_serial) do
-    state = finish_frame(state)
-
     # dbus-daemon's bus/dispatch.c replies to Hello before emitting the
     # directed NameAcquired signal. Until that reply supplies our unique name,
     # any other frame is a protocol error rather than application traffic.
@@ -358,8 +382,6 @@ defmodule Rebus.Connection.Dispatch do
          source
        )
        when type in [:method_return, :error] do
-    state = finish_frame(state)
-
     case reply(msg, state) do
       {:ok, state} -> parse_flat_messages(rest, state, continuation, source)
       {:error, reason} -> {:protocol_error, reason, state}
@@ -377,11 +399,11 @@ defmodule Rebus.Connection.Dispatch do
     # primitive, one raw descriptor cannot be transferred safely to all of
     # them, so FD-bearing signals are rejected and closed.
     if msg.unix_fds == [] do
-      parse_flat_messages(rest, notify(msg, finish_frame(state)), continuation, source)
+      parse_flat_messages(rest, notify(msg, state), continuation, source)
     else
       close_message_fds(msg)
       Logger.warning("D-Bus FD frame dropped: :signal_ownership", reason: :signal_ownership)
-      parse_flat_messages(rest, finish_frame(state), continuation, source)
+      parse_flat_messages(rest, state, continuation, source)
     end
   end
 
@@ -395,13 +417,12 @@ defmodule Rebus.Connection.Dispatch do
     # No method served by this connection takes a descriptor, so any received
     # descriptor is closed before the call is answered.
     close_message_fds(msg)
-    state = answer_method_call(msg, finish_frame(state))
-    parse_flat_messages(rest, state, continuation, source)
+    parse_flat_messages(rest, answer_method_call(msg, state), continuation, source)
   end
 
   defp dispatch_inbound_message(%Message{} = msg, rest, state, continuation, source) do
     close_message_fds(msg)
-    parse_flat_messages(rest, finish_frame(state), continuation, source)
+    parse_flat_messages(rest, state, continuation, source)
   end
 
   defp dispatch_hello_reply({:ok, name}, rest, %Connection{} = state, source) do
