@@ -1,7 +1,3 @@
-# Release Notes
-
-## Unreleased
-
 ### Added
 
 - Add `Rebus.MatchRule` and `Rebus.add_match/3`/`remove_match/3` for bounded,
