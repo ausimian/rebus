@@ -43,7 +43,7 @@ defmodule Rebus do
 
       # Add a signal handler to receive all signals.
       case Rebus.add_signal_handler(conn) do
-        ref when is_reference(ref) -> Rebus.delete_signal_handler(conn, ref)
+        {:ok, ref} -> Rebus.delete_signal_handler(conn, ref)
         {:error, reason} -> {:error, reason}
       end
 
@@ -1348,7 +1348,7 @@ defmodule Rebus do
 
   ## Return Values
 
-  - `reference()` - A unique reference that identifies this signal handler
+  - `{:ok, reference()}` - A unique reference that identifies this signal handler
   - `{:error, :not_connected}` - Connection establishment has not completed.
   - `{:error, :timeout}` - The connection did not service the request promptly.
   - `{:error, :disconnected}` - The connection has stopped.
@@ -1358,10 +1358,10 @@ defmodule Rebus do
       {:ok, conn} = Rebus.connect(%{family: :local, path: "/tmp/my-dbus"})
 
       case Rebus.add_signal_handler(conn) do
-        ref when is_reference(ref) ->
+        {:ok, ref} ->
           # The calling process will now receive messages like:
           # {^ref, %Rebus.Message{type: :signal, ...}}
-          ref
+          {:ok, ref}
 
         {:error, reason} ->
           # Retry or handle the unavailable connection.
@@ -1402,7 +1402,7 @@ defmodule Rebus do
   or `{:error, :disconnected}` if it has stopped.
   """
   @spec add_signal_handler(pid()) ::
-          reference() | {:error, :not_connected | :timeout | :disconnected}
+          {:ok, reference()} | {:error, :not_connected | :timeout | :disconnected}
   defdelegate add_signal_handler(conn), to: Rebus.Connection
 
   @doc """
@@ -1427,7 +1427,7 @@ defmodule Rebus do
 
       {:ok, conn} = Rebus.connect(%{family: :local, path: "/tmp/my-dbus"})
 
-      with ref when is_reference(ref) <- Rebus.add_signal_handler(conn),
+      with {:ok, ref} <- Rebus.add_signal_handler(conn),
            :ok <- Rebus.delete_signal_handler(conn, ref) do
         :ok
       else

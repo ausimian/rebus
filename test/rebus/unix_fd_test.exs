@@ -943,7 +943,7 @@ defmodule Rebus.UnixFDTest do
     server: server,
     connection: connection
   } do
-    handler_ref = Rebus.add_signal_handler(connection)
+    {:ok, handler_ref} = Rebus.add_signal_handler(connection)
     before_fds = fd_set!()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 
@@ -1056,7 +1056,7 @@ defmodule Rebus.UnixFDTest do
 
     assert {:error, :unix_fd_not_negotiated} = Rebus.send(connection, message)
 
-    handler_ref = Rebus.add_signal_handler(connection)
+    {:ok, handler_ref} = Rebus.add_signal_handler(connection)
     before_fds = fd_set!()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 
@@ -1276,7 +1276,7 @@ defmodule Rebus.UnixFDTest do
     server: server,
     connection: connection
   } do
-    handler_ref = Rebus.add_signal_handler(connection)
+    {:ok, handler_ref} = Rebus.add_signal_handler(connection)
     before_fds = fd_set!()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 
@@ -1323,7 +1323,7 @@ defmodule Rebus.UnixFDTest do
     server: server,
     connection: connection
   } do
-    handler_ref = Rebus.add_signal_handler(connection)
+    {:ok, handler_ref} = Rebus.add_signal_handler(connection)
     before_fds = fd_set!()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 

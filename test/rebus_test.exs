@@ -319,7 +319,7 @@ defmodule RebusTest do
       {:ok, addr_b} = TestServer.get_listen_addr(svr_b)
       {:ok, conn_a} = Rebus.connect(addr_a)
       {:ok, conn_b} = Rebus.connect(addr_b)
-      ref_b = Rebus.add_signal_handler(conn_b)
+      {:ok, ref_b} = Rebus.add_signal_handler(conn_b)
 
       assert :ok = Rebus.delete_signal_handler(conn_a, ref_b)
 
@@ -1340,7 +1340,7 @@ defmodule RebusTest do
 
     test "decodes a one-byte fragmented inbound frame", %{svr: svr} do
       cli = connect_until_ready(svr)
-      ref = Rebus.add_signal_handler(cli)
+      {:ok, ref} = Rebus.add_signal_handler(cli)
 
       message =
         Message.new!(:signal,
@@ -2253,7 +2253,7 @@ defmodule RebusTest do
 
     test "drains a large coalesced signal burst before a partial tail", %{svr: svr} do
       cli = connect_until_ready(svr)
-      ref = Rebus.add_signal_handler(cli)
+      {:ok, ref} = Rebus.add_signal_handler(cli)
 
       messages =
         for index <- 1..101 do
@@ -2300,7 +2300,7 @@ defmodule RebusTest do
 
     test "survives an inbound method call", %{svr: svr} do
       cli = connect_until_ready(svr)
-      ref = Rebus.add_signal_handler(cli)
+      {:ok, ref} = Rebus.add_signal_handler(cli)
 
       method_call =
         Message.new!(:method_call,
@@ -3899,13 +3899,19 @@ defmodule RebusTest do
   describe "Signals" do
     setup [:server_setup, :client_setup]
 
+    test "registration returns an ok tuple carrying the handler reference", %{cli: cli} do
+      assert {:ok, ref} = Rebus.add_signal_handler(cli)
+      assert is_reference(ref)
+      assert :ok = Rebus.delete_signal_handler(cli, ref)
+    end
+
     test "are received", %{cli: cli, svr: svr} do
       # add a remove a signal handler to test that works
-      ref = Rebus.add_signal_handler(cli)
+      {:ok, ref} = Rebus.add_signal_handler(cli)
       Rebus.delete_signal_handler(cli, ref)
 
       # Add one back
-      ref = Rebus.add_signal_handler(cli)
+      {:ok, ref} = Rebus.add_signal_handler(cli)
 
       # Send the NameAcquired signal
       signal =

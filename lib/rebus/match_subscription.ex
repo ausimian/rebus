@@ -1176,7 +1176,7 @@ defmodule Rebus.MatchSubscription.Worker do
     handler_ref = make_ref()
 
     case Connection.add_signal_handler(conn, owner, handler_ref, rule, timeout) do
-      ^handler_ref -> {:ok, handler_ref}
+      {:ok, ^handler_ref} = ok -> ok
       {:error, _reason} = error -> error
     end
   end

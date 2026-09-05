@@ -84,7 +84,7 @@ defmodule Rebus.Connection do
   end
 
   @spec add_signal_handler(pid()) ::
-          reference() | {:error, :timeout | :disconnected | :not_connected}
+          {:ok, reference()} | {:error, :timeout | :disconnected | :not_connected}
   def add_signal_handler(conn) when is_pid(conn) do
     handler_ref = make_ref()
 
@@ -101,7 +101,7 @@ defmodule Rebus.Connection do
   # internal API preserves the existing all-signal public handler API.
   @doc false
   @spec add_signal_handler(pid(), pid(), reference(), MatchRule.t(), non_neg_integer()) ::
-          reference() | {:error, :timeout | :disconnected | :not_connected}
+          {:ok, reference()} | {:error, :timeout | :disconnected | :not_connected}
   def add_signal_handler(conn, subscriber, handler_ref, %MatchRule{} = rule, timeout)
       when is_pid(conn) and is_pid(subscriber) and is_reference(handler_ref) and
              is_integer(timeout) and timeout >= 0 do
@@ -958,7 +958,7 @@ defmodule Rebus.Connection do
         handler_state
       )
 
-    {:reply, handler_ref,
+    {:reply, {:ok, handler_ref},
      %{
        state
        | signal_handler_monitor_index:
