@@ -228,7 +228,8 @@ defmodule Rebus do
       `connect/2` returns. Each setup operation has one
       total budget, so peer progress cannot extend an authentication response
       indefinitely. Expiry makes `connect/2` return
-      `{:error, :read_timeout}`. `connect/2` waits for the validated initial
+      `{:error, :read_timeout}`. For bus connections, `connect/2` waits for the
+      validated initial
       Hello reply before returning `{:ok, pid}`; that reply is bounded from the
       time Hello is sent and peer progress cannot extend the setup budget. Once
       established, it bounds
@@ -242,7 +243,13 @@ defmodule Rebus do
       starts or a cookie challenge is received, it is never selected; failures
       are terminal and Rebus sends neither `CANCEL` nor `AUTH ANONYMOUS`.
       `ANONYMOUS` provides no authentication, confidentiality, or integrity;
-      use it only for deliberately unauthenticated peer-to-peer services.
+      use it only for deliberately unauthenticated endpoints, which are
+      peer-to-peer and therefore also require `bus: false`.
+    - `:bus` - Boolean, default `true`. Pass `false` for a peer-to-peer
+      endpoint that is not a message bus. Rebus then sends no Hello, the
+      connection has no unique name, and `add_match/3` returns
+      `{:error, :not_a_bus}`. It is not allowed with `:system` or `:session`,
+      which are message buses by definition.
 
   ## Return Values
 
@@ -268,7 +275,8 @@ defmodule Rebus do
   - `{:error, {:hello_failed, :resource_limit}}` - The peer's initial Hello
     reply exceeded a local decoding safety cap.
   - `{:error, :invalid_timeout | :invalid_read_timeout | :invalid_write_timeout |
-    :invalid_allow_anonymous | :invalid_name}` - A connection option was invalid.
+    :invalid_allow_anonymous | :invalid_bus_option | :invalid_name}` - A
+    connection option was invalid.
   - `{:error, {:name_taken, pid}}` - The requested local name is held by a
     setup or established connection process. The PID can be adopted or passed to
     `close/1` when it is no longer needed.
@@ -350,8 +358,9 @@ defmodule Rebus do
   names; larger lists are treated as malformed.
 
   `ANONYMOUS` remains disabled unless `allow_anonymous: true` is passed. It is
-  appropriate only for intentionally unauthenticated peer-to-peer services and
-  is not a safe message-bus or network trust mechanism.
+  appropriate only for intentionally unauthenticated peer-to-peer services,
+  which also require `bus: false`, and is not a safe message-bus or network
+  trust mechanism.
 
   ## Examples
 
@@ -1264,6 +1273,9 @@ defmodule Rebus do
   This registers the rule with `org.freedesktop.DBus.AddMatch` and returns a
   subscription reference. The process receives matching signals as
   `{reference, %Rebus.Message{}}`, just like `add_signal_handler/1`.
+
+  `AddMatch` is a bus-driver method, so a connection opened with `bus: false`
+  returns `{:error, :not_a_bus}` and nothing is sent.
 
   Build the rule with `Rebus.MatchRule.new/1`; raw match strings are not
   accepted. Rules are canonical and connection-scoped: equivalent rules share
