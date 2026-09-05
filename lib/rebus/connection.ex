@@ -3,11 +3,11 @@ defmodule Rebus.Connection do
   use GenServer, restart: :temporary
   use TypedStruct
 
-  alias Rebus.SignalHandler
+  alias Rebus.Auth
   alias Rebus.MatchRule
   alias Rebus.Message
+  alias Rebus.SignalHandler
   alias Rebus.UnixFD
-  alias Rebus.Auth
   require Logger
 
   @default_write_timeout 5_000
@@ -3326,9 +3326,7 @@ defmodule Rebus.Connection do
     state = drop_active(state, retain_monitor?: live? and write.kind == :call)
     state = %{state | serial: next_serial(write.serial)}
 
-    if not live? do
-      advance_writes(state)
-    else
+    if live? do
       case write.kind do
         :send ->
           GenServer.reply(write.from, :ok)
@@ -3368,6 +3366,8 @@ defmodule Rebus.Connection do
               advance_writes(release_outbound_monitor(state, write))
           end
       end
+    else
+      advance_writes(state)
     end
   end
 
