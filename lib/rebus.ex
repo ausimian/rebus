@@ -155,6 +155,7 @@ defmodule Rebus do
           | :match_rule_cleanup_pending
           | :match_subscription_state_lost
           | :sender_routing_ambiguous
+          | :not_a_bus
           | {:reply_dropped, :method_return | {:error, binary()}}
           | {:bus_error, binary()}
 
@@ -227,7 +228,8 @@ defmodule Rebus do
       `connect/2` returns. Each setup operation has one
       total budget, so peer progress cannot extend an authentication response
       indefinitely. Expiry makes `connect/2` return
-      `{:error, :read_timeout}`. `connect/2` waits for the validated initial
+      `{:error, :read_timeout}`. For bus connections, `connect/2` waits for the
+      validated initial
       Hello reply before returning `{:ok, pid}`; that reply is bounded from the
       time Hello is sent and peer progress cannot extend the setup budget. Once
       established, it bounds
@@ -241,7 +243,13 @@ defmodule Rebus do
       starts or a cookie challenge is received, it is never selected; failures
       are terminal and Rebus sends neither `CANCEL` nor `AUTH ANONYMOUS`.
       `ANONYMOUS` provides no authentication, confidentiality, or integrity;
-      use it only for deliberately unauthenticated peer-to-peer services.
+      use it only for deliberately unauthenticated endpoints, which are
+      peer-to-peer and therefore also require `bus: false`.
+    - `:bus` - Boolean, default `true`. Pass `false` for a peer-to-peer
+      endpoint that is not a message bus. Rebus then sends no Hello, the
+      connection has no unique name, and `add_match/3` returns
+      `{:error, :not_a_bus}`. It is not allowed with `:system` or `:session`,
+      which are message buses by definition.
 
   ## Return Values
 
@@ -267,7 +275,8 @@ defmodule Rebus do
   - `{:error, {:hello_failed, :resource_limit}}` - The peer's initial Hello
     reply exceeded a local decoding safety cap.
   - `{:error, :invalid_timeout | :invalid_read_timeout | :invalid_write_timeout |
-    :invalid_allow_anonymous | :invalid_name}` - A connection option was invalid.
+    :invalid_allow_anonymous | :invalid_bus_option | :invalid_name}` - A
+    connection option was invalid.
   - `{:error, {:name_taken, pid}}` - The requested local name is held by a
     setup or established connection process. The PID can be adopted or passed to
     `close/1` when it is no longer needed.
@@ -349,8 +358,9 @@ defmodule Rebus do
   names; larger lists are treated as malformed.
 
   `ANONYMOUS` remains disabled unless `allow_anonymous: true` is passed. It is
-  appropriate only for intentionally unauthenticated peer-to-peer services and
-  is not a safe message-bus or network trust mechanism.
+  appropriate only for intentionally unauthenticated peer-to-peer services,
+  which also require `bus: false`, and is not a safe message-bus or network
+  trust mechanism.
 
   ## Examples
 
@@ -390,16 +400,20 @@ defmodule Rebus do
   def connect(address, opts \\ [])
 
   def connect(:system, opts) do
-    case Application.get_env(:rebus, :system_bus_address, @default_system_bus_address) do
-      nil -> {:error, :no_system_bus_address}
-      address -> connect_bus_address(address, opts)
+    with :ok <- validate_bus_alias_option(opts) do
+      case Application.get_env(:rebus, :system_bus_address, @default_system_bus_address) do
+        nil -> {:error, :no_system_bus_address}
+        address -> connect_bus_address(address, opts)
+      end
     end
   end
 
   def connect(:session, opts) do
-    case System.get_env("DBUS_SESSION_BUS_ADDRESS") do
-      nil -> {:error, :no_session_bus_address}
-      address -> connect_bus_address(address, opts)
+    with :ok <- validate_bus_alias_option(opts) do
+      case System.get_env("DBUS_SESSION_BUS_ADDRESS") do
+        nil -> {:error, :no_session_bus_address}
+        address -> connect_bus_address(address, opts)
+      end
     end
   end
 
@@ -443,6 +457,16 @@ defmodule Rebus do
 
   defp strip_public_connection_options(opts) do
     Keyword.drop(opts, @publicly_ignored_connection_options)
+  end
+
+  # `:system` and `:session` name message buses, so they cannot be peer-to-peer
+  # endpoints. Reject the option before any address lookup or I/O so the error
+  # does not depend on the local environment.
+  defp validate_bus_alias_option(opts) do
+    case Keyword.get(opts, :bus, true) do
+      true -> :ok
+      _bus -> {:error, :invalid_bus_option}
+    end
   end
 
   defp connect_bus_address(address, opts) do
@@ -1035,6 +1059,7 @@ defmodule Rebus do
   defp retryable_bus_address_error?(:invalid_read_timeout), do: false
   defp retryable_bus_address_error?(:invalid_write_timeout), do: false
   defp retryable_bus_address_error?(:invalid_allow_anonymous), do: false
+  defp retryable_bus_address_error?(:invalid_bus_option), do: false
   defp retryable_bus_address_error?(:invalid_name), do: false
   defp retryable_bus_address_error?(:invalid_auth_id_fun), do: false
   defp retryable_bus_address_error?(:invalid_auth_username_fun), do: false
@@ -1248,6 +1273,9 @@ defmodule Rebus do
   This registers the rule with `org.freedesktop.DBus.AddMatch` and returns a
   subscription reference. The process receives matching signals as
   `{reference, %Rebus.Message{}}`, just like `add_signal_handler/1`.
+
+  `AddMatch` is a bus-driver method, so a connection opened with `bus: false`
+  returns `{:error, :not_a_bus}` and nothing is sent.
 
   Build the rule with `Rebus.MatchRule.new/1`; raw match strings are not
   accepted. Rules are canonical and connection-scoped: equivalent rules share

@@ -232,6 +232,7 @@ defmodule Rebus.MatchSubscription.Worker do
       reset_token: nil,
       reset_task_monitor: nil,
       state_lost?: false,
+      bus?: nil,
       persistence: empty_persistence_changes()
     }
 
@@ -269,10 +270,7 @@ defmodule Rebus.MatchSubscription.Worker do
         {:reply, {:error, :sender_routing_ambiguous}, state}
 
       true ->
-        {request_id, state} = put_request(state, from, owner, :add, key, nil, deadline)
-        state = ensure_rule(state, key, rule)
-        state = enqueue_request(state, key, request_id)
-        {:noreply, dispatch_rule(state, key)}
+        add_subscription(state, from, owner, rule, key, deadline)
     end
   end
 
@@ -301,6 +299,39 @@ defmodule Rebus.MatchSubscription.Worker do
       :error ->
         # A reference is idempotent and scoped to its original connection.
         {:reply, :ok, state}
+    end
+  end
+
+  defp add_subscription(state, from, owner, rule, key, deadline) do
+    case ensure_bus(state, deadline) do
+      {:ok, state} ->
+        {request_id, state} = put_request(state, from, owner, :add, key, nil, deadline)
+        state = ensure_rule(state, key, rule)
+        state = enqueue_request(state, key, request_id)
+        {:noreply, dispatch_rule(state, key)}
+
+      {:error, reason, state} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  # AddMatch is a bus-driver method, so it cannot be served by a peer-to-peer
+  # connection. The answer is fixed for the connection's life: ask once, then
+  # cache it so an established bus connection pays no extra round trip.
+  defp ensure_bus(%{bus?: true} = state, _deadline), do: {:ok, state}
+  defp ensure_bus(%{bus?: false} = state, _deadline), do: {:error, :not_a_bus, state}
+
+  defp ensure_bus(state, deadline) do
+    case remaining_timeout(deadline) do
+      {:ok, timeout} ->
+        case Connection.bus?(state.conn, timeout) do
+          true -> {:ok, %{state | bus?: true}}
+          false -> {:error, :not_a_bus, %{state | bus?: false}}
+          {:error, reason} -> {:error, reason, state}
+        end
+
+      {:error, reason} ->
+        {:error, reason, state}
     end
   end
 

@@ -83,6 +83,18 @@ defmodule Rebus.Connection do
       {:error, :disconnected}
   end
 
+  # Whether this connection completed the message-bus handshake. A connection
+  # created with `bus: false` never sends Hello, so bus-driver methods such as
+  # AddMatch cannot be served. The answer is fixed for the connection's life,
+  # which lets callers cache it instead of asking per operation.
+  @doc false
+  @spec bus?(pid(), non_neg_integer()) ::
+          boolean() | {:error, :timeout | :disconnected | :not_connected}
+  def bus?(conn, timeout \\ @default_read_timeout)
+      when is_pid(conn) and is_integer(timeout) and timeout >= 0 do
+    safe_setup_call(conn, :bus?, nil, timeout)
+  end
+
   @spec add_signal_handler(pid()) ::
           {:ok, reference()} | {:error, :timeout | :disconnected | :not_connected}
   def add_signal_handler(conn) when is_pid(conn) do
@@ -162,6 +174,7 @@ defmodule Rebus.Connection do
     field :expected_guid, binary() | nil, default: nil
     field :precomputed_auth_id, binary() | nil, default: nil
     field :allow_anonymous?, boolean(), default: false
+    field :bus?, boolean(), default: true
     field :connect_waiter, {pid(), reference()} | nil, default: nil
     field :connect_waiter_monitor, reference() | nil, default: nil
     field :connect_accepted?, boolean(), default: false
@@ -222,6 +235,7 @@ defmodule Rebus.Connection do
     expected_guid = Keyword.get(args, :expected_guid)
     precomputed_auth_id = Keyword.get(args, :precomputed_auth_id)
     allow_anonymous? = Keyword.get(args, :allow_anonymous, false)
+    bus? = Keyword.get(args, :bus, true)
     name = Keyword.get(args, :name)
     connect_waiter = Keyword.get(args, :connect_waiter)
     auth_id_runner = Keyword.get(args, :auth_id_fun, &run_auth_id/1)
@@ -248,6 +262,9 @@ defmodule Rebus.Connection do
 
       not is_boolean(allow_anonymous?) ->
         {:stop, :invalid_allow_anonymous}
+
+      not is_boolean(bus?) ->
+        {:stop, :invalid_bus_option}
 
       not (is_nil(name) or is_atom(name)) ->
         {:stop, :invalid_name}
@@ -279,6 +296,7 @@ defmodule Rebus.Connection do
                expected_guid: expected_guid,
                precomputed_auth_id: precomputed_auth_id,
                allow_anonymous?: allow_anonymous?,
+               bus?: bus?,
                connect_waiter: connect_waiter,
                connect_waiter_monitor: monitor_connect_waiter(connect_waiter),
                auth_id_runner: auth_id_runner,
@@ -316,8 +334,9 @@ defmodule Rebus.Connection do
       ) do
     # The continuation runs before queued application calls, making Hello the
     # first D-Bus frame after setup acceptance. The final acknowledgement is
-    # withheld until its correlated reply has established the connection.
-    {:noreply, %{state | connect_accepted?: true}, {:continue, :hello}}
+    # withheld until its correlated reply has established the connection. A
+    # non-bus connection has no Hello to correlate, so it establishes directly.
+    {:noreply, %{state | connect_accepted?: true}, {:continue, setup_continuation(state)}}
   end
 
   def handle_info(
@@ -511,9 +530,9 @@ defmodule Rebus.Connection do
       {:stop, {:shutdown, :caller_gone}, state}
     else
       case initialize(state, addr) do
-        {:ok, initialized, {:continue, :hello}} ->
+        {:ok, initialized, {:continue, continuation}} ->
           if is_nil(initialized.connect_waiter) do
-            {:noreply, initialized, {:continue, :hello}}
+            {:noreply, initialized, {:continue, continuation}}
           else
             notify_connect_waiter(initialized.connect_waiter, {:ok, self()})
             {:noreply, initialized}
@@ -553,6 +572,18 @@ defmodule Rebus.Connection do
       end
     else
       {:error, reason} -> stop_for_protocol_error(reason, state)
+    end
+  end
+
+  # A peer-to-peer endpoint has no bus driver, so there is no Hello to send or
+  # correlate. The connection is established as soon as BEGIN has been written,
+  # with no unique name, and joins the ordinary receive loop. Authentication may
+  # already have read peer frames alongside its final response; those buffered
+  # bytes are ordinary inbound traffic here.
+  def handle_continue(:established, %__MODULE__{} = state) do
+    case establish_connection(%{state | established?: true}) do
+      {:ok, state} -> process_inbound(state, :recv)
+      {:error, :caller_gone} -> {:stop, {:shutdown, :caller_gone}, state}
     end
   end
 
@@ -907,6 +938,10 @@ defmodule Rebus.Connection do
     end
   end
 
+  def handle_call(:bus?, _from, %__MODULE__{} = state) do
+    {:reply, state.bus?, state}
+  end
+
   def handle_call(
         {:add_signal_handler, _pid, _handler_ref},
         _from,
@@ -1247,8 +1282,11 @@ defmodule Rebus.Connection do
        | guid: guid,
          inbound_segments: if(rest == <<>>, do: [], else: [{byte_size(rest), rest}]),
          inbound_size: byte_size(rest)
-     }, {:continue, :hello}}
+     }, {:continue, setup_continuation(state)}}
   end
+
+  defp setup_continuation(%__MODULE__{bus?: false}), do: :established
+  defp setup_continuation(%__MODULE__{}), do: :hello
 
   defp aggregate_setup_auth_id(%__MODULE__{precomputed_auth_id: auth_id}, _deadline)
        when is_binary(auth_id),
@@ -2669,6 +2707,14 @@ defmodule Rebus.Connection do
     true
   rescue
     ArgumentError -> false
+  end
+
+  # A non-bus connection has no unique name, so nothing can be its own
+  # NameAcquired signal. Match the absent name explicitly rather than letting
+  # `nil` participate in the header comparison below.
+  defp notify(%Message{} = msg, %__MODULE__{name: nil} = state) do
+    Rebus.SignalHandler.notify(msg)
+    state
   end
 
   defp notify(%Message{} = msg, %__MODULE__{name: name} = state) do

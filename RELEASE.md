@@ -1,5 +1,9 @@
 ### Added
 
+- Add the `bus: false` connection option for peer-to-peer D-Bus endpoints that
+  are not a message bus. Rebus skips Hello, the connection has no unique name,
+  and `add_match/3` returns `{:error, :not_a_bus}`. This makes
+  `allow_anonymous: true` usable for its intended peer-to-peer case.
 - Add `Rebus.MatchRule` and `Rebus.add_match/3`/`remove_match/3` for bounded,
   validated D-Bus signal subscriptions. Canonical rules share bus registrations
   across independent handler references, filter only supported criteria

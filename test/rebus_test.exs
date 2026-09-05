@@ -3933,6 +3933,178 @@ defmodule RebusTest do
     end
   end
 
+  describe "Peer-to-peer connections" do
+    setup [:server_setup]
+
+    test "establish without sending Hello and without a unique name", %{svr: svr} do
+      cli = connect_peer(svr)
+
+      refute_receive {^svr, %Message{header_fields: %{member: "Hello"}}}, 300
+
+      state = :sys.get_state(cli)
+      assert state.established?
+      assert is_nil(state.name)
+      assert is_nil(state.hello_serial)
+      assert :ok = Rebus.close(cli)
+    end
+
+    test "complete a method call round trip", %{svr: svr} do
+      cli = connect_peer(svr)
+
+      message =
+        Message.new!(:method_call,
+          path: "/org/example/Peer",
+          interface: "org.example.Peer",
+          member: "Ping"
+        )
+
+      task = Task.async(fn -> Rebus.call(cli, message, 2_000) end)
+
+      assert_receive {^svr,
+                      %Message{type: :method_call, header_fields: %{member: "Ping"}} = call},
+                     1_000
+
+      :ok =
+        TestServer.push(
+          svr,
+          Message.new!(:method_return,
+            reply_serial: call.serial,
+            signature: "s",
+            body: ["pong"]
+          )
+        )
+
+      assert {:ok, %Message{type: :method_return, body: ["pong"]}} = Task.await(task, 2_000)
+      assert :ok = Rebus.close(cli)
+    end
+
+    test "send signals to the peer", %{svr: svr} do
+      cli = connect_peer(svr)
+
+      signal =
+        Message.new!(:signal,
+          path: "/org/example/Peer",
+          interface: "org.example.Peer",
+          member: "Changed",
+          signature: "s",
+          body: ["ready"]
+        )
+
+      assert :ok = Rebus.send(cli, signal)
+
+      assert_receive {^svr,
+                      %Message{
+                        type: :signal,
+                        header_fields: %{member: "Changed"},
+                        body: ["ready"]
+                      }},
+                     1_000
+
+      assert :ok = Rebus.close(cli)
+    end
+
+    test "deliver peer signals to a signal handler", %{svr: svr} do
+      cli = connect_peer(svr)
+
+      assert {:ok, ref} = Rebus.add_signal_handler(cli)
+
+      :ok =
+        TestServer.push(
+          svr,
+          Message.new!(:signal,
+            path: "/org/example/Peer",
+            interface: "org.example.Peer",
+            member: "Pushed",
+            signature: "s",
+            body: ["from-peer"]
+          )
+        )
+
+      assert_receive {^ref, %Message{type: :signal, body: ["from-peer"]}}, 1_000
+      assert :ok = Rebus.close(cli)
+    end
+
+    test "process peer bytes coalesced with the authentication response" do
+      early =
+        Message.new!(:signal,
+          path: "/org/example/Peer",
+          interface: "org.example.Peer",
+          member: "Early",
+          signature: "s",
+          body: ["early"]
+        )
+
+      late =
+        Message.new!(:signal,
+          path: "/org/example/Peer",
+          interface: "org.example.Peer",
+          member: "Late",
+          signature: "s",
+          body: ["late"]
+        )
+
+      {:ok, encoded_early} = Message.encode(early)
+      {:ok, encoded_late} = Message.encode(%{late | serial: 2})
+      encoded_late = IO.iodata_to_binary(encoded_late)
+      split = div(byte_size(encoded_late), 2)
+      <<head::binary-size(^split), tail::binary>> = encoded_late
+
+      {:ok, svr} =
+        start_supervised(
+          {Rebus.TestServer,
+           tap: self(),
+           auto_hello: false,
+           auth_response:
+             "OK " <> @test_bus_guid <> "\r\n" <> IO.iodata_to_binary(encoded_early) <> head},
+          id: :peer_coalesced_server
+        )
+
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      assert {:ok, cli} = Rebus.connect(addr, bus: false)
+      assert {:ok, ref} = Rebus.add_signal_handler(cli)
+
+      # The retained pre-BEGIN bytes must still frame the next signal.
+      :ok = TestServer.push_raw(svr, tail)
+
+      assert_receive {^ref, %Message{type: :signal, body: ["late"]}}, 1_000
+      assert :ok = Rebus.close(cli)
+    end
+
+    test "reject match subscriptions without contacting the peer", %{svr: svr} do
+      cli = connect_peer(svr)
+
+      rule = Rebus.MatchRule.new!(interface: "org.example.Peer", member: "Changed")
+
+      assert {:error, :not_a_bus} = Rebus.add_match(cli, rule, 1_000)
+      assert :ok = Rebus.remove_match(cli, make_ref(), 1_000)
+
+      refute_receive {^svr, %Message{header_fields: %{member: "AddMatch"}}}, 300
+      assert :ok = Rebus.close(cli)
+    end
+
+    test "reject a non-boolean bus option" do
+      assert {:error, :invalid_bus_option} =
+               Rebus.connect(%{family: :inet, addr: {127, 0, 0, 1}, port: 1}, bus: :yes)
+    end
+
+    test "reject bus: false for the session bus alias" do
+      put_session_bus_address(nil)
+
+      assert {:error, :invalid_bus_option} = Rebus.connect(:session, bus: false)
+    end
+
+    test "reject bus: false for the system bus alias" do
+      assert {:error, :invalid_bus_option} = Rebus.connect(:system, bus: false)
+    end
+  end
+
+  defp connect_peer(svr, opts \\ []) do
+    :ok = TestServer.set_auto_hello(svr, false)
+    {:ok, addr} = TestServer.get_listen_addr(svr)
+    {:ok, cli} = Rebus.connect(addr, Keyword.put(opts, :bus, false))
+    cli
+  end
+
   defp server_setup(_) do
     # The 'tap' process receives client frames. The server automatically replies
     # to Hello; tests that need to control the handshake disable that behaviour.

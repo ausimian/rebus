@@ -69,6 +69,16 @@ a supervisor-owned PID; pass that PID to Rebus APIs and release it with
 `Rebus.close/1` when it is no longer needed. Starting or managing connection
 processes directly is unsupported.
 
+## Peer-to-peer connections
+
+```elixir
+{:ok, conn} = Rebus.connect(%{family: :local, path: "/tmp/peer"}, bus: false)
+```
+
+`bus: false` connects to an endpoint that is not a message bus: Rebus sends no
+`Hello`, the connection has no unique name, and `Rebus.add_match/3` returns
+`{:error, :not_a_bus}`. It is rejected for `:system` and `:session`.
+
 ## Routed signal subscriptions
 
 Use `Rebus.MatchRule` and `Rebus.add_match/3` to receive broadcast signals
@@ -206,7 +216,8 @@ later candidate addresses or IPs.
 `allow_anonymous: true`, and only after the peer advertised it. Anonymous D-Bus
 performs no authentication, confidentiality, or integrity check; use it only
 for intentionally unauthenticated peer-to-peer services, never as trust for a
-message bus or an unprotected network endpoint. Rebus never downgrades to it
+message bus or an unprotected network endpoint. Such an endpoint is not a bus,
+so the connection also needs `bus: false`. Rebus never downgrades to it
 after a DBUS_COOKIE_SHA1 protocol or authentication failure. It is selected
 directly only when the peer did not advertise `DBUS_COOKIE_SHA1`, or when the
 local username cannot be obtained before cookie `AUTH` starts. Once cookie
