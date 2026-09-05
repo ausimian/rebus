@@ -18,6 +18,17 @@ defmodule Rebus.TestServer do
     GenServer.cast(svr, {:push, msg})
   end
 
+  # Frames pushed at the client are stamped with the server's own serial.
+  # These variants return that serial so a test can assert the `reply_serial`
+  # of the frame the client sends back.
+  def push_call(svr, %Message{} = msg) when is_pid(svr) do
+    GenServer.call(svr, {:push_call, msg})
+  end
+
+  def push_call_with_fds(svr, %Message{} = msg, fds) when is_pid(svr) and is_list(fds) do
+    GenServer.call(svr, {:push_call_with_fds, msg, fds})
+  end
+
   def push_raw(svr, data) when is_binary(data) do
     GenServer.cast(svr, {:push_raw, data})
   end
@@ -216,6 +227,14 @@ defmodule Rebus.TestServer do
     {:reply, :ok, %{state | auto_hello: enabled, auto_hello_name_acquired?: send_name_acquired?}}
   end
 
+  def handle_call({:push_call, %Message{} = msg}, _from, %__MODULE__{} = state) do
+    {:reply, {:ok, state.serial}, send_message(msg, state)}
+  end
+
+  def handle_call({:push_call_with_fds, %Message{} = msg, fds}, _from, %__MODULE__{} = state) do
+    {:reply, {:ok, state.serial}, send_message_with_fds(msg, fds, state)}
+  end
+
   def handle_call({:push_raw_fragments, data}, _from, %__MODULE__{} = state) do
     for <<byte <- data>> do
       :ok = :socket.send(state.cli_sock, <<byte>>)
@@ -244,9 +263,7 @@ defmodule Rebus.TestServer do
 
   @impl true
   def handle_cast({:push, %Message{} = msg}, %__MODULE__{} = state) do
-    {:ok, bin} = Rebus.Message.encode(%{msg | serial: state.serial})
-    :ok = :socket.send(state.cli_sock, bin)
-    {:noreply, %{state | serial: state.serial + 1}}
+    {:noreply, send_message(msg, state)}
   end
 
   def handle_cast({:push_raw, data}, %__MODULE__{} = state) do
@@ -255,22 +272,7 @@ defmodule Rebus.TestServer do
   end
 
   def handle_cast({:push_with_fds, %Message{} = msg, fds}, %__MODULE__{} = state) do
-    msg = %{msg | serial: state.serial}
-    {:ok, bin} = Message.encode(msg)
-    rights = for fd <- fds, into: <<>>, do: <<fd::native-signed-32>>
-
-    :ok =
-      :socket.sendmsg(
-        state.cli_sock,
-        %{
-          iov: [IO.iodata_to_binary(bin)],
-          ctrl: [%{level: :socket, type: :rights, data: rights}]
-        },
-        [],
-        1_000
-      )
-
-    {:noreply, %{state | serial: state.serial + 1}}
+    {:noreply, send_message_with_fds(msg, fds, state)}
   end
 
   @impl true
@@ -285,6 +287,30 @@ defmodule Rebus.TestServer do
   end
 
   def terminate(_reason, _state), do: :ok
+
+  defp send_message(%Message{} = msg, %__MODULE__{} = state) do
+    {:ok, bin} = Message.encode(%{msg | serial: state.serial})
+    :ok = :socket.send(state.cli_sock, bin)
+    %{state | serial: state.serial + 1}
+  end
+
+  defp send_message_with_fds(%Message{} = msg, fds, %__MODULE__{} = state) do
+    {:ok, bin} = Message.encode(%{msg | serial: state.serial})
+    rights = for fd <- fds, into: <<>>, do: <<fd::native-signed-32>>
+
+    :ok =
+      :socket.sendmsg(
+        state.cli_sock,
+        %{
+          iov: [IO.iodata_to_binary(bin)],
+          ctrl: [%{level: :socket, type: :rights, data: rights}]
+        },
+        [],
+        1_000
+      )
+
+    %{state | serial: state.serial + 1}
+  end
 
   defp loopback_address(:inet), do: :loopback
   defp loopback_address(:inet6), do: {0, 0, 0, 0, 0, 0, 0, 1}

@@ -1,5 +1,12 @@
 ### Added
 
+- Answer inbound method calls instead of dropping them: an unhandled call now
+  receives an `org.freedesktop.DBus.Error.UnknownMethod` error reply, so a
+  calling peer fails immediately instead of blocking until its own timeout.
+  Replies join the caller write queue, honour `:write_timeout`, and stop being
+  queued once a stalled transport has left too many of them unwritten.
+- Implement `org.freedesktop.DBus.Peer`. `Ping` returns an empty reply and
+  `GetMachineId` returns the host machine id, as `busctl` and `d-feet` expect.
 - Add the `bus: false` connection option for peer-to-peer D-Bus endpoints that
   are not a message bus. Rebus skips Hello, the connection has no unique name,
   and `add_match/3` returns `{:error, :not_a_bus}`. This makes

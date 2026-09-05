@@ -69,6 +69,14 @@ a supervisor-owned PID; pass that PID to Rebus APIs and release it with
 `Rebus.close/1` when it is no longer needed. Starting or managing connection
 processes directly is unsupported.
 
+## Inbound method calls
+
+Rebus answers method calls made *to* a connection: `org.freedesktop.DBus.Peer`
+(`Ping` and `GetMachineId`) is implemented, and every other method call is
+refused with `org.freedesktop.DBus.Error.UnknownMethod` rather than being
+dropped. A call flagged `:no_reply_expected` receives no reply. There is no API
+for serving your own methods yet.
+
 ## Peer-to-peer connections
 
 ```elixir
