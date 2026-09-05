@@ -38,7 +38,8 @@ It is a breaking release: result shapes changed and validation is stricter.
 - **Breaking:** validation now rejects invalid bodies, incomplete signatures,
   missing or invalid required headers, and malformed or over-long D-Bus names.
 - **Breaking:** decoding rejects booleans other than 0 and 1, and non-zero
-  alignment padding, as libdbus does.
+  alignment padding, including between the header and the body, as libdbus
+  does.
 - **Breaking:** doubles use `:infinity`, `:negative_infinity` and `:nan`.
 - **Breaking:** Rebus requires Elixir 1.18 or later.
 - Signals are delivered by the connection that received them, so an internal

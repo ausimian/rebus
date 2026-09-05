@@ -1154,6 +1154,30 @@ defmodule Rebus.MessageTest do
                Message.decode(<<prefix::binary, 1, suffix::binary>>)
     end
 
+    test "rejects non-zero padding between the header fields and the body" do
+      fields = [
+        [1, {"o", "/test"}],
+        [2, {"s", "test.interface"}],
+        [3, {"s", "Test"}],
+        [8, {"g", "y"}]
+      ]
+
+      wire = wire_message(fields, <<7>>)
+      <<_::binary-size(12), header_fields_length::little-32, _::binary>> = wire
+      header_fields_end = 16 + header_fields_length
+
+      # The header fields do not end on an 8-byte boundary, so the body is
+      # preceded by padding that the fixture must actually contain.
+      assert rem(header_fields_end, 8) != 0
+      assert {:ok, message} = Message.decode(wire)
+      assert message.body == [7]
+
+      <<prefix::binary-size(header_fields_end), 0, suffix::binary>> = wire
+
+      assert {:error, :invalid_message} =
+               Message.decode(<<prefix::binary, 1, suffix::binary>>)
+    end
+
     test "rejects invalid endianness flag" do
       # Create a message with invalid endianness (not 'l' or 'B')
       invalid_data = <<99, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0>>
