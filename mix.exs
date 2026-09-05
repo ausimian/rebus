@@ -23,6 +23,7 @@ defmodule Rebus.MixProject do
           Rebus.TestImpl,
           Rebus.TestImpl.Clock,
           Rebus.TestImpl.Connector,
+          Rebus.TestImpl.Hooks,
           Rebus.TestImpl.Identity,
           Rebus.TestImpl.Resolver
         ]

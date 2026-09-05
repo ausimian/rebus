@@ -241,14 +241,6 @@ defmodule Rebus.Connection do
     # always uses the defaults; tests substitute a module rather than reaching
     # into per-operation state.
     field :impl, Rebus.Impl.t(), default: Rebus.Impl.default()
-    field :fd_claim_handoff_fun, function() | nil, default: nil
-    # Deterministic transition seams used only by the FD lifecycle tests.
-    field :fd_claim_delivery_fun, function() | nil, default: nil
-    field :fd_claim_ack_fun, function() | nil, default: nil
-    # Narrow deterministic-test seam. Production requests retain their public
-    # deadline exactly; tests can hold the internal timer long enough to order
-    # a caller-side alias timeout before a queued late reply.
-    field :request_timeout_slack, non_neg_integer(), default: 0
   end
 
   @impl true
@@ -890,7 +882,7 @@ defmodule Rebus.Connection do
       when is_reference(delivery_ref) and is_reference(delivery_alias) ->
         if fd_claim_live?(claim) and Process.alive?(pid) do
           claim = rearm_fd_claim(claim_ref, claim)
-          run_fd_claim_hook(state.fd_claim_delivery_fun)
+          state.impl.hooks.fd_claim_delivery()
 
           if fd_claim_live?(claim) and Process.alive?(pid) do
             send(delivery_alias, {:rebus_fd_reply, claim_ref, delivery_ref, msg})
@@ -922,7 +914,7 @@ defmodule Rebus.Connection do
   def handle_call({:ack_fd_reply, claim_ref, delivery_ref}, {pid, _tag}, %__MODULE__{} = state) do
     case Map.fetch(state.fd_claims, claim_ref) do
       {:ok, %{pid: ^pid, delivery_ref: ^delivery_ref} = claim} ->
-        run_fd_claim_ack_hook(state.fd_claim_ack_fun, claim)
+        state.impl.hooks.fd_claim_ack(claim)
 
         # A call alias timing out does not revoke a queued acknowledgement. It
         # is the resolver's FIFO position after this message that makes its
@@ -2827,7 +2819,7 @@ defmodule Rebus.Connection do
                 deadline: claim_deadline
               }
 
-              run_fd_claim_handoff_hook(state.fd_claim_handoff_fun)
+              state.impl.hooks.fd_claim_handoff()
               GenServer.reply(from, {:fd_claim, claim_ref})
 
               {:ok,
@@ -2938,16 +2930,6 @@ defmodule Rebus.Connection do
         {outcome, %{state | fd_claim_outcomes: outcomes}}
     end
   end
-
-  defp run_fd_claim_handoff_hook(nil), do: :ok
-  defp run_fd_claim_handoff_hook(fun) when is_function(fun, 0), do: fun.()
-
-  defp run_fd_claim_hook(nil), do: :ok
-  defp run_fd_claim_hook(fun) when is_function(fun, 0), do: fun.()
-
-  defp run_fd_claim_ack_hook(nil, _claim), do: :ok
-  defp run_fd_claim_ack_hook(fun, _claim) when is_function(fun, 0), do: fun.()
-  defp run_fd_claim_ack_hook(fun, claim) when is_function(fun, 1), do: fun.(claim)
 
   defp drop_resource_limited_reply(
          %{type: :method_return, reply_serial: reply_serial},
@@ -3427,7 +3409,7 @@ defmodule Rebus.Connection do
                 Process.send_after(
                   self(),
                   {:request_timeout, write.serial, write.request_ref},
-                  remaining + state.request_timeout_slack
+                  remaining + state.impl.hooks.request_timeout_slack()
                 )
 
               state = %{

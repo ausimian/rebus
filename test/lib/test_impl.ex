@@ -48,20 +48,28 @@ defmodule Rebus.TestImpl do
     ArgumentError -> :ok
   end
 
+  @hook_callbacks [
+    :fd_claim_ack,
+    :fd_claim_delivery,
+    :fd_claim_handoff,
+    :request_timeout_slack
+  ]
+
   @doc """
-  Installs the test transport on a running connection, with `overrides`.
+  Installs the doubles serving `overrides` on a running connection.
   """
   @spec install(pid(), keyword() | map()) :: :ok
   def install(conn, overrides) when is_pid(conn) do
     :ok = put(conn, overrides)
+    doubles = Map.new(overrides, fn {callback, _fun} -> double(callback) end)
 
-    _ =
-      :sys.replace_state(conn, fn state ->
-        %{state | impl: %{state.impl | transport: __MODULE__}}
-      end)
+    _ = :sys.replace_state(conn, fn state -> %{state | impl: Map.merge(state.impl, doubles)} end)
 
     :ok
   end
+
+  defp double(callback) when callback in @hook_callbacks, do: {:hooks, __MODULE__.Hooks}
+  defp double(_transport_callback), do: {:transport, __MODULE__}
 
   @doc """
   Returns `state` with the test transport installed and `overrides` registered
@@ -235,4 +243,28 @@ defmodule Rebus.TestImpl.Connector do
         address,
         args
       ])
+end
+
+defmodule Rebus.TestImpl.Hooks do
+  @moduledoc false
+
+  @behaviour Rebus.Connection.Hooks
+
+  alias Rebus.Connection.Hooks.Default
+
+  @impl Rebus.Connection.Hooks
+  def fd_claim_handoff,
+    do: Rebus.TestImpl.dispatch(:fd_claim_handoff, Default, :fd_claim_handoff, [])
+
+  @impl Rebus.Connection.Hooks
+  def fd_claim_delivery,
+    do: Rebus.TestImpl.dispatch(:fd_claim_delivery, Default, :fd_claim_delivery, [])
+
+  @impl Rebus.Connection.Hooks
+  def fd_claim_ack(claim),
+    do: Rebus.TestImpl.dispatch(:fd_claim_ack, Default, :fd_claim_ack, [claim])
+
+  @impl Rebus.Connection.Hooks
+  def request_timeout_slack,
+    do: Rebus.TestImpl.dispatch(:request_timeout_slack, Default, :request_timeout_slack, [])
 end

@@ -341,19 +341,16 @@ defmodule Rebus.UnixFDTest do
     before_fds = fd_set!()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | fd_claim_handoff_fun: fn ->
-            send(parent, :fd_claim_handoff_waiting)
+    TestImpl.install(connection,
+      fd_claim_handoff: fn ->
+        send(parent, :fd_claim_handoff_waiting)
 
-            receive do
-              :continue_fd_claim_handoff -> :ok
-            end
-          end,
-          request_timeout_slack: 1_000
-      }
-    end)
+        receive do
+          :continue_fd_claim_handoff -> :ok
+        end
+      end,
+      request_timeout_slack: fn -> 1_000 end
+    )
 
     method =
       Message.new!(:method_call,
@@ -405,23 +402,20 @@ defmodule Rebus.UnixFDTest do
     before_fds = fd_set!()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | fd_claim_delivery_fun: fn ->
-            send(parent, :fd_delivery_waiting)
+    TestImpl.install(connection,
+      fd_claim_delivery: fn ->
+        send(parent, :fd_delivery_waiting)
 
-            receive do
-              :continue_fd_delivery -> :ok
-            end
-          end,
-          # The caller's alias must time out while the connection still holds
-          # the request, so the reply has to survive the socket round trip on
-          # a loaded runner. Keep the connection-side reaper well behind the
-          # caller deadline, as the timed-out alias test above does.
-          request_timeout_slack: 1_000
-      }
-    end)
+        receive do
+          :continue_fd_delivery -> :ok
+        end
+      end,
+      # The caller's alias must time out while the connection still holds the
+      # request, so the reply has to survive the socket round trip on a loaded
+      # runner. Keep the connection-side reaper well behind the caller
+      # deadline, as the timed-out alias test above does.
+      request_timeout_slack: fn -> 1_000 end
+    )
 
     method =
       Message.new!(:method_call,
@@ -472,18 +466,15 @@ defmodule Rebus.UnixFDTest do
     before_fds = fd_set!()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | fd_claim_ack_fun: fn ->
-            send(parent, :fd_ack_waiting)
+    TestImpl.install(connection,
+      fd_claim_ack: fn _claim ->
+        send(parent, :fd_ack_waiting)
 
-            receive do
-              :continue_fd_ack -> :ok
-            end
-          end
-      }
-    end)
+        receive do
+          :continue_fd_ack -> :ok
+        end
+      end
+    )
 
     method =
       Message.new!(:method_call,
@@ -531,18 +522,15 @@ defmodule Rebus.UnixFDTest do
     before_fds = fd_set!()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | fd_claim_delivery_fun: fn ->
-            send(parent, :claimed_fd_delivery_waiting)
+    TestImpl.install(connection,
+      fd_claim_delivery: fn ->
+        send(parent, :claimed_fd_delivery_waiting)
 
-            receive do
-              :continue_claimed_fd_delivery -> :ok
-            end
-          end
-      }
-    end)
+        receive do
+          :continue_claimed_fd_delivery -> :ok
+        end
+      end
+    )
 
     caller =
       spawn(fn ->
@@ -640,18 +628,15 @@ defmodule Rebus.UnixFDTest do
     parent = self()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | fd_claim_ack_fun: fn %{msg: %Message{unix_fds: [received]}} ->
-            send(parent, {:close_claim_ack_waiting, received})
+    TestImpl.install(connection,
+      fd_claim_ack: fn %{msg: %Message{unix_fds: [received]}} ->
+        send(parent, {:close_claim_ack_waiting, received})
 
-            receive do
-              :continue_close_claim_ack -> :ok
-            end
-          end
-      }
-    end)
+        receive do
+          :continue_close_claim_ack -> :ok
+        end
+      end
+    )
 
     method =
       Message.new!(:method_call,

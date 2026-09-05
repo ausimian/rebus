@@ -10,7 +10,8 @@ defmodule Rebus.Impl do
     identity: Rebus.Identity.Posix,
     resolver: Rebus.Resolver.Inet,
     clock: Rebus.Clock.System,
-    connector: Rebus.Connector.Supervised
+    connector: Rebus.Connector.Supervised,
+    hooks: Rebus.Connection.Hooks.Default
   }
 
   # Substituting an implementation is a test affordance, so the private
@@ -26,7 +27,8 @@ defmodule Rebus.Impl do
           identity: module(),
           resolver: module(),
           clock: module(),
-          connector: module()
+          connector: module(),
+          hooks: module()
         }
 
   @spec default() :: t()
