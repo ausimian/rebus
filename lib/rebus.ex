@@ -88,6 +88,11 @@ defmodule Rebus do
   with a call is closed. There is no API to serve method calls from
   application code.
 
+  Signals are delivered by the connection process itself: each connection keeps
+  its own table of registered handlers and sends every matching signal directly
+  to the handler's owner, so signals received on one connection never reach
+  handlers registered on another.
+
   ## Error Handling
 
   `connect/2` returns `{:ok, connection}` or `{:error, reason}`. `call/3`
@@ -747,7 +752,8 @@ defmodule Rebus do
   receive signals to avoid message queue buildup.
 
   Signal handlers are automatically cleaned up when the connection is closed
-  or when the handler exits.
+  or when the handler exits. A handler is registered with the connection it was
+  added to and only receives signals that arrive on that connection.
 
   Returns `{:error, :not_connected}` while connection establishment is pending,
   `{:error, :timeout}` if the connection cannot service the request promptly,
