@@ -102,14 +102,7 @@ defmodule Rebus.Signature do
   def parse(signature) when is_binary(signature) and byte_size(signature) <= @max_length do
     case parse_types(:binary.bin_to_list(signature), 0, 0, 0, []) do
       {:ok, [], types} ->
-        types = Enum.reverse(types)
-
-        try do
-          :ok = validate_nesting!(types, new_nesting_state())
-          {:ok, types}
-        rescue
-          ResourceLimitError -> {:error, :resource_limit}
-        end
+        types |> Enum.reverse() |> check_nesting()
 
       _ ->
         {:error, :invalid_signature}
@@ -125,6 +118,13 @@ defmodule Rebus.Signature do
       {:error, :invalid_signature} -> raise ArgumentError, "invalid D-Bus signature"
       {:error, :resource_limit} -> raise ResourceLimitError, limit: :nesting
     end
+  end
+
+  defp check_nesting(types) do
+    :ok = validate_nesting!(types, new_nesting_state())
+    {:ok, types}
+  rescue
+    ResourceLimitError -> {:error, :resource_limit}
   end
 
   defp parse_types([], _arrays, _structs, _total, acc), do: {:ok, [], acc}
@@ -169,9 +169,8 @@ defmodule Rebus.Signature do
     do: {:error, :invalid_signature}
 
   defp parse_dict([key | rest], arrays, structs, total) when key in ~c"ybnqiuxtdsogh" do
-    with {:ok, value, [?} | remaining]} <- parse_type(rest, arrays, structs + 1, total + 1, true) do
-      {:ok, {:dict_entry, basic_type(key), value}, remaining}
-    else
+    case parse_type(rest, arrays, structs + 1, total + 1, true) do
+      {:ok, value, [?} | remaining]} -> {:ok, {:dict_entry, basic_type(key), value}, remaining}
       _ -> {:error, :invalid_signature}
     end
   end

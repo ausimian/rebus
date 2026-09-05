@@ -83,6 +83,8 @@
 ### Changed
 
 - Rebus now requires Elixir 1.18 or later.
+- Connection log entries now carry their drop or stop reason as `reason:`
+  Logger metadata, so handlers can filter on it. The message text is unchanged.
 - Clarify the public Quick Start with `send/2`, document exact TCP
   socket-address maps, and remove the stale test-count claim.
 - CI now runs the ordinary Unix-FD lifecycle suite on every valid combination

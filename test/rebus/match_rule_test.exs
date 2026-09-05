@@ -1745,11 +1745,9 @@ defmodule Rebus.MatchRuleTest do
   # normally in that gap, especially on older OTP schedulers. Cleanup must not
   # turn that successful shutdown into a test failure.
   defp stop_worker(worker) when is_pid(worker) do
-    try do
-      GenServer.stop(worker)
-    catch
-      :exit, {:noproc, _} -> :ok
-    end
+    GenServer.stop(worker)
+  catch
+    :exit, {:noproc, _} -> :ok
   end
 
   defp start_direct_connection(server) do

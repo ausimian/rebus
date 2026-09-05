@@ -45,19 +45,17 @@ defmodule Rebus.UnixFD do
   end
 
   defp close_unix_fd(fd) do
-    try do
-      case :prim_file.file_desc_to_ref(fd, [:raw]) do
-        {:ok, file} ->
-          _ = :file.close(file)
-          :ok
+    case :prim_file.file_desc_to_ref(fd, [:raw]) do
+      {:ok, file} ->
+        _ = :file.close(file)
+        :ok
 
-        {:error, reason} ->
-          {:error, reason}
-      end
-    rescue
-      _exception -> {:error, :close_failed}
-    catch
-      _kind, _reason -> {:error, :close_failed}
+      {:error, reason} ->
+        {:error, reason}
     end
+  rescue
+    _exception -> {:error, :close_failed}
+  catch
+    _kind, _reason -> {:error, :close_failed}
   end
 end

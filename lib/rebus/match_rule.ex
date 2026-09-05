@@ -174,9 +174,8 @@ defmodule Rebus.MatchRule do
            put_if_valid(criteria, :path_namespace, opts, &WireValue.valid_object_path?/1),
          {:ok, criteria} <- put_if_valid(criteria, :destination, opts, &valid_unique_name?/1),
          {:ok, criteria} <- put_arguments(criteria, :args, opts),
-         {:ok, criteria} <- put_arguments(criteria, :arg_paths, opts),
-         {:ok, criteria} <- put_if_valid(criteria, :arg0namespace, opts, &valid_namespace?/1) do
-      {:ok, criteria}
+         {:ok, criteria} <- put_arguments(criteria, :arg_paths, opts) do
+      put_if_valid(criteria, :arg0namespace, opts, &valid_namespace?/1)
     end
   end
 
@@ -214,11 +213,7 @@ defmodule Rebus.MatchRule do
 
   defp normalize_arguments(values) when is_list(values) do
     cond do
-      Enum.map(values, fn
-        {index, _value} -> index
-        _value -> nil
-      end)
-      |> then(&(&1 != Enum.uniq(&1))) ->
+      duplicate_indexes?(values) ->
         {:error, :duplicate_match_option}
 
       Enum.all?(values, fn
@@ -233,6 +228,16 @@ defmodule Rebus.MatchRule do
   end
 
   defp normalize_arguments(_values), do: {:error, :invalid_match_argument}
+
+  defp duplicate_indexes?(values) do
+    indexes =
+      Enum.map(values, fn
+        {index, _value} -> index
+        _value -> nil
+      end)
+
+    indexes != Enum.uniq(indexes)
+  end
 
   defp encode(criteria) do
     ["type='signal'" | encode_criteria(criteria)]
@@ -321,12 +326,14 @@ defmodule Rebus.MatchRule do
   end
 
   defp argument_matches?(criteria, %Message{} = message) do
-    with {:ok, types} <- Signature.parse(Message.signature(message)) do
-      exact_argument_matches?(Map.get(criteria, :args, %{}), message.body, types) and
-        path_argument_matches?(Map.get(criteria, :arg_paths, %{}), message.body, types) and
-        arg0namespace_matches?(Map.get(criteria, :arg0namespace), message.body, types)
-    else
-      _ -> false
+    case Signature.parse(Message.signature(message)) do
+      {:ok, types} ->
+        exact_argument_matches?(Map.get(criteria, :args, %{}), message.body, types) and
+          path_argument_matches?(Map.get(criteria, :arg_paths, %{}), message.body, types) and
+          arg0namespace_matches?(Map.get(criteria, :arg0namespace), message.body, types)
+
+      _ ->
+        false
     end
   end
 

@@ -39,43 +39,47 @@ defmodule Rebus.Connection do
       request_ref = make_ref()
       deadline = System.monotonic_time(:millisecond) + timeout
 
-      try do
-        pid
-        |> GenServer.call({:call, msg, deadline, request_ref}, timeout)
-        |> receive_fd_reply_claim(pid, deadline, request_ref)
-      catch
-        :exit, {:timeout, _call} ->
-          GenServer.cast(pid, {:cancel, request_ref})
-          {:error, :timeout}
-
-        :exit, _reason ->
-          {:error, :disconnected}
-      end
+      call_for_reply(pid, msg, deadline, request_ref, timeout)
     else
       {:error, :remote_connection_unsupported}
     end
   end
 
-  @spec send(pid(), Message.t(), non_neg_integer()) :: :ok | {:error, term()}
-  def send(pid, %Message{} = msg, dispatch_timeout \\ @default_write_timeout)
+  defp call_for_reply(pid, msg, deadline, request_ref, timeout) do
+    pid
+    |> GenServer.call({:call, msg, deadline, request_ref}, timeout)
+    |> receive_fd_reply_claim(pid, deadline, request_ref)
+  catch
+    :exit, {:timeout, _call} ->
+      GenServer.cast(pid, {:cancel, request_ref})
+      {:error, :timeout}
+
+    :exit, _reason ->
+      {:error, :disconnected}
+  end
+
+  @spec dispatch(pid(), Message.t(), non_neg_integer()) :: :ok | {:error, term()}
+  def dispatch(pid, %Message{} = msg, dispatch_timeout \\ @default_write_timeout)
       when is_pid(pid) and is_integer(dispatch_timeout) and dispatch_timeout >= 0 do
     if node(pid) == node() do
       request_ref = make_ref()
       deadline = System.monotonic_time(:millisecond) + dispatch_timeout
 
-      try do
-        GenServer.call(pid, {:send, msg, deadline, request_ref}, dispatch_timeout)
-      catch
-        :exit, {:timeout, _call} ->
-          GenServer.cast(pid, {:cancel, request_ref})
-          {:error, :timeout}
-
-        :exit, _reason ->
-          {:error, :disconnected}
-      end
+      call_for_dispatch(pid, msg, deadline, request_ref, dispatch_timeout)
     else
       {:error, :remote_connection_unsupported}
     end
+  end
+
+  defp call_for_dispatch(pid, msg, deadline, request_ref, dispatch_timeout) do
+    GenServer.call(pid, {:send, msg, deadline, request_ref}, dispatch_timeout)
+  catch
+    :exit, {:timeout, _call} ->
+      GenServer.cast(pid, {:cancel, request_ref})
+      {:error, :timeout}
+
+    :exit, _reason ->
+      {:error, :disconnected}
   end
 
   @spec add_signal_handler(pid()) ::
@@ -384,7 +388,7 @@ defmodule Rebus.Connection do
   end
 
   def handle_info({:gen_event_EXIT, {SignalHandler, ref}, _reason}, %__MODULE__{} = state) do
-    # Because handlers are addede via :gen_event.add_sup_handler/3, we receive
+    # Because handlers are added via :gen_event.add_sup_handler/3, we receive
     # `:gen_event_EXIT` messages when they are removed. We can use this to clean
     # up the monitor
     {:noreply, remove_signal_handler_monitor(state, ref)}
@@ -406,7 +410,7 @@ defmodule Rebus.Connection do
   def handle_info({:fd_claim_timeout, claim_ref}, %__MODULE__{} = state) do
     case Map.fetch(state.fd_claims, claim_ref) do
       {:ok, _claim} ->
-        Logger.warning("D-Bus FD reply claim dropped: :claim_timeout")
+        Logger.warning("D-Bus FD reply claim dropped: :claim_timeout", reason: :claim_timeout)
         {:noreply, drop_fd_claim(state, claim_ref, close?: true)}
 
       :error ->
@@ -828,7 +832,7 @@ defmodule Rebus.Connection do
           run_fd_claim_hook(state.fd_claim_delivery_fun)
 
           if fd_claim_live?(claim) and Process.alive?(pid) do
-            Kernel.send(delivery_alias, {:rebus_fd_reply, claim_ref, delivery_ref, msg})
+            send(delivery_alias, {:rebus_fd_reply, claim_ref, delivery_ref, msg})
 
             {:reply, :ok,
              %{
@@ -1060,13 +1064,13 @@ defmodule Rebus.Connection do
         stop_for_protocol_error({:hello_failed, :resource_limit}, finish_frame(state))
 
       {:error, :resource_limit, envelope, rest} ->
-        Logger.warning("D-Bus frame dropped: :resource_limit")
+        Logger.warning("D-Bus frame dropped: :resource_limit", reason: :resource_limit)
         state = discard_inbound_unix_fds(state)
         {:ok, state} = drop_resource_limited_reply(envelope, state)
         parse_flat_messages(rest, finish_frame(state), continuation, source)
 
       {:error, :resource_limit} ->
-        Logger.warning("D-Bus frame dropped: :resource_limit")
+        Logger.warning("D-Bus frame dropped: :resource_limit", reason: :resource_limit)
         state = discard_inbound_unix_fds(state)
 
         case Message.expected_size(data) do
@@ -1107,7 +1111,8 @@ defmodule Rebus.Connection do
   # close the descriptors, drop only this frame, and continue with a coalesced
   # successor rather than letting a peer kill unrelated calls or handlers.
   defp drop_recoverable_fd_frame(reason, rest, state, continuation, source) do
-    Logger.warning("D-Bus FD frame dropped: #{inspect(fd_drop_reason(reason))}")
+    reason = fd_drop_reason(reason)
+    Logger.warning("D-Bus FD frame dropped: #{inspect(reason)}", reason: reason)
     parse_flat_messages(rest, finish_frame(state), continuation, source)
   end
 
@@ -1185,7 +1190,7 @@ defmodule Rebus.Connection do
       parse_flat_messages(rest, notify(msg, finish_frame(state)), continuation, source)
     else
       close_message_fds(msg)
-      Logger.warning("D-Bus FD frame dropped: :signal_ownership")
+      Logger.warning("D-Bus FD frame dropped: :signal_ownership", reason: :signal_ownership)
       parse_flat_messages(rest, finish_frame(state), continuation, source)
     end
   end
@@ -1381,9 +1386,8 @@ defmodule Rebus.Connection do
         "REJECTED" <> _rest ->
           # A mechanism rejection is terminal: do not silently lower the
           # authentication level after starting DBUS_COOKIE_SHA1.
-          with {:rejected, advertised} <- parse_auth_response(line) do
-            {:error, {:auth_rejected, advertised}}
-          else
+          case parse_auth_response(line) do
+            {:rejected, advertised} -> {:error, {:auth_rejected, advertised}}
             {:error, reason} -> {:error, reason}
           end
 
@@ -1472,12 +1476,10 @@ defmodule Rebus.Connection do
   defp valid_guid?(guid) when is_binary(guid) and byte_size(guid) == 32, do: hex_guid?(guid)
   defp valid_guid?(_guid), do: false
 
-  defp hex_guid?(guid) do
-    for <<byte <- guid>>, reduce: true do
-      true when byte in ?0..?9 or byte in ?a..?f or byte in ?A..?F -> true
-      _ -> false
-    end
-  end
+  defp hex_guid?(guid), do: all_bytes?(guid, &hex_byte?/1)
+
+  defp hex_byte?(byte) when byte in ?0..?9 or byte in ?a..?f or byte in ?A..?F, do: true
+  defp hex_byte?(_byte), do: false
 
   defp guid_equal?(<<>>, <<>>), do: true
 
@@ -1491,7 +1493,7 @@ defmodule Rebus.Connection do
   defp ascii_lower(byte), do: byte
 
   defp notify_connect_waiter({pid, ref}, result) when is_pid(pid) and is_reference(ref),
-    do: Kernel.send(pid, {ref, result})
+    do: send(pid, {ref, result})
 
   defp notify_connect_waiter(nil, _result), do: :ok
 
@@ -1508,7 +1510,7 @@ defmodule Rebus.Connection do
         # queued monitor event first, then send the acknowledgement before
         # releasing the monitor: a caller that dies after this send owns the
         # normal established-connection lifecycle, while a prior death wins.
-        Kernel.send(pid, {connect_ref, :accepted})
+        send(pid, {connect_ref, :accepted})
         {:ok, release_connect_waiter(state)}
     end
   end
@@ -1516,16 +1518,14 @@ defmodule Rebus.Connection do
   defp establish_connection(%__MODULE__{} = state), do: {:ok, state}
 
   defp safe_setup_call(conn, message, cancellation \\ nil, timeout \\ @default_read_timeout) do
-    try do
-      GenServer.call(conn, message, timeout)
-    catch
-      :exit, {:timeout, _call} ->
-        if cancellation, do: GenServer.cast(conn, cancellation)
-        {:error, :timeout}
+    GenServer.call(conn, message, timeout)
+  catch
+    :exit, {:timeout, _call} ->
+      if cancellation, do: GenServer.cast(conn, cancellation)
+      {:error, :timeout}
 
-      :exit, _reason ->
-        {:error, :disconnected}
-    end
+    :exit, _reason ->
+      {:error, :disconnected}
   end
 
   defp receive_fd_reply_claim({:fd_claim, claim_ref}, conn, deadline, _request_ref)
@@ -1536,76 +1536,78 @@ defmodule Rebus.Connection do
     # below merely consumes a message already enqueued before that operation.
     delivery_alias = :erlang.alias([:reply])
 
-    try do
-      with {:ok, timeout} <- fd_claim_remaining_timeout(deadline),
-           :ok <- claim_fd_reply(conn, claim_ref, delivery_ref, delivery_alias, timeout) do
-        receive do
-          {:rebus_fd_reply, ^claim_ref, ^delivery_ref, %Message{} = msg} ->
-            # Ownership moves only after the server acknowledges the claim.
-            # The first acknowledgement is bounded by the original request
-            # deadline plus the handoff grace. If its reply races that bound,
-            # the FIFO resolver waits for the definitive transfer-or-close
-            # outcome rather than returning an ambiguous raw descriptor.
-            case acknowledge_fd_reply(conn, claim_ref, delivery_ref, deadline) do
-              :ok -> msg
-              {:error, _reason} = error -> error
-            end
-        after
-          timeout ->
-            discard_fd_claim(conn, claim_ref, deadline)
-            {:error, :timeout}
-        end
-      else
-        {:error, :timeout} ->
-          discard_fd_claim(conn, claim_ref, deadline)
-          {:error, :timeout}
-
-        {:error, _reason} = error ->
-          discard_fd_claim(conn, claim_ref, deadline)
-          error
-      end
-    after
-      :erlang.unalias(delivery_alias)
-      drain_fd_reply_delivery(claim_ref, delivery_ref)
-    end
+    await_fd_reply(conn, claim_ref, delivery_ref, delivery_alias, deadline)
   end
 
   defp receive_fd_reply_claim(result, _conn, _deadline, _request_ref), do: result
 
-  defp claim_fd_reply(conn, claim_ref, delivery_ref, delivery_alias, timeout) do
-    try do
-      case GenServer.call(
-             conn,
-             {:claim_fd_reply, claim_ref, delivery_ref, delivery_alias},
-             timeout
-           ) do
-        :ok -> :ok
-        {:error, _reason} = error -> error
-        _unexpected -> {:error, :fd_claim_expired}
+  defp await_fd_reply(conn, claim_ref, delivery_ref, delivery_alias, deadline) do
+    with {:ok, timeout} <- fd_claim_remaining_timeout(deadline),
+         :ok <- claim_fd_reply(conn, claim_ref, delivery_ref, delivery_alias, timeout) do
+      receive do
+        {:rebus_fd_reply, ^claim_ref, ^delivery_ref, %Message{} = msg} ->
+          # Ownership moves only after the server acknowledges the claim.
+          # The first acknowledgement is bounded by the original request
+          # deadline plus the handoff grace. If its reply races that bound,
+          # the FIFO resolver waits for the definitive transfer-or-close
+          # outcome rather than returning an ambiguous raw descriptor.
+          case acknowledge_fd_reply(conn, claim_ref, delivery_ref, deadline) do
+            :ok -> msg
+            {:error, _reason} = error -> error
+          end
+      after
+        timeout ->
+          discard_fd_claim(conn, claim_ref, deadline)
+          {:error, :timeout}
       end
-    catch
-      :exit, {:timeout, _call} -> {:error, :timeout}
-      :exit, _reason -> {:error, :disconnected}
+    else
+      {:error, :timeout} ->
+        discard_fd_claim(conn, claim_ref, deadline)
+        {:error, :timeout}
+
+      {:error, _reason} = error ->
+        discard_fd_claim(conn, claim_ref, deadline)
+        error
     end
+  after
+    :erlang.unalias(delivery_alias)
+    drain_fd_reply_delivery(claim_ref, delivery_ref)
+  end
+
+  defp claim_fd_reply(conn, claim_ref, delivery_ref, delivery_alias, timeout) do
+    case GenServer.call(
+           conn,
+           {:claim_fd_reply, claim_ref, delivery_ref, delivery_alias},
+           timeout
+         ) do
+      :ok -> :ok
+      {:error, _reason} = error -> error
+      _unexpected -> {:error, :fd_claim_expired}
+    end
+  catch
+    :exit, {:timeout, _call} -> {:error, :timeout}
+    :exit, _reason -> {:error, :disconnected}
   end
 
   defp acknowledge_fd_reply(conn, claim_ref, delivery_ref, deadline) do
     case fd_claim_remaining_timeout(deadline) do
       {:ok, timeout} ->
-        try do
-          case GenServer.call(conn, {:ack_fd_reply, claim_ref, delivery_ref}, timeout) do
-            :ok -> :ok
-            {:error, _reason} = error -> error
-            _unexpected -> {:error, :fd_claim_expired}
-          end
-        catch
-          :exit, {:timeout, _call} -> resolve_fd_claim(conn, claim_ref, delivery_ref)
-          :exit, _reason -> {:error, :disconnected}
-        end
+        call_ack_fd_reply(conn, claim_ref, delivery_ref, timeout)
 
       :error ->
         resolve_fd_claim(conn, claim_ref, delivery_ref)
     end
+  end
+
+  defp call_ack_fd_reply(conn, claim_ref, delivery_ref, timeout) do
+    case GenServer.call(conn, {:ack_fd_reply, claim_ref, delivery_ref}, timeout) do
+      :ok -> :ok
+      {:error, _reason} = error -> error
+      _unexpected -> {:error, :fd_claim_expired}
+    end
+  catch
+    :exit, {:timeout, _call} -> resolve_fd_claim(conn, claim_ref, delivery_ref)
+    :exit, _reason -> {:error, :disconnected}
   end
 
   defp resolve_fd_claim(conn, claim_ref, delivery_ref) do
@@ -1618,31 +1620,35 @@ defmodule Rebus.Connection do
     # only indeterminate case explicit as :disconnected.
     monitor_ref = Process.monitor(conn)
 
-    try do
-      case GenServer.call(conn, {:resolve_fd_claim, claim_ref, delivery_ref}, :infinity) do
-        :acknowledged -> :ok
-        _ -> {:error, :fd_claim_expired}
-      end
-    catch
-      :exit, _reason -> {:error, :disconnected}
-    after
-      Process.demonitor(monitor_ref, [:flush])
+    await_fd_claim_resolution(conn, claim_ref, delivery_ref, monitor_ref)
+  end
+
+  defp await_fd_claim_resolution(conn, claim_ref, delivery_ref, monitor_ref) do
+    case GenServer.call(conn, {:resolve_fd_claim, claim_ref, delivery_ref}, :infinity) do
+      :acknowledged -> :ok
+      _ -> {:error, :fd_claim_expired}
     end
+  catch
+    :exit, _reason -> {:error, :disconnected}
+  after
+    Process.demonitor(monitor_ref, [:flush])
   end
 
   defp discard_fd_claim(conn, claim_ref, deadline) do
     case fd_claim_cleanup_remaining_timeout(deadline) do
       {:ok, timeout} ->
-        try do
-          _ = GenServer.call(conn, {:discard_fd_claim, claim_ref}, timeout)
-          :ok
-        catch
-          :exit, _reason -> :ok
-        end
+        call_discard_fd_claim(conn, claim_ref, timeout)
 
       :error ->
         :ok
     end
+  end
+
+  defp call_discard_fd_claim(conn, claim_ref, timeout) do
+    _ = GenServer.call(conn, {:discard_fd_claim, claim_ref}, timeout)
+    :ok
+  catch
+    :exit, _reason -> :ok
   end
 
   defp drain_fd_reply_delivery(claim_ref, delivery_ref) do
@@ -1794,30 +1800,26 @@ defmodule Rebus.Connection do
   end
 
   defp safely_open_auth_username_port(executable, port_opener, timeout) do
-    try do
-      port =
-        port_opener.({:spawn_executable, String.to_charlist(executable)}, [
-          :binary,
-          :exit_status,
-          args: ["-un"]
-        ])
+    port =
+      port_opener.({:spawn_executable, String.to_charlist(executable)}, [
+        :binary,
+        :exit_status,
+        args: ["-un"]
+      ])
 
-      collect_auth_id_output(port, <<>>, read_deadline(timeout), timeout)
-    rescue
-      _exception -> {:error, :port_open_failed}
-    catch
-      _kind, _reason -> {:error, :port_open_failed}
-    end
+    collect_auth_id_output(port, <<>>, read_deadline(timeout), timeout)
+  rescue
+    _exception -> {:error, :port_open_failed}
+  catch
+    _kind, _reason -> {:error, :port_open_failed}
   end
 
-  defp valid_auth_username?(username) when byte_size(username) in 1..64 do
-    for <<byte <- username>>, reduce: true do
-      valid when byte in 0x21..0x7E -> valid
-      _invalid -> false
-    end
-  end
+  defp valid_auth_username?(username) when byte_size(username) in 1..64,
+    do: all_bytes?(username, &visible_ascii_byte?/1)
 
   defp valid_auth_username?(_username), do: false
+
+  defp visible_ascii_byte?(byte), do: byte in 0x21..0x7E
 
   defp auth_id_uid(auth_id) when is_binary(auth_id) do
     with {:ok, uid_bytes} <- Base.decode16(auth_id, case: :mixed),
@@ -1838,42 +1840,43 @@ defmodule Rebus.Connection do
 
     pid =
       spawn_link(fn ->
-        result =
-          try do
-            Auth.cookie_response(username, uid, challenge)
-          rescue
-            _exception -> {:error, :auth_cookie_unavailable}
-          catch
-            _kind, _reason -> {:error, :auth_cookie_unavailable}
-          end
-
-        Kernel.send(delivery_alias, {ref, result})
+        send(delivery_alias, {ref, safe_cookie_response(username, uid, challenge)})
       end)
 
     monitor_ref = Process.monitor(pid)
 
-    try do
-      receive do
-        {^ref, result} ->
-          result
+    await_cookie_response(pid, ref, delivery_alias, monitor_ref, timeout)
+  end
 
-        {:DOWN, ^monitor_ref, :process, ^pid, _reason} ->
-          {:error, :auth_cookie_unavailable}
-      after
-        timeout ->
-          Process.unlink(pid)
-          :erlang.unalias(delivery_alias)
-          Process.exit(pid, :kill)
-          {:error, :read_timeout}
-      end
+  defp safe_cookie_response(username, uid, challenge) do
+    Auth.cookie_response(username, uid, challenge)
+  rescue
+    _exception -> {:error, :auth_cookie_unavailable}
+  catch
+    _kind, _reason -> {:error, :auth_cookie_unavailable}
+  end
+
+  defp await_cookie_response(pid, ref, delivery_alias, monitor_ref, timeout) do
+    receive do
+      {^ref, result} ->
+        result
+
+      {:DOWN, ^monitor_ref, :process, ^pid, _reason} ->
+        {:error, :auth_cookie_unavailable}
     after
-      # The one-shot alias rejects a late worker result atomically. Drain a
-      # response queued before unaliasing so a derived digest cannot linger in
-      # this GenServer's mailbox after the bounded credential operation ends.
-      :erlang.unalias(delivery_alias)
-      drain_cookie_response_delivery(ref)
-      Process.demonitor(monitor_ref, [:flush])
+      timeout ->
+        Process.unlink(pid)
+        :erlang.unalias(delivery_alias)
+        Process.exit(pid, :kill)
+        {:error, :read_timeout}
     end
+  after
+    # The one-shot alias rejects a late worker result atomically. Drain a
+    # response queued before unaliasing so a derived digest cannot linger in
+    # this GenServer's mailbox after the bounded credential operation ends.
+    :erlang.unalias(delivery_alias)
+    drain_cookie_response_delivery(ref)
+    Process.demonitor(monitor_ref, [:flush])
   end
 
   defp drain_cookie_response_delivery(ref) do
@@ -1907,40 +1910,34 @@ defmodule Rebus.Connection do
   end
 
   defp safely_run_auth_id(runner, timeout) do
-    try do
-      runner.(timeout)
-    rescue
-      _exception -> {:error, :runner_failed}
-    catch
-      _kind, _reason -> {:error, :runner_failed}
-    end
+    runner.(timeout)
+  rescue
+    _exception -> {:error, :runner_failed}
+  catch
+    _kind, _reason -> {:error, :runner_failed}
   end
 
   defp safely_find_executable(executable_finder) do
-    try do
-      executable_finder.("id")
-    rescue
-      _exception -> nil
-    catch
-      _kind, _reason -> nil
-    end
+    executable_finder.("id")
+  rescue
+    _exception -> nil
+  catch
+    _kind, _reason -> nil
   end
 
   defp safely_open_auth_id_port(executable, port_opener, timeout) do
-    try do
-      port =
-        port_opener.({:spawn_executable, String.to_charlist(executable)}, [
-          :binary,
-          :exit_status,
-          args: ["-u"]
-        ])
+    port =
+      port_opener.({:spawn_executable, String.to_charlist(executable)}, [
+        :binary,
+        :exit_status,
+        args: ["-u"]
+      ])
 
-      collect_auth_id_output(port, <<>>, read_deadline(timeout), timeout)
-    rescue
-      _exception -> {:error, :port_open_failed}
-    catch
-      _kind, _reason -> {:error, :port_open_failed}
-    end
+    collect_auth_id_output(port, <<>>, read_deadline(timeout), timeout)
+  rescue
+    _exception -> {:error, :port_open_failed}
+  catch
+    _kind, _reason -> {:error, :port_open_failed}
   end
 
   defp collect_auth_id_output(port, output, deadline, maximum) do
@@ -1976,19 +1973,21 @@ defmodule Rebus.Connection do
   end
 
   defp safe_close_port(port) do
-    try do
-      Port.close(port)
-    catch
-      _kind, _reason -> :ok
-    end
+    Port.close(port)
+  catch
+    _kind, _reason -> :ok
   end
 
-  defp uid_bytes?(uid) do
-    for <<byte <- uid>>, reduce: true do
-      true -> byte in ?0..?9
-      false -> false
-    end
-  end
+  defp uid_bytes?(uid), do: all_bytes?(uid, &digit_byte?/1)
+
+  defp digit_byte?(byte), do: byte in ?0..?9
+
+  # Walk the binary directly: no intermediate list, and the first byte that
+  # fails the predicate ends the walk.
+  defp all_bytes?(<<>>, _predicate), do: true
+
+  defp all_bytes?(<<byte, rest::binary>>, predicate),
+    do: predicate.(byte) and all_bytes?(rest, predicate)
 
   defp stop_and_close(sock, reason) do
     _ = :socket.close(sock)
@@ -2182,13 +2181,13 @@ defmodule Rebus.Connection do
 
   defp stop_for_transport_error(reason, %__MODULE__{} = state) do
     reason = normalize_socket_error(reason)
-    Logger.warning("D-Bus connection transport stopped: #{inspect(reason)}")
+    Logger.warning("D-Bus connection transport stopped: #{inspect(reason)}", reason: reason)
     {:stop, {:shutdown, reason}, state |> discard_inbound_unix_fds() |> fail_pending()}
   end
 
   defp stop_for_protocol_error(reason, %__MODULE__{} = state) do
     reason = sanitize_protocol_reason(reason)
-    Logger.warning("D-Bus connection protocol stopped: #{inspect(reason)}")
+    Logger.warning("D-Bus connection protocol stopped: #{inspect(reason)}", reason: reason)
     {:stop, {:shutdown, reason}, state |> discard_inbound_unix_fds() |> fail_pending()}
   end
 
@@ -2286,15 +2285,13 @@ defmodule Rebus.Connection do
   defp close_recvmsg_fds({:error, _reason, fds}), do: UnixFD.close_all(fds)
 
   defp recvmsg_data(iov) do
-    try do
-      data = IO.iodata_to_binary(iov)
+    data = IO.iodata_to_binary(iov)
 
-      if byte_size(data) <= @max_read_chunk,
-        do: {:ok, data},
-        else: {:error, :message_too_large}
-    rescue
-      ArgumentError -> {:error, :invalid_unix_fds}
-    end
+    if byte_size(data) <= @max_read_chunk,
+      do: {:ok, data},
+      else: {:error, :message_too_large}
+  rescue
+    ArgumentError -> {:error, :invalid_unix_fds}
   end
 
   defp recvmsg_fds(ctrl, flags) do
@@ -2699,12 +2696,10 @@ defmodule Rebus.Connection do
   end
 
   defp iolist?(data) do
-    try do
-      _ = IO.iodata_to_binary(data)
-      true
-    rescue
-      ArgumentError -> false
-    end
+    _ = IO.iodata_to_binary(data)
+    true
+  rescue
+    ArgumentError -> false
   end
 
   defp notify(%Message{} = msg, %__MODULE__{name: name} = state) do
@@ -2925,34 +2920,38 @@ defmodule Rebus.Connection do
   end
 
   defp encode_message(%Message{} = msg) do
-    try do
-      case Message.encode(msg) do
-        {:ok, bin} ->
-          {:ok, bin}
+    case Message.encode(msg) do
+      {:ok, bin} ->
+        {:ok, bin}
 
-        {:error, reason}
-        when reason in [
-               :invalid_body,
-               :invalid_header_fields,
-               :invalid_message,
-               :message_too_large
-             ] ->
-          Logger.warning("D-Bus message encoding failed: #{inspect(reason)}")
-          {:error, :encode_failed}
-
-        {:error, _reason} ->
-          Logger.warning("D-Bus message encoding failed: :invalid_message")
-          {:error, :encode_failed}
-      end
-    rescue
-      exception ->
-        Logger.warning("D-Bus message encoding failed: #{inspect(exception.__struct__)}")
+      {:error, reason}
+      when reason in [
+             :invalid_body,
+             :invalid_header_fields,
+             :invalid_message,
+             :message_too_large
+           ] ->
+        Logger.warning("D-Bus message encoding failed: #{inspect(reason)}", reason: reason)
         {:error, :encode_failed}
-    catch
-      kind, _reason ->
-        Logger.warning("D-Bus message encoding failed: #{inspect(kind)}")
+
+      {:error, _reason} ->
+        Logger.warning("D-Bus message encoding failed: :invalid_message",
+          reason: :invalid_message
+        )
+
         {:error, :encode_failed}
     end
+  rescue
+    exception ->
+      Logger.warning("D-Bus message encoding failed: #{inspect(exception.__struct__)}",
+        reason: exception.__struct__
+      )
+
+      {:error, :encode_failed}
+  catch
+    kind, _reason ->
+      Logger.warning("D-Bus message encoding failed: #{inspect(kind)}", reason: kind)
+      {:error, :encode_failed}
   end
 
   defp validate_call_message(%Message{type: :method_call, flags: flags}) do
@@ -3064,14 +3063,16 @@ defmodule Rebus.Connection do
   defp classify_sendmsg_result(result, payload_length) do
     case result do
       {:ok, rest} ->
-        with {:ok, rest} <- send_rest_binary(rest),
-             do: {:continue, rest},
-             else: (_ -> {:error, {:send_fatal, :send_failed}})
+        case send_rest_binary(rest) do
+          {:ok, rest} -> {:continue, rest}
+          _ -> {:error, {:send_fatal, :send_failed}}
+        end
 
       {:select, {select_info, rest}} when is_sendmsg_select_info(select_info) ->
-        with {:ok, rest} <- send_rest_binary(rest),
-             do: {:select, select_info, rest},
-             else: (_ -> {:error, {:send_fatal, :send_failed}})
+        case send_rest_binary(rest) do
+          {:ok, rest} -> {:select, select_info, rest}
+          _ -> {:error, {:send_fatal, :send_failed}}
+        end
 
       {:select, select_info} when is_sendmsg_select_info(select_info) ->
         {:select, select_info, nil}
@@ -3102,11 +3103,9 @@ defmodule Rebus.Connection do
   end
 
   defp send_rest_binary(rest) do
-    try do
-      {:ok, IO.iodata_to_binary(rest)}
-    rescue
-      ArgumentError -> :error
-    end
+    {:ok, IO.iodata_to_binary(rest)}
+  rescue
+    ArgumentError -> :error
   end
 
   # Writes are one-frame-at-a-time.  OTP retains the unaccepted RestData in every
@@ -3207,13 +3206,11 @@ defmodule Rebus.Connection do
     do: {:noreply, state}
 
   defp advance_writes(%__MODULE__{active_write: write} = state) do
-    cond do
-      (expired?(write) or cancelled?(write, state)) and not write.partial? ->
-        advance_writes(drop_active(state, cancel?: true))
-
-      true ->
-        result = safe_socket_send(state, write)
-        handle_write_result(result, %{state | active_write: %{write | wait: nil}})
+    if (expired?(write) or cancelled?(write, state)) and not write.partial? do
+      advance_writes(drop_active(state, cancel?: true))
+    else
+      result = safe_socket_send(state, write)
+      handle_write_result(result, %{state | active_write: %{write | wait: nil}})
     end
   end
 

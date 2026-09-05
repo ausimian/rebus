@@ -98,16 +98,18 @@ defmodule Rebus.MatchSubscription do
     if node(conn) == node() do
       deadline = System.monotonic_time(:millisecond) + timeout
 
-      try do
-        with {:ok, worker} <- worker_for(conn) do
-          Worker.call(worker, {:add, self(), rule, deadline}, deadline, @call_overhead)
-        end
-      catch
-        :exit, _reason -> {:error, :disconnected}
-      end
+      call_add(conn, rule, deadline)
     else
       {:error, :remote_connection_unsupported}
     end
+  end
+
+  defp call_add(conn, rule, deadline) do
+    with {:ok, worker} <- worker_for(conn) do
+      Worker.call(worker, {:add, self(), rule, deadline}, deadline, @call_overhead)
+    end
+  catch
+    :exit, _reason -> {:error, :disconnected}
   end
 
   @spec remove(pid(), reference(), non_neg_integer()) :: :ok | {:error, term()}
@@ -116,27 +118,29 @@ defmodule Rebus.MatchSubscription do
     if node(conn) == node() do
       deadline = System.monotonic_time(:millisecond) + timeout
 
-      try do
-        case Registry.lookup(Rebus.MatchSubscription.Registry, conn) do
-          [{worker, _value}] ->
-            Worker.call(worker, {:remove, ref, deadline}, deadline, @call_overhead)
-
-          [] ->
-            if persisted?(conn) do
-              with {:ok, worker} <- worker_for(conn) do
-                Worker.call(worker, {:remove, ref, deadline}, deadline, @call_overhead)
-              end
-            else
-              # References are idempotent and scoped to their original connection.
-              :ok
-            end
-        end
-      catch
-        :exit, _reason -> {:error, :disconnected}
-      end
+      call_remove(conn, ref, deadline)
     else
       {:error, :remote_connection_unsupported}
     end
+  end
+
+  defp call_remove(conn, ref, deadline) do
+    case Registry.lookup(Rebus.MatchSubscription.Registry, conn) do
+      [{worker, _value}] ->
+        Worker.call(worker, {:remove, ref, deadline}, deadline, @call_overhead)
+
+      [] ->
+        if persisted?(conn) do
+          with {:ok, worker} <- worker_for(conn) do
+            Worker.call(worker, {:remove, ref, deadline}, deadline, @call_overhead)
+          end
+        else
+          # References are idempotent and scoped to their original connection.
+          :ok
+        end
+    end
+  catch
+    :exit, _reason -> {:error, :disconnected}
   end
 
   defp worker_for(conn) do
@@ -191,16 +195,18 @@ defmodule Rebus.MatchSubscription.Worker do
   def call(worker, request, deadline, overhead) do
     case remaining_timeout(deadline) do
       {:ok, timeout} when timeout > 0 ->
-        try do
-          GenServer.call(worker, request, timeout + overhead)
-        catch
-          :exit, {:timeout, _call} -> {:error, :timeout}
-          :exit, _reason -> {:error, :disconnected}
-        end
+        safe_worker_call(worker, request, timeout + overhead)
 
       _expired ->
         {:error, :timeout}
     end
+  end
+
+  defp safe_worker_call(worker, request, timeout) do
+    GenServer.call(worker, request, timeout)
+  catch
+    :exit, {:timeout, _call} -> {:error, :timeout}
+    :exit, _reason -> {:error, :disconnected}
   end
 
   @impl true
@@ -1093,24 +1099,26 @@ defmodule Rebus.MatchSubscription.Worker do
   end
 
   defp remove_operation(conn, rule, ref, handler, final?, deadline) do
-    with :ok <- ensure_handler_removed(conn, ref, handler, deadline) do
-      if final? do
-        case invoke_bus_method(conn, "RemoveMatch", rule, deadline) do
-          :ok ->
-            {:removed, ref, :final}
+    case ensure_handler_removed(conn, ref, handler, deadline) do
+      :ok ->
+        if final? do
+          case invoke_bus_method(conn, "RemoveMatch", rule, deadline) do
+            :ok ->
+              {:removed, ref, :final}
 
-          error ->
-            cond do
-              match_rule_not_found?(error) -> {:removed, ref, :final}
-              definitive_bus_error?(error) -> {:remove_definitive_error, ref, error}
-              true -> {:remove_ambiguous, ref, error}
-            end
+            error ->
+              cond do
+                match_rule_not_found?(error) -> {:removed, ref, :final}
+                definitive_bus_error?(error) -> {:remove_definitive_error, ref, error}
+                true -> {:remove_ambiguous, ref, error}
+              end
+          end
+        else
+          {:removed, ref, :nonfinal}
         end
-      else
-        {:removed, ref, :nonfinal}
-      end
-    else
-      {:error, _reason} = error -> {:remove_failed, error, :active}
+
+      {:error, _reason} = error ->
+        {:remove_failed, error, :active}
     end
   end
 
@@ -1174,11 +1182,8 @@ defmodule Rebus.MatchSubscription.Worker do
   end
 
   defp delete_local_handler(conn, handler_ref, deadline) do
-    with {:ok, timeout} <- remaining_timeout(deadline),
-         :ok <- Connection.delete_signal_handler(conn, handler_ref, timeout) do
-      :ok
-    else
-      {:error, _reason} = error -> error
+    with {:ok, timeout} <- remaining_timeout(deadline) do
+      Connection.delete_signal_handler(conn, handler_ref, timeout)
     end
   end
 
@@ -1186,8 +1191,6 @@ defmodule Rebus.MatchSubscription.Worker do
     with {:ok, timeout} <- remaining_timeout(deadline),
          %Message{} = reply <- Rebus.call(conn, bus_message(member, rule), timeout) do
       bus_reply_result(reply)
-    else
-      {:error, _reason} = error -> error
     end
   end
 

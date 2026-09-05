@@ -105,8 +105,7 @@
           {Credo.Check.Readability.ParenthesesOnZeroArityDefs, []},
           {Credo.Check.Readability.PipeIntoAnonymousFunctions, []},
           {Credo.Check.Readability.PredicateFunctionNames, []},
-          # Re-enable when #83 lands.
-          {Credo.Check.Readability.PreferImplicitTry, false},
+          {Credo.Check.Readability.PreferImplicitTry, []},
           {Credo.Check.Readability.RedundantBlankLines, []},
           {Credo.Check.Readability.Semicolons, []},
           {Credo.Check.Readability.SpaceAfterCommas, []},
@@ -115,15 +114,13 @@
           {Credo.Check.Readability.TrailingWhiteSpace, []},
           {Credo.Check.Readability.UnnecessaryAliasExpansion, []},
           {Credo.Check.Readability.VariableNames, []},
-          # Re-enable when #83 lands.
-          {Credo.Check.Readability.WithSingleClause, false},
+          {Credo.Check.Readability.WithSingleClause, []},
 
           #
           ## Refactoring Opportunities
           #
           {Credo.Check.Refactor.Apply, []},
-          # Re-enable when #83 lands.
-          {Credo.Check.Refactor.CondStatements, false},
+          {Credo.Check.Refactor.CondStatements, []},
           # Re-enable when #82 lands.
           {Credo.Check.Refactor.CyclomaticComplexity, false},
           {Credo.Check.Refactor.FilterCount, []},
@@ -137,8 +134,7 @@
           {Credo.Check.Refactor.NegatedConditionsWithElse, []},
           # Re-enable when #82 lands.
           {Credo.Check.Refactor.Nesting, false},
-          # Re-enable when #83 lands.
-          {Credo.Check.Refactor.RedundantWithClauseResult, false},
+          {Credo.Check.Refactor.RedundantWithClauseResult, []},
           {Credo.Check.Refactor.RejectReject, []},
           {Credo.Check.Refactor.UnlessWithElse, []},
           {Credo.Check.Refactor.WithClauses, []},
@@ -152,7 +148,9 @@
           {Credo.Check.Warning.ExpensiveEmptyEnumCheck, []},
           {Credo.Check.Warning.IExPry, []},
           {Credo.Check.Warning.IoInspect, []},
-          {Credo.Check.Warning.MissedMetadataKeyInLoggerConfig, []},
+          # Rebus is a library and ships no Logger formatter config, so declare
+          # the metadata keys it emits here instead.
+          {Credo.Check.Warning.MissedMetadataKeyInLoggerConfig, [metadata_keys: [:reason]]},
           {Credo.Check.Warning.OperationOnSameValues, []},
           {Credo.Check.Warning.OperationWithConstantResult, []},
           {Credo.Check.Warning.RaiseInsideRescue, []},

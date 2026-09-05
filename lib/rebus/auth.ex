@@ -141,22 +141,20 @@ defmodule Rebus.Auth do
   defp safe_stat_size?(_stat, :directory), do: true
 
   defp read_bounded_file(path) do
-    try do
-      with {:ok, file} <- :file.open(String.to_charlist(path), [:read, :binary, :raw]) do
-        result =
-          case :file.read(file, @max_cookie_file_size + 1) do
-            {:ok, contents} when byte_size(contents) <= @max_cookie_file_size -> {:ok, contents}
-            _ -> {:error, :auth_cookie_unavailable}
-          end
+    with {:ok, file} <- :file.open(String.to_charlist(path), [:read, :binary, :raw]) do
+      result =
+        case :file.read(file, @max_cookie_file_size + 1) do
+          {:ok, contents} when byte_size(contents) <= @max_cookie_file_size -> {:ok, contents}
+          _ -> {:error, :auth_cookie_unavailable}
+        end
 
-        :ok = :file.close(file)
-        result
-      end
-    rescue
-      _exception -> {:error, :auth_cookie_unavailable}
-    catch
-      _kind, _reason -> {:error, :auth_cookie_unavailable}
+      :ok = :file.close(file)
+      result
     end
+  rescue
+    _exception -> {:error, :auth_cookie_unavailable}
+  catch
+    _kind, _reason -> {:error, :auth_cookie_unavailable}
   end
 
   defp find_cookie(contents, wanted_id) do
@@ -231,20 +229,20 @@ defmodule Rebus.Auth do
   defp parse_cookie_line(_line), do: :error
 
   defp valid_mechanism?(mechanism)
-       when byte_size(mechanism) in 1..@max_mechanism_size do
-    for <<byte <- mechanism>>, reduce: true do
-      valid when byte in ?A..?Z or byte in ?0..?9 or byte in [?_, ?-] -> valid
-      _invalid -> false
-    end
-  end
+       when byte_size(mechanism) in 1..@max_mechanism_size,
+       do: all_bytes?(mechanism, &valid_mechanism_byte?/1)
 
   defp valid_mechanism?(_mechanism), do: false
 
+  defp valid_mechanism_byte?(byte)
+       when byte in ?A..?Z or byte in ?0..?9 or byte in [?_, ?-],
+       do: true
+
+  defp valid_mechanism_byte?(_byte), do: false
+
   defp validate_context(context)
        when byte_size(context) in 1..@max_cookie_context_size do
-    if Enum.all?(for(<<byte <- context>>, do: byte), &valid_context_byte?/1),
-      do: :ok,
-      else: :error
+    if all_bytes?(context, &valid_context_byte?/1), do: :ok, else: :error
   end
 
   defp validate_context(_context), do: :error
@@ -253,14 +251,14 @@ defmodule Rebus.Auth do
   defp valid_context_byte?(_byte), do: false
 
   defp validate_cookie_id(value) when byte_size(value) in 1..20 do
-    if Enum.all?(for(<<byte <- value>>, do: byte), &(&1 in ?0..?9)), do: :ok, else: :error
+    if all_bytes?(value, &digit_byte?/1), do: :ok, else: :error
   end
 
   defp validate_cookie_id(_value), do: :error
 
   defp validate_challenge(challenge)
        when byte_size(challenge) in 1..@max_cookie_challenge_size do
-    if Enum.all?(for(<<byte <- challenge>>, do: byte), &(&1 in 0x21..0x7E)), do: :ok, else: :error
+    if all_bytes?(challenge, &visible_ascii_byte?/1), do: :ok, else: :error
   end
 
   defp validate_challenge(_challenge), do: :error
@@ -276,8 +274,20 @@ defmodule Rebus.Auth do
   defp validate_cookie(_cookie), do: :error
 
   defp validate_username(username) when byte_size(username) in 1..64 do
-    if Enum.all?(for(<<byte <- username>>, do: byte), &(&1 in 0x21..0x7E)), do: :ok, else: :error
+    if all_bytes?(username, &visible_ascii_byte?/1), do: :ok, else: :error
   end
 
   defp validate_username(_username), do: :error
+
+  defp digit_byte?(byte), do: byte in ?0..?9
+
+  defp visible_ascii_byte?(byte), do: byte in 0x21..0x7E
+
+  # Walk the binary directly: no intermediate list, and the first byte that
+  # fails the predicate ends the walk. Every caller guards a non-empty binary;
+  # the empty binary trivially satisfies the predicate.
+  defp all_bytes?(<<>>, _predicate), do: true
+
+  defp all_bytes?(<<byte, rest::binary>>, predicate),
+    do: predicate.(byte) and all_bytes?(rest, predicate)
 end

@@ -507,9 +507,8 @@ defmodule Rebus do
       {:error, :unsupported_bus_transport}
     else
       with {:ok, timeout} <-
-             address_attempt_timeout(deadline, candidate_count + 1, monotonic_time, nil),
-           {:ok, auth_id} <- Rebus.Connection.get_auth_id(timeout, auth_id_runner) do
-        {:ok, auth_id}
+             address_attempt_timeout(deadline, candidate_count + 1, monotonic_time, nil) do
+        Rebus.Connection.get_auth_id(timeout, auth_id_runner)
       end
     end
   end
@@ -1013,11 +1012,9 @@ defmodule Rebus do
   end
 
   defp resolve_tcp(host, family, timeout) do
-    try do
-      :inet.getaddrs(:binary.bin_to_list(host), family, timeout)
-    catch
-      _kind, _reason -> {:error, :resolution_failed}
-    end
+    :inet.getaddrs(:binary.bin_to_list(host), family, timeout)
+  catch
+    _kind, _reason -> {:error, :resolution_failed}
   end
 
   defp safe_resolver_reason(reason) when is_atom(reason), do: reason
@@ -1045,14 +1042,12 @@ defmodule Rebus do
   end
 
   defp connection_child?(pid) do
-    try do
-      Enum.any?(DynamicSupervisor.which_children(Rebus.ConnectionSupervisor), fn
-        {_id, ^pid, _type, _modules} -> true
-        _child -> false
-      end)
-    catch
-      :exit, _reason -> false
-    end
+    Enum.any?(DynamicSupervisor.which_children(Rebus.ConnectionSupervisor), fn
+      {_id, ^pid, _type, _modules} -> true
+      _child -> false
+    end)
+  catch
+    :exit, _reason -> false
   end
 
   defp await_connection(pid, connect_ref, monitor_ref) do
@@ -1108,17 +1103,19 @@ defmodule Rebus do
   @spec close(pid()) :: :ok | {:error, :not_found | :remote_connection_unsupported}
   def close(conn) when is_pid(conn) do
     if node(conn) == node() do
-      try do
-        case DynamicSupervisor.terminate_child(Rebus.ConnectionSupervisor, conn) do
-          :ok -> :ok
-          _ -> {:error, :not_found}
-        end
-      catch
-        :exit, _reason -> {:error, :not_found}
-      end
+      terminate_connection_child(conn)
     else
       {:error, :remote_connection_unsupported}
     end
+  end
+
+  defp terminate_connection_child(conn) do
+    case DynamicSupervisor.terminate_child(Rebus.ConnectionSupervisor, conn) do
+      :ok -> :ok
+      _ -> {:error, :not_found}
+    end
+  catch
+    :exit, _reason -> {:error, :not_found}
   end
 
   @doc """
@@ -1217,7 +1214,7 @@ defmodule Rebus do
   """
   @spec send(pid(), Rebus.Message.t()) :: :ok | {:error, error_reason()}
   def send(conn, %Rebus.Message{} = message) when is_pid(conn),
-    do: Rebus.Connection.send(conn, message)
+    do: Rebus.Connection.dispatch(conn, message)
 
   @doc """
   Sends a message with a custom dispatch timeout in milliseconds.
@@ -1227,7 +1224,7 @@ defmodule Rebus do
   @spec send(pid(), Rebus.Message.t(), non_neg_integer()) :: :ok | {:error, error_reason()}
   def send(conn, %Rebus.Message{} = message, timeout)
       when is_pid(conn) and is_integer(timeout) and timeout >= 0 do
-    Rebus.Connection.send(conn, message, timeout)
+    Rebus.Connection.dispatch(conn, message, timeout)
   end
 
   @doc """

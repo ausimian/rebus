@@ -62,15 +62,13 @@ defmodule Rebus.BusAddress do
   """
   @spec parse(term()) :: {:ok, [candidate()]} | {:error, {:invalid_bus_address, error_reason()}}
   def parse(address) when is_binary(address) do
-    cond do
-      byte_size(address) > @max_address_length ->
-        error(:too_long)
-
-      true ->
-        address
-        |> :binary.split(";", [:global])
-        |> drop_trailing_empty_entry()
-        |> parse_entries()
+    if byte_size(address) > @max_address_length do
+      error(:too_long)
+    else
+      address
+      |> :binary.split(";", [:global])
+      |> drop_trailing_empty_entry()
+      |> parse_entries()
     end
   end
 
@@ -124,17 +122,15 @@ defmodule Rebus.BusAddress do
   defp parse_parameters(parameters) do
     entries = :binary.split(parameters, ",", [:global])
 
-    cond do
-      length(entries) > @max_parameters ->
-        error(:too_many_parameters)
-
-      true ->
-        Enum.reduce_while(entries, {:ok, %{}}, fn parameter, {:ok, pairs} ->
-          case parse_parameter(parameter, pairs) do
-            {:ok, parsed} -> {:cont, {:ok, parsed}}
-            {:error, _reason} = error -> {:halt, error}
-          end
-        end)
+    if length(entries) > @max_parameters do
+      error(:too_many_parameters)
+    else
+      Enum.reduce_while(entries, {:ok, %{}}, fn parameter, {:ok, pairs} ->
+        case parse_parameter(parameter, pairs) do
+          {:ok, parsed} -> {:cont, {:ok, parsed}}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
     end
   end
 
@@ -241,12 +237,12 @@ defmodule Rebus.BusAddress do
     end
   end
 
-  defp hex_guid?(guid) do
-    for <<byte <- guid>>, reduce: true do
-      true when byte in ?0..?9 or byte in ?a..?f or byte in ?A..?F -> true
-      _ -> false
-    end
-  end
+  defp hex_guid?(<<>>), do: true
+
+  defp hex_guid?(<<byte, rest::binary>>) when byte in ?0..?9 or byte in ?a..?f or byte in ?A..?F,
+    do: hex_guid?(rest)
+
+  defp hex_guid?(_guid), do: false
 
   defp decode_value(value), do: decode_value(value, [])
 
