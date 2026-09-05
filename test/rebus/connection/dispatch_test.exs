@@ -12,6 +12,7 @@ defmodule Rebus.Connection.DispatchTest do
   alias Rebus.MatchRule
   alias Rebus.Message
   alias Rebus.ScriptedTransport
+  alias Rebus.TestFD
 
   @machine_id "0123456789abcdef0123456789abcdef"
   @unknown_method_error "org.freedesktop.DBus.Error.UnknownMethod"
@@ -42,8 +43,9 @@ defmodule Rebus.Connection.DispatchTest do
       assert log =~ "Ignoring late or orphaned D-Bus reply for serial 9"
     end
 
+    @tag skip: TestFD.skip_reason()
     test "opens a file-descriptor claim for a reply that carries descriptors" do
-      {sock, fd} = descriptor()
+      fd = descriptor()
       %{tag: tag, request_ref: request_ref} = entry = caller()
 
       state =
@@ -69,7 +71,6 @@ defmodule Rebus.Connection.DispatchTest do
       # The claim still owns the descriptor, so this test closes it rather than
       # leaving it open for the life of the run.
       FDClaims.close_all(state.fd_claims)
-      _ = :socket.close(sock)
     end
 
     test "fails a pending call whose reply hit a resource limit" do
@@ -327,13 +328,10 @@ defmodule Rebus.Connection.DispatchTest do
   defp handler(rule),
     do: %{pid: self(), monitor_ref: Process.monitor(self()), rule: rule}
 
-  # A descriptor this test owns, so the close-or-deliver path under test never
-  # closes an arbitrary number.
-  defp descriptor do
-    {:ok, sock} = :socket.open(:inet, :stream, :default)
-    {:ok, fd} = :socket.getopt(sock, {:otp, :fd})
-    {sock, fd}
-  end
+  # A descriptor this test owns outright, so the close-or-deliver path under
+  # test never closes a number another socket still holds. `{:otp, :fd}` on a
+  # socket the test keeps would do exactly that; see `Rebus.TestFD`.
+  defp descriptor, do: TestFD.dup!()
 
   # A well-formed `method_return` frame whose body exceeds a local scalar cap,
   # so parsing yields the reply envelope and `{:error, :resource_limit, ...}`.
