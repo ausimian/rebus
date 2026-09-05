@@ -505,6 +505,54 @@ defmodule Rebus.AuthTest do
       assert :ok = Task.await(anonymous_server, 2_000)
     end
 
+    test "completes a peer-to-peer connection that has no bus driver" do
+      {server, addr} =
+        start_auth_server(fn peer ->
+          assert "\0AUTH EXTERNAL " <> _external_id = receive_line(peer)
+          :ok = :socket.send(peer, "REJECTED ANONYMOUS\r\n")
+          assert "AUTH ANONYMOUS" = receive_line(peer)
+          :ok = :socket.send(peer, "OK #{@guid}\r\n")
+          assert "BEGIN " = receive_line(peer)
+
+          # A peer-to-peer endpoint implements no bus driver, so the first
+          # frame it ever sees must be the application's own method call.
+          assert %Message{
+                   type: :method_call,
+                   header_fields: %{member: "Ping"},
+                   serial: serial
+                 } = receive_message(peer)
+
+          reply =
+            Message.new!(:method_return,
+              reply_serial: serial,
+              serial: 1,
+              signature: "s",
+              body: ["pong"]
+            )
+
+          {:ok, encoded} = Message.encode(reply)
+          :ok = :socket.send(peer, encoded)
+          wait_for_finish()
+        end)
+
+      assert {:ok, connection} = Rebus.connect(addr, bus: false, allow_anonymous: true)
+
+      ping =
+        Message.new!(:method_call,
+          path: "/org/example/Peer",
+          interface: "org.example.Peer",
+          member: "Ping"
+        )
+
+      assert {:ok, %Message{type: :method_return, body: ["pong"]}} =
+               Rebus.call(connection, ping, 2_000)
+
+      assert is_nil(:sys.get_state(connection).name)
+      assert :ok = Rebus.close(connection)
+      send(server.pid, :finish)
+      assert :ok = Task.await(server, 2_000)
+    end
+
     test "reports anonymous rejection and malformed responses without peer payloads" do
       for {reply, expected} <- [
             {"REJECTED ANONYMOUS\r\n", {:auth_rejected, ["ANONYMOUS"]}},

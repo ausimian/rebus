@@ -390,16 +390,20 @@ defmodule Rebus do
   def connect(address, opts \\ [])
 
   def connect(:system, opts) do
-    case Application.get_env(:rebus, :system_bus_address, @default_system_bus_address) do
-      nil -> {:error, :no_system_bus_address}
-      address -> connect_bus_address(address, opts)
+    with :ok <- validate_bus_alias_option(opts) do
+      case Application.get_env(:rebus, :system_bus_address, @default_system_bus_address) do
+        nil -> {:error, :no_system_bus_address}
+        address -> connect_bus_address(address, opts)
+      end
     end
   end
 
   def connect(:session, opts) do
-    case System.get_env("DBUS_SESSION_BUS_ADDRESS") do
-      nil -> {:error, :no_session_bus_address}
-      address -> connect_bus_address(address, opts)
+    with :ok <- validate_bus_alias_option(opts) do
+      case System.get_env("DBUS_SESSION_BUS_ADDRESS") do
+        nil -> {:error, :no_session_bus_address}
+        address -> connect_bus_address(address, opts)
+      end
     end
   end
 
@@ -443,6 +447,16 @@ defmodule Rebus do
 
   defp strip_public_connection_options(opts) do
     Keyword.drop(opts, @publicly_ignored_connection_options)
+  end
+
+  # `:system` and `:session` name message buses, so they cannot be peer-to-peer
+  # endpoints. Reject the option before any address lookup or I/O so the error
+  # does not depend on the local environment.
+  defp validate_bus_alias_option(opts) do
+    case Keyword.get(opts, :bus, true) do
+      true -> :ok
+      _bus -> {:error, :invalid_bus_option}
+    end
   end
 
   defp connect_bus_address(address, opts) do
@@ -1035,6 +1049,7 @@ defmodule Rebus do
   defp retryable_bus_address_error?(:invalid_read_timeout), do: false
   defp retryable_bus_address_error?(:invalid_write_timeout), do: false
   defp retryable_bus_address_error?(:invalid_allow_anonymous), do: false
+  defp retryable_bus_address_error?(:invalid_bus_option), do: false
   defp retryable_bus_address_error?(:invalid_name), do: false
   defp retryable_bus_address_error?(:invalid_auth_id_fun), do: false
   defp retryable_bus_address_error?(:invalid_auth_username_fun), do: false
