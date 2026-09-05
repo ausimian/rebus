@@ -9,6 +9,12 @@ defmodule Rebus.MatchRuleTest do
   alias Rebus.Message
   alias Rebus.TestServer
 
+  # Upper bound on `kill_supervised/2` waiting for restart-budget room, in
+  # `wait_until/2` attempts of 10 ms each: one budget period plus slack. Past
+  # that the wait cannot help, and the kill would take the supervisor down, so
+  # the helper fails there instead of leaving a later assertion to explain it.
+  @restart_room_attempts 600
+
   describe "MatchRule" do
     test "builds canonical, quoted signal rules" do
       assert {:ok, rule} =
@@ -669,7 +675,7 @@ defmodule Rebus.MatchRuleTest do
       assert map_size(refs) == 20
 
       worker = subscription_worker(connection)
-      Process.exit(worker, :kill)
+      kill_worker(worker)
 
       assert wait_until(fn ->
                case Registry.lookup(Rebus.MatchSubscription.Registry, connection) do
@@ -827,7 +833,7 @@ defmodule Rebus.MatchRuleTest do
       assert wait_until(fn -> not Rebus.MatchSubscription.persisted?(connection) end)
 
       worker = subscription_worker(connection)
-      Process.exit(worker, :kill)
+      kill_worker(worker)
 
       assert wait_until(fn ->
                case Registry.lookup(Rebus.MatchSubscription.Registry, connection) do
@@ -858,7 +864,7 @@ defmodule Rebus.MatchRuleTest do
       ref = assert_subscription(owner)
 
       worker = subscription_worker(connection)
-      Process.exit(worker, :kill)
+      kill_worker(worker)
 
       assert wait_until(fn ->
                case Registry.lookup(Rebus.MatchSubscription.Registry, connection) do
@@ -1856,9 +1862,66 @@ defmodule Rebus.MatchRuleTest do
   end
 
   defp await_restart(pid, monitors, replaced) do
-    Process.exit(pid, :kill)
+    kill_supervised(pid, Rebus.MatchSubscription.Supervisor)
     Enum.each(monitors, &assert_down/1)
     assert wait_until(fn -> Enum.all?(replaced, &replaced?/1) end)
+  end
+
+  defp kill_worker(worker), do: kill_supervised(worker, Rebus.MatchSubscription)
+
+  # Every kill in this module lands under `Rebus.MatchSubscription.Supervisor`
+  # or the `Rebus.MatchSubscription` dynamic supervisor beneath it, and each of
+  # those carries the default budget of three restarts in five seconds. The
+  # tests here are synchronous, so a kill in one test still counts against the
+  # next. A kill made once `supervisor` has no budget left does not restart the
+  # target locally: it takes `supervisor` down, and the escalation eventually
+  # restarts `Rebus.MatchSubscription.Store`, replacing the state table these
+  # tests assert on. Waiting for room first keeps each kill local. The common
+  # case has room and does not wait.
+  defp kill_supervised(pid, supervisor) when is_pid(pid) do
+    assert wait_until(
+             fn -> not restart_budget_full?(supervisor) end,
+             @restart_room_attempts
+           ),
+           "restart budget of #{inspect(supervisor)} did not free up"
+
+    Process.exit(pid, :kill)
+  end
+
+  defp restart_budget_full?(name) do
+    case Process.whereis(name) do
+      nil -> false
+      pid -> pid |> :sys.get_state() |> budget_full?()
+    end
+  end
+
+  # `DynamicSupervisor` keeps its budget in a struct, so the fields are named.
+  # The OTP `supervisor` record is positional: intensity, period and the list
+  # of restart timestamps sit at positions 5, 6 and 7 as verified on OTP 27 and
+  # 28, and the matrix also runs OTP 29. Any shape not recognised here is
+  # false, so the kill proceeds at once and degrades to the pre-fix behaviour
+  # rather than failing.
+  defp budget_full?(%{max_restarts: max, max_seconds: period, restarts: restarts})
+       when is_integer(max) and is_integer(period) and is_list(restarts),
+       do: recent_restarts(restarts, period) >= max
+
+  defp budget_full?(state)
+       when is_tuple(state) and tuple_size(state) > 7 and elem(state, 0) == :state do
+    intensity = elem(state, 5)
+    period = elem(state, 6)
+    restarts = elem(state, 7)
+
+    is_integer(intensity) and is_integer(period) and is_list(restarts) and
+      recent_restarts(restarts, period) >= intensity
+  end
+
+  defp budget_full?(_state), do: false
+
+  # The supervisors record restart times with `:erlang.monotonic_time(1)` and
+  # only prune the list when they add to it, so age the entries out here.
+  defp recent_restarts(restarts, period) do
+    now = System.monotonic_time(:second)
+    Enum.count(restarts, &(is_integer(&1) and now <= &1 + period))
   end
 
   defp assert_down({target, monitor}) do
