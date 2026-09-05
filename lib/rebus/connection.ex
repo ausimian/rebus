@@ -1511,7 +1511,6 @@ defmodule Rebus.Connection do
             state,
             sock,
             auth_id,
-            mechanisms,
             username,
             rest,
             deadline,
@@ -1551,7 +1550,6 @@ defmodule Rebus.Connection do
          state,
          sock,
          auth_id,
-         mechanisms,
          username,
          rest,
          deadline,
@@ -1574,7 +1572,6 @@ defmodule Rebus.Connection do
             auth_id,
             username,
             challenge,
-            mechanisms,
             rest,
             deadline,
             maximum
@@ -1606,7 +1603,6 @@ defmodule Rebus.Connection do
          auth_id,
          username,
          challenge,
-         _mechanisms,
          rest,
          deadline,
          maximum
