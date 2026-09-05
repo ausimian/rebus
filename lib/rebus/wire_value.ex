@@ -31,10 +31,14 @@ defmodule Rebus.WireValue do
   end
 
   def validate!(:signature, value) do
-    case if(valid_string?(value), do: Signature.parse(value), else: {:error, :invalid_signature}) do
-      {:ok, _types} -> :ok
-      {:error, :resource_limit} -> raise Rebus.ResourceLimitError, limit: :nesting
-      {:error, :invalid_signature} -> raise ArgumentError, "invalid D-Bus signature"
+    if valid_string?(value) do
+      case Signature.parse(value) do
+        {:ok, _types} -> :ok
+        {:error, :resource_limit} -> raise Rebus.ResourceLimitError, limit: :nesting
+        {:error, :invalid_signature} -> raise ArgumentError, "invalid D-Bus signature"
+      end
+    else
+      raise ArgumentError, "invalid D-Bus signature"
     end
   end
 end

@@ -388,7 +388,7 @@ defmodule Rebus.Connection do
   end
 
   def handle_info({:gen_event_EXIT, {SignalHandler, ref}, _reason}, %__MODULE__{} = state) do
-    # Because handlers are addede via :gen_event.add_sup_handler/3, we receive
+    # Because handlers are added via :gen_event.add_sup_handler/3, we receive
     # `:gen_event_EXIT` messages when they are removed. We can use this to clean
     # up the monitor
     {:noreply, remove_signal_handler_monitor(state, ref)}
@@ -1475,12 +1475,10 @@ defmodule Rebus.Connection do
   defp valid_guid?(guid) when is_binary(guid) and byte_size(guid) == 32, do: hex_guid?(guid)
   defp valid_guid?(_guid), do: false
 
-  defp hex_guid?(guid) do
-    for <<byte <- guid>>, reduce: true do
-      true when byte in ?0..?9 or byte in ?a..?f or byte in ?A..?F -> true
-      _ -> false
-    end
-  end
+  defp hex_guid?(guid), do: all_bytes?(guid, &hex_byte?/1)
+
+  defp hex_byte?(byte) when byte in ?0..?9 or byte in ?a..?f or byte in ?A..?F, do: true
+  defp hex_byte?(_byte), do: false
 
   defp guid_equal?(<<>>, <<>>), do: true
 
@@ -1815,14 +1813,12 @@ defmodule Rebus.Connection do
     _kind, _reason -> {:error, :port_open_failed}
   end
 
-  defp valid_auth_username?(username) when byte_size(username) in 1..64 do
-    for <<byte <- username>>, reduce: true do
-      valid when byte in 0x21..0x7E -> valid
-      _invalid -> false
-    end
-  end
+  defp valid_auth_username?(username) when byte_size(username) in 1..64,
+    do: all_bytes?(username, &visible_ascii_byte?/1)
 
   defp valid_auth_username?(_username), do: false
+
+  defp visible_ascii_byte?(byte), do: byte in 0x21..0x7E
 
   defp auth_id_uid(auth_id) when is_binary(auth_id) do
     with {:ok, uid_bytes} <- Base.decode16(auth_id, case: :mixed),
@@ -1981,12 +1977,16 @@ defmodule Rebus.Connection do
     _kind, _reason -> :ok
   end
 
-  defp uid_bytes?(uid) do
-    for <<byte <- uid>>, reduce: true do
-      true -> byte in ?0..?9
-      false -> false
-    end
-  end
+  defp uid_bytes?(uid), do: all_bytes?(uid, &digit_byte?/1)
+
+  defp digit_byte?(byte), do: byte in ?0..?9
+
+  # Walk the binary directly: no intermediate list, and the first byte that
+  # fails the predicate ends the walk.
+  defp all_bytes?(<<>>, _predicate), do: true
+
+  defp all_bytes?(<<byte, rest::binary>>, predicate),
+    do: predicate.(byte) and all_bytes?(rest, predicate)
 
   defp stop_and_close(sock, reason) do
     _ = :socket.close(sock)

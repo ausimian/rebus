@@ -213,11 +213,7 @@ defmodule Rebus.MatchRule do
 
   defp normalize_arguments(values) when is_list(values) do
     cond do
-      Enum.map(values, fn
-        {index, _value} -> index
-        _value -> nil
-      end)
-      |> then(&(&1 != Enum.uniq(&1))) ->
+      duplicate_indexes?(values) ->
         {:error, :duplicate_match_option}
 
       Enum.all?(values, fn
@@ -232,6 +228,16 @@ defmodule Rebus.MatchRule do
   end
 
   defp normalize_arguments(_values), do: {:error, :invalid_match_argument}
+
+  defp duplicate_indexes?(values) do
+    indexes =
+      Enum.map(values, fn
+        {index, _value} -> index
+        _value -> nil
+      end)
+
+    indexes != Enum.uniq(indexes)
+  end
 
   defp encode(criteria) do
     ["type='signal'" | encode_criteria(criteria)]

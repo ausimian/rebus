@@ -237,12 +237,12 @@ defmodule Rebus.BusAddress do
     end
   end
 
-  defp hex_guid?(guid) do
-    for <<byte <- guid>>, reduce: true do
-      true when byte in ?0..?9 or byte in ?a..?f or byte in ?A..?F -> true
-      _ -> false
-    end
-  end
+  defp hex_guid?(<<>>), do: true
+
+  defp hex_guid?(<<byte, rest::binary>>) when byte in ?0..?9 or byte in ?a..?f or byte in ?A..?F,
+    do: hex_guid?(rest)
+
+  defp hex_guid?(_guid), do: false
 
   defp decode_value(value), do: decode_value(value, [])
 
