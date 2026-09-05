@@ -74,6 +74,10 @@ defmodule Rebus.TestServer do
 
   @impl true
   def init(opts) do
+    # Without this, a supervised shutdown kills the server outright and
+    # `terminate/2` never unlinks the socket path.
+    Process.flag(:trap_exit, true)
+
     family = opts[:family] || :inet
     path = opts[:path]
 
@@ -218,6 +222,10 @@ defmodule Rebus.TestServer do
 
     {:noreply, %{state | handle: nil}, {:continue, action}}
   end
+
+  # Trapping exits means a linked process other than the parent would deliver
+  # an EXIT message here; ignore it as the default implementation would.
+  def handle_info(_message, %__MODULE__{} = state), do: {:noreply, state}
 
   @impl true
   def handle_call(:get_listen_addr, _from, %__MODULE__{} = state) do

@@ -26,9 +26,7 @@ defmodule Rebus.TestFD do
   """
   @spec dup!() :: non_neg_integer()
   def dup! do
-    # `/tmp` rather than `System.tmp_dir!/0`: macOS caps a local socket path at
-    # around 104 bytes, and `$TMPDIR` there is already most of that.
-    path = Path.join("/tmp", "rebus-test-fd-#{System.unique_integer([:positive])}")
+    path = Rebus.TestTmp.path("fd")
     {:ok, listener} = :socket.open(:local, :stream, :default)
     :ok = :socket.bind(listener, %{family: :local, path: path})
     :ok = :socket.listen(listener, 1)

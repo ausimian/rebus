@@ -334,11 +334,7 @@ defmodule Rebus.Connection.HandshakeTest do
     do: Base.encode16("#{@context} 1 #{@server_challenge}", case: :lower)
 
   defp with_private_keyring(fun) do
-    home =
-      Path.join(
-        System.tmp_dir!(),
-        "rebus-handshake-#{System.unique_integer([:positive, :monotonic])}"
-      )
+    home = Rebus.TestTmp.path("hs")
 
     keyring = Path.join(home, ".dbus-keyrings")
     previous_home = System.get_env("HOME")
