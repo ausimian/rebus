@@ -79,20 +79,9 @@ defmodule Rebus.Decoder do
   end
 
   @doc false
-  @spec decode(binary(), binary(), endianness(), pos_integer()) :: [any()]
-  def decode(signature, data, endianness, element_budget) do
-    {values, _position} =
-      decode_with_position(signature, data, endianness, element_budget, @default_scalar_budget)
-
-    values
-  end
-
-  @doc false
-  @spec decode(binary(), binary(), endianness(), pos_integer(), pos_integer()) :: [any()]
-  def decode(signature, data, endianness, element_budget, scalar_budget) do
-    {values, _position} =
-      decode_with_position(signature, data, endianness, element_budget, scalar_budget)
-
+  @spec decode(binary(), binary(), endianness(), keyword()) :: [any()]
+  def decode(signature, data, endianness, opts) do
+    {values, _position} = decode_with_position(signature, data, endianness, opts)
     values
   end
 
@@ -108,24 +97,14 @@ defmodule Rebus.Decoder do
   """
   @spec decode_with_position(binary(), binary(), endianness()) :: {[any()], non_neg_integer()}
   def decode_with_position(signature, data, endianness \\ :little) do
-    decode_with_position(signature, data, endianness, @default_element_budget)
+    decode_with_position(signature, data, endianness, [])
   end
 
   @doc false
-  @spec decode_with_position(binary(), binary(), endianness(), pos_integer()) ::
+  @spec decode_with_position(binary(), binary(), endianness(), keyword()) ::
           {[any()], non_neg_integer()}
-  def decode_with_position(signature, data, endianness, element_budget)
-      when is_integer(element_budget) and element_budget > 0 do
-    decode_with_position(signature, data, endianness, element_budget, @default_scalar_budget)
-  end
-
-  @doc false
-  @spec decode_with_position(binary(), binary(), endianness(), pos_integer(), pos_integer()) ::
-          {[any()], non_neg_integer()}
-  def decode_with_position(signature, data, endianness, element_budget, scalar_budget)
-      when is_integer(element_budget) and element_budget > 0 and is_integer(scalar_budget) and
-             scalar_budget > 0 do
-    state = new_state(endianness, 0, data, element_budget, scalar_budget)
+  def decode_with_position(signature, data, endianness, opts) when is_list(opts) do
+    state = new_state(endianness, 0, data, opts)
     types = Signature.parse!(signature)
     Signature.validate_nesting!(types, state)
 
@@ -137,14 +116,7 @@ defmodule Rebus.Decoder do
   @spec decode_at_position(binary(), binary(), endianness(), non_neg_integer()) :: list()
   def decode_at_position(signature, data, endianness, starting_position) do
     # Create state with the starting position for proper alignment calculations
-    state =
-      new_state(
-        endianness,
-        starting_position,
-        data,
-        @default_element_budget,
-        @default_scalar_budget
-      )
+    state = new_state(endianness, starting_position, data, [])
 
     types = Signature.parse!(signature)
     Signature.validate_nesting!(types, state)
@@ -165,11 +137,7 @@ defmodule Rebus.Decoder do
   end
 
   # Decode individual values based on their type
-  defp decode_single({:byte, _}, state) do
-    {value, new_state} = read_aligned_bytes(state, 1, 1)
-    <<byte_value::8>> = value
-    {byte_value, new_state}
-  end
+  defp decode_single({:byte, _}, state), do: read_integer(state, 1, :unsigned)
 
   defp decode_single({:boolean, _}, state) do
     # The specification only permits 0 and 1 on the wire; anything else is a
@@ -181,99 +149,21 @@ defmodule Rebus.Decoder do
     end
   end
 
-  defp decode_single({:int16, _}, state) do
-    {value, new_state} = read_aligned_bytes(state, 2, 2)
+  defp decode_single({:int16, _}, state), do: read_integer(state, 2, :signed)
 
-    decoded_value =
-      case state.endianness do
-        :little ->
-          <<result::little-signed-16>> = value
-          result
+  defp decode_single({:uint16, _}, state), do: read_integer(state, 2, :unsigned)
 
-        :big ->
-          <<result::big-signed-16>> = value
-          result
-      end
+  defp decode_single({:int32, _}, state), do: read_integer(state, 4, :signed)
 
-    {decoded_value, new_state}
-  end
+  defp decode_single({:uint32, _}, state), do: decode_uint32(state)
 
-  defp decode_single({:uint16, _}, state) do
-    {value, new_state} = read_aligned_bytes(state, 2, 2)
+  defp decode_single({:int64, _}, state), do: read_integer(state, 8, :signed)
 
-    decoded_value =
-      case state.endianness do
-        :little ->
-          <<result::little-16>> = value
-          result
-
-        :big ->
-          <<result::big-16>> = value
-          result
-      end
-
-    {decoded_value, new_state}
-  end
-
-  defp decode_single({:int32, _}, state) do
-    decode_int32(state)
-  end
-
-  defp decode_single({:uint32, _}, state) do
-    decode_uint32(state)
-  end
-
-  defp decode_single({:int64, _}, state) do
-    {value, new_state} = read_aligned_bytes(state, 8, 8)
-
-    decoded_value =
-      case state.endianness do
-        :little ->
-          <<result::little-signed-64>> = value
-          result
-
-        :big ->
-          <<result::big-signed-64>> = value
-          result
-      end
-
-    {decoded_value, new_state}
-  end
-
-  defp decode_single({:uint64, _}, state) do
-    {value, new_state} = read_aligned_bytes(state, 8, 8)
-
-    decoded_value =
-      case state.endianness do
-        :little ->
-          <<result::little-64>> = value
-          result
-
-        :big ->
-          <<result::big-64>> = value
-          result
-      end
-
-    {decoded_value, new_state}
-  end
+  defp decode_single({:uint64, _}, state), do: read_integer(state, 8, :unsigned)
 
   defp decode_single({:double, _}, state) do
-    {value, new_state} = read_aligned_bytes(state, 8, 8)
-
-    bits =
-      case state.endianness do
-        :little ->
-          <<result::little-64>> = value
-          result
-
-        :big ->
-          <<result::big-64>> = value
-          result
-      end
-
-    decoded_value = decode_double(bits, state.endianness)
-
-    {decoded_value, new_state}
+    {bits, new_state} = read_integer(state, 8, :unsigned)
+    {decode_double(bits, state.endianness), new_state}
   end
 
   defp decode_single({:string, _}, state) do
@@ -311,17 +201,9 @@ defmodule Rebus.Decoder do
       raise ArgumentError, "D-Bus array size limit exceeded"
     end
 
-    # Calculate how much data this array should consume in total
-    # This includes alignment padding + the actual array data
-    alignment_padding =
-      case get_alignment(element_type) do
-        alignment ->
-          current_pos = length_state.position
-          aligned_pos = align_position(current_pos, alignment)
-          aligned_pos - current_pos
-      end
-
-    total_array_size = alignment_padding + array_length
+    # An array consumes its alignment padding plus the declared element bytes.
+    padding = padding_for(length_state.position, Signature.alignment(element_type))
+    total_array_size = padding + array_length
 
     # Extract exactly the data for this array
     <<array_binary::binary-size(^total_array_size), remaining_data::binary>> = length_state.data
@@ -331,17 +213,18 @@ defmodule Rebus.Decoder do
     # Create a temporary state to decode just this array
     temp_state = %{scalar_state | data: array_binary}
     nested_state = Signature.enter_container!(temp_state, :array)
-
-    # Align to element type boundary
-    element_alignment = get_alignment(element_type)
-    aligned_state = align_to(nested_state, element_alignment)
+    aligned_state = skip_padding(nested_state, padding)
 
     # Track where array data ends within this isolated binary
     array_end_position = aligned_state.position + array_length
 
+    # Whether elements are charged against the element budget is invariant over
+    # the array, so decide it once here rather than per element.
+    budgeted? = budgeted_array_element?(element_type)
+
     # Decode elements until we reach the end
     {elements, final_temp_state} =
-      decode_array_elements(element_type, aligned_state, array_end_position, [])
+      decode_array_elements(element_type, aligned_state, array_end_position, budgeted?, [])
 
     # Return with the remaining data and updated position
     final_state = %{
@@ -386,17 +269,30 @@ defmodule Rebus.Decoder do
 
   # Helper functions
 
-  defp new_state(endianness, position, data, element_budget, scalar_budget) do
+  defp new_state(endianness, position, data, opts) do
+    opts =
+      Keyword.validate!(opts,
+        element_budget: @default_element_budget,
+        scalar_budget: @default_scalar_budget
+      )
+
     Map.merge(
       %{
         endianness: endianness,
         position: position,
         data: data,
-        element_budget: element_budget,
-        scalar_budget: scalar_budget
+        element_budget: budget!(opts, :element_budget),
+        scalar_budget: budget!(opts, :scalar_budget)
       },
       Signature.new_nesting_state()
     )
+  end
+
+  defp budget!(opts, key) do
+    case Keyword.fetch!(opts, key) do
+      budget when is_integer(budget) and budget > 0 -> budget
+      _other -> raise ArgumentError, "#{key} must be a positive integer"
+    end
   end
 
   defp consume_element!(%{element_budget: budget} = state) when budget > 0,
@@ -405,7 +301,7 @@ defmodule Rebus.Decoder do
   defp consume_element!(_state), do: raise(ResourceLimitError, limit: :structural)
 
   defp charge_scalar_array!(state, element_type, array_length) do
-    case scalar_width(element_type) do
+    case Signature.fixed_width(element_type) do
       nil -> state
       width -> consume_scalars!(state, div(array_length, width))
     end
@@ -416,62 +312,42 @@ defmodule Rebus.Decoder do
 
   defp consume_scalars!(_state, _count), do: raise(ResourceLimitError, limit: :scalar)
 
-  defp scalar_width({:byte, _}), do: 1
-  defp scalar_width({:boolean, _}), do: 4
-  defp scalar_width({type, _}) when type in [:int16, :uint16], do: 2
-  defp scalar_width({type, _}) when type in [:int32, :uint32, :unix_fd], do: 4
-  defp scalar_width({type, _}) when type in [:int64, :uint64, :double], do: 8
-  defp scalar_width(_), do: nil
+  defp decode_uint32(state), do: read_integer(state, 4, :unsigned)
 
-  defp decode_int32(state) do
-    {value, new_state} = read_aligned_bytes(state, 4, 4)
-
-    decoded_value =
-      case state.endianness do
-        :little ->
-          <<result::little-signed-32>> = value
-          result
-
-        :big ->
-          <<result::big-signed-32>> = value
-          result
-      end
-
-    {decoded_value, new_state}
+  # Fixed-width integers are read at their natural alignment, then matched
+  # directly out of the aligned binary.
+  defp read_integer(state, size, signedness) do
+    {bytes, new_state} = read_aligned_bytes(state, size, size)
+    {integer_value(size, signedness, state.endianness, bytes), new_state}
   end
 
-  defp decode_uint32(state) do
-    {value, new_state} = read_aligned_bytes(state, 4, 4)
+  defp integer_value(1, :unsigned, _endianness, <<value::8>>), do: value
+  defp integer_value(2, :signed, :little, <<value::little-signed-16>>), do: value
+  defp integer_value(2, :signed, :big, <<value::big-signed-16>>), do: value
+  defp integer_value(2, :unsigned, :little, <<value::little-unsigned-16>>), do: value
+  defp integer_value(2, :unsigned, :big, <<value::big-unsigned-16>>), do: value
+  defp integer_value(4, :signed, :little, <<value::little-signed-32>>), do: value
+  defp integer_value(4, :signed, :big, <<value::big-signed-32>>), do: value
+  defp integer_value(4, :unsigned, :little, <<value::little-unsigned-32>>), do: value
+  defp integer_value(4, :unsigned, :big, <<value::big-unsigned-32>>), do: value
+  defp integer_value(8, :signed, :little, <<value::little-signed-64>>), do: value
+  defp integer_value(8, :signed, :big, <<value::big-signed-64>>), do: value
+  defp integer_value(8, :unsigned, :little, <<value::little-unsigned-64>>), do: value
+  defp integer_value(8, :unsigned, :big, <<value::big-unsigned-64>>), do: value
 
-    decoded_value =
-      case state.endianness do
-        :little ->
-          <<result::little-32>> = value
-          result
-
-        :big ->
-          <<result::big-32>> = value
-          result
-      end
-
-    {decoded_value, new_state}
+  defp decode_string_like(state, 1) do
+    {value, length_state} = read_bytes(state, 1)
+    <<length::8>> = value
+    read_string_body(length_state, length)
   end
 
-  defp decode_string_like(state, length_size) do
-    # Read length
-    {length, length_state} =
-      case length_size do
-        1 ->
-          {value, new_state} = read_bytes(state, 1)
-          <<len::8>> = value
-          {len, new_state}
+  defp decode_string_like(state, 4) do
+    {length, length_state} = decode_uint32(state)
+    read_string_body(length_state, length)
+  end
 
-        4 ->
-          decode_uint32(state)
-      end
-
-    # Read string data
-    {string_data, string_state} = read_bytes(length_state, length)
+  defp read_string_body(state, length) do
+    {string_data, string_state} = read_bytes(state, length)
 
     # Skip null terminator
     {null, final_state} = read_bytes(string_state, 1)
@@ -492,14 +368,16 @@ defmodule Rebus.Decoder do
   end
 
   defp align_to(state, alignment) do
-    current_pos = state.position
-    aligned_pos = align_position(current_pos, alignment)
-    padding_size = aligned_pos - current_pos
+    skip_padding(state, padding_for(state.position, alignment))
+  end
 
+  defp skip_padding(state, 0), do: state
+
+  defp skip_padding(state, padding_size) do
     # Skip padding bytes in the data
     padded_data = binary_part(state.data, padding_size, byte_size(state.data) - padding_size)
     check_zero_padding!(state.data, padding_size)
-    %{state | position: aligned_pos, data: padded_data}
+    %{state | position: state.position + padding_size, data: padded_data}
   end
 
   # The specification requires alignment padding to be NUL bytes.
@@ -514,72 +392,35 @@ defmodule Rebus.Decoder do
     end
   end
 
-  defp align_position(position, alignment) do
-    remainder = rem(position, alignment)
-
-    if remainder == 0 do
-      position
-    else
-      position + (alignment - remainder)
+  defp padding_for(position, alignment) do
+    case rem(position, alignment) do
+      0 -> 0
+      remainder -> alignment - remainder
     end
   end
 
   # Array-specific helper functions
 
-  defp get_alignment({:byte, _}), do: 1
-  defp get_alignment({:boolean, _}), do: 4
-  defp get_alignment({:int16, _}), do: 2
-  defp get_alignment({:uint16, _}), do: 2
-  defp get_alignment({:int32, _}), do: 4
-  defp get_alignment({:uint32, _}), do: 4
-  defp get_alignment({:int64, _}), do: 8
-  defp get_alignment({:uint64, _}), do: 8
-  defp get_alignment({:double, _}), do: 8
-  defp get_alignment({:string, _}), do: 4
-  defp get_alignment({:object_path, _}), do: 4
-  defp get_alignment({:signature, _}), do: 1
-  defp get_alignment({:variant, _}), do: 1
-  defp get_alignment({:unix_fd, _}), do: 4
-  defp get_alignment({:array, _}), do: 4
-  defp get_alignment({:struct, _}), do: 8
-  defp get_alignment({:dict_entry, _, _}), do: 8
-
-  defp decode_array_elements(_element_type, state, end_position, acc)
+  defp decode_array_elements(_element_type, state, end_position, _budgeted?, acc)
        when state.position >= end_position do
     {Enum.reverse(acc), state}
   end
 
-  defp decode_array_elements(element_type, state, end_position, acc) do
-    # For structs in arrays, each struct must be aligned to 8-byte boundary
-    aligned_state =
-      case element_type do
-        {:struct, _} -> align_to(state, 8)
-        # dict entries are also structs
-        {:dict_entry, _, _} -> align_to(state, 8)
-        _ -> state
-      end
+  defp decode_array_elements(element_type, state, end_position, budgeted?, acc) do
+    element_state = if budgeted?, do: consume_element!(state), else: state
 
-    element_state =
-      if budgeted_array_element?(element_type),
-        do: consume_element!(aligned_state),
-        else: aligned_state
-
+    # Struct and dict-entry elements are aligned to 8 by decode_single/2 itself.
     {value, new_state} = decode_single(element_type, element_state)
 
-    if new_state.position <= aligned_state.position do
+    if new_state.position <= state.position do
       raise ArgumentError, "D-Bus array element did not consume input"
     end
 
-    decode_array_elements(element_type, new_state, end_position, [value | acc])
+    decode_array_elements(element_type, new_state, end_position, budgeted?, [value | acc])
   end
 
-  defp budgeted_array_element?({type, _})
-       when type in [:string, :object_path, :signature, :variant],
-       do: true
-
-  defp budgeted_array_element?({type, _}) when type in [:array, :struct], do: true
-  defp budgeted_array_element?({:dict_entry, _, _}), do: true
-  defp budgeted_array_element?(_), do: false
+  # Only variable-width elements are charged against the element budget.
+  defp budgeted_array_element?(element_type), do: Signature.fixed_width(element_type) == nil
 
   defp decode_double(0x7FF0_0000_0000_0000, _endianness), do: :infinity
   defp decode_double(0xFFF0_0000_0000_0000, _endianness), do: :negative_infinity

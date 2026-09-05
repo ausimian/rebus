@@ -34,15 +34,17 @@ defmodule Rebus.DecoderTest do
 
   describe "basic types" do
     test "bounds decoded elements with an injectable budget" do
-      assert [] = Decoder.decode("", <<>>, :little, 1)
+      assert [] = Decoder.decode("", <<>>, :little, element_budget: 1)
 
       data = <<3::little-32, 1, 2, 3>>
-      assert [[1, 2, 3]] = Decoder.decode("ay", data, :little, 4)
-      assert [[1, 2, 3]] = Decoder.decode("ay", data, :little, 1)
-      assert [[1, 2, 3]] = Decoder.decode("ay", data, :little, 1, 3)
+      assert [[1, 2, 3]] = Decoder.decode("ay", data, :little, element_budget: 4)
+      assert [[1, 2, 3]] = Decoder.decode("ay", data, :little, element_budget: 1)
+
+      assert [[1, 2, 3]] =
+               Decoder.decode("ay", data, :little, element_budget: 1, scalar_budget: 3)
 
       assert_raise ResourceLimitError, fn ->
-        Decoder.decode("ay", data, :little, 1, 2)
+        Decoder.decode("ay", data, :little, element_budget: 1, scalar_budget: 2)
       end
 
       for {signature, data, budget} <- [
@@ -52,10 +54,10 @@ defmodule Rebus.DecoderTest do
             {"a{si}", [[{"one", 1}, {"two", 2}]], 7}
           ] do
         encoded = Encoder.encode(signature, data) |> IO.iodata_to_binary()
-        assert ^data = Decoder.decode(signature, encoded, :little, budget)
+        assert ^data = Decoder.decode(signature, encoded, :little, element_budget: budget)
 
         assert_raise ResourceLimitError, fn ->
-          Decoder.decode(signature, encoded, :little, budget - 1)
+          Decoder.decode(signature, encoded, :little, element_budget: budget - 1)
         end
       end
     end
@@ -63,7 +65,9 @@ defmodule Rebus.DecoderTest do
     test "classifies truncated declared arrays as malformed before resource limits" do
       truncated = <<1_000_001::little-32, 1>>
 
-      assert_raise MatchError, fn -> Decoder.decode("ay", truncated, :little, 1, 1) end
+      assert_raise MatchError, fn ->
+        Decoder.decode("ay", truncated, :little, element_budget: 1, scalar_budget: 1)
+      end
     end
 
     test "rejects malformed string-like wire values" do

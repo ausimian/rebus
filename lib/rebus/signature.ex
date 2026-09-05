@@ -128,6 +128,37 @@ defmodule Rebus.Signature do
     end
   end
 
+  # Returns the D-Bus wire alignment, in bytes, of a parsed type.
+  @doc false
+  @spec alignment(ast()) :: 1 | 2 | 4 | 8
+  def alignment({:byte, _}), do: 1
+  def alignment({:boolean, _}), do: 4
+  def alignment({:int16, _}), do: 2
+  def alignment({:uint16, _}), do: 2
+  def alignment({:int32, _}), do: 4
+  def alignment({:uint32, _}), do: 4
+  def alignment({:int64, _}), do: 8
+  def alignment({:uint64, _}), do: 8
+  def alignment({:double, _}), do: 8
+  def alignment({:string, _}), do: 4
+  def alignment({:object_path, _}), do: 4
+  def alignment({:signature, _}), do: 1
+  def alignment({:variant, _}), do: 1
+  def alignment({:unix_fd, _}), do: 4
+  def alignment({:array, _}), do: 4
+  def alignment({:struct, _}), do: 8
+  def alignment({:dict_entry, _, _}), do: 8
+
+  # Returns the fixed wire width, in bytes, of a parsed type, or nil when it varies.
+  @doc false
+  @spec fixed_width(ast()) :: 1 | 2 | 4 | 8 | nil
+  def fixed_width({:byte, _}), do: 1
+  def fixed_width({:boolean, _}), do: 4
+  def fixed_width({type, _}) when type in [:int16, :uint16], do: 2
+  def fixed_width({type, _}) when type in [:int32, :uint32, :unix_fd], do: 4
+  def fixed_width({type, _}) when type in [:int64, :uint64, :double], do: 8
+  def fixed_width(_type), do: nil
+
   defp check_nesting(types) do
     :ok = validate_nesting!(types, new_nesting_state())
     {:ok, types}
