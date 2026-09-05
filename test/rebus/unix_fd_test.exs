@@ -996,6 +996,41 @@ defmodule Rebus.UnixFDTest do
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
   end
 
+  test "answers an FD-bearing inbound method call and closes its descriptor", %{
+    server: server,
+    connection: connection
+  } do
+    before_fds = fd_set!()
+    {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
+
+    call =
+      Message.new!(:method_call,
+        path: "/test",
+        interface: "test.interface",
+        member: "TakesFD",
+        sender: ":1.99",
+        signature: "h",
+        body: [0],
+        fds: [fd]
+      )
+
+    {:ok, serial} = TestServer.push_call_with_fds(server, call, [fd])
+
+    assert_receive {^server,
+                    %Message{
+                      type: :error,
+                      header_fields: %{
+                        reply_serial: ^serial,
+                        destination: ":1.99",
+                        error_name: "org.freedesktop.DBus.Error.UnknownMethod"
+                      }
+                    }},
+                   1_000
+
+    assert Process.alive?(connection)
+    assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
+  end
+
   test "closes a reply whose original caller died before delivery", %{
     server: server,
     connection: connection

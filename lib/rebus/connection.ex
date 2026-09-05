@@ -32,6 +32,18 @@ defmodule Rebus.Connection do
   @fd_claim_handoff_grace 100
   @fd_claim_cleanup_grace 250
 
+  # Rebus serves no methods, so an inbound method call is refused rather than
+  # dropped: a caller fails immediately instead of waiting for its own timeout.
+  @unknown_method_error "org.freedesktop.DBus.Error.UnknownMethod"
+  @unknown_method_message "Method not handled by this connection"
+
+  # A peer that floods method calls without reading its socket would otherwise
+  # grow the write queue without bound: replies are produced per inbound frame
+  # but drain only as fast as the transport accepts them. Beyond this many
+  # queued connection-originated replies, further calls go unanswered, exactly
+  # as if their reply had expired before it could be written.
+  @max_queued_replies 64
+
   @spec call(pid(), Message.t(), non_neg_integer()) ::
           {:ok, Message.t()} | {:error, Rebus.call_error()}
   def call(pid, %Message{} = msg, timeout)
@@ -183,6 +195,8 @@ defmodule Rebus.Connection do
     field :partial_frame_timer, {reference(), reference()} | nil, default: nil
     field :unix_fd_transport?, boolean(), default: false
     field :unix_fd_negotiated?, boolean(), default: false
+    # Connection-originated replies waiting behind the active write.
+    field :queued_replies, non_neg_integer(), default: 0
 
     field :pending,
           %{
@@ -345,6 +359,10 @@ defmodule Rebus.Connection do
       ) do
     {:stop, {:shutdown, :caller_gone}, state}
   end
+
+  # Replies this connection originates are queued from the inbound path, which
+  # returns its own receive continuation. This starts the writer for them.
+  def handle_info(:advance_writes, %__MODULE__{} = state), do: advance_writes(state)
 
   def handle_info({:"$socket", s, :select, h}, %__MODULE__{sock: s, rref: h} = state) do
     {:noreply, %{state | rref: nil}, {:continue, :recv}}
@@ -1231,9 +1249,90 @@ defmodule Rebus.Connection do
     end
   end
 
+  defp dispatch_inbound_message(
+         %Message{type: :method_call} = msg,
+         rest,
+         %__MODULE__{} = state,
+         continuation,
+         source
+       ) do
+    # No method served by this connection takes a descriptor, so any received
+    # descriptor is closed before the call is answered.
+    close_message_fds(msg)
+    state = answer_method_call(msg, finish_frame(state))
+    parse_flat_messages(rest, state, continuation, source)
+  end
+
   defp dispatch_inbound_message(%Message{} = msg, rest, state, continuation, source) do
     close_message_fds(msg)
     parse_flat_messages(rest, finish_frame(state), continuation, source)
+  end
+
+  # Rebus has no service-side API, so every inbound method call is refused
+  # with `UnknownMethod`. A caller that asked for no reply gets none.
+  defp answer_method_call(%Message{flags: flags} = msg, %__MODULE__{} = state) do
+    cond do
+      :no_reply_expected in flags ->
+        state
+
+      state.queued_replies >= @max_queued_replies ->
+        Logger.warning("D-Bus internal reply dropped: :reply_queue_full",
+          reason: :reply_queue_full
+        )
+
+        state
+
+      true ->
+        queue_method_call_reply(unknown_method_reply(), msg, state)
+    end
+  end
+
+  # The reply body never echoes caller-supplied data: a fixed sentence keeps
+  # peer-controlled bytes out of the frames this connection emits.
+  defp unknown_method_reply do
+    [
+      error_name: @unknown_method_error,
+      signature: "s",
+      body: [@unknown_method_message]
+    ]
+  end
+
+  defp queue_method_call_reply(reply_opts, %Message{} = msg, %__MODULE__{} = state) do
+    reply_opts = reply_opts ++ [reply_serial: msg.serial] ++ reply_destination(msg)
+
+    case Message.new(:error, reply_opts) do
+      {:ok, reply} ->
+        state =
+          queue_write(%{state | queued_replies: state.queued_replies + 1}, %{
+            kind: :reply,
+            from: nil,
+            msg: reply,
+            deadline: System.monotonic_time(:millisecond) + state.write_timeout,
+            request_ref: make_ref()
+          })
+
+        kick_writes(state)
+
+      {:error, reason} ->
+        Logger.warning("D-Bus internal reply dropped: #{inspect(reason)}", reason: reason)
+        state
+    end
+  end
+
+  # A bus sets `sender` on every forwarded frame; a peer-to-peer caller has no
+  # name, and its reply carries no destination. The name is copied so a small
+  # retained header cannot pin the receive buffer it was parsed from.
+  defp reply_destination(%Message{header_fields: %{sender: sender}}) when is_binary(sender),
+    do: [destination: :binary.copy(sender)]
+
+  defp reply_destination(%Message{}), do: []
+
+  # The inbound path owns its own continuation (it must keep parsing coalesced
+  # frames and re-arm the reader), so it cannot return the writer's. This
+  # self-message starts the writer instead, after the current callback returns.
+  defp kick_writes(%__MODULE__{} = state) do
+    send(self(), :advance_writes)
+    state
   end
 
   defp close_message_fds(%Message{unix_fds: fds}), do: UnixFD.close_all(fds)
@@ -3125,18 +3224,36 @@ defmodule Rebus.Connection do
 
   # Writes are one-frame-at-a-time.  OTP retains the unaccepted RestData in every
   # partial result; retaining it here is what preserves D-Bus stream framing.
-  defp enqueue_write(state, operation) do
-    monitor_ref = Process.monitor(elem(operation.from, 0))
+  defp enqueue_write(state, operation), do: advance_writes(queue_write(state, operation))
+
+  # Connection-originated frames (`kind: :reply`) have no caller: no `from` to
+  # reply to, no monitor to release, and no cancellation. They share the FIFO
+  # write queue so a reply can never overtake or starve caller traffic.
+  defp queue_write(state, operation) do
+    monitor_ref = monitor_operation(operation)
     operation = Map.put(operation, :monitor_ref, monitor_ref)
 
-    advance_writes(%{
+    %{
       state
       | write_queue: :queue.in(operation, state.write_queue),
         queued_requests: MapSet.put(state.queued_requests, operation.request_ref),
         outbound_monitor_index:
-          Map.put(state.outbound_monitor_index, monitor_ref, operation.request_ref)
-    })
+          index_outbound_monitor(state.outbound_monitor_index, monitor_ref, operation.request_ref)
+    }
   end
+
+  defp release_reply_slot(%__MODULE__{} = state, %{kind: :reply}),
+    do: %{state | queued_replies: state.queued_replies - 1}
+
+  defp release_reply_slot(%__MODULE__{} = state, _operation), do: state
+
+  defp monitor_operation(%{from: nil}), do: nil
+  defp monitor_operation(%{from: from}), do: Process.monitor(elem(from, 0))
+
+  defp index_outbound_monitor(index, nil, _request_ref), do: index
+
+  defp index_outbound_monitor(index, monitor_ref, request_ref),
+    do: Map.put(index, monitor_ref, request_ref)
 
   defp advance_writes(%__MODULE__{active_write: nil} = state) do
     case :queue.out(state.write_queue) do
@@ -3145,7 +3262,7 @@ defmodule Rebus.Connection do
 
       {{:value, operation}, queue} ->
         state = %{
-          state
+          release_reply_slot(state, operation)
           | write_queue: queue,
             queued_requests: MapSet.delete(state.queued_requests, operation.request_ref)
         }
@@ -3194,21 +3311,15 @@ defmodule Rebus.Connection do
                       advance_writes(%{state | active_write: write})
 
                     {:error, reason} ->
-                      state = release_outbound_monitor(state, operation)
-                      GenServer.reply(operation.from, {:error, reason})
-                      advance_writes(state)
+                      advance_writes(fail_operation(state, operation, reason))
                   end
 
                 {:error, reason} ->
-                  state = release_outbound_monitor(state, operation)
-                  GenServer.reply(operation.from, {:error, reason})
-                  advance_writes(state)
+                  advance_writes(fail_operation(state, operation, reason))
               end
 
             {:error, reason} ->
-              state = release_outbound_monitor(state, operation)
-              GenServer.reply(operation.from, {:error, reason})
-              advance_writes(state)
+              advance_writes(fail_operation(state, operation, reason))
           end
         end
     end
@@ -3227,6 +3338,20 @@ defmodule Rebus.Connection do
       result = safe_socket_send(state, write)
       handle_write_result(result, %{state | active_write: %{write | wait: nil}})
     end
+  end
+
+  # A connection-originated reply has no caller to inform. Failing to encode,
+  # serialize or transport one is a defect in this library rather than a caller
+  # error, so it is logged and the frame is dropped; the connection continues.
+  defp fail_operation(state, %{kind: :reply} = operation, reason) do
+    Logger.warning("D-Bus internal reply dropped: #{inspect(reason)}", reason: reason)
+    release_outbound_monitor(state, operation)
+  end
+
+  defp fail_operation(state, operation, reason) do
+    state = release_outbound_monitor(state, operation)
+    GenServer.reply(operation.from, {:error, reason})
+    state
   end
 
   defp handle_write_result(result, %__MODULE__{active_write: write} = state) do
@@ -3340,6 +3465,9 @@ defmodule Rebus.Connection do
 
     if live? do
       case write.kind do
+        :reply ->
+          advance_writes(state)
+
         :send ->
           GenServer.reply(write.from, :ok)
           advance_writes(state)
@@ -3398,6 +3526,8 @@ defmodule Rebus.Connection do
       do: state,
       else: release_outbound_monitor(state, write)
   end
+
+  defp release_outbound_monitor(state, %{monitor_ref: nil}), do: state
 
   defp release_outbound_monitor(state, operation) do
     Process.demonitor(operation.monitor_ref, [:flush])
@@ -3491,6 +3621,8 @@ defmodule Rebus.Connection do
 
   defp cancel_socket_write(_state, _wait), do: :ok
 
+  defp reply_if_live(%{from: nil}, _reply, _state), do: :ok
+
   defp reply_if_live(operation, reply, state) do
     if not cancelled_or_expired?(operation, state), do: GenServer.reply(operation.from, reply)
   end
@@ -3502,15 +3634,11 @@ defmodule Rebus.Connection do
 
       write ->
         _ = Process.cancel_timer(write.timer_ref)
-        Process.demonitor(write.monitor_ref, [:flush])
-        GenServer.reply(write.from, {:error, :disconnected})
+        abandon_outbound_operation(write)
     end
 
     :queue.to_list(state.write_queue)
-    |> Enum.each(fn operation ->
-      Process.demonitor(operation.monitor_ref, [:flush])
-      GenServer.reply(operation.from, {:error, :disconnected})
-    end)
+    |> Enum.each(&abandon_outbound_operation/1)
 
     Enum.each(state.pending, fn {_serial, {from, timer_ref, _request_ref, monitor_ref, _deadline}} ->
       _ = Process.cancel_timer(timer_ref)
@@ -3541,8 +3669,17 @@ defmodule Rebus.Connection do
         active_write: nil,
         write_queue: :queue.new(),
         queued_requests: MapSet.new(),
-        cancelled_requests: MapSet.new()
+        cancelled_requests: MapSet.new(),
+        queued_replies: 0
     }
+  end
+
+  # A queued connection-originated reply is simply discarded on teardown.
+  defp abandon_outbound_operation(%{from: nil}), do: :ok
+
+  defp abandon_outbound_operation(operation) do
+    Process.demonitor(operation.monitor_ref, [:flush])
+    GenServer.reply(operation.from, {:error, :disconnected})
   end
 
   defp remove_indexes(state, request_ref, monitor_ref) do

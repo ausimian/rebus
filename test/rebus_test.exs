@@ -4111,6 +4111,158 @@ defmodule RebusTest do
     end
   end
 
+  describe "Inbound method calls" do
+    setup [:server_setup, :client_setup]
+
+    test "are refused with UnknownMethod and leave the connection usable", %{svr: svr, cli: cli} do
+      {:ok, serial} = TestServer.push_call(svr, unhandled_call())
+
+      assert_receive {^svr, %Message{type: :error, header_fields: fields, body: [detail]}}, 1_000
+
+      assert fields.error_name == "org.freedesktop.DBus.Error.UnknownMethod"
+      assert fields.reply_serial == serial
+      assert fields.destination == ":1.99"
+      assert fields.signature == "s"
+      assert is_binary(detail)
+      # The reply body must never echo caller-supplied data.
+      refute detail =~ "Boom"
+
+      assert_method_call_round_trip(svr, cli)
+    end
+
+    test "are dropped silently when the caller expects no reply", %{svr: svr, cli: cli} do
+      :ok = TestServer.push(svr, unhandled_call(flags: [:no_reply_expected]))
+
+      refute_receive {^svr, %Message{}}, 300
+      assert Process.alive?(cli)
+
+      assert_method_call_round_trip(svr, cli)
+    end
+
+    test "stop being queued once the writer stalls", %{svr: svr, cli: cli} do
+      # A stalled transport must not let a flood of inbound calls grow the
+      # write queue without bound: the queue settles at its cap (one reply is
+      # already the active write) and later calls go unanswered.
+      continuation = {:select_info, :send, make_ref()}
+
+      :sys.replace_state(cli, fn state ->
+        %{state | send_fun: fn _sock, _rest, _flags, _timeout -> {:select, continuation} end}
+      end)
+
+      capture_log(fn ->
+        for _ <- 1..80, do: TestServer.push(svr, unhandled_call())
+
+        assert wait_until(fn -> :sys.get_state(cli).queued_replies >= 63 end)
+        Process.sleep(50)
+        assert :sys.get_state(cli).queued_replies <= 64
+        assert Process.alive?(cli)
+      end)
+    end
+
+    test "are answered while a caller reply is still outstanding", %{svr: svr, cli: cli} do
+      message =
+        Message.new!(:method_call,
+          path: "/org/example/Object",
+          interface: "org.example.Interface",
+          member: "Slow",
+          destination: "org.example.Service"
+        )
+
+      task = Task.async(fn -> Rebus.call(cli, message, 2_000) end)
+      {:ok, serial} = TestServer.push_call(svr, unhandled_call())
+
+      assert_receive {^svr,
+                      %Message{type: :method_call, header_fields: %{member: "Slow"}} = call},
+                     1_000
+
+      assert_receive {^svr,
+                      %Message{
+                        type: :error,
+                        header_fields: %{
+                          reply_serial: ^serial,
+                          error_name: "org.freedesktop.DBus.Error.UnknownMethod"
+                        }
+                      }},
+                     1_000
+
+      :ok =
+        TestServer.push(
+          svr,
+          Message.new!(:method_return,
+            reply_serial: call.serial,
+            signature: "s",
+            body: ["done"]
+          )
+        )
+
+      assert {:ok, %Message{type: :method_return, body: ["done"]}} = Task.await(task, 2_000)
+    end
+  end
+
+  describe "Inbound method calls on a peer-to-peer connection" do
+    setup [:server_setup]
+
+    test "are refused without a destination header", %{svr: svr} do
+      cli = connect_peer(svr)
+
+      {:ok, serial} =
+        TestServer.push_call(
+          svr,
+          Message.new!(:method_call,
+            path: "/org/example/Nope",
+            interface: "org.example.Nope",
+            member: "Boom"
+          )
+        )
+
+      assert_receive {^svr, %Message{type: :error, header_fields: fields}}, 1_000
+
+      assert fields.error_name == "org.freedesktop.DBus.Error.UnknownMethod"
+      assert fields.reply_serial == serial
+      refute Map.has_key?(fields, :destination)
+
+      assert :ok = Rebus.close(cli)
+    end
+  end
+
+  defp unhandled_call(opts \\ []) do
+    Message.new!(
+      :method_call,
+      Keyword.merge(
+        [
+          path: "/org/example/Nope",
+          interface: "org.example.Nope",
+          member: "Boom",
+          sender: ":1.99"
+        ],
+        opts
+      )
+    )
+  end
+
+  defp assert_method_call_round_trip(svr, cli) do
+    message =
+      Message.new!(:method_call,
+        path: "/org/example/Object",
+        interface: "org.example.Interface",
+        member: "Echo",
+        destination: "org.example.Service"
+      )
+
+    task = Task.async(fn -> Rebus.call(cli, message, 2_000) end)
+
+    assert_receive {^svr, %Message{type: :method_call, header_fields: %{member: "Echo"}} = call},
+                   1_000
+
+    :ok =
+      TestServer.push(
+        svr,
+        Message.new!(:method_return, reply_serial: call.serial, signature: "s", body: ["echo"])
+      )
+
+    assert {:ok, %Message{type: :method_return, body: ["echo"]}} = Task.await(task, 2_000)
+  end
+
   defp connect_peer(svr, opts \\ []) do
     :ok = TestServer.set_auto_hello(svr, false)
     {:ok, addr} = TestServer.get_listen_addr(svr)
