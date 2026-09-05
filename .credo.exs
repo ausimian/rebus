@@ -120,8 +120,7 @@
           ## Refactoring Opportunities
           #
           {Credo.Check.Refactor.Apply, []},
-          # Re-enable when #83 lands.
-          {Credo.Check.Refactor.CondStatements, false},
+          {Credo.Check.Refactor.CondStatements, []},
           # Re-enable when #82 lands.
           {Credo.Check.Refactor.CyclomaticComplexity, false},
           {Credo.Check.Refactor.FilterCount, []},

@@ -62,15 +62,13 @@ defmodule Rebus.BusAddress do
   """
   @spec parse(term()) :: {:ok, [candidate()]} | {:error, {:invalid_bus_address, error_reason()}}
   def parse(address) when is_binary(address) do
-    cond do
-      byte_size(address) > @max_address_length ->
-        error(:too_long)
-
-      true ->
-        address
-        |> :binary.split(";", [:global])
-        |> drop_trailing_empty_entry()
-        |> parse_entries()
+    if byte_size(address) > @max_address_length do
+      error(:too_long)
+    else
+      address
+      |> :binary.split(";", [:global])
+      |> drop_trailing_empty_entry()
+      |> parse_entries()
     end
   end
 
@@ -124,17 +122,15 @@ defmodule Rebus.BusAddress do
   defp parse_parameters(parameters) do
     entries = :binary.split(parameters, ",", [:global])
 
-    cond do
-      length(entries) > @max_parameters ->
-        error(:too_many_parameters)
-
-      true ->
-        Enum.reduce_while(entries, {:ok, %{}}, fn parameter, {:ok, pairs} ->
-          case parse_parameter(parameter, pairs) do
-            {:ok, parsed} -> {:cont, {:ok, parsed}}
-            {:error, _reason} = error -> {:halt, error}
-          end
-        end)
+    if length(entries) > @max_parameters do
+      error(:too_many_parameters)
+    else
+      Enum.reduce_while(entries, {:ok, %{}}, fn parameter, {:ok, pairs} ->
+        case parse_parameter(parameter, pairs) do
+          {:ok, parsed} -> {:cont, {:ok, parsed}}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
     end
   end
 

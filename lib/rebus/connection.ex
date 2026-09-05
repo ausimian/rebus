@@ -3199,13 +3199,11 @@ defmodule Rebus.Connection do
     do: {:noreply, state}
 
   defp advance_writes(%__MODULE__{active_write: write} = state) do
-    cond do
-      (expired?(write) or cancelled?(write, state)) and not write.partial? ->
-        advance_writes(drop_active(state, cancel?: true))
-
-      true ->
-        result = safe_socket_send(state, write)
-        handle_write_result(result, %{state | active_write: %{write | wait: nil}})
+    if (expired?(write) or cancelled?(write, state)) and not write.partial? do
+      advance_writes(drop_active(state, cancel?: true))
+    else
+      result = safe_socket_send(state, write)
+      handle_write_result(result, %{state | active_write: %{write | wait: nil}})
     end
   end
 
