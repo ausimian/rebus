@@ -4251,14 +4251,19 @@ defmodule RebusTest do
         %{state | send_fun: fn _sock, _rest, _flags, _timeout -> {:select, continuation} end}
       end)
 
-      capture_log(fn ->
-        for _ <- 1..80, do: TestServer.push(svr, unhandled_call())
+      log =
+        capture_log(fn ->
+          for _ <- 1..80, do: TestServer.push(svr, unhandled_call())
 
-        assert wait_until(fn -> :sys.get_state(cli).queued_replies >= 63 end)
-        Process.sleep(50)
-        assert :sys.get_state(cli).queued_replies <= 64
-        assert Process.alive?(cli)
-      end)
+          assert wait_until(fn -> :sys.get_state(cli).queued_replies >= 63 end)
+          Process.sleep(50)
+          assert :sys.get_state(cli).queued_replies <= 64
+          assert Process.alive?(cli)
+        end)
+
+      # Many calls are refused, but the refusal is logged once per saturation
+      # episode so a flooding peer cannot also flood the log.
+      assert length(String.split(log, ":reply_queue_full")) - 1 == 1
     end
 
     test "are answered while a caller reply is still outstanding", %{svr: svr, cli: cli} do

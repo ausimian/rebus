@@ -204,8 +204,11 @@ defmodule Rebus.Connection do
     # `nil` until org.freedesktop.DBus.Peer.GetMachineId is first served;
     # `:unavailable` caches a definitive negative lookup.
     field :machine_id, binary() | :unavailable | nil, default: nil
-    # Connection-originated replies waiting behind the active write.
+    # Connection-originated replies waiting behind the active write, and
+    # whether the cap was hit since the queue last drained below it (so the
+    # refusal is logged once per saturation episode, not once per call).
     field :queued_replies, non_neg_integer(), default: 0
+    field :reply_queue_saturated?, boolean(), default: false
 
     field :pending,
           %{
@@ -1286,16 +1289,22 @@ defmodule Rebus.Connection do
         state
 
       state.queued_replies >= @max_queued_replies ->
-        Logger.warning("D-Bus internal reply dropped: :reply_queue_full",
-          reason: :reply_queue_full
-        )
-
-        state
+        refuse_saturated_reply(state)
 
       true ->
         {reply_opts, state} = method_call_reply(msg, state)
         queue_method_call_reply(reply_opts, msg, state)
     end
+  end
+
+  # A peer flooding calls into a stalled transport must not also flood the
+  # log: warn when the cap is first hit, then stay quiet until the queue has
+  # drained below it again.
+  defp refuse_saturated_reply(%__MODULE__{reply_queue_saturated?: true} = state), do: state
+
+  defp refuse_saturated_reply(%__MODULE__{} = state) do
+    Logger.warning("D-Bus internal reply dropped: :reply_queue_full", reason: :reply_queue_full)
+    %{state | reply_queue_saturated?: true}
   end
 
   defp method_call_reply(%Message{header_fields: header_fields}, %__MODULE__{} = state) do
@@ -3302,7 +3311,7 @@ defmodule Rebus.Connection do
   end
 
   defp release_reply_slot(%__MODULE__{} = state, %{kind: :reply}),
-    do: %{state | queued_replies: state.queued_replies - 1}
+    do: %{state | queued_replies: state.queued_replies - 1, reply_queue_saturated?: false}
 
   defp release_reply_slot(%__MODULE__{} = state, _operation), do: state
 
@@ -3729,7 +3738,8 @@ defmodule Rebus.Connection do
         write_queue: :queue.new(),
         queued_requests: MapSet.new(),
         cancelled_requests: MapSet.new(),
-        queued_replies: 0
+        queued_replies: 0,
+        reply_queue_saturated?: false
     }
   end
 
