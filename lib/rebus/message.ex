@@ -384,7 +384,7 @@ defmodule Rebus.Message do
 
   ## Examples
 
-      iex> message = Rebus.Message.new!(:signal, path: "/", interface: "test", member: "Test")
+      iex> message = Rebus.Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Test")
       iex> {:ok, iodata} = Rebus.Message.encode(message)
       iex> is_binary(IO.iodata_to_binary(iodata))
       true
@@ -454,7 +454,7 @@ defmodule Rebus.Message do
 
   ## Examples
 
-      iex> message = Rebus.Message.new!(:signal, path: "/", interface: "test", member: "Test")
+      iex> message = Rebus.Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Test")
       iex> {:ok, encoded} = Rebus.Message.encode(message)
       iex> {:ok, decoded} = Rebus.Message.decode(encoded)
       iex> decoded.type
@@ -724,11 +724,11 @@ defmodule Rebus.Message do
 
   ## Examples
 
-      iex> message = Rebus.Message.new!(:signal, path: "/", interface: "test", member: "Test", body: [42], signature: "i")
+      iex> message = Rebus.Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Test", body: [42], signature: "i")
       iex> Rebus.Message.signature(message)
       "i"
 
-      iex> message = Rebus.Message.new!(:signal, path: "/", interface: "test", member: "Test")
+      iex> message = Rebus.Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Test")
       iex> Rebus.Message.signature(message)
       ""
   """
@@ -987,14 +987,14 @@ defmodule Rebus.Message do
         end
 
       {:interface, interface} when is_binary(interface) ->
-        if valid_interface_name?(interface) do
+        if WireValue.valid_interface_name?(interface) do
           {:ok, interface}
         else
           {:error, "Invalid interface name: #{interface}"}
         end
 
       {:member, member} when is_binary(member) ->
-        if valid_member_name?(member) do
+        if WireValue.valid_member_name?(member) do
           {:ok, member}
         else
           {:error, "Invalid member name: #{member}"}
@@ -1002,21 +1002,21 @@ defmodule Rebus.Message do
 
       {:error_name, error_name} when is_binary(error_name) ->
         # Error names follow interface naming rules
-        if valid_interface_name?(error_name) do
+        if WireValue.valid_error_name?(error_name) do
           {:ok, error_name}
         else
           {:error, "Invalid error name: #{error_name}"}
         end
 
       {:destination, dest} when is_binary(dest) ->
-        if valid_bus_name?(dest) do
+        if WireValue.valid_bus_name?(dest) do
           {:ok, dest}
         else
           {:error, "Invalid destination: #{dest}"}
         end
 
       {:sender, sender} when is_binary(sender) ->
-        if valid_bus_name?(sender) do
+        if WireValue.valid_bus_name?(sender) do
           {:ok, sender}
         else
           {:error, "Invalid sender: #{sender}"}
@@ -1044,44 +1044,6 @@ defmodule Rebus.Message do
 
   # Validation helpers for D-Bus naming rules
   defp valid_object_path?(path), do: WireValue.valid_object_path?(path)
-
-  defp valid_interface_name?(name) when is_binary(name) do
-    if WireValue.valid_string?(name) do
-      parts = String.split(name, ".")
-      parts != [] and Enum.all?(parts, &valid_name_element/1)
-    else
-      false
-    end
-  end
-
-  defp valid_member_name?(name) when is_binary(name) do
-    WireValue.valid_string?(name) and valid_name_element(name)
-  end
-
-  defp valid_bus_name?(name) when is_binary(name) do
-    cond do
-      not WireValue.valid_string?(name) ->
-        false
-
-      String.starts_with?(name, ":") ->
-        # Unique connection name
-        String.match?(name, ~r{\A:[A-Za-z0-9._-]+\z})
-
-      true ->
-        # Well-known bus name
-        parts = String.split(name, ".")
-        length(parts) >= 2 and Enum.all?(parts, &valid_bus_name_element/1)
-    end
-  end
-
-  defp valid_bus_name_element(element) when is_binary(element) do
-    String.match?(element, ~r/\A[A-Za-z_-][A-Za-z0-9_-]*\z/)
-  end
-
-  defp valid_name_element(element) when is_binary(element) do
-    String.length(element) > 0 and
-      String.match?(element, ~r{\A[A-Za-z_][A-Za-z0-9_]*\z})
-  end
 
   defp validate_decoded_header_fields(type, header_fields) do
     with :ok <- validate_required_fields(type, header_fields),

@@ -347,7 +347,7 @@ defmodule Rebus.MessageTest do
       assert {:ok, message} =
                Message.new(:signal,
                  path: "/test",
-                 interface: "test",
+                 interface: "org.example.Test",
                  member: "Test",
                  body: [42, "hello", true]
                )
@@ -360,7 +360,7 @@ defmodule Rebus.MessageTest do
       assert {:ok, message} =
                Message.new(:signal,
                  path: "/test",
-                 interface: "test",
+                 interface: "org.example.Test",
                  member: "Test"
                )
 
@@ -370,7 +370,7 @@ defmodule Rebus.MessageTest do
     end
 
     test "validates required fields for method call" do
-      assert {:error, reason} = Message.new(:method_call, interface: "test")
+      assert {:error, reason} = Message.new(:method_call, interface: "org.example.Test")
       assert reason =~ "Missing required field: path"
     end
 
@@ -398,7 +398,7 @@ defmodule Rebus.MessageTest do
       assert {:error, reason} =
                Message.new(:signal,
                  path: "/test",
-                 interface: "test",
+                 interface: "org.example.Test",
                  member: "Test",
                  flags: [:invalid_flag]
                )
@@ -410,25 +410,34 @@ defmodule Rebus.MessageTest do
       assert {:error, reason} =
                Message.new(:signal,
                  path: "invalid_path",
-                 interface: "test",
+                 interface: "org.example.Test",
                  member: "Test"
                )
 
       assert reason =~ "Invalid object path"
     end
 
-    test "validates interface names" do
-      # Interface names should require at least two components for proper validation
-      # But for testing we allow single components. For strict D-Bus compliance,
-      # this should be "test.interface"
-      assert {:ok, _} =
+    test "rejects single-element interface names required to have two elements" do
+      # D-Bus specification, "Valid Names": interface names are "composed of 2
+      # or more elements separated by a period ('.') character".
+      assert {:error, reason} =
                Message.new(:signal,
                  path: "/test",
-                 # This would normally be invalid in strict D-Bus
                  interface: "invalid",
                  member: "Test"
                )
 
+      assert reason =~ "Invalid interface name"
+
+      assert {:ok, _} =
+               Message.new(:signal,
+                 path: "/test",
+                 interface: "valid.interface",
+                 member: "Test"
+               )
+    end
+
+    test "validates interface names" do
       # Test with completely invalid interface name
       assert {:error, reason} =
                Message.new(:signal,
@@ -439,6 +448,31 @@ defmodule Rebus.MessageTest do
                )
 
       assert reason =~ "Invalid interface name"
+    end
+
+    test "validates error names with the interface name grammar" do
+      # D-Bus specification, "Valid Names": "Error names have the same
+      # restrictions as interface names", so a single element is invalid.
+      assert {:error, reason} = Message.new(:error, error_name: "Failed", reply_serial: 1)
+      assert reason =~ "Invalid error name"
+
+      assert {:ok, _} =
+               Message.new(:error, error_name: "org.example.Error.Failed", reply_serial: 1)
+    end
+
+    test "validates destination and sender as bus names" do
+      # D-Bus specification, "Valid Names": "Bus names must contain at least
+      # one '.' (period) character (and thus at least two elements)."
+      assert {:error, reason} = signal_with(destination: ":1")
+      assert reason =~ "Invalid destination"
+      assert {:ok, _} = signal_with(destination: ":1.7")
+      assert {:ok, _} = signal_with(destination: "org.example.Service")
+
+      assert {:error, reason} = signal_with(sender: ":1")
+      assert reason =~ "Invalid sender"
+      assert {:error, reason} = signal_with(sender: "org")
+      assert reason =~ "Invalid sender"
+      assert {:ok, _} = signal_with(sender: ":1.42")
     end
 
     test "validates member names" do
@@ -467,7 +501,7 @@ defmodule Rebus.MessageTest do
 
     test "raises on error" do
       assert_raise ArgumentError, fn ->
-        Message.new!(:method_call, interface: "test")
+        Message.new!(:method_call, interface: "org.example.Test")
       end
     end
   end
@@ -2180,5 +2214,12 @@ defmodule Rebus.MessageTest do
         assert remaining_data == <<>>
       end
     end
+  end
+
+  defp signal_with(extra) do
+    Message.new(
+      :signal,
+      Keyword.merge([path: "/test", interface: "org.example.Test", member: "Test"], extra)
+    )
   end
 end
