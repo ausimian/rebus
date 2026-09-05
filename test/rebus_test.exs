@@ -4497,7 +4497,7 @@ defmodule RebusTest do
   # The address-list walk selects its resolver, connector, identity and clock
   # through the private `:__impl__` option rather than a separate argument.
   defp connect_candidates(candidates, opts, impl) do
-    Rebus.connect_address_candidates(candidates, Keyword.put(opts, :__impl__, Map.new(impl)))
+    Rebus.AddressList.connect(candidates, Keyword.put(opts, :__impl__, Map.new(impl)))
   end
 
   defp split_fixture_options(opts) do
