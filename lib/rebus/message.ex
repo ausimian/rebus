@@ -85,6 +85,7 @@ defmodule Rebus.Message do
 
   alias Rebus.Decoder
   alias Rebus.Encoder
+  alias Rebus.Message.UnixFDs
   alias Rebus.ResourceLimitError
   alias Rebus.Signature
   alias Rebus.WireValue
@@ -158,6 +159,12 @@ defmodule Rebus.Message do
   }
 
   @type_codes Map.new(@message_types, fn {k, v} -> {v, k} end)
+  @message_type_values Map.values(@message_types)
+
+  # Exceptions the encoder and decoder raise on malformed input. Each caller
+  # maps the whole set to one error reason.
+  @encode_exceptions [ArgumentError, CaseClauseError, FunctionClauseError, KeyError, MatchError]
+  @decode_exceptions [ArgumentError, CaseClauseError, FunctionClauseError, MatchError]
 
   # Message flag constants
   @flags %{
@@ -247,17 +254,9 @@ defmodule Rebus.Message do
   def validate_encoded_size(header_fields_size, body_length)
       when is_integer(header_fields_size) and header_fields_size >= 4 and is_integer(body_length) and
              body_length >= 0 do
-    header_fields_length = header_fields_size - 4
-
-    header_padded_length =
-      (12 + header_fields_size)
-      |> then(&(div(&1 + 7, 8) * 8))
-
-    if header_fields_length <= @max_array_size and
-         header_padded_length + body_length <= @max_message_size do
-      :ok
-    else
-      {:error, :message_too_large}
+    case frame_geometry(header_fields_size - 4, body_length) do
+      {:ok, _header_padded_length, _total_size} -> :ok
+      {:error, :message_too_large} = error -> error
     end
   end
 
@@ -315,39 +314,33 @@ defmodule Rebus.Message do
   """
   @spec new(message_type(), keyword()) :: {:ok, t()} | {:error, construction_error()}
   def new(type, opts \\ []) do
-    with {:ok, validated_type} <- validate_type(type),
+    with :ok <- validate_message_type(type),
          {:ok, flags} <- validate_flags(Keyword.get(opts, :flags, [])),
          {:ok, version} <- validate_version(Keyword.get(opts, :version, 1)),
          {:ok, body} <- validate_body(Keyword.get(opts, :body, [])),
          {:ok, signature} <- get_or_generate_signature(opts, body),
          :ok <- validate_signature_format(signature),
-         {:ok, unix_fds} <- extract_unix_fds(opts),
+         {:ok, unix_fds} <- UnixFDs.extract_unix_fds(opts),
          {:ok, header_fields} <- extract_header_fields(opts),
          {:ok, validated_fields} <- validate_header_fields(header_fields),
-         :ok <- validate_required_fields(validated_type, header_fields),
+         :ok <- validate_required_fields(type, header_fields),
          {:ok, body_length} <- calculate_body_length(body, signature),
-         :ok <- validate_unix_fd_indices(signature, body, unix_fds) do
-      # Add signature to header_fields if body is present
-      validated_fields =
-        if signature != "",
-          do: Map.put(validated_fields, :signature, signature),
-          else: validated_fields
-
-      with {:ok, validated_fields} <- put_unix_fd_count(validated_fields, unix_fds),
-           {:ok, header_fields_data} <- encode_header_fields(validated_fields, :little),
-           :ok <- validate_encoded_size(IO.iodata_length(header_fields_data), body_length) do
-        {:ok,
-         %__MODULE__{
-           type: validated_type,
-           flags: flags,
-           version: version,
-           body_length: body_length,
-           serial: 1,
-           header_fields: validated_fields,
-           body: body,
-           unix_fds: unix_fds
-         }}
-      end
+         :ok <- UnixFDs.validate_unix_fd_indices(signature, body, unix_fds),
+         {:ok, validated_fields} <- put_signature_field(validated_fields, signature),
+         {:ok, validated_fields} <- UnixFDs.put_unix_fd_count(validated_fields, unix_fds),
+         {:ok, header_fields_data} <- encode_header_fields(validated_fields, :little),
+         :ok <- validate_encoded_size(IO.iodata_length(header_fields_data), body_length) do
+      {:ok,
+       %__MODULE__{
+         type: type,
+         flags: flags,
+         version: version,
+         body_length: body_length,
+         serial: 1,
+         header_fields: validated_fields,
+         body: body,
+         unix_fds: unix_fds
+       }}
     else
       {:error, _} = error -> error
     end
@@ -433,7 +426,7 @@ defmodule Rebus.Message do
          {:ok, header_fields_encoded} <- encode_header_fields(message.header_fields, endianness),
          {:ok, body_data} <-
            encode_body(message.body, Map.get(message.header_fields, :signature, ""), endianness),
-         :ok <- validate_unix_fds(message),
+         :ok <- UnixFDs.validate_unix_fds(message),
          :ok <-
            validate_encoded_size(
              IO.iodata_length(header_fields_encoded),
@@ -448,17 +441,9 @@ defmodule Rebus.Message do
       flags_byte = encode_flags_byte(message.flags)
       version_byte = message.version
 
-      # Build complete header as iodata
       header_fixed =
-        case endianness do
-          :little ->
-            <<endian_flag, type_byte, flags_byte, version_byte, body_length::little-32,
-              message.serial::little-32>>
-
-          :big ->
-            <<endian_flag, type_byte, flags_byte, version_byte, body_length::big-32,
-              message.serial::big-32>>
-        end
+        <<endian_flag, type_byte, flags_byte, version_byte,
+          length_and_serial(endianness, body_length, message.serial)::binary>>
 
       # Combine header parts as iodata
       header_iodata = [header_fixed, header_fields_encoded]
@@ -508,7 +493,8 @@ defmodule Rebus.Message do
                optional(:error_name) => binary(),
                type: message_type(),
                reply_serial: pos_integer() | nil
-             }, binary()}
+             }
+             | nil, binary()}
           | {:error, any()}
           | nil
   def parse_inbound(binary) when is_binary(binary) do
@@ -520,8 +506,14 @@ defmodule Rebus.Message do
           {:ok, message} ->
             {:ok, message, remaining_data}
 
+          # The frame boundary is known here, so every resource-limit result
+          # carries the remainder; the envelope is absent when the limit
+          # tripped before the reply fields were validated.
           {:error, :resource_limit, envelope} ->
             {:error, :resource_limit, envelope, remaining_data}
+
+          {:error, :resource_limit} ->
+            {:error, :resource_limit, nil, remaining_data}
 
           {:error, reason} ->
             {:error, reason}
@@ -558,12 +550,9 @@ defmodule Rebus.Message do
     ResourceLimitError ->
       {:error, :resource_limit}
 
-    _error in [ArgumentError] ->
-      {:error, :invalid_message}
-
-    _error in [CaseClauseError, FunctionClauseError, MatchError] ->
-      # These are the parser failures expected from hostile wire input. Keep this
-      # pure protocol module silent; the connection layer reports the safe result.
+    # These are the parser failures expected from hostile wire input. Keep this
+    # pure protocol module silent; the connection layer reports the safe result.
+    _error in @decode_exceptions ->
       {:error, :invalid_message}
   end
 
@@ -582,9 +571,7 @@ defmodule Rebus.Message do
     # It is the authoritative encoded header-fields size and was bounded above.
     {:ok, header_fields_length} = extract_array_length(rest, endianness)
     header_fields_size = 4 + header_fields_length
-    # Fixed header (12 bytes) + header fields
-    header_length = 12 + header_fields_size
-    header_padded_length = div(header_length + 7, 8) * 8
+    header_padded_length = header_padded_length(header_fields_length)
 
     # The body starts after the padding, relative to the end of the fixed
     # header. Like libdbus, the padding is matched as NUL rather than skipped.
@@ -724,7 +711,7 @@ defmodule Rebus.Message do
          :ok <- validate_required_fields(message.type, message.header_fields),
          :ok <- validate_signature_format(signature),
          :ok <- validate_body_signature(message.body, signature) do
-      validate_unix_fds(message)
+      UnixFDs.validate_unix_fds(message)
     end
   end
 
@@ -785,7 +772,7 @@ defmodule Rebus.Message do
   def attach_unix_fds(%__MODULE__{} = message, fds) when is_list(fds) do
     message = %{message | unix_fds: fds}
 
-    case validate_unix_fds(message) do
+    case UnixFDs.validate_unix_fds(message) do
       :ok -> {:ok, message}
       {:error, reason} -> {:error, reason}
     end
@@ -794,12 +781,6 @@ defmodule Rebus.Message do
   def attach_unix_fds(_message, _fds), do: {:error, :invalid_unix_fds}
 
   # Private helper functions
-
-  defp validate_type(type) when type in [:method_call, :method_return, :error, :signal] do
-    {:ok, type}
-  end
-
-  defp validate_type(_type), do: {:error, :invalid_type}
 
   defp validate_flags(flags) when is_list(flags) do
     valid_flags = Map.values(@flags)
@@ -832,10 +813,7 @@ defmodule Rebus.Message do
 
   defp generate_signature([]), do: ""
 
-  defp generate_signature(body) do
-    # This is a simple signature generation - in practice you'd want more sophisticated logic
-    Enum.map_join(body, "", &infer_type/1)
-  end
+  defp generate_signature(body), do: Enum.map_join(body, "", &infer_type/1)
 
   defp infer_type(value)
        when is_integer(value) and value >= -2_147_483_648 and value <= 2_147_483_647,
@@ -865,112 +843,10 @@ defmodule Rebus.Message do
     {:ok, fields}
   end
 
-  defp extract_unix_fds(opts) do
-    case Keyword.get(opts, :fds, []) do
-      fds when is_list(fds) -> validate_unix_fd_list(fds)
-      _fds -> {:error, :invalid_unix_fds}
-    end
-  end
+  defp put_signature_field(header_fields, ""), do: {:ok, header_fields}
 
-  defp put_unix_fd_count(header_fields, fds) do
-    count = length(fds)
-
-    case Map.fetch(header_fields, :unix_fds) do
-      :error when count == 0 -> {:ok, header_fields}
-      :error -> {:ok, Map.put(header_fields, :unix_fds, count)}
-      {:ok, ^count} -> {:ok, header_fields}
-      {:ok, _count} -> {:error, :invalid_unix_fds}
-    end
-  end
-
-  defp validate_unix_fds(%__MODULE__{header_fields: header_fields, unix_fds: fds} = message)
-       when is_map(header_fields) and is_list(fds) do
-    with {:ok, fds} <- validate_unix_fd_list(fds),
-         count <- length(fds),
-         ^count <- Map.get(header_fields, :unix_fds, 0),
-         :ok <- validate_unix_fd_indices(signature(message), message.body, fds) do
-      :ok
-    else
-      _ -> {:error, :invalid_unix_fds}
-    end
-  end
-
-  defp validate_unix_fds(_message), do: {:error, :invalid_unix_fds}
-
-  defp validate_unix_fd_list(fds) when length(fds) <= @max_unix_fds do
-    if Enum.all?(fds, &(is_integer(&1) and &1 >= 0)) do
-      {:ok, fds}
-    else
-      {:error, :invalid_unix_fds}
-    end
-  end
-
-  defp validate_unix_fd_list(fds) when is_list(fds), do: {:error, :unix_fd_limit}
-
-  defp validate_unix_fd_indices(signature, body, fds)
-       when is_binary(signature) and is_list(body) do
-    with {:ok, types} <- Signature.parse(signature),
-         :ok <- validate_unix_fd_values(types, body, length(fds)) do
-      :ok
-    else
-      _ -> {:error, :invalid_unix_fds}
-    end
-  end
-
-  defp validate_unix_fd_indices(_signature, _body, _fds), do: {:error, :invalid_unix_fds}
-
-  defp validate_unix_fd_values([], [], _fd_count), do: :ok
-
-  defp validate_unix_fd_values([type | types], [value | values], fd_count) do
-    with :ok <- validate_unix_fd_value(type, value, fd_count) do
-      validate_unix_fd_values(types, values, fd_count)
-    end
-  end
-
-  defp validate_unix_fd_values(_types, _values, _fd_count), do: {:error, :invalid_unix_fds}
-
-  defp validate_unix_fd_value({:unix_fd, _}, index, fd_count)
-       when is_integer(index) and index >= 0 and index < fd_count,
-       do: :ok
-
-  defp validate_unix_fd_value({:unix_fd, _}, _index, _fd_count), do: {:error, :invalid_unix_fds}
-
-  defp validate_unix_fd_value({:array, type}, values, fd_count) when is_list(values) do
-    Enum.reduce_while(values, :ok, fn value, :ok ->
-      case validate_unix_fd_value(type, value, fd_count) do
-        :ok -> {:cont, :ok}
-        error -> {:halt, error}
-      end
-    end)
-  end
-
-  defp validate_unix_fd_value({:struct, types}, values, fd_count) when is_list(values),
-    do: validate_unix_fd_values(types, values, fd_count)
-
-  defp validate_unix_fd_value({:dict_entry, key_type, value_type}, {key, value}, fd_count) do
-    with :ok <- validate_unix_fd_value(key_type, key, fd_count) do
-      validate_unix_fd_value(value_type, value, fd_count)
-    end
-  end
-
-  defp validate_unix_fd_value({:variant, _}, {nested_signature, value}, fd_count)
-       when is_binary(nested_signature) do
-    case Signature.parse(nested_signature) do
-      {:ok, [type]} -> validate_unix_fd_value(type, value, fd_count)
-      _ -> {:error, :invalid_unix_fds}
-    end
-  end
-
-  defp validate_unix_fd_value({kind, _}, _value, _fd_count)
-       when kind in [:string, :object_path, :signature],
-       do: :ok
-
-  # Every other fixed-width basic type is fd-free; :unix_fd is matched above.
-  defp validate_unix_fd_value({_kind, _} = type, _value, _fd_count) do
-    if Signature.fixed_width(type), do: :ok, else: {:error, :invalid_unix_fds}
-  end
-
-  defp validate_unix_fd_value(_type, _value, _fd_count), do: {:error, :invalid_unix_fds}
+  defp put_signature_field(header_fields, signature),
+    do: {:ok, Map.put(header_fields, :signature, signature)}
 
   defp validate_required_fields(type, header_fields) do
     required = Map.get(@required_fields, type, [])
@@ -994,7 +870,7 @@ defmodule Rebus.Message do
   end
 
   defp validate_header_field(:path, path) when is_binary(path),
-    do: validated_field(:path, path, valid_object_path?(path))
+    do: validated_field(:path, path, WireValue.valid_object_path?(path))
 
   defp validate_header_field(:interface, interface) when is_binary(interface),
     do: validated_field(:interface, interface, WireValue.valid_interface_name?(interface))
@@ -1013,10 +889,9 @@ defmodule Rebus.Message do
     do: validated_field(:sender, sender, WireValue.valid_bus_name?(sender))
 
   defp validate_header_field(:signature, signature) when is_binary(signature) do
-    case Signature.parse(signature) do
-      {:ok, _types} -> {:ok, signature}
-      {:error, :resource_limit} -> {:error, :resource_limit}
-      {:error, :invalid_signature} -> {:error, :invalid_signature}
+    case validate_signature_format(signature) do
+      :ok -> {:ok, signature}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -1036,9 +911,6 @@ defmodule Rebus.Message do
 
   defp validated_field(_field, value, true), do: {:ok, value}
   defp validated_field(field, _value, false), do: {:error, {:invalid_header_field, field}}
-
-  # Validation helpers for D-Bus naming rules
-  defp valid_object_path?(path), do: WireValue.valid_object_path?(path)
 
   defp validate_decoded_header_fields(type, header_fields) do
     with :ok <- validate_required_fields(type, header_fields),
@@ -1061,23 +933,8 @@ defmodule Rebus.Message do
   defp encode_body(body, signature, endianness) do
     {:ok, Encoder.encode(signature, body, endianness)}
   rescue
-    ResourceLimitError ->
-      {:error, :resource_limit}
-
-    ArgumentError ->
-      {:error, :invalid_body}
-
-    CaseClauseError ->
-      {:error, :invalid_body}
-
-    FunctionClauseError ->
-      {:error, :invalid_body}
-
-    KeyError ->
-      {:error, :invalid_body}
-
-    MatchError ->
-      {:error, :invalid_body}
+    ResourceLimitError -> {:error, :resource_limit}
+    _error in @encode_exceptions -> {:error, :invalid_body}
   end
 
   defp validate_body_signature([], ""), do: :ok
@@ -1113,11 +970,7 @@ defmodule Rebus.Message do
     {:ok, Encoder.encode_at_position("a(yv)", [fields_data], endianness, 12)}
   rescue
     ResourceLimitError -> {:error, :resource_limit}
-    ArgumentError -> {:error, :invalid_header_fields}
-    CaseClauseError -> {:error, :invalid_header_fields}
-    FunctionClauseError -> {:error, :invalid_header_fields}
-    KeyError -> {:error, :invalid_header_fields}
-    MatchError -> {:error, :invalid_header_fields}
+    _error in @encode_exceptions -> {:error, :invalid_header_fields}
   end
 
   defp encode_flags_byte(flags) do
@@ -1170,6 +1023,12 @@ defmodule Rebus.Message do
   defp read_uint32(<<value::little-32>>, :little), do: value
   defp read_uint32(<<value::big-32>>, :big), do: value
 
+  defp length_and_serial(:little, body_length, serial),
+    do: <<body_length::little-32, serial::little-32>>
+
+  defp length_and_serial(:big, body_length, serial),
+    do: <<body_length::big-32, serial::big-32>>
+
   defp parse_endianness(?l), do: {:ok, :little}
   defp parse_endianness(?B), do: {:ok, :big}
   defp parse_endianness(_), do: {:error, :invalid_endianness}
@@ -1185,50 +1044,47 @@ defmodule Rebus.Message do
   end
 
   defp declared_message_size(rest, body_length, endianness) do
-    with {:ok, header_fields_length} <- extract_array_length(rest, endianness) do
-      total_message_size(header_fields_length, body_length)
+    with {:ok, header_fields_length} <- extract_array_length(rest, endianness),
+         {:ok, _header_padded_length, total_size} <-
+           frame_geometry(header_fields_length, body_length) do
+      {:ok, total_size}
     end
   end
 
-  defp total_message_size(header_fields_length, _body_length)
+  # Bounded padded header length and complete frame size for a header-fields
+  # array data length (the array's declared length, excluding its own length
+  # field). Callers that are already inside a bounded frame use
+  # `header_padded_length/1` instead of repeating the limit checks.
+  defp frame_geometry(header_fields_length, _body_length)
        when header_fields_length > @max_array_size,
        do: {:error, :message_too_large}
 
-  defp total_message_size(header_fields_length, body_length) do
-    header_padded_length =
-      (12 + 4 + header_fields_length)
-      |> then(&(div(&1 + 7, 8) * 8))
+  defp frame_geometry(header_fields_length, body_length) do
+    header_padded_length = header_padded_length(header_fields_length)
+    total_size = header_padded_length + body_length
 
-    total_message_size = header_padded_length + body_length
-
-    if total_message_size <= @max_message_size do
-      {:ok, total_message_size}
+    if total_size <= @max_message_size do
+      {:ok, header_padded_length, total_size}
     else
       {:error, :message_too_large}
     end
   end
 
-  defp extract_array_length(binary, endianness) do
-    # D-Bus arrays start with a 4-byte length field
-    if byte_size(binary) >= 4 do
-      case endianness do
-        :little ->
-          <<array_length::little-32, _rest::binary>> = binary
-          {:ok, array_length}
+  # Fixed header (12 bytes) plus the header-fields array and its length field,
+  # padded to the body's 8-byte boundary.
+  defp header_padded_length(header_fields_length),
+    do: div(12 + 4 + header_fields_length + 7, 8) * 8
 
-        :big ->
-          <<array_length::big-32, _rest::binary>> = binary
-          {:ok, array_length}
-      end
-    else
-      {:error, :insufficient_data}
-    end
-  end
+  # D-Bus arrays start with a 4-byte length field.
+  defp extract_array_length(<<array_length::little-32, _rest::binary>>, :little),
+    do: {:ok, array_length}
 
-  defp validate_message_type(type) when type in [:method_call, :method_return, :error, :signal] do
-    :ok
-  end
+  defp extract_array_length(<<array_length::big-32, _rest::binary>>, :big),
+    do: {:ok, array_length}
 
+  defp extract_array_length(_binary, _endianness), do: {:error, :insufficient_data}
+
+  defp validate_message_type(type) when type in @message_type_values, do: :ok
   defp validate_message_type(_type), do: {:error, :invalid_type}
 
   defp validate_header_field_types(header_fields) when is_map(header_fields) do
@@ -1277,14 +1133,8 @@ defmodule Rebus.Message do
       _ -> {:error, :invalid_message}
     end
   rescue
-    ResourceLimitError ->
-      {:error, :resource_limit}
-
-    ArgumentError ->
-      {:error, :invalid_message}
-
-    _error in [CaseClauseError, FunctionClauseError, MatchError] ->
-      {:error, :invalid_message}
+    ResourceLimitError -> {:error, :resource_limit}
+    _error in @decode_exceptions -> {:error, :invalid_message}
   end
 
   defp validate_signature_format(signature) when is_binary(signature) do

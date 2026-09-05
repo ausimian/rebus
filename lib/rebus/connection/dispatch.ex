@@ -288,33 +288,16 @@ defmodule Rebus.Connection.Dispatch do
       {:error, :resource_limit, _envelope, _rest} when not is_nil(state.hello_serial) ->
         {:protocol_error, {:hello_failed, :resource_limit}, finish_frame(state)}
 
-      {:error, :resource_limit} when not is_nil(state.hello_serial) ->
-        {:protocol_error, {:hello_failed, :resource_limit}, finish_frame(state)}
-
+      # `parse_inbound/1` knows the frame boundary, so the remainder is always
+      # supplied and this frame can be dropped without rescanning the buffer.
       {:error, :resource_limit, envelope, rest} ->
         Logger.warning("D-Bus frame dropped: :resource_limit", reason: :resource_limit)
         state = discard_inbound_unix_fds(state)
         {:ok, state} = drop_resource_limited_reply(envelope, state)
         parse_flat_messages(rest, finish_frame(state), continuation, source)
 
-      {:error, :resource_limit} ->
-        Logger.warning("D-Bus frame dropped: :resource_limit", reason: :resource_limit)
-        state = discard_inbound_unix_fds(state)
-        skip_resource_limited_frame(data, state, continuation, source)
-
       {:error, reason} ->
         {:protocol_error, reason, state}
-    end
-  end
-
-  defp skip_resource_limited_frame(data, %Connection{} = state, continuation, source) do
-    case Message.expected_size(data) do
-      {:ok, frame_size} ->
-        <<_dropped::binary-size(^frame_size), rest::binary>> = data
-        parse_flat_messages(rest, finish_frame(state), continuation, source)
-
-      _ ->
-        {:protocol_error, :invalid_message, state}
     end
   end
 

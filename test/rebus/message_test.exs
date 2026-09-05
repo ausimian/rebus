@@ -96,6 +96,29 @@ defmodule Rebus.MessageTest do
       assert {:error, :resource_limit} = Message.decode(limited)
     end
 
+    test "carries the remainder when the limit trips in the header fields" do
+      limited =
+        wire_message(
+          [[1, {"o", "/test"}], [2, {"s", "test.interface"}], [3, {"s", "HeaderLimited"}]] ++
+            List.duplicate([10, {"ay", []}], 25_001),
+          <<>>
+        )
+
+      valid =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "AfterHeaderLimit"
+        )
+
+      {:ok, valid_data} = encode_to_binary(valid)
+
+      assert {:error, :resource_limit, nil, ^valid_data} =
+               Message.parse_inbound(limited <> valid_data)
+
+      assert {:error, :resource_limit} = Message.parse(limited <> valid_data)
+    end
+
     test "keeps a validated error name in an error reply resource envelope" do
       error_name = "org.example.ResourceLimited"
 
