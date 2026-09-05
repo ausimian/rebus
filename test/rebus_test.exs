@@ -489,7 +489,7 @@ defmodule RebusTest do
 
     test "connect! raises on failure" do
       # Try to connect to non-existent socket
-      assert_raise RuntimeError, ~r/Failed to connect to D-Bus/, fn ->
+      assert_raise ArgumentError, ~r/^failed to connect to D-Bus: /, fn ->
         Rebus.connect!(%{family: :inet, addr: {{127, 0, 0, 1}, 9999}})
       end
     end

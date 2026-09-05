@@ -1130,13 +1130,15 @@ defmodule Rebus do
   end
 
   @doc """
-  Same as `connect/2`, but raises an exception on failure.
+  Same as `connect/2`, but raises `ArgumentError` on failure.
+
+  The exception message carries the reason `connect/2` would have returned.
   """
   @spec connect!(address(), keyword()) :: pid()
   def connect!(address, opts \\ []) do
     case connect(address, opts) do
       {:ok, pid} -> pid
-      {:error, reason} -> raise "Failed to connect to D-Bus: #{inspect(reason)}"
+      {:error, reason} -> raise ArgumentError, "failed to connect to D-Bus: #{inspect(reason)}"
     end
   end
 
