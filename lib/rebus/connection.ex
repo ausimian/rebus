@@ -5,6 +5,7 @@ defmodule Rebus.Connection do
 
   alias Rebus.Connection.Handshake
   alias Rebus.Connection.Inbound
+  alias Rebus.Connection.Rights
   alias Rebus.Connection.SocketError
   alias Rebus.Connection.Writer
   alias Rebus.MachineId
@@ -171,12 +172,10 @@ defmodule Rebus.Connection do
     # The pending receive select handle, or nil when no receive is outstanding.
     field :rref, :socket.select_handle() | nil, default: nil
     field :inbound, Inbound.t(), default: Inbound.new()
-    field :inbound_unix_fds, [UnixFD.t()], default: []
-    # Ancillary data rejected before a complete D-Bus frame is known belongs
-    # to that frame, not to a later coalesced frame. The descriptors themselves
-    # are closed immediately; this bit makes the eventual frame a recoverable
-    # drop once its byte boundary is available.
-    field :inbound_fd_tainted?, boolean(), default: false
+    # SCM_RIGHTS descriptors received with the frame currently being assembled,
+    # and the taint bit recording ancillary data rejected before that frame's
+    # boundary was known.
+    field :inbound_fds, Rights.t(), default: Rights.new()
     field :name, binary() | nil, default: nil
     field :hello_serial, non_neg_integer() | nil, default: nil
     field :established?, boolean(), default: false
@@ -315,12 +314,12 @@ defmodule Rebus.Connection do
           sock: sock,
           impl: impl,
           partial_frame_timer: timer_ref,
-          inbound_unix_fds: inbound_unix_fds,
+          inbound_fds: inbound_fds,
           fd_claims: fd_claims
         }
       ) do
     cancel_partial_frame_timer(timer_ref)
-    _ = UnixFD.close_all(inbound_unix_fds)
+    _ = UnixFD.close_all(Rights.fds(inbound_fds))
     close_fd_claims(fd_claims)
     _ = impl.transport.close(sock)
     :ok
@@ -1037,46 +1036,24 @@ defmodule Rebus.Connection do
   end
 
   defp attach_inbound_fds(%Message{} = msg, %__MODULE__{} = state) do
-    fds = state.inbound_unix_fds
-    tainted? = state.inbound_fd_tainted?
-    state = %{state | inbound_unix_fds: [], inbound_fd_tainted?: false}
+    case Rights.attach(state.inbound_fds, msg, state.unix_fd_negotiated?) do
+      {:ok, msg, inbound_fds} ->
+        {:ok, msg, %{state | inbound_fds: inbound_fds}}
 
-    with :ok <- inbound_fd_frame_clean?(tainted?),
-         :ok <- inbound_fd_negotiated?(msg, state),
-         {:ok, msg} <- Message.attach_unix_fds(msg, fds) do
-      {:ok, msg, state}
-    else
-      {:error, reason} ->
+      {:error, reason, fds, inbound_fds} ->
         _ = UnixFD.close_all(fds)
-        {:error, reason, state}
+        {:error, reason, %{state | inbound_fds: inbound_fds}}
     end
   end
-
-  defp inbound_fd_frame_clean?(false), do: :ok
-  defp inbound_fd_frame_clean?(true), do: {:error, :invalid_unix_fds}
 
   # Count/index/negotiation checks run after a complete D-Bus frame and its
   # ancillary data have been collected. The stream boundary is therefore known:
   # close the descriptors, drop only this frame, and continue with a coalesced
   # successor rather than letting a peer kill unrelated calls or handlers.
   defp drop_recoverable_fd_frame(reason, rest, state, continuation, source) do
-    reason = fd_drop_reason(reason)
+    reason = Rights.drop_reason(reason)
     Logger.warning("D-Bus FD frame dropped: #{inspect(reason)}", reason: reason)
     parse_flat_messages(rest, finish_frame(state), continuation, source)
-  end
-
-  defp fd_drop_reason(reason)
-       when reason in [:invalid_unix_fds, :unix_fd_not_negotiated, :unix_fd_limit],
-       do: reason
-
-  defp fd_drop_reason(_reason), do: :invalid_unix_fds
-
-  defp inbound_fd_negotiated?(%Message{header_fields: header_fields, unix_fds: fds}, state) do
-    if state.unix_fd_negotiated? or (Map.get(header_fields, :unix_fds, 0) == 0 and fds == []) do
-      :ok
-    else
-      {:error, :unix_fd_not_negotiated}
-    end
   end
 
   defp dispatch_inbound_message(
@@ -1681,9 +1658,9 @@ defmodule Rebus.Connection do
     {:stop, {:shutdown, reason}, state |> discard_inbound_unix_fds() |> fail_pending()}
   end
 
-  defp discard_inbound_unix_fds(%__MODULE__{inbound_unix_fds: fds} = state) do
-    _ = UnixFD.close_all(fds)
-    %{state | inbound_unix_fds: [], inbound_fd_tainted?: false}
+  defp discard_inbound_unix_fds(%__MODULE__{inbound_fds: inbound_fds} = state) do
+    _ = UnixFD.close_all(Rights.fds(inbound_fds))
+    %{state | inbound_fds: Rights.new()}
   end
 
   # Each zero-length receive returns data already available through the fixed
@@ -1697,168 +1674,41 @@ defmodule Rebus.Connection do
     append_inbound(data, state, continuation)
   end
 
-  defp append_recvmsg(
-         %{iov: iov, ctrl: ctrl, flags: flags},
-         %__MODULE__{} = state,
-         continuation
-       )
-       when is_list(ctrl) and is_list(flags) do
-    fds = recvmsg_fds(ctrl, flags)
-
-    case recvmsg_data(iov) do
-      {:ok, data} ->
-        append_recvmsg_fds(fds, data, state, continuation)
-
-      {:error, reason} ->
-        # Validate control data before iodata so descriptors cannot leak when
-        # the recvmsg shape is invalid. No frame bytes are usable in this case.
-        _ = close_recvmsg_fds(fds)
-        stop_for_protocol_error(reason, state)
-    end
+  # Everything the rights decoder borrows from the connection for one
+  # `recvmsg` result.
+  defp rights_context(%__MODULE__{} = state) do
+    %{
+      negotiated?: state.unix_fd_negotiated?,
+      frame_pending?: Inbound.pending?(state.inbound),
+      max_bytes: @max_read_chunk
+    }
   end
 
-  defp append_recvmsg(%{ctrl: ctrl, flags: flags}, %__MODULE__{} = state, _continuation)
-       when is_list(ctrl) and is_list(flags) do
-    _ = close_recvmsg_fds(recvmsg_fds(ctrl, flags))
-    stop_for_protocol_error(:invalid_unix_fds, state)
+  defp append_recvmsg(message, %__MODULE__{} = state, continuation) do
+    message
+    |> Rights.decode(state.inbound_fds, rights_context(state))
+    |> apply_rights_decision(state, continuation)
   end
 
-  defp append_recvmsg(%{ctrl: ctrl}, %__MODULE__{} = state, _continuation) when is_list(ctrl) do
-    _ = close_recvmsg_fds(recvmsg_fds(ctrl, []))
-    stop_for_protocol_error(:invalid_unix_fds, state)
+  # The single close-or-deliver ownership path for every received descriptor:
+  # `:frame` retains them for the frame under assembly, and the other two
+  # decisions close exactly the descriptors they name.
+  defp apply_rights_decision({:frame, data, fds}, %__MODULE__{} = state, continuation) do
+    append_inbound(
+      data,
+      %{state | inbound_fds: Rights.retain(state.inbound_fds, fds)},
+      continuation
+    )
   end
 
-  defp append_recvmsg(_message, %__MODULE__{} = state, _continuation),
-    do: stop_for_protocol_error(:invalid_unix_fds, state)
-
-  defp append_recvmsg_fds({:ok, []}, data, state, continuation),
-    do: append_inbound(data, state, continuation)
-
-  defp append_recvmsg_fds({:ok, fds}, data, state, continuation) do
-    cond do
-      not state.unix_fd_negotiated? ->
-        _ = UnixFD.close_all(fds)
-        quarantine_ancillary_frame(data, state, continuation)
-
-      data == <<>> ->
-        _ = UnixFD.close_all(fds)
-        # A rights-only recvmsg result has no byte offset to associate with a
-        # D-Bus frame, so it cannot be recovered without risking later frame
-        # ownership.
-        stop_for_protocol_error(:invalid_unix_fds, state)
-
-      Inbound.pending?(state.inbound) or state.inbound_unix_fds != [] ->
-        _ = UnixFD.close_all(fds)
-        quarantine_ancillary_frame(data, state, continuation)
-
-      true ->
-        append_inbound(data, %{state | inbound_unix_fds: fds}, continuation)
-    end
-  end
-
-  defp append_recvmsg_fds({:error, :unix_fd_truncated, fds}, _data, state, _continuation) do
+  defp apply_rights_decision({:quarantine, data, fds}, %__MODULE__{} = state, continuation) do
     _ = UnixFD.close_all(fds)
-    # MSG_CTRUNC means the kernel may have installed descriptors omitted from
-    # the returned control data. Their identities are unknowable, so this
-    # cannot be quarantined frame-locally and must fail closed.
-    stop_for_protocol_error(:unix_fd_truncated, state)
+    append_inbound(data, %{state | inbound_fds: Rights.taint(state.inbound_fds)}, continuation)
   end
 
-  defp append_recvmsg_fds({:error, _reason, fds}, data, state, continuation) do
+  defp apply_rights_decision({:stop, reason, fds}, %__MODULE__{} = state, _continuation) do
     _ = UnixFD.close_all(fds)
-    # We decoded every complete descriptor before finding the malformed or
-    # oversized tail. Close them now and drop only the byte-aligned frame.
-    quarantine_ancillary_frame(data, state, continuation)
-  end
-
-  defp close_recvmsg_fds({:ok, fds}), do: UnixFD.close_all(fds)
-  defp close_recvmsg_fds({:error, _reason, fds}), do: UnixFD.close_all(fds)
-
-  defp recvmsg_data(iov) do
-    data = IO.iodata_to_binary(iov)
-
-    if byte_size(data) <= @max_read_chunk,
-      do: {:ok, data},
-      else: {:error, :message_too_large}
-  rescue
-    ArgumentError -> {:error, :invalid_unix_fds}
-  end
-
-  defp recvmsg_fds(ctrl, flags) do
-    case {extract_rights_fds(ctrl), :ctrunc in flags} do
-      {{:ok, fds}, true} ->
-        {:error, :unix_fd_truncated, fds}
-
-      {{:error, _reason, fds}, true} ->
-        # Preserve every complete descriptor decoded before the malformed or
-        # oversized tail so the single fail-closed path can close it. CTRUNC
-        # takes precedence because the kernel may have omitted more descriptors
-        # whose identities are unknowable.
-        {:error, :unix_fd_truncated, fds}
-
-      {result, _ctrunc?} ->
-        result
-    end
-  end
-
-  defp quarantine_ancillary_frame(<<>>, %__MODULE__{} = state, _continuation) do
-    stop_for_protocol_error(:invalid_unix_fds, state)
-  end
-
-  defp quarantine_ancillary_frame(data, %__MODULE__{} = state, continuation) do
-    append_inbound(data, %{state | inbound_fd_tainted?: true}, continuation)
-  end
-
-  defp extract_rights_fds(ctrl) do
-    {fds, reason} =
-      Enum.reduce(ctrl, {[], nil}, fn
-        %{level: :socket, type: :rights, data: data}, {fds, reason} when is_binary(data) ->
-          case decode_rights_data(data) do
-            {:ok, received} ->
-              append_received_fds(fds, received, reason)
-
-            # A malformed control payload can still contain complete
-            # descriptors before its invalid tail. Continue scanning later
-            # cmsgs too, retaining every descriptor for the single close path.
-            {:error, received} ->
-              append_received_fds(fds, received, reason || :invalid_unix_fds)
-          end
-
-        # An SCM_RIGHTS item with a non-binary payload must fail closed, but
-        # later rights cmsgs can still carry descriptors which must be closed.
-        %{level: :socket, type: :rights}, {fds, reason} ->
-          {fds, reason || :invalid_unix_fds}
-
-        _cmsg, acc ->
-          acc
-      end)
-
-    case reason do
-      nil -> {:ok, fds}
-      reason -> {:error, reason, fds}
-    end
-  end
-
-  defp append_received_fds(fds, received, reason) do
-    fds = fds ++ received
-
-    reason =
-      reason ||
-        if length(fds) > Message.max_unix_fds(), do: :unix_fd_limit
-
-    {fds, reason}
-  end
-
-  defp decode_rights_data(data) do
-    complete_size = div(byte_size(data), 4) * 4
-    <<complete::binary-size(^complete_size), _tail::binary>> = data
-    fds = for <<fd::native-signed-32 <- complete>>, do: fd
-
-    cond do
-      Enum.any?(fds, &(&1 < 0)) -> {:error, fds}
-      complete_size == byte_size(data) -> {:ok, fds}
-      true -> {:error, fds}
-    end
+    stop_for_protocol_error(reason, state)
   end
 
   defp append_inbound(data, %__MODULE__{} = state, continuation) do

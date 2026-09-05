@@ -562,8 +562,8 @@ defmodule Rebus.UnixFDTest do
         1_000
       )
 
-    assert eventually(fn -> :sys.get_state(connection).inbound_unix_fds != [] end)
-    [received] = :sys.get_state(connection).inbound_unix_fds
+    assert eventually(fn -> :sys.get_state(connection).inbound_fds.fds != [] end)
+    [received] = :sys.get_state(connection).inbound_fds.fds
 
     ref = Process.monitor(connection)
     assert :ok = Rebus.close(connection)
@@ -1082,7 +1082,7 @@ defmodule Rebus.UnixFDTest do
     # only a taint bit remains while the eight-byte prefix is buffered.
     assert eventually(fn ->
              state = :sys.get_state(connection)
-             state.inbound_fd_tainted? and state.inbound.size == byte_size(prefix)
+             state.inbound_fds.tainted? and state.inbound.size == byte_size(prefix)
            end)
 
     :ok =
