@@ -148,7 +148,9 @@
           {Credo.Check.Warning.ExpensiveEmptyEnumCheck, []},
           {Credo.Check.Warning.IExPry, []},
           {Credo.Check.Warning.IoInspect, []},
-          {Credo.Check.Warning.MissedMetadataKeyInLoggerConfig, []},
+          # Rebus is a library and ships no Logger formatter config, so declare
+          # the metadata keys it emits here instead.
+          {Credo.Check.Warning.MissedMetadataKeyInLoggerConfig, [metadata_keys: [:reason]]},
           {Credo.Check.Warning.OperationOnSameValues, []},
           {Credo.Check.Warning.OperationWithConstantResult, []},
           {Credo.Check.Warning.RaiseInsideRescue, []},

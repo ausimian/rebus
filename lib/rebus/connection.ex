@@ -410,7 +410,7 @@ defmodule Rebus.Connection do
   def handle_info({:fd_claim_timeout, claim_ref}, %__MODULE__{} = state) do
     case Map.fetch(state.fd_claims, claim_ref) do
       {:ok, _claim} ->
-        Logger.warning("D-Bus FD reply claim dropped: :claim_timeout")
+        Logger.warning("D-Bus FD reply claim dropped: :claim_timeout", reason: :claim_timeout)
         {:noreply, drop_fd_claim(state, claim_ref, close?: true)}
 
       :error ->
@@ -1064,13 +1064,13 @@ defmodule Rebus.Connection do
         stop_for_protocol_error({:hello_failed, :resource_limit}, finish_frame(state))
 
       {:error, :resource_limit, envelope, rest} ->
-        Logger.warning("D-Bus frame dropped: :resource_limit")
+        Logger.warning("D-Bus frame dropped: :resource_limit", reason: :resource_limit)
         state = discard_inbound_unix_fds(state)
         {:ok, state} = drop_resource_limited_reply(envelope, state)
         parse_flat_messages(rest, finish_frame(state), continuation, source)
 
       {:error, :resource_limit} ->
-        Logger.warning("D-Bus frame dropped: :resource_limit")
+        Logger.warning("D-Bus frame dropped: :resource_limit", reason: :resource_limit)
         state = discard_inbound_unix_fds(state)
 
         case Message.expected_size(data) do
@@ -1111,7 +1111,8 @@ defmodule Rebus.Connection do
   # close the descriptors, drop only this frame, and continue with a coalesced
   # successor rather than letting a peer kill unrelated calls or handlers.
   defp drop_recoverable_fd_frame(reason, rest, state, continuation, source) do
-    Logger.warning("D-Bus FD frame dropped: #{inspect(fd_drop_reason(reason))}")
+    reason = fd_drop_reason(reason)
+    Logger.warning("D-Bus FD frame dropped: #{inspect(reason)}", reason: reason)
     parse_flat_messages(rest, finish_frame(state), continuation, source)
   end
 
@@ -1189,7 +1190,7 @@ defmodule Rebus.Connection do
       parse_flat_messages(rest, notify(msg, finish_frame(state)), continuation, source)
     else
       close_message_fds(msg)
-      Logger.warning("D-Bus FD frame dropped: :signal_ownership")
+      Logger.warning("D-Bus FD frame dropped: :signal_ownership", reason: :signal_ownership)
       parse_flat_messages(rest, finish_frame(state), continuation, source)
     end
   end
@@ -2180,13 +2181,13 @@ defmodule Rebus.Connection do
 
   defp stop_for_transport_error(reason, %__MODULE__{} = state) do
     reason = normalize_socket_error(reason)
-    Logger.warning("D-Bus connection transport stopped: #{inspect(reason)}")
+    Logger.warning("D-Bus connection transport stopped: #{inspect(reason)}", reason: reason)
     {:stop, {:shutdown, reason}, state |> discard_inbound_unix_fds() |> fail_pending()}
   end
 
   defp stop_for_protocol_error(reason, %__MODULE__{} = state) do
     reason = sanitize_protocol_reason(reason)
-    Logger.warning("D-Bus connection protocol stopped: #{inspect(reason)}")
+    Logger.warning("D-Bus connection protocol stopped: #{inspect(reason)}", reason: reason)
     {:stop, {:shutdown, reason}, state |> discard_inbound_unix_fds() |> fail_pending()}
   end
 
@@ -2930,20 +2931,26 @@ defmodule Rebus.Connection do
              :invalid_message,
              :message_too_large
            ] ->
-        Logger.warning("D-Bus message encoding failed: #{inspect(reason)}")
+        Logger.warning("D-Bus message encoding failed: #{inspect(reason)}", reason: reason)
         {:error, :encode_failed}
 
       {:error, _reason} ->
-        Logger.warning("D-Bus message encoding failed: :invalid_message")
+        Logger.warning("D-Bus message encoding failed: :invalid_message",
+          reason: :invalid_message
+        )
+
         {:error, :encode_failed}
     end
   rescue
     exception ->
-      Logger.warning("D-Bus message encoding failed: #{inspect(exception.__struct__)}")
+      Logger.warning("D-Bus message encoding failed: #{inspect(exception.__struct__)}",
+        reason: exception.__struct__
+      )
+
       {:error, :encode_failed}
   catch
     kind, _reason ->
-      Logger.warning("D-Bus message encoding failed: #{inspect(kind)}")
+      Logger.warning("D-Bus message encoding failed: #{inspect(kind)}", reason: kind)
       {:error, :encode_failed}
   end
 
