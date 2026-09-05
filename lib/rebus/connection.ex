@@ -808,7 +808,10 @@ defmodule Rebus.Connection do
   defp validate_outbound_fd_transport(%Message{}, %__MODULE__{}), do: :ok
 
   # Everything a claim operation borrows from the connection for one call.
-  defp fd_claims_context(%__MODULE__{impl: %{hooks: hooks}}), do: %{hooks: hooks}
+  # `Rebus.Connection.Dispatch` opens claims of its own and asks for it here.
+  @doc false
+  @spec fd_claims_context(t()) :: FDClaims.context()
+  def fd_claims_context(%__MODULE__{impl: %{hooks: hooks}}), do: %{hooks: hooks}
 
   defp drop_fd_claim(%__MODULE__{} = state, claim_ref, opts),
     do: %{state | fd_claims: FDClaims.drop(state.fd_claims, claim_ref, opts)}

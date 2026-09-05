@@ -621,7 +621,7 @@ defmodule Rebus.Connection.Dispatch do
           monitor_ref: entry.monitor_ref,
           deadline: entry.deadline
         },
-        fd_claims_context(state)
+        Connection.fd_claims_context(state)
       )
 
     %{state | fd_claims: claims}
@@ -630,10 +630,6 @@ defmodule Rebus.Connection.Dispatch do
   # A pending entry is only ever registered for a call that arrived through
   # `handle_call/3`, so its `from` is always a `t:GenServer.from/0`.
   defp live_from?({pid, _tag}) when is_pid(pid), do: Process.alive?(pid)
-
-  # Everything a claim operation borrows from the connection for one call. The
-  # connection builds the same map for the claim calls it serves itself.
-  defp fd_claims_context(%Connection{impl: %{hooks: hooks}}), do: %{hooks: hooks}
 
   defp drop_resource_limited_reply(
          %{type: :method_return, reply_serial: reply_serial},
