@@ -214,15 +214,12 @@ defmodule Rebus.MatchSubscription.Worker do
       ref_monitors: %{},
       requests: %{},
       request_monitors: %{},
-      request_owner_index: %{},
       operations: %{},
       operation_monitors: %{},
       recovering_rules: MapSet.new(),
       initial_cleanup_keys: MapSet.new(),
       initial_cleanup_queue: :queue.new(),
       resetting?: false,
-      reset_attempt: 0,
-      reset_timer: nil,
       reset_token: nil,
       reset_task_monitor: nil,
       state_lost?: false,
@@ -489,10 +486,10 @@ defmodule Rebus.MatchSubscription.Worker do
         maybe_idle_rule(state, key)
 
       %{kind: :add} = request when rule.status == :installing ->
-        start_add_new(state, key, request_id, request)
+        start_add(state, key, :add_new, request_id, request)
 
       %{kind: :add} = request when rule.status == :active ->
-        start_add_existing(state, key, request_id, request)
+        start_add(state, key, :add_existing, request_id, request)
 
       %{kind: :remove, ref: ref} = request when rule.status == :active ->
         dispatch_remove(state, key, request_id, request, ref)
@@ -509,26 +506,19 @@ defmodule Rebus.MatchSubscription.Worker do
     end
   end
 
-  defp start_add_new(state, key, request_id, request) do
+  defp start_add(state, key, type, request_id, request) do
     rule = Map.fetch!(state.rules, key).rule
     conn = state.conn
     owner = request.owner
     deadline = request.deadline
 
-    start_operation(state, key, :add_new, request_id, fn ->
-      add_new_operation(conn, owner, rule, deadline)
-    end)
-  end
+    fun =
+      case type do
+        :add_new -> fn -> add_new_operation(conn, owner, rule, deadline) end
+        :add_existing -> fn -> add_existing_operation(conn, owner, rule, deadline) end
+      end
 
-  defp start_add_existing(state, key, request_id, request) do
-    rule = Map.fetch!(state.rules, key).rule
-    conn = state.conn
-    owner = request.owner
-    deadline = request.deadline
-
-    start_operation(state, key, :add_existing, request_id, fn ->
-      add_existing_operation(conn, owner, rule, deadline)
-    end)
+    start_operation(state, key, type, request_id, fun)
   end
 
   defp start_remove(state, key, request_id, request, subscription) do
@@ -587,46 +577,33 @@ defmodule Rebus.MatchSubscription.Worker do
   defp start_operation(state, key, type, request_id, fun) do
     token = make_ref()
     worker = self()
+    operation = %{key: key, type: type, request_id: request_id, monitor: nil}
 
-    case Task.Supervisor.start_child(Rebus.MatchSubscription.TaskSupervisor, fn ->
-           send(worker, {:operation_result, token, fun.()})
-         end) do
-      {:ok, pid} ->
-        monitor_ref = Process.monitor(pid)
-        rule = Map.fetch!(state.rules, key)
-        state = put_rule(state, key, %{rule | operation: token})
+    started =
+      Task.Supervisor.start_child(Rebus.MatchSubscription.TaskSupervisor, fn ->
+        send(worker, {:operation_result, token, fun.()})
+      end)
 
-        %{
-          state
-          | operations:
-              Map.put(state.operations, token, %{
-                key: key,
-                type: type,
-                request_id: request_id,
-                monitor: monitor_ref
-              }),
-            operation_monitors: Map.put(state.operation_monitors, monitor_ref, token)
-        }
-        |> persist_state()
+    rule = Map.fetch!(state.rules, key)
+    state = put_rule(state, key, %{rule | operation: token})
 
-      {:error, _reason} ->
-        rule = Map.fetch!(state.rules, key)
-        state = put_rule(state, key, %{rule | operation: token})
+    state =
+      case started do
+        {:ok, pid} ->
+          monitor_ref = Process.monitor(pid)
 
-        state = %{
-          state
-          | operations:
-              Map.put(state.operations, token, %{
-                key: key,
-                type: type,
-                request_id: request_id,
-                monitor: nil
-              })
-        }
+          %{
+            state
+            | operations: Map.put(state.operations, token, %{operation | monitor: monitor_ref}),
+              operation_monitors: Map.put(state.operation_monitors, monitor_ref, token)
+          }
 
-        send(self(), {:operation_result, token, {:operation_failed, :disconnected}})
-        persist_state(state)
-    end
+        {:error, _reason} ->
+          send(self(), {:operation_result, token, {:operation_failed, :disconnected}})
+          %{state | operations: Map.put(state.operations, token, operation)}
+      end
+
+    persist_state(state)
   end
 
   defp take_operation(state, token) do
@@ -655,6 +632,22 @@ defmodule Rebus.MatchSubscription.Worker do
 
         {operation, state}
     end
+  end
+
+  defp complete_operation(state, key, %{type: :initial_cleanup}, {:operation_failed, _reason}) do
+    state
+    |> release_initial_cleanup(key)
+    |> operation_failed(key, :initial_cleanup, nil)
+    |> start_next_initial_cleanup()
+  end
+
+  defp complete_operation(
+         state,
+         key,
+         %{type: type, request_id: request_id},
+         {:operation_failed, _reason}
+       ) do
+    operation_failed(state, key, type, request_id)
   end
 
   defp complete_operation(state, key, %{type: :add_new, request_id: request_id}, result) do
@@ -712,11 +705,6 @@ defmodule Rebus.MatchSubscription.Worker do
     end
   end
 
-  defp complete_add_new(state, key, request_id, {:operation_failed, _reason}) do
-    state = reply_request_if_present(state, request_id, {:error, :disconnected})
-    request_connection_reset(state, key)
-  end
-
   defp complete_add_existing(state, key, request_id, {:added_existing, handler_ref}) do
     case accept_add_request(state, request_id) do
       {:ok, request, state} ->
@@ -739,11 +727,6 @@ defmodule Rebus.MatchSubscription.Worker do
     state
     |> reply_request_if_live(request_id, error)
     |> dispatch_rule(key)
-  end
-
-  defp complete_add_existing(state, key, request_id, {:operation_failed, _reason}) do
-    state = reply_request_if_present(state, request_id, {:error, :disconnected})
-    request_connection_reset(state, key)
   end
 
   defp complete_remove(state, key, request_id, {:remove_failed, error, :active}) do
@@ -774,11 +757,6 @@ defmodule Rebus.MatchSubscription.Worker do
     state = mark_handler_removed(state, ref)
     state = reply_request_if_live(state, request_id, error)
     enter_recovery(state, key, :rule)
-  end
-
-  defp complete_remove(state, key, request_id, {:operation_failed, _reason}) do
-    state = reply_request_if_present(state, request_id, {:error, :disconnected})
-    request_connection_reset(state, key)
   end
 
   defp complete_recovery(state, key, :cleared) do
@@ -814,11 +792,6 @@ defmodule Rebus.MatchSubscription.Worker do
     schedule_recovery_retry(state, key)
   end
 
-  defp complete_recovery(state, key, {:operation_failed, _reason}) do
-    log_recovery(:operation_lost)
-    request_connection_reset(state, key)
-  end
-
   defp complete_initial_cleanup(state, key, :cleared), do: complete_recovery(state, key, :cleared)
 
   defp complete_initial_cleanup(state, key, :handlers_cleared),
@@ -839,9 +812,20 @@ defmodule Rebus.MatchSubscription.Worker do
     enter_recovery(state, key, :rule)
   end
 
-  defp complete_initial_cleanup(state, key, {:operation_failed, _reason}) do
+  # Every operation type fails the same way: the task died without reporting a
+  # safe outcome, so the connection is reset. The request-bearing types answer
+  # their caller; the recovery tracks, which never carry a request, log the
+  # loss instead.
+  defp operation_failed(state, key, type, _request_id)
+       when type in [:recovery, :initial_cleanup] do
     log_recovery(:operation_lost)
     request_connection_reset(state, key)
+  end
+
+  defp operation_failed(state, key, _type, request_id) do
+    state
+    |> reply_request_if_present(request_id, {:error, :disconnected})
+    |> request_connection_reset(key)
   end
 
   defp owner_down(state, monitor_ref, ref) do
@@ -1158,15 +1142,26 @@ defmodule Rebus.MatchSubscription.Worker do
   defp remove_bus_rule(_conn, _rule, ref, false, _deadline), do: {:removed, ref, :nonfinal}
 
   defp remove_bus_rule(conn, rule, ref, true, deadline) do
+    case remove_match(conn, rule, deadline) do
+      :ok -> {:removed, ref, :final}
+      {:definitive, error} -> {:remove_definitive_error, ref, error}
+      {:ambiguous, error} -> {:remove_ambiguous, ref, error}
+    end
+  end
+
+  # Shared RemoveMatch classification: a rule the bus does not know is already
+  # gone, a bus error is definitive, and anything else leaves the server-side
+  # rule unresolved.
+  defp remove_match(conn, rule, deadline) do
     case invoke_bus_method(conn, "RemoveMatch", rule, deadline) do
       :ok ->
-        {:removed, ref, :final}
+        :ok
 
       error ->
         cond do
-          match_rule_not_found?(error) -> {:removed, ref, :final}
-          definitive_bus_error?(error) -> {:remove_definitive_error, ref, error}
-          true -> {:remove_ambiguous, ref, error}
+          match_rule_not_found?(error) -> :ok
+          definitive_bus_error?(error) -> {:definitive, error}
+          true -> {:ambiguous, error}
         end
     end
   end
@@ -1203,16 +1198,9 @@ defmodule Rebus.MatchSubscription.Worker do
   defp remove_remote_rule(_conn, %{remote_may_exist?: false}, _deadline), do: :ok
 
   defp remove_remote_rule(conn, %{rule: rule}, deadline) do
-    case invoke_bus_method(conn, "RemoveMatch", rule, deadline) do
-      :ok ->
-        :ok
-
-      error ->
-        cond do
-          match_rule_not_found?(error) -> :ok
-          definitive_bus_error?(error) -> {:definitive, error}
-          true -> :ambiguous
-        end
+    case remove_match(conn, rule, deadline) do
+      {:ambiguous, _error} -> :ambiguous
+      result -> result
     end
   end
 
@@ -1301,44 +1289,37 @@ defmodule Rebus.MatchSubscription.Worker do
      %{
        state
        | requests: Map.put(state.requests, request_id, request),
-         request_monitors: Map.put(state.request_monitors, monitor_ref, request_id),
-         request_owner_index: Map.put(state.request_owner_index, request_id, monitor_ref)
+         request_monitors: Map.put(state.request_monitors, monitor_ref, request_id)
      }}
   end
 
-  defp reply_request_if_live(state, request_id, reply) do
-    case Map.get(state.requests, request_id) do
-      nil ->
-        state
-
-      request ->
-        if before_deadline?(request.deadline) and Process.alive?(request.owner) do
-          reply_request(state, request_id, reply)
-        else
-          reply_request(
-            state,
-            request_id,
-            {:error, if(Process.alive?(request.owner), do: :timeout, else: :disconnected)}
-          )
-        end
+  # A caller only gets the operation's own reply while it is still waiting for
+  # one: a dead owner is disconnected and a passed deadline is a timeout.
+  defp expired_reason(request) do
+    cond do
+      not Process.alive?(request.owner) -> :disconnected
+      not before_deadline?(request.deadline) -> :timeout
+      true -> nil
     end
   end
 
-  defp reply_request_if_live_after_persist(state, request_id, reply) do
-    case Map.get(state.requests, request_id) do
-      nil ->
-        state
+  defp effective_reply(request, reply) do
+    case expired_reason(request) do
+      nil -> reply
+      reason -> {:error, reason}
+    end
+  end
 
-      request ->
-        if before_deadline?(request.deadline) and Process.alive?(request.owner) do
-          reply_request_after_persist(state, request_id, reply)
-        else
-          reply_request_after_persist(
-            state,
-            request_id,
-            {:error, if(Process.alive?(request.owner), do: :timeout, else: :disconnected)}
-          )
-        end
+  defp reply_request_if_live(state, request_id, reply),
+    do: reply_if_live(state, request_id, reply, false)
+
+  defp reply_request_if_live_after_persist(state, request_id, reply),
+    do: reply_if_live(state, request_id, reply, true)
+
+  defp reply_if_live(state, request_id, reply, persist?) do
+    case Map.get(state.requests, request_id) do
+      nil -> state
+      request -> take_and_reply(state, request_id, effective_reply(request, reply), persist?)
     end
   end
 
@@ -1348,17 +1329,9 @@ defmodule Rebus.MatchSubscription.Worker do
         {:expired, state}
 
       request ->
-        if before_deadline?(request.deadline) and Process.alive?(request.owner) do
-          {:ok, request, state}
-        else
-          state =
-            reply_request(
-              state,
-              request_id,
-              {:error, if(Process.alive?(request.owner), do: :timeout, else: :disconnected)}
-            )
-
-          {:expired, state}
+        case expired_reason(request) do
+          nil -> {:ok, request, state}
+          reason -> {:expired, reply_request(state, request_id, {:error, reason})}
         end
     end
   end
@@ -1368,7 +1341,13 @@ defmodule Rebus.MatchSubscription.Worker do
   defp reply_request_if_present(state, request_id, reply),
     do: reply_request(state, request_id, reply)
 
-  defp reply_request_after_persist(state, request_id, reply) do
+  defp reply_request_after_persist(state, request_id, reply),
+    do: take_and_reply(state, request_id, reply, true)
+
+  defp reply_request(state, request_id, reply),
+    do: take_and_reply(state, request_id, reply, false)
+
+  defp take_and_reply(state, request_id, reply, persist?) do
     case Map.pop(state.requests, request_id) do
       {nil, _requests} ->
         state
@@ -1380,36 +1359,16 @@ defmodule Rebus.MatchSubscription.Worker do
         state = %{
           state
           | requests: requests,
-            request_monitors: Map.delete(state.request_monitors, monitor_ref),
-            request_owner_index: Map.delete(state.request_owner_index, request_id)
+            request_monitors: Map.delete(state.request_monitors, monitor_ref)
         }
 
         # A completed operation may be observed immediately by its caller,
-        # including by stopping this worker. Persist its final state before
-        # replying so restart recovery never mistakes an acknowledged stable
-        # subscription for an uncertain in-flight operation.
-        state = persist_state(state)
+        # including by stopping this worker. When a caller asks to persist, the
+        # write happens before the reply, so restart recovery never mistakes an
+        # acknowledged stable subscription for an uncertain in-flight operation.
+        state = if persist?, do: persist_state(state), else: state
         GenServer.reply(from, reply)
         state
-    end
-  end
-
-  defp reply_request(state, request_id, reply) do
-    case Map.pop(state.requests, request_id) do
-      {nil, _requests} ->
-        state
-
-      {%{from: from, timer: timer, monitor: monitor_ref}, requests} ->
-        _ = Process.cancel_timer(timer, async: true, info: false)
-        Process.demonitor(monitor_ref, [:flush])
-        GenServer.reply(from, reply)
-
-        %{
-          state
-          | requests: requests,
-            request_monitors: Map.delete(state.request_monitors, monitor_ref),
-            request_owner_index: Map.delete(state.request_owner_index, request_id)
-        }
     end
   end
 
@@ -1723,49 +1682,36 @@ defmodule Rebus.MatchSubscription.Worker do
   end
 
   defp put_rule(state, key, rule) do
-    changes = state.persistence
-
-    changes = %{
-      changes
-      | dirty_rules: MapSet.put(changes.dirty_rules, key),
-        removed_rules: MapSet.delete(changes.removed_rules, key)
-    }
-
-    %{state | rules: Map.put(state.rules, key, rule), persistence: changes}
+    state = %{state | rules: Map.put(state.rules, key, rule)}
+    track_change(state, :rules, key, :dirty)
   end
 
   defp delete_rule(state, key) do
-    changes = state.persistence
-
-    changes = %{
-      changes
-      | dirty_rules: MapSet.delete(changes.dirty_rules, key),
-        removed_rules: MapSet.put(changes.removed_rules, key)
-    }
-
-    %{state | rules: Map.delete(state.rules, key), persistence: changes}
+    state = %{state | rules: Map.delete(state.rules, key)}
+    track_change(state, :rules, key, :removed)
   end
 
-  defp mark_subscription_dirty(state, ref) do
-    changes = state.persistence
+  defp mark_subscription_dirty(state, ref),
+    do: track_change(state, :subscriptions, ref, :dirty)
 
-    changes = %{
-      changes
-      | dirty_subscriptions: MapSet.put(changes.dirty_subscriptions, ref),
-        removed_subscriptions: MapSet.delete(changes.removed_subscriptions, ref)
-    }
+  defp mark_subscription_removed(state, ref),
+    do: track_change(state, :subscriptions, ref, :removed)
 
-    %{state | persistence: changes}
-  end
+  # A key belongs to exactly one of its kind's two change sets, so recording a
+  # change moves it into one and out of the other.
+  defp track_change(state, kind, key, change) do
+    {dirty, removed} =
+      case kind do
+        :rules -> {:dirty_rules, :removed_rules}
+        :subscriptions -> {:dirty_subscriptions, :removed_subscriptions}
+      end
 
-  defp mark_subscription_removed(state, ref) do
-    changes = state.persistence
+    {into, out_of} = if change == :dirty, do: {dirty, removed}, else: {removed, dirty}
 
-    changes = %{
-      changes
-      | dirty_subscriptions: MapSet.delete(changes.dirty_subscriptions, ref),
-        removed_subscriptions: MapSet.put(changes.removed_subscriptions, ref)
-    }
+    changes =
+      state.persistence
+      |> Map.update!(into, &MapSet.put(&1, key))
+      |> Map.update!(out_of, &MapSet.delete(&1, key))
 
     %{state | persistence: changes}
   end

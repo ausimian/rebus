@@ -1514,8 +1514,7 @@ defmodule Rebus.MatchRuleTest do
               monitor: request_monitor
             }
           },
-          request_monitors: %{request_monitor => request_id},
-          request_owner_index: %{request_id => request_monitor}
+          request_monitors: %{request_monitor => request_id}
       }
 
       assert {:noreply, _state} =
@@ -2048,8 +2047,7 @@ defmodule Rebus.MatchRuleTest do
     {%{
        state
        | requests: %{request_id => request},
-         request_monitors: %{monitor => request_id},
-         request_owner_index: %{request_id => monitor}
+         request_monitors: %{monitor => request_id}
      }, request_id}
   end
 
