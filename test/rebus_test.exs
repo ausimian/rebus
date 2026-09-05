@@ -1280,8 +1280,6 @@ defmodule RebusTest do
     test "caps each inbound receive allocation below the maximum frame size", %{svr: svr} do
       cli = connect_until_ready(svr)
 
-      assert Connection.inbound_receive_buffer_size() == 65_536
-
       assert {:ok, receive_buffer} = :socket.getopt(:sys.get_state(cli).sock, {:otp, :rcvbuf})
 
       buffer_size =
@@ -1290,7 +1288,7 @@ defmodule RebusTest do
           size when is_integer(size) -> size
         end
 
-      assert buffer_size == Connection.inbound_receive_buffer_size()
+      assert buffer_size == 65_536
       assert buffer_size < Message.max_message_size()
     end
 
@@ -1463,7 +1461,7 @@ defmodule RebusTest do
 
     test "falls back safely when configuring the OTP receive buffer" do
       parent = self()
-      tuple_value = {1, Connection.inbound_receive_buffer_size()}
+      tuple_value = {1, 65_536}
       warning = "D-Bus connection is using OTP's default receive buffer"
 
       TestImpl.put(

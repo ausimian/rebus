@@ -82,15 +82,6 @@ defmodule Rebus.TestImpl do
   end
 
   @doc """
-  Builds a `:__impl__` option value, registering `overrides` for the caller.
-  """
-  @spec impl(keyword() | map(), keyword() | map()) :: map()
-  def impl(modules, overrides \\ []) do
-    :ok = put(self(), overrides)
-    Map.new(modules)
-  end
-
-  @doc """
   Registers identity overrides under `key` and returns the stub module.
   """
   @spec identity(pid() | atom(), keyword() | map()) :: module()

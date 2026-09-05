@@ -1945,7 +1945,7 @@ defmodule Rebus.Connection do
   @doc false
   @spec get_auth_id(pos_integer(), module()) ::
           {:ok, binary()} | {:error, :auth_id_unavailable | :read_timeout}
-  def get_auth_id(timeout, identity \\ Rebus.Identity.Posix)
+  def get_auth_id(timeout, identity)
       when is_integer(timeout) and timeout > 0 and is_atom(identity) do
     case safely_lookup_identity(identity, :auth_id, timeout) do
       {:ok, output} when is_binary(output) and byte_size(output) <= @max_auth_id_output ->
@@ -1970,7 +1970,7 @@ defmodule Rebus.Connection do
   @doc false
   @spec get_auth_username(pos_integer(), module()) ::
           {:ok, binary()} | {:error, :auth_cookie_unavailable | :read_timeout}
-  def get_auth_username(timeout, identity \\ Rebus.Identity.Posix)
+  def get_auth_username(timeout, identity)
       when is_integer(timeout) and timeout > 0 and is_atom(identity) do
     case safely_lookup_identity(identity, :username, timeout) do
       {:ok, output} when is_binary(output) and byte_size(output) <= @max_auth_id_output ->
@@ -2521,10 +2521,6 @@ defmodule Rebus.Connection do
       buffer_incomplete_message(state, continuation)
     end
   end
-
-  @doc false
-  @spec inbound_receive_buffer_size() :: pos_integer()
-  def inbound_receive_buffer_size, do: @max_read_chunk
 
   defp inbound_prefix(%__MODULE__{} = state, size) do
     state.inbound_segments
