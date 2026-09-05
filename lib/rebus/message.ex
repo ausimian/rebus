@@ -492,7 +492,8 @@ defmodule Rebus.Message do
                optional(:error_name) => binary(),
                type: message_type(),
                reply_serial: pos_integer() | nil
-             }, binary()}
+             }
+             | nil, binary()}
           | {:error, any()}
           | nil
   def parse_inbound(binary) when is_binary(binary) do
@@ -504,8 +505,14 @@ defmodule Rebus.Message do
           {:ok, message} ->
             {:ok, message, remaining_data}
 
+          # The frame boundary is known here, so every resource-limit result
+          # carries the remainder; the envelope is absent when the limit
+          # tripped before the reply fields were validated.
           {:error, :resource_limit, envelope} ->
             {:error, :resource_limit, envelope, remaining_data}
+
+          {:error, :resource_limit} ->
+            {:error, :resource_limit, nil, remaining_data}
 
           {:error, reason} ->
             {:error, reason}
