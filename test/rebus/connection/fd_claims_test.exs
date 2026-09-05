@@ -6,14 +6,10 @@ defmodule Rebus.Connection.FDClaimsTest do
   alias Rebus.Connection.FDClaims
   alias Rebus.Connection.Hooks
   alias Rebus.Message
+  alias Rebus.TestFD
   alias Rebus.UnixFD
 
-  @moduletag skip:
-               if(
-                 :os.type() in [{:unix, :linux}, {:unix, :darwin}],
-                 do: false,
-                 else: "SCM_RIGHTS coverage is supported on Linux and macOS"
-               )
+  @moduletag skip: TestFD.skip_reason()
 
   describe "open/3" do
     test "answers the caller with a claim token and retains the descriptor" do
@@ -486,45 +482,16 @@ defmodule Rebus.Connection.FDClaimsTest do
   end
 
   # `UnixFD.close/1` answers `{:error, :ebadf}` for a descriptor which is
-  # already closed, so it is both the openness assertion and the cleanup.
+  # already closed, so it is both the openness assertion and the cleanup. The
+  # `:ebadf` answer only means "closed" while nothing else can reopen the
+  # number, which is why this module stays `async: false`.
   defp open?(fd), do: UnixFD.close(fd) == :ok
 
   defp closed?(fd), do: UnixFD.close(fd) == {:error, :ebadf}
 
   # A descriptor this test owns outright: a dup received over SCM_RIGHTS, so
   # closing it cannot disturb a socket or file the VM still holds.
-  defp owned_fd! do
-    path = Path.join("/tmp", "rebus-fd-claims-#{System.unique_integer([:positive])}")
-    {:ok, listener} = :socket.open(:local, :stream, :default)
-    :ok = :socket.bind(listener, %{family: :local, path: path})
-    :ok = :socket.listen(listener, 1)
-    {:ok, sender} = :socket.open(:local, :stream, :default)
-    {:ok, address} = :socket.sockname(listener)
-    :ok = :socket.connect(sender, address)
-    {:ok, receiver} = :socket.accept(listener, 1_000)
-    {:ok, fd} = :socket.getopt(listener, {:otp, :fd})
-
-    :ok =
-      :socket.sendmsg(
-        sender,
-        %{
-          iov: ["x"],
-          ctrl: [%{level: :socket, type: :rights, data: <<fd::native-signed-32>>}]
-        },
-        [],
-        1_000
-      )
-
-    {:ok, %{ctrl: ctrl}} = :socket.recvmsg(receiver, 0, 256, [], 1_000)
-
-    [%{data: <<received::native-signed-32>>}] =
-      Enum.filter(ctrl, &match?(%{level: :socket, type: :rights}, &1))
-
-    Enum.each([sender, receiver, listener], &:socket.close/1)
-    File.rm(path)
-
-    received
-  end
+  defp owned_fd!, do: TestFD.dup!()
 
   defmodule AckHooks do
     @moduledoc false

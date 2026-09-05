@@ -8,6 +8,7 @@ defmodule Rebus.Connection.SetupTest do
   alias Rebus.Connection.Writer
   alias Rebus.Message
   alias Rebus.ScriptedTransport
+  alias Rebus.TestFD
   alias Rebus.TestImpl
 
   @guid "30313233343536373839616263646566"
@@ -151,8 +152,9 @@ defmodule Rebus.Connection.SetupTest do
                Setup.hello_reply_buffer(hello_pending(signal))
     end
 
+    @tag skip: TestFD.skip_reason()
     test "refuses a Hello reply that carries descriptors" do
-      {sock, fd} = descriptor()
+      fd = descriptor()
 
       reply =
         Message.new!(:method_return,
@@ -172,8 +174,6 @@ defmodule Rebus.Connection.SetupTest do
       # test hands it one it owns rather than an arbitrary number.
       assert {:protocol_error, :invalid_unix_fds, %Connection{}} =
                Setup.hello_reply_buffer(state)
-
-      _ = :socket.close(sock)
     end
   end
 
@@ -264,13 +264,10 @@ defmodule Rebus.Connection.SetupTest do
     iodata(encoded)
   end
 
-  # A descriptor this test owns, so the close-or-deliver path under test closes
-  # a real descriptor of ours rather than an arbitrary number.
-  defp descriptor do
-    {:ok, sock} = :socket.open(:inet, :stream, :default)
-    {:ok, fd} = :socket.getopt(sock, {:otp, :fd})
-    {sock, fd}
-  end
+  # A descriptor this test owns outright, so the close-or-deliver path under
+  # test closes a number no other socket still holds. `{:otp, :fd}` on a socket
+  # the test keeps would do exactly that; see `Rebus.TestFD`.
+  defp descriptor, do: TestFD.dup!()
 
   defp dead_process do
     pid = spawn(fn -> :ok end)
