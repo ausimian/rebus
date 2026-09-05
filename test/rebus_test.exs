@@ -2690,7 +2690,8 @@ defmodule RebusTest do
       assert {:error, :econnrefused} =
                Rebus.connect_address_candidates(candidates, [timeout: 100],
                  resolver: resolver,
-                 connector: connector
+                 connector: connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end
                )
 
       assert_receive {:resolved, :inet6, timeout6}
@@ -3055,6 +3056,7 @@ defmodule RebusTest do
                  [timeout: 100],
                  resolver: resolver,
                  connector: connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
                  # This test controls both resolver and connector outcomes;
                  # keep its address-budget assertion independent of runner
                  # scheduling before the first deterministic attempt.
@@ -3122,7 +3124,8 @@ defmodule RebusTest do
                  ],
                  [timeout: 100],
                  resolver: resolver,
-                 connector: connector
+                 connector: connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end
                )
 
       assert_receive {:resolved, :inet}
@@ -3145,6 +3148,7 @@ defmodule RebusTest do
                  [{:tcp, sentinel, 12_345, :unspec, nil}],
                  [timeout: 100],
                  resolver: resolver,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
                  # This test controls the resolver result; make its reason
                  # assertion independent of scheduler time before resolution.
                  monotonic_time: fn -> 0 end
@@ -3268,6 +3272,7 @@ defmodule RebusTest do
                  [{:local, "/tmp/one", nil}, {:local, "/tmp/two", nil}],
                  [timeout: 50],
                  connector: aborting_connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
                  monotonic_time: monotonic_time
                )
 
@@ -3284,6 +3289,7 @@ defmodule RebusTest do
                  [{:local, "/tmp/one", nil}, {:local, "/tmp/two", nil}],
                  [timeout: 50],
                  connector: unavailable_cookie_connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
                  monotonic_time: monotonic_time
                )
 
