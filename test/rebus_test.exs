@@ -21,7 +21,7 @@ defmodule RebusTest do
       {:ok, addr} = TestServer.get_listen_addr(svr)
       {:ok, _cli} = Rebus.connect(addr)
 
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
     end
 
     test "connect! returns pid on success", %{svr: svr} do
@@ -29,7 +29,7 @@ defmodule RebusTest do
       pid = Rebus.connect!(addr)
 
       assert is_pid(pid)
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
     end
 
     test "drops resource-limited frames and continues coalesced signals", %{svr: svr} do
@@ -426,7 +426,7 @@ defmodule RebusTest do
                   end}
                )
 
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
       refute_receive :precomputed_auth_id_runner
       assert Rebus.close(precomputed_cli) in [:ok, {:error, :not_found}]
     end
@@ -465,7 +465,7 @@ defmodule RebusTest do
 
       assert {:ok, cli} = Rebus.connect(addr, name: name)
       assert Process.whereis(name) == cli
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
 
       on_exit(fn ->
         if pid = Process.whereis(name), do: Rebus.close(pid)
@@ -576,7 +576,7 @@ defmodule RebusTest do
 
       {:ok, working_addr} = TestServer.get_listen_addr(svr)
       assert {:ok, _cli} = Rebus.connect(working_addr, read_timeout: 500)
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
     end
 
     test "does not let a silent setup block an independent connection" do
@@ -601,7 +601,7 @@ defmodule RebusTest do
 
       assert_receive {^healthy_svr, :auth_received}, 500
       assert {:ok, _cli} = Task.await(healthy_connect, 1_000)
-      assert_receive {^healthy_svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(healthy_svr)
       assert {:error, :read_timeout} = Task.await(silent_connect, 1_500)
     end
 
@@ -610,7 +610,7 @@ defmodule RebusTest do
       :ok = TestServer.set_auto_hello(svr, false)
       connect_task = Task.async(fn -> Rebus.connect(addr) end)
 
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      hello = await_hello(svr)
       assert nil == Task.yield(connect_task, 50)
       handle_hello(hello, svr)
       assert {:ok, cli} = Task.await(connect_task, 1_000)
@@ -639,7 +639,7 @@ defmodule RebusTest do
       read_timeout = 2_000
       connect_task = Task.async(fn -> Rebus.connect(addr, read_timeout: read_timeout) end)
 
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}, 1_000
+      hello = await_hello(svr)
       started_at = System.monotonic_time(:millisecond)
 
       log =
@@ -661,7 +661,7 @@ defmodule RebusTest do
       :ok = TestServer.set_auto_hello(svr, false)
       connect_task = Task.async(fn -> Rebus.connect(addr, name: name) end)
 
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      hello = await_hello(svr)
       cli = Process.whereis(name)
       assert is_pid(cli)
 
@@ -719,7 +719,7 @@ defmodule RebusTest do
       :ok = TestServer.set_auto_hello(svr, false)
       connect_task = Task.async(fn -> Rebus.connect(addr, name: name) end)
 
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      hello = await_hello(svr)
       cli = Process.whereis(name)
       assert is_pid(cli)
       ref = Process.monitor(cli)
@@ -782,7 +782,7 @@ defmodule RebusTest do
       :ok = TestServer.set_auto_hello(svr, false)
       connect_task = Task.async(fn -> Rebus.connect(addr, name: name, read_timeout: 6_000) end)
 
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      hello = await_hello(svr)
       cli = Process.whereis(name)
       assert is_pid(cli)
 
@@ -844,7 +844,7 @@ defmodule RebusTest do
 
       assert {:ok, _cli} = Task.await(connect_task, 1_000)
       assert {:error, :not_connected} = Task.await(call_task, 1_000)
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}, serial: 1}}
+      assert await_hello(svr).serial == 1
 
       on_exit(fn ->
         if connection = Process.whereis(name), do: Rebus.close(connection)
@@ -869,7 +869,7 @@ defmodule RebusTest do
     test "lets read_timeout override timeout", %{svr: svr} do
       {:ok, addr} = TestServer.get_listen_addr(svr)
       assert {:ok, _cli} = Rebus.connect(addr, timeout: 1, read_timeout: 500)
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
     end
 
     test "keeps the default inbound read timeout after a short setup timeout", %{svr: svr} do
@@ -918,7 +918,7 @@ defmodule RebusTest do
       {:ok, working_addr} = TestServer.get_listen_addr(svr)
       assert {:ok, cli} = Rebus.connect(working_addr, name: name)
       assert Process.whereis(name) == cli
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
 
       on_exit(fn ->
         if pid = Process.whereis(name), do: Rebus.close(pid)
@@ -993,7 +993,7 @@ defmodule RebusTest do
           refute_receive :unexpected_auth_id_lookup, 100
 
           assert {:ok, retry_cli} = Rebus.connect(addr, name: name)
-          assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}, 1_000
+          await_hello(svr)
           assert :ok = Rebus.close(retry_cli)
         end)
 
@@ -1091,7 +1091,8 @@ defmodule RebusTest do
       assert_receive {:setup_ready, ^cli}, 1_000
       :sys.replace_state(cli, fn state -> %{state | serial: 42} end)
       send(cli, {connect_ref, :accepted})
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}, serial: 42} = hello}
+      hello = await_hello(svr)
+      assert hello.serial == 42
       handle_hello(hello, svr)
       assert_receive :setup_accepted, 1_000
       assert wait_until(fn -> :sys.get_state(cli).name == ":1.100" end)
@@ -1102,7 +1103,7 @@ defmodule RebusTest do
       :ok = TestServer.set_auto_hello(svr, false)
       task = Task.async(fn -> Rebus.connect(addr, read_timeout: 300) end)
 
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
       assert {:error, :read_timeout} = Task.await(task, 1_000)
     end
 
@@ -1124,7 +1125,7 @@ defmodule RebusTest do
 
       {:ok, addr} = TestServer.get_listen_addr(auth_svr)
       assert {:ok, _cli} = Rebus.connect(addr, read_timeout: 300)
-      assert_receive {^auth_svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(auth_svr)
     end
 
     test "does not extend authentication setup past its total read timeout" do
@@ -1158,7 +1159,7 @@ defmodule RebusTest do
 
       {:ok, addr} = TestServer.get_listen_addr(auth_svr)
       assert {:error, :read_timeout} = Rebus.connect(addr, read_timeout: 150)
-      assert_receive {^auth_svr, :auth_received}
+      assert_receive {^auth_svr, :auth_received}, 1_000
     end
 
     test "rejects an overlong authentication response" do
@@ -1954,7 +1955,7 @@ defmodule RebusTest do
       {:ok, addr} = TestServer.get_listen_addr(svr)
       :ok = TestServer.set_auto_hello(svr, false)
       connect_task = Task.async(fn -> Rebus.connect(addr) end)
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      hello = await_hello(svr)
 
       error_name = "org.example.LargeReply"
       payload = String.duplicate("sensitive hello error body ", 10_000)
@@ -2120,7 +2121,7 @@ defmodule RebusTest do
 
       {:ok, addr} = TestServer.get_listen_addr(svr)
       assert {:ok, cli} = Rebus.connect(addr)
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
 
       state = :sys.get_state(cli)
       assert state.guid == guid
@@ -2134,7 +2135,7 @@ defmodule RebusTest do
       {:ok, addr} = TestServer.get_listen_addr(svr)
       :ok = TestServer.set_auto_hello(svr, false)
       connect_task = Task.async(fn -> Rebus.connect(addr) end)
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      hello = await_hello(svr)
 
       log =
         capture_log(fn ->
@@ -2366,7 +2367,7 @@ defmodule RebusTest do
 
       {:ok, _cli} = Rebus.connect(%{family: :local, path: socket_path})
 
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
     end
   end
 
@@ -2377,7 +2378,7 @@ defmodule RebusTest do
       put_system_bus_address("unix:path=#{path},guid=#{@test_bus_guid}")
 
       assert {:ok, _cli} = Rebus.connect(:system)
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
     end
 
     test ":system returns error when address is nil" do
@@ -2392,7 +2393,7 @@ defmodule RebusTest do
       put_session_bus_address("unix:path=#{path},guid=#{@test_bus_guid}")
 
       assert {:ok, _cli} = Rebus.connect(:session)
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
     end
 
     test ":session ignores caller-supplied address-list setup internals" do
@@ -2414,7 +2415,7 @@ defmodule RebusTest do
                  precomputed_auth_id: "not-an-auth-id"
                )
 
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
       refute_receive :malicious_list_auth_id_fun
     end
 
@@ -2434,7 +2435,7 @@ defmodule RebusTest do
       put_session_bus_address("unix:path=#{path},guid=#{expected_guid}")
 
       assert {:ok, _cli} = Rebus.connect(:session)
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
     end
 
     test ":session fails closed on a guid mismatch without logging the configured value" do
@@ -2464,7 +2465,7 @@ defmodule RebusTest do
           assert {:error, :guid_mismatch} = Rebus.connect(:session)
         end)
 
-      assert_receive {^mismatched, :auth_received}
+      assert_receive {^mismatched, :auth_received}, 1_000
       refute_receive {^fallback, %Message{header_fields: %{member: "Hello"}}}, 100
       refute log =~ expected_guid
     end
@@ -2476,7 +2477,7 @@ defmodule RebusTest do
       put_session_bus_address("autolaunch:;unix:path=#{path}")
 
       assert {:ok, _cli} = Rebus.connect(:session)
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
 
       put_session_bus_address("unix:;unix:path=#{path}")
       assert {:error, {:invalid_bus_address, :missing_path}} = Rebus.connect(:session)
@@ -2494,7 +2495,7 @@ defmodule RebusTest do
       put_session_bus_address("tcp:host=127.0.0.1,port=#{port}")
 
       assert {:ok, _cli} = Rebus.connect(:session)
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
     end
 
     test ":session falls back to the next supported address in order" do
@@ -2506,7 +2507,7 @@ defmodule RebusTest do
       )
 
       assert {:ok, _cli} = Rebus.connect(:session)
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
     end
 
     test ":session falls back from unimplemented Unix forms" do
@@ -2518,7 +2519,7 @@ defmodule RebusTest do
       )
 
       assert {:ok, _cli} = Rebus.connect(:session)
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
     end
 
     test ":session ignores a forward-compatible Unix parameter" do
@@ -2527,7 +2528,7 @@ defmodule RebusTest do
       put_session_bus_address("unix:path=#{path},future=option")
 
       assert {:ok, _cli} = Rebus.connect(:session)
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
     end
 
     test ":session falls back after a TCP connection failure" do
@@ -2536,7 +2537,7 @@ defmodule RebusTest do
       put_session_bus_address("tcp:host=127.0.0.1,port=1;unix:path=#{path}")
 
       assert {:ok, _cli} = Rebus.connect(:session)
-      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+      await_hello(svr)
     end
 
     test ":session returns the final supported connection failure" do
@@ -2560,7 +2561,7 @@ defmodule RebusTest do
         put_session_bus_address("unix:abstract=#{abstract},guid=#{@test_bus_guid}")
 
         assert {:ok, _cli} = Rebus.connect(:session)
-        assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+        await_hello(svr)
       end
 
       test ":session connects through an IPv6 TCP address" do
@@ -2570,7 +2571,7 @@ defmodule RebusTest do
         put_session_bus_address("tcp:host=%3A%3A1,port=#{port},family=ipv6")
 
         assert {:ok, _cli} = Rebus.connect(:session)
-        assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+        await_hello(svr)
       end
     end
 
@@ -2689,7 +2690,8 @@ defmodule RebusTest do
       assert {:error, :econnrefused} =
                Rebus.connect_address_candidates(candidates, [timeout: 100],
                  resolver: resolver,
-                 connector: connector
+                 connector: connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end
                )
 
       assert_receive {:resolved, :inet6, timeout6}
@@ -3054,6 +3056,7 @@ defmodule RebusTest do
                  [timeout: 100],
                  resolver: resolver,
                  connector: connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
                  # This test controls both resolver and connector outcomes;
                  # keep its address-budget assertion independent of runner
                  # scheduling before the first deterministic attempt.
@@ -3121,7 +3124,8 @@ defmodule RebusTest do
                  ],
                  [timeout: 100],
                  resolver: resolver,
-                 connector: connector
+                 connector: connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end
                )
 
       assert_receive {:resolved, :inet}
@@ -3144,6 +3148,7 @@ defmodule RebusTest do
                  [{:tcp, sentinel, 12_345, :unspec, nil}],
                  [timeout: 100],
                  resolver: resolver,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
                  # This test controls the resolver result; make its reason
                  # assertion independent of scheduler time before resolution.
                  monotonic_time: fn -> 0 end
@@ -3267,6 +3272,7 @@ defmodule RebusTest do
                  [{:local, "/tmp/one", nil}, {:local, "/tmp/two", nil}],
                  [timeout: 50],
                  connector: aborting_connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
                  monotonic_time: monotonic_time
                )
 
@@ -3283,6 +3289,7 @@ defmodule RebusTest do
                  [{:local, "/tmp/one", nil}, {:local, "/tmp/two", nil}],
                  [timeout: 50],
                  connector: unavailable_cookie_connector,
+                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
                  monotonic_time: monotonic_time
                )
 
@@ -3308,7 +3315,7 @@ defmodule RebusTest do
       # Call the method (in a task to avoid blocking the test)
       task = Task.async(fn -> Rebus.call(cli, method) end)
       # Confirm the server received it
-      assert_receive {^svr, %Message{} = rcvd}
+      assert_receive {^svr, %Message{} = rcvd}, 1_000
       assert rcvd.body == ["foobar"]
 
       # Reply to the method call to unblock the caller
@@ -3335,7 +3342,7 @@ defmodule RebusTest do
         )
 
       task = Task.async(fn -> Rebus.call(cli, method) end)
-      assert_receive {^svr, %Message{} = received}
+      assert_receive {^svr, %Message{} = received}, 1_000
 
       error =
         Message.new!(:error,
@@ -3363,7 +3370,7 @@ defmodule RebusTest do
         )
 
       task = Task.async(fn -> Rebus.call(cli, method, 500) end)
-      assert_receive {^svr, %Message{header_fields: %{member: "NeverReplies"}}}
+      assert_receive {^svr, %Message{header_fields: %{member: "NeverReplies"}}}, 1_000
 
       [{serial, {_from, _timer_ref, request_ref, _monitor_ref, _deadline}}] =
         :sys.get_state(cli).pending |> Map.to_list()
@@ -3404,7 +3411,7 @@ defmodule RebusTest do
         )
 
       assert :ok = Rebus.send(cli, signal)
-      assert_receive {^svr, %Message{header_fields: %{member: "StillAvailable"}}}
+      assert_receive {^svr, %Message{header_fields: %{member: "StillAvailable"}}}, 1_000
     end
 
     test "times out a busy send without delivering it later", %{cli: cli, svr: svr} do
@@ -3429,7 +3436,7 @@ defmodule RebusTest do
       method = Message.new!(:method_call, path: "/org/freedesktop/DBus", member: "CallerDies")
       task = Task.async(fn -> Rebus.call(cli, method, 5_000) end)
 
-      assert_receive {^svr, %Message{header_fields: %{member: "CallerDies"}}}
+      assert_receive {^svr, %Message{header_fields: %{member: "CallerDies"}}}, 1_000
       assert map_size(:sys.get_state(cli).pending) == 1
       _ = Task.shutdown(task, :brutal_kill)
 
@@ -3442,12 +3449,12 @@ defmodule RebusTest do
     test "fails pending calls when the transport closes", %{cli: cli, svr: svr} do
       method = Message.new!(:method_call, path: "/org/freedesktop/DBus", member: "Pending")
       task = Task.async(fn -> Rebus.call(cli, method, 5_000) end)
-      assert_receive {^svr, %Message{header_fields: %{member: "Pending"}}}
+      assert_receive {^svr, %Message{header_fields: %{member: "Pending"}}}, 1_000
       ref = Process.monitor(cli)
       :ok = :socket.close(:sys.get_state(cli).sock)
 
       assert {:error, :disconnected} = Task.await(task)
-      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, _reason}}
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, _reason}}, 1_000
     end
 
     test "correlates concurrent calls when replies arrive out of order", %{cli: cli, svr: svr} do
@@ -3456,8 +3463,11 @@ defmodule RebusTest do
       first_task = Task.async(fn -> Rebus.call(cli, first) end)
       second_task = Task.async(fn -> Rebus.call(cli, second) end)
 
-      assert_receive {^svr, %Message{header_fields: %{member: first_member}} = first_received}
-      assert_receive {^svr, %Message{header_fields: %{member: second_member}} = second_received}
+      assert_receive {^svr, %Message{header_fields: %{member: first_member}} = first_received},
+                     1_000
+
+      assert_receive {^svr, %Message{header_fields: %{member: second_member}} = second_received},
+                     1_000
 
       received = %{first_member => first_received, second_member => second_received}
 
@@ -3516,7 +3526,7 @@ defmodule RebusTest do
     test "skips live pending serials when serial numbers wrap", %{cli: cli, svr: svr} do
       first = Message.new!(:method_call, path: "/org/freedesktop/DBus", member: "First")
       first_task = Task.async(fn -> Rebus.call(cli, first) end)
-      assert_receive {^svr, %Message{} = first_received}
+      assert_receive {^svr, %Message{} = first_received}, 1_000
 
       :ok = :sys.suspend(cli)
       _ = :sys.replace_state(cli, fn state -> %{state | serial: 4_294_967_295} end)
@@ -3530,13 +3540,13 @@ defmodule RebusTest do
         )
 
       assert :ok = Rebus.send(cli, signal)
-      assert_receive {^svr, %Message{serial: 4_294_967_295}}
+      assert_receive {^svr, %Message{serial: 4_294_967_295}}, 1_000
       assert :ok = Rebus.send(cli, signal)
-      assert_receive {^svr, %Message{serial: 1}}
+      assert_receive {^svr, %Message{serial: 1}}, 1_000
 
       second = Message.new!(:method_call, path: "/org/freedesktop/DBus", member: "Second")
       second_task = Task.async(fn -> Rebus.call(cli, second) end)
-      assert_receive {^svr, %Message{serial: 3} = second_received}
+      assert_receive {^svr, %Message{serial: 3} = second_received}, 1_000
 
       :ok =
         TestServer.push(svr, Message.new!(:method_return, reply_serial: second_received.serial))
@@ -3561,7 +3571,7 @@ defmodule RebusTest do
         )
 
       assert {:error, :disconnected} = Rebus.send(cli, signal)
-      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, _reason}}
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, _reason}}, 1_000
     end
 
     test "rejects remote connection PIDs" do
@@ -3607,7 +3617,10 @@ defmodule RebusTest do
         )
 
       assert :ok = Rebus.send(cli, signal)
-      assert_receive {^svr, %Message{type: :signal, header_fields: %{member: "StillConnected"}}}
+
+      assert_receive {^svr, %Message{type: :signal, header_fields: %{member: "StillConnected"}}},
+                     1_000
+
       assert Process.alive?(cli)
     end
 
@@ -3929,7 +3942,7 @@ defmodule RebusTest do
 
       :ok = TestServer.push(svr, signal)
 
-      assert_receive {^ref, %Message{body: ["foobar"]}}
+      assert_receive {^ref, %Message{body: ["foobar"]}}, 1_000
     end
   end
 
@@ -4116,7 +4129,7 @@ defmodule RebusTest do
     {:ok, addr} = TestServer.get_listen_addr(svr)
     {:ok, cli} = Rebus.connect(addr)
 
-    assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+    await_hello(svr)
 
     %{cli: cli}
   end
@@ -4151,6 +4164,15 @@ defmodule RebusTest do
     end
   end
 
+  # The Hello frame only reaches the test server after connect/2 has spawned
+  # `id -u` through a port and completed the EXTERNAL and NEGOTIATE_UNIX_FD
+  # handshake, which can exceed the 100ms assert_receive default on a loaded
+  # runner. Every Hello wait goes through here so the budget stays generous.
+  defp await_hello(svr, timeout \\ 1_000) do
+    assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}, timeout
+    hello
+  end
+
   defp connect_until_hello(svr, opts \\ []) do
     {_fixture_opts, connect_opts} = split_fixture_options(opts)
     {:ok, addr} = TestServer.get_listen_addr(svr)
@@ -4160,7 +4182,7 @@ defmodule RebusTest do
     {:ok, cli} =
       DynamicSupervisor.start_child(Rebus.ConnectionSupervisor, {Rebus.Connection, args})
 
-    assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}, 1_000
+    hello = await_hello(svr)
     assert hello.serial == 1
     {cli, hello}
   end
@@ -4173,7 +4195,7 @@ defmodule RebusTest do
 
     {:ok, addr} = TestServer.get_listen_addr(svr)
     {:ok, cli} = Rebus.connect(addr, connect_opts)
-    assert_receive {^svr, %Message{header_fields: %{member: "Hello"}, serial: 1}}
+    assert await_hello(svr).serial == 1
     cli
   end
 
@@ -4189,7 +4211,7 @@ defmodule RebusTest do
     {:ok, cli} =
       DynamicSupervisor.start_child(Rebus.ConnectionSupervisor, {Rebus.Connection, args})
 
-    assert_receive {^svr, %Message{header_fields: %{member: "Hello"}, serial: 1}}
+    assert await_hello(svr).serial == 1
     assert wait_until(fn -> :sys.get_state(cli).established? end)
     cli
   end
@@ -4383,7 +4405,7 @@ defmodule RebusTest do
       end)
 
     server_pid = server.pid
-    assert_receive {:fragmented_socket_ready, ^server_pid, addr}
+    assert_receive {:fragmented_socket_ready, ^server_pid, addr}, 1_000
     {:ok, sock} = :socket.open(:inet, :stream, :default)
     :ok = :socket.connect(sock, addr)
     {sock, server}

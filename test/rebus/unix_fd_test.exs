@@ -422,7 +422,12 @@ defmodule Rebus.UnixFDTest do
             receive do
               :continue_fd_delivery -> :ok
             end
-          end
+          end,
+          # The caller's alias must time out while the connection still holds
+          # the request, so the reply has to survive the socket round trip on
+          # a loaded runner. Keep the connection-side reaper well behind the
+          # caller deadline, as the timed-out alias test above does.
+          request_timeout_slack: 1_000
       }
     end)
 
@@ -435,7 +440,7 @@ defmodule Rebus.UnixFDTest do
 
     caller =
       spawn(fn ->
-        result = Rebus.call(connection, method, 100)
+        result = Rebus.call(connection, method, 500)
         send(parent, {:delayed_fd_result, result})
 
         receive do
@@ -458,7 +463,7 @@ defmodule Rebus.UnixFDTest do
 
     :ok = TestServer.push_with_fds(server, reply, [fd])
     assert_receive :fd_delivery_waiting, 1_000
-    assert_receive {:delayed_fd_result, {:error, :timeout}}, 1_000
+    assert_receive {:delayed_fd_result, {:error, :timeout}}, 2_000
 
     send(connection, :continue_fd_delivery)
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
@@ -495,7 +500,10 @@ defmodule Rebus.UnixFDTest do
         member: "DelayedFDAck"
       )
 
-    task = Task.async(fn -> Rebus.call(connection, method, 50) end)
+    # The reply has to reach the connection inside the caller deadline, so the
+    # budget must cover a socket round trip on a loaded runner. Every deadline
+    # below scales with it; only the wall-clock margin changes.
+    task = Task.async(fn -> Rebus.call(connection, method, 200) end)
 
     assert_receive {^server, %Message{serial: serial, header_fields: %{member: "DelayedFDAck"}}},
                    1_000
@@ -511,11 +519,11 @@ defmodule Rebus.UnixFDTest do
     :ok = TestServer.push_with_fds(server, reply, [fd])
     assert_receive :fd_ack_waiting, 1_000
 
-    # The first acknowledgement call expires at 150ms. Keep the handler
-    # blocked beyond the former 250ms cleanup grace: the FIFO resolver must
+    # The first acknowledgement call expires at 300ms. Keep the handler
+    # blocked beyond the 450ms claim cleanup deadline: the FIFO resolver must
     # still wait for a definitive close rather than return while this queued
     # acknowledgement could later transfer ownership.
-    Process.sleep(350)
+    Process.sleep(550)
     send(connection, :continue_fd_ack)
 
     assert {:error, :fd_claim_expired} = Task.await(task, 1_000)
@@ -660,7 +668,10 @@ defmodule Rebus.UnixFDTest do
         member: "CloseClaimFD"
       )
 
-    call_task = Task.async(fn -> Rebus.call(connection, method, 50) end)
+    # The reply has to reach the connection inside the caller deadline, so the
+    # budget must cover a socket round trip on a loaded runner. The release
+    # sleep below scales with it; only the wall-clock margin changes.
+    call_task = Task.async(fn -> Rebus.call(connection, method, 200) end)
 
     assert_receive {^server, %Message{serial: serial, header_fields: %{member: "CloseClaimFD"}}},
                    1_000
@@ -681,9 +692,9 @@ defmodule Rebus.UnixFDTest do
     assert nil == Task.yield(close_task, 20)
 
     # The shutdown signal enters the connection mailbox before the client can
-    # enqueue an acknowledgement. Release after the claim deadline so an ack
-    # cannot transfer ownership if scheduling changes at the boundary.
-    Process.sleep(350)
+    # enqueue an acknowledgement. Release after the 450ms claim deadline so an
+    # ack cannot transfer ownership if scheduling changes at the boundary.
+    Process.sleep(550)
     send(connection, :continue_close_claim_ack)
 
     assert :ok = Task.await(close_task, 1_000)
