@@ -30,7 +30,7 @@ message = Rebus.Message.new!(:method_call,
 )
 
 # A reply is always the full D-Bus message, including error replies.
-%Rebus.Message{type: :method_return, body: [result]} = Rebus.call(conn, message)
+{:ok, %Rebus.Message{type: :method_return, body: [result]}} = Rebus.call(conn, message)
 
 # Set a per-call timeout in milliseconds. Timed-out calls are cleaned up.
 {:error, :timeout} = Rebus.call(conn, message, 1_000)
@@ -47,8 +47,10 @@ signal = Rebus.Message.new!(:signal,
 :ok = Rebus.send(conn, signal)
 ```
 
-`Rebus.call/3` returns `%Rebus.Message{}` for both `:method_return` and
-`:error` replies. It returns `{:error, :timeout}` when no reply arrives before
+`Rebus.call/3` returns `{:ok, %Rebus.Message{type: :method_return}}` for a
+successful reply and `{:error, %Rebus.Message{type: :error}}` for a D-Bus error
+reply; both carry the full message, including any received descriptors that the
+caller owns. It returns `{:error, :timeout}` when no reply arrives before
 the configured timeout, and `{:error, :encode_failed}` if the outgoing message
 cannot be encoded. `Rebus.send/2` is fire-and-forget and is intended for
 signals and method calls with the `:no_reply_expected` flag. `Rebus.call/3`

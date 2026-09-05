@@ -33,7 +33,7 @@ defmodule Rebus.Connection do
   @fd_claim_cleanup_grace 250
 
   @spec call(pid(), Message.t(), non_neg_integer()) ::
-          Message.t() | {:error, Rebus.error_reason()}
+          {:ok, Message.t()} | {:error, Rebus.call_error()}
   def call(pid, %Message{} = msg, timeout)
       when is_pid(pid) and is_integer(timeout) and timeout >= 0 do
     if node(pid) == node() do
@@ -1540,7 +1540,17 @@ defmodule Rebus.Connection do
     await_fd_reply(conn, claim_ref, delivery_ref, delivery_alias, deadline)
   end
 
+  defp receive_fd_reply_claim(%Message{} = msg, _conn, _deadline, _request_ref),
+    do: reply_result(msg)
+
   defp receive_fd_reply_claim(result, _conn, _deadline, _request_ref), do: result
+
+  # A D-Bus error reply is a definitive peer answer, not a transport failure,
+  # but callers should not have to test the type to branch on it. The complete
+  # message is retained in either shape so its error name, body and any owned
+  # descriptors stay available to the caller.
+  defp reply_result(%Message{type: :error} = msg), do: {:error, msg}
+  defp reply_result(%Message{} = msg), do: {:ok, msg}
 
   defp await_fd_reply(conn, claim_ref, delivery_ref, delivery_alias, deadline) do
     with {:ok, timeout} <- fd_claim_remaining_timeout(deadline),
@@ -1553,7 +1563,7 @@ defmodule Rebus.Connection do
           # the FIFO resolver waits for the definitive transfer-or-close
           # outcome rather than returning an ambiguous raw descriptor.
           case acknowledge_fd_reply(conn, claim_ref, delivery_ref, deadline) do
-            :ok -> msg
+            :ok -> reply_result(msg)
             {:error, _reason} = error -> error
           end
       after

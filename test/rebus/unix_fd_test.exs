@@ -295,7 +295,48 @@ defmodule Rebus.UnixFDTest do
       )
 
     :ok = TestServer.push_with_fds(server, reply, [fd])
-    assert %Message{type: :method_return, unix_fds: [received]} = Task.await(task, 1_000)
+    assert {:ok, %Message{type: :method_return, unix_fds: [received]}} = Task.await(task, 1_000)
+    assert received != fd
+    assert :ok = UnixFD.close(received)
+  end
+
+  test "delivers a received descriptor with an FD-bearing D-Bus error reply", %{
+    server: server,
+    connection: connection
+  } do
+    method =
+      Message.new!(:method_call,
+        path: "/test",
+        interface: "test.interface",
+        member: "ReceiveErrorFD"
+      )
+
+    task = Task.async(fn -> Rebus.call(connection, method, 1_000) end)
+
+    assert_receive {^server,
+                    %Message{serial: serial, header_fields: %{member: "ReceiveErrorFD"}}},
+                   1_000
+
+    {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
+
+    reply =
+      Message.new!(:error,
+        error_name: "org.example.FailedWithFD",
+        reply_serial: serial,
+        signature: "h",
+        body: [0],
+        fds: [fd]
+      )
+
+    :ok = TestServer.push_with_fds(server, reply, [fd])
+
+    assert {:error,
+            %Message{
+              type: :error,
+              header_fields: %{error_name: "org.example.FailedWithFD"},
+              unix_fds: [received]
+            }} = Task.await(task, 1_000)
+
     assert received != fd
     assert :ok = UnixFD.close(received)
   end
@@ -891,7 +932,7 @@ defmodule Rebus.UnixFDTest do
           )
 
         :ok = TestServer.push_with_fds(server, reply, [fd])
-        assert %Message{unix_fds: [received]} = Task.await(task, 1_000)
+        assert {:ok, %Message{unix_fds: [received]}} = Task.await(task, 1_000)
         assert received != fd
         assert :ok = UnixFD.close(received)
       end
@@ -1226,7 +1267,7 @@ defmodule Rebus.UnixFDTest do
         1_000
       )
 
-    assert %Message{header_fields: %{reply_serial: ^serial}} = Task.await(task, 1_000)
+    assert {:ok, %Message{header_fields: %{reply_serial: ^serial}}} = Task.await(task, 1_000)
     assert Process.alive?(connection)
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
   end

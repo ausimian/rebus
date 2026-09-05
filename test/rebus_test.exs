@@ -150,7 +150,7 @@ defmodule RebusTest do
       :ok =
         TestServer.push(svr, Message.new!(:method_return, reply_serial: follow_up_request.serial))
 
-      assert %Message{type: :method_return} = Task.await(follow_up_task, 1_000)
+      assert {:ok, %Message{type: :method_return}} = Task.await(follow_up_task, 1_000)
     end
 
     test "reports the validated error name when an error reply is resource-limited", %{svr: svr} do
@@ -628,7 +628,7 @@ defmodule RebusTest do
                      500
 
       :ok = TestServer.push(svr, Message.new!(:method_return, reply_serial: request.serial))
-      assert %Message{type: :method_return} = Task.await(call_task, 1_000)
+      assert {:ok, %Message{type: :method_return}} = Task.await(call_task, 1_000)
     end
 
     test "fails a resource-limited Hello reply promptly instead of waiting for its timeout", %{
@@ -701,7 +701,7 @@ defmodule RebusTest do
 
       assert_receive {^svr, %Message{header_fields: %{member: "RetryCall"}} = request}, 1_000
       :ok = TestServer.push(svr, Message.new!(:method_return, reply_serial: request.serial))
-      assert %Message{type: :method_return} = Task.await(retry_task, 1_000)
+      assert {:ok, %Message{type: :method_return}} = Task.await(retry_task, 1_000)
 
       retry_send = %{
         initial_send
@@ -3323,7 +3323,7 @@ defmodule RebusTest do
 
       TestServer.push(svr, reply)
 
-      resp = Task.await(task)
+      assert {:ok, resp} = Task.await(task)
       assert resp.body == ["response"]
     end
 
@@ -3347,8 +3347,12 @@ defmodule RebusTest do
 
       :ok = TestServer.push(svr, error)
 
-      assert %Message{type: :error, header_fields: %{error_name: "org.example.Failed"}} =
-               Task.await(task)
+      assert {:error,
+              %Message{
+                type: :error,
+                header_fields: %{error_name: "org.example.Failed"},
+                body: ["failed"]
+              }} = Task.await(task)
     end
 
     test "cleans pending calls that time out", %{cli: cli, svr: svr} do
@@ -3477,8 +3481,8 @@ defmodule RebusTest do
           )
         )
 
-      assert %Message{body: ["first reply"]} = Task.await(first_task)
-      assert %Message{body: ["second reply"]} = Task.await(second_task)
+      assert {:ok, %Message{body: ["first reply"]}} = Task.await(first_task)
+      assert {:ok, %Message{body: ["second reply"]}} = Task.await(second_task)
     end
 
     test "rejects operation and message combinations it cannot honour", %{cli: cli} do
@@ -3540,8 +3544,8 @@ defmodule RebusTest do
       :ok =
         TestServer.push(svr, Message.new!(:method_return, reply_serial: first_received.serial))
 
-      assert %Message{serial: _} = Task.await(first_task)
-      assert %Message{serial: _} = Task.await(second_task)
+      assert {:ok, %Message{serial: _}} = Task.await(first_task)
+      assert {:ok, %Message{serial: _}} = Task.await(second_task)
     end
 
     test "stops the connection when a send fails", %{cli: cli} do
