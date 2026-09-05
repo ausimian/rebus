@@ -22,6 +22,21 @@ defmodule Rebus.Connection do
   @default_write_timeout 5_000
   @default_read_timeout 5_000
 
+  # The settings a connection carries verbatim into its state. Most are read
+  # only while the connection is being set up.
+  @setting_fields [
+    :impl,
+    :write_timeout,
+    :read_timeout,
+    :setup_timeout,
+    :aggregate_setup_timeout?,
+    :expected_guid,
+    :precomputed_auth_id,
+    :allow_anonymous?,
+    :bus?,
+    :connect_waiter
+  ]
+
   @spec call(pid(), Message.t(), non_neg_integer()) ::
           {:ok, Message.t()} | {:error, Rebus.call_error()}
   def call(pid, %Message{} = msg, timeout)
@@ -267,22 +282,21 @@ defmodule Rebus.Connection do
       {:ok, sock} ->
         _ = configure_receive_buffer(impl.transport, sock)
 
-        {:ok,
-         %__MODULE__{
-           sock: sock,
-           impl: impl,
-           write_timeout: settings.write_timeout,
-           read_timeout: settings.read_timeout,
-           setup_timeout: settings.setup_timeout,
-           aggregate_setup_timeout?: settings.aggregate_setup_timeout?,
-           expected_guid: settings.expected_guid,
-           precomputed_auth_id: settings.precomputed_auth_id,
-           allow_anonymous?: settings.allow_anonymous?,
-           bus?: settings.bus?,
-           connect_waiter: settings.connect_waiter,
-           connect_waiter_monitor: Setup.monitor_connect_waiter(settings.connect_waiter),
-           unix_fd_transport?: Setup.unix_fd_transport_supported?(family)
-         }, {:continue, {:setup, addr}}}
+        # Every setting whose name is also a struct field is copied wholesale;
+        # the rest of the settings map is either validated only (`timeout`) or
+        # means something else on the struct (`name` is the registered process
+        # name, not the unique bus name).
+        state =
+          struct!(
+            %__MODULE__{
+              sock: sock,
+              connect_waiter_monitor: Setup.monitor_connect_waiter(settings.connect_waiter),
+              unix_fd_transport?: Setup.unix_fd_transport_supported?(family)
+            },
+            Map.take(settings, @setting_fields)
+          )
+
+        {:ok, state, {:continue, {:setup, addr}}}
 
       {:error, reason} ->
         {:stop, normalize_socket_error(reason)}
