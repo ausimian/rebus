@@ -2215,6 +2215,71 @@ defmodule RebusTest do
       assert {:error, :no_system_bus_address} = Rebus.connect(:system)
     end
 
+    test ":system prefers DBUS_SYSTEM_BUS_ADDRESS over the configured address" do
+      path = socket_path()
+      {:ok, svr} = start_supervised({Rebus.TestServer, tap: self(), family: :local, path: path})
+      put_system_bus_address("unix:path=/definitely/not/a/bus")
+      put_bus_env("DBUS_SYSTEM_BUS_ADDRESS", "unix:path=#{path},guid=#{@test_bus_guid}")
+
+      assert {:ok, _cli} = Rebus.connect(:system)
+      await_hello(svr)
+    end
+
+    test ":system falls back to the configured address for an empty environment variable" do
+      path = socket_path()
+      {:ok, svr} = start_supervised({Rebus.TestServer, tap: self(), family: :local, path: path})
+      put_system_bus_address("unix:path=#{path},guid=#{@test_bus_guid}")
+      put_bus_env("DBUS_SYSTEM_BUS_ADDRESS", "")
+
+      assert {:ok, _cli} = Rebus.connect(:system)
+      await_hello(svr)
+    end
+
+    test ":session falls back to the socket in XDG_RUNTIME_DIR" do
+      dir = runtime_dir("rebus")
+
+      {:ok, svr} =
+        start_supervised(
+          {Rebus.TestServer, tap: self(), family: :local, path: Path.join(dir, "bus")}
+        )
+
+      put_session_bus_address(nil)
+      put_bus_env("XDG_RUNTIME_DIR", dir)
+
+      assert {:ok, _cli} = Rebus.connect(:session)
+      await_hello(svr)
+    end
+
+    test ":session escapes a runtime directory holding address syntax" do
+      dir = runtime_dir("rebus%a;b")
+
+      {:ok, svr} =
+        start_supervised(
+          {Rebus.TestServer, tap: self(), family: :local, path: Path.join(dir, "bus")}
+        )
+
+      put_session_bus_address(nil)
+      put_bus_env("XDG_RUNTIME_DIR", dir)
+
+      assert {:ok, _cli} = Rebus.connect(:session)
+      await_hello(svr)
+    end
+
+    test ":session treats an empty DBUS_SESSION_BUS_ADDRESS as unset" do
+      dir = runtime_dir("rebus")
+
+      {:ok, svr} =
+        start_supervised(
+          {Rebus.TestServer, tap: self(), family: :local, path: Path.join(dir, "bus")}
+        )
+
+      put_session_bus_address("")
+      put_bus_env("XDG_RUNTIME_DIR", dir)
+
+      assert {:ok, _cli} = Rebus.connect(:session)
+      await_hello(svr)
+    end
+
     test ":session connects through a Unix pathname with a guid suffix" do
       path = socket_path()
       {:ok, svr} = start_supervised({Rebus.TestServer, tap: self(), family: :local, path: path})
@@ -2468,7 +2533,7 @@ defmodule RebusTest do
       assert {:error, {:invalid_bus_address, :not_binary}} = Rebus.connect(:system)
     end
 
-    test ":session returns error when DBUS_SESSION_BUS_ADDRESS is not set" do
+    test ":session returns error when neither the variable nor XDG_RUNTIME_DIR is set" do
       put_session_bus_address(nil)
 
       assert {:error, :no_session_bus_address} = Rebus.connect(:session)
@@ -4692,7 +4757,17 @@ defmodule RebusTest do
     "/tmp/rebus_test_#{System.os_time(:nanosecond)}_#{:erlang.unique_integer([:positive])}.sock"
   end
 
+  defp runtime_dir(name) do
+    dir = Path.join(System.tmp_dir!(), "#{name}_#{:erlang.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf(dir) end)
+    dir
+  end
+
   defp put_system_bus_address(address) do
+    # The environment variable takes precedence, so a test of the config key
+    # must not inherit one from the environment running the suite.
+    put_bus_env("DBUS_SYSTEM_BUS_ADDRESS", nil)
     previous = Application.fetch_env(:rebus, :system_bus_address)
 
     on_exit(fn ->
@@ -4706,20 +4781,26 @@ defmodule RebusTest do
   end
 
   defp put_session_bus_address(address) do
-    previous = System.get_env("DBUS_SESSION_BUS_ADDRESS")
+    put_bus_env("DBUS_SESSION_BUS_ADDRESS", address)
+    # `$XDG_RUNTIME_DIR/bus` is the fallback, so clear it unless a test sets it.
+    put_bus_env("XDG_RUNTIME_DIR", nil)
+  end
+
+  defp put_bus_env(name, value) do
+    previous = System.get_env(name)
 
     on_exit(fn ->
       if is_nil(previous) do
-        System.delete_env("DBUS_SESSION_BUS_ADDRESS")
+        System.delete_env(name)
       else
-        System.put_env("DBUS_SESSION_BUS_ADDRESS", previous)
+        System.put_env(name, previous)
       end
     end)
 
-    if is_nil(address) do
-      System.delete_env("DBUS_SESSION_BUS_ADDRESS")
+    if is_nil(value) do
+      System.delete_env(name)
     else
-      System.put_env("DBUS_SESSION_BUS_ADDRESS", address)
+      System.put_env(name, value)
     end
   end
 end

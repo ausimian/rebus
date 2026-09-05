@@ -79,8 +79,10 @@ it. Rebus supports Linux and macOS, the platforms exercised in CI.
 {:ok, conn} = Rebus.connect(%{family: :inet, addr: {127, 0, 0, 1}, port: 12345})
 ```
 
-`:system` and `:session` read a D-Bus address list, from the
-`:system_bus_address` config key and `DBUS_SESSION_BUS_ADDRESS` respectively.
+`:system` and `:session` read a D-Bus address list: `:system` from
+`DBUS_SYSTEM_BUS_ADDRESS`, else the `:system_bus_address` config key, else
+`unix:path=/run/dbus/system_bus_socket`; `:session` from
+`DBUS_SESSION_BUS_ADDRESS`, else `unix:path=$XDG_RUNTIME_DIR/bus`.
 Rebus tries the supported entries in order and skips transports it cannot use.
 See [Authentication](https://hexdocs.pm/rebus/authentication.html) for what an
 address list may hold.

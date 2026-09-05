@@ -57,3 +57,5 @@ It is a breaking release: result shapes changed and validation is stricter.
 - A body that failed to encode was silently sent as an empty body.
 - Pending replies leaked when a call timed out or no reply arrived.
 - Well-known bus names containing hyphens were rejected.
+- `:system` and `:session` honour `DBUS_SYSTEM_BUS_ADDRESS` and fall back to
+  `$XDG_RUNTIME_DIR/bus`, as other D-Bus implementations do.
