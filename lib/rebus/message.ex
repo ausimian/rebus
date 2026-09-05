@@ -38,14 +38,9 @@ defmodule Rebus.Message do
 
   The `unix_fds` struct field is separate from the `:unix_fds` header count.
   Construct outbound messages with `fds: [fd, ...]`; `h` body values are their
-  zero-based wire indexes. Outbound descriptors are borrowed and are never
-  closed by Rebus. Inbound descriptors appear in `message.unix_fds` only on a
-  successfully delivered live call reply and are then owned by that receiving
-  process, which must close each one exactly once with `Rebus.UnixFD.close/1`
-  or adopt it using a suitable OTP/OS API. Rebus retains inbound descriptors
-  until the public `Rebus.call/3` delivery is acknowledged internally, so a
-  caller timeout, cancellation, caller death, or connection teardown closes
-  them instead. Signals and orphaned replies do not transfer descriptors.
+  zero-based wire indexes. Inbound descriptors appear in `message.unix_fds`
+  only on a `Rebus.call/3` reply, and the calling process then owns them. See
+  [Unix file descriptor passing](unix_fds.html).
 
   ## Message Flags
 

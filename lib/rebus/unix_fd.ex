@@ -16,6 +16,8 @@ defmodule Rebus.UnixFD do
 
   The helpers are available only on Unix systems with OTP's raw-file support.
   They return `{:error, :unsupported}` elsewhere.
+
+  See [Unix file descriptor passing](unix_fds.html).
   """
 
   @typedoc "A raw, process-owned Unix file descriptor."

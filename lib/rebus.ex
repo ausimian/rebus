@@ -103,18 +103,8 @@ defmodule Rebus do
 
   ## Unix file descriptors
 
-  On Linux and macOS local Unix sockets, Rebus requests D-Bus's optional
-  `NEGOTIATE_UNIX_FD` extension during authentication. Pass outbound raw Unix
-  descriptors as `fds: [...]` to `Rebus.Message.new/2`; they are borrowed and
-  never closed by Rebus. A successfully delivered `call/3` reply can expose
-  owned inbound descriptors in `message.unix_fds`, which the receiving caller
-  must close exactly once with `Rebus.UnixFD.close/1` or adopt with an OTP/OS
-  API. FD transfer is rejected over TCP or without peer agreement.
-
-  Rebus closes and drops inbound FD-bearing signals: one raw descriptor cannot
-  be safely shared across multiple signal subscribers. It keeps the connection
-  alive after that complete-frame rejection. Outbound signals and method calls,
-  and inbound method-call replies, are supported.
+  On Linux and macOS, a local Unix-socket connection can carry raw file
+  descriptors. See [Unix file descriptor passing](unix_fds.html).
 
   ## Examples
 
@@ -241,15 +231,10 @@ defmodule Rebus do
       gaps between inbound fragments, is reset whenever a peer makes progress,
       and is inactive while no frame is buffered. Expiry then terminates the
       temporary connection; inflight callers receive `{:error, :disconnected}`.
-    - `:allow_anonymous` - Boolean, default `false`. When `true`, Rebus can
-      use the peer-advertised D-Bus `ANONYMOUS` mechanism only after `EXTERNAL`
-      is rejected and `DBUS_COOKIE_SHA1` was not advertised, or before cookie
-      `AUTH` starts when the local username is unavailable. Once cookie `AUTH`
-      starts or a cookie challenge is received, it is never selected; failures
-      are terminal and Rebus sends neither `CANCEL` nor `AUTH ANONYMOUS`.
-      `ANONYMOUS` provides no authentication, confidentiality, or integrity;
-      use it only for deliberately unauthenticated endpoints, which are
-      peer-to-peer and therefore also require `bus: false`.
+    - `:allow_anonymous` - Boolean, default `false`. When `true`, Rebus may
+      use the peer-advertised `ANONYMOUS` mechanism, which authenticates
+      nothing and also requires `bus: false`. See
+      [Authentication](authentication.html).
     - `:bus` - Boolean, default `true`. Pass `false` for a peer-to-peer
       endpoint that is not a message bus. Rebus then sends no Hello, the
       connection has no unique name, and `add_match/3` returns
@@ -343,30 +328,8 @@ defmodule Rebus do
 
   ## Authentication mechanisms
 
-  Rebus sends `AUTH EXTERNAL` first. On a valid bounded `REJECTED` list it
-  prefers `DBUS_COOKIE_SHA1`, using the effective `id -un` username and only a
-  private `$HOME/.dbus-keyrings/<context>` file owned by the effective UID.
-  A final home symlink is followed only after its target directory is validated;
-  the keyring directory and file must be non-symlink. The resolved home cannot
-  be group/other writable and the keyring directory and file are inaccessible
-  to group and other users. Unsupported owner/mode metadata fails closed.
-  Cookie data, challenges, authorization identities, server GUIDs, and peer
-  authentication payloads are not logged or returned. Cookie authentication can
-  support local TCP endpoints where Unix credentials cannot be passed, but it
-  provides no transport encryption or integrity.
-
-  Rebus accepts either hex case from a peer or cookie file for interoperability,
-  while always emitting the lower-case form required by DBUS_COOKIE_SHA1. Cookie
-  contexts follow the D-Bus grammar and therefore cannot contain a period,
-  whitespace, or path separator. Cookie reads accept at most 256 bounded lines,
-  skipping malformed unrelated records but rejecting ambiguous target records.
-  To bound peer-controlled state, a `REJECTED` list is limited to 64 mechanism
-  names; larger lists are treated as malformed.
-
-  `ANONYMOUS` remains disabled unless `allow_anonymous: true` is passed. It is
-  appropriate only for intentionally unauthenticated peer-to-peer services,
-  which also require `bus: false`, and is not a safe message-bus or network
-  trust mechanism.
+  Rebus tries `EXTERNAL` first, then `DBUS_COOKIE_SHA1`, and `ANONYMOUS` only
+  with `allow_anonymous: true`. See [Authentication](authentication.html).
 
   ## Examples
 
@@ -389,18 +352,9 @@ defmodule Rebus do
 
   ## Unix file descriptors
 
-  On Linux and macOS, local Unix-domain connections request the optional
-  `NEGOTIATE_UNIX_FD` authentication extension. Construct a message with
-  `fds: [fd, ...]` and use zero-based `h` body indexes. These outbound raw
-  descriptors are borrowed: Rebus neither duplicates nor closes them. A live
-  method reply may expose received descriptors in `message.unix_fds`; its
-  receiving process owns and must close each raw descriptor exactly once with
-  `Rebus.UnixFD.close/1` or adopt it using a suitable OTP/OS API. FD-bearing
-  messages are rejected before writing over TCP or when the peer did not agree
-  to negotiation. FD-bearing signals are closed and dropped because a
-  descriptor cannot safely have multiple subscribers without a platform-level
-  duplicate; this complete-frame rejection does not stop the connection.
-
+  A local Unix-socket connection negotiates descriptor passing with the peer
+  during authentication. See
+  [Unix file descriptor passing](unix_fds.html).
   """
   @spec connect(address(), keyword()) :: {:ok, pid()} | {:error, term()}
   def connect(address, opts \\ [])
@@ -518,14 +472,11 @@ defmodule Rebus do
   `{:error, :unix_fd_send_failed}` means an outbound borrowed descriptor could
   not be passed before any bytes of that frame were accepted; the connection
   remains usable and the descriptor remains owned by its sender.
-  A Unix-FD reply that reaches its private ownership handoff has a 100ms
-  initial acknowledgement grace after the reply deadline. If that
-  acknowledgement is already queued when the grace expires, `call/3` waits for
-  the live connection to resolve it FIFO instead of returning an ambiguous
-  ownership result; that wait has no separate fixed wall-clock limit.
-  `{:error, :fd_claim_expired}` means Rebus definitively closed the still-owned
-  received descriptors rather than exposing them after the claim deadline. A
-  connection that stops during this resolution returns `{:error, :disconnected}`.
+  A reply carrying descriptors can return after `timeout`, because `call/3`
+  waits for descriptor ownership to be settled rather than left undecided.
+  `{:error, :fd_claim_expired}` then means Rebus closed those descriptors, and
+  `{:error, :disconnected}` that the connection stopped first; see
+  [Unix file descriptor passing](unix_fds.html).
   `{:error, {:reply_dropped, :method_return}}` means the peer definitely
   received the request and produced a successful reply, but its payload
   exceeded a local decoding resource cap and was discarded.
@@ -611,39 +562,18 @@ defmodule Rebus do
   is removed or its owning process exits.
 
   The supplied timeout is a single budget for local handler installation and
-  the AddMatch reply. `{:error, :timeout}` is delivery-ambiguous: no local
+  the AddMatch reply. `{:error, :timeout}` is delivery-ambiguous: no
   subscription reference is returned, but the bus might already have installed
-  the rule. Rebus starts bounded cleanup and retries transport-ambiguous
-  removal with capped exponential backoff while the connection remains alive.
-  Later subscriptions for the same rule wait behind that cleanup, subject to
-  their own timeout; a completed AddMatch is committed only if its caller is
-  still alive and within its deadline. D-Bus error replies become
-  `{:error, {:bus_error, error_name}}`; reply bodies are intentionally not
-  exposed. A well-known `sender` remains bus-owned because its forwarded
-  header is normally the current unique owner. Because D-Bus does not identify
-  the AddMatch rule that admitted a signal, Rebus rejects an overlapping rule
-  with a different sender predicate as
-  `{:error, :sender_routing_ambiguous}` rather than cross-delivering a signal
-  to a sender-pinned subscription. Unique sender names are locally verified.
+  the rule. A D-Bus error reply becomes `{:error, {:bus_error, error_name}}`,
+  and an overlapping rule with a different sender is rejected as
+  `{:error, :sender_routing_ambiguous}`.
 
-  Recovery tracks at most 64 distinct ambiguous rules per connection. Reaching
-  that capacity closes the connection, which makes the bus discard its match
-  rules, rather than retaining unbounded uncertain state. The first normal
-  cleanup after an owner exits is separate from that ambiguity budget: up to
-  16 initial removals run concurrently and the remainder queue safely.
-  Definitive
-  RemoveMatch errors are classified separately but still retry bounded cleanup:
-  they cannot prove whether an earlier removal took effect. If a subscription
-  worker restarts while an operation is in flight, Rebus returns
-  `{:error, :match_subscription_state_lost}` until connection teardown clears
-  the unresolved local and remote state; it never treats the reference as
-  successfully removed based only on an absent worker map.
-
-  Client-side filtering is applied only for the criteria accepted by
-  `Rebus.MatchRule`: interface/member/path/destination headers, `argN`,
-  `argNpath`, and `arg0namespace`. Sender matching is owned by the bus, since
-  a well-known sender can be forwarded under its unique name. Rebus does not
-  emulate eavesdropping or bus access policy.
+  After an ambiguous outcome Rebus cleans up in the background, so a later
+  subscription for the same rule can return
+  `{:error, :match_rule_cleanup_pending}`, and an operation whose state is
+  lost returns `{:error, :match_subscription_state_lost}`. See
+  [Signal subscriptions and match rules](match_rules.html) for sender matching
+  and the full list of reasons.
 
   ## Example
 
@@ -670,20 +600,13 @@ defmodule Rebus do
   Removing a reference is idempotent and scoped to the connection on which it
   was created. The final reference issues
   `org.freedesktop.DBus.RemoveMatch`; earlier references only stop their local
-  handler before it asks the bus to remove the final rule, so a successfully
-  removed reference cannot receive a later signal. A handler-delete failure or
-  timeout retains the reference for retry. If the final RemoveMatch returns a
-  D-Bus error, the stopped reference is retained and can be retried. If it
-  times out or disconnects, Rebus keeps the local handler stopped and retries
-  bounded cleanup in the background. New subscriptions for that rule queue
-  behind recovery and retain their own deadlines. A definitive D-Bus error
-  keeps the stopped reference for an explicit retry; if its owner exits, Rebus
-  keeps bounded background cleanup rather than treating remote state as absent.
+  handler, so a successfully removed reference cannot receive a later signal.
+  A failed or timed-out removal keeps the reference so you can retry it.
 
-  When the owner process exits, Rebus removes its local handler and performs a
-  bounded best-effort RemoveMatch if it held the final reference. Closing the
-  connection stops all local handlers and the bus discards every match rule for
-  that connection; no RemoveMatch is attempted after teardown.
+  Rebus removes the local handler and the bus rule when the owning process
+  exits, and closing the connection discards both. See
+  [Signal subscriptions and match rules](match_rules.html) for what an
+  ambiguous removal leaves behind.
   """
   @spec remove_match(pid(), reference(), non_neg_integer()) ::
           :ok | {:error, match_error_reason()}
