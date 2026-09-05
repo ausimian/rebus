@@ -4,6 +4,7 @@ defmodule Rebus.Connection do
   use TypedStruct
 
   alias Rebus.Connection.Handshake
+  alias Rebus.Connection.Inbound
   alias Rebus.Connection.SocketError
   alias Rebus.MachineId
   alias Rebus.MatchRule
@@ -17,7 +18,6 @@ defmodule Rebus.Connection do
   @default_read_timeout 5_000
   @max_read_chunk 65_536
   @max_read_attempts 1
-  @max_inbound_segments 64
   @max_serial 4_294_967_295
   @max_unix_fd_control_size 256
   # A reply carrying descriptors is first acknowledged through a small
@@ -177,10 +177,7 @@ defmodule Rebus.Connection do
     field :guid, binary() | nil, default: nil
     # The pending receive select handle, or nil when no receive is outstanding.
     field :rref, :socket.select_handle() | nil, default: nil
-    field :inbound_segments, [{pos_integer(), binary()}], default: []
-    field :inbound_size, non_neg_integer(), default: 0
-    field :inbound_expected_size, pos_integer() | nil, default: nil
-    field :inbound_flatten_count, non_neg_integer(), default: 0
+    field :inbound, Inbound.t(), default: Inbound.new()
     field :inbound_unix_fds, [UnixFD.t()], default: []
     # Ancillary data rejected before a complete D-Bus frame is known belongs
     # to that frame, not to a later coalesced frame. The descriptors themselves
@@ -602,7 +599,7 @@ defmodule Rebus.Connection do
       state.unix_fd_negotiated? ->
         transport(state).recvmsg(
           state.sock,
-          inbound_receive_size(state),
+          Inbound.receive_size(state.inbound, @max_read_chunk),
           @max_unix_fd_control_size,
           [],
           :nowait
@@ -714,7 +711,7 @@ defmodule Rebus.Connection do
   defp receive_hello_reply_recvmsg(%__MODULE__{} = state, deadline, timeout) do
     case transport(state).recvmsg(
            state.sock,
-           inbound_receive_size(state),
+           Inbound.receive_size(state.inbound, @max_read_chunk),
            recvmsg_control_size(state),
            [],
            timeout
@@ -1055,7 +1052,7 @@ defmodule Rebus.Connection do
         end
 
       nil ->
-        append_inbound(retain_remainder(data, source), state, continuation)
+        append_inbound(Inbound.retain_remainder(data, source), state, continuation)
 
       {:error, :resource_limit, _envelope, _rest} when not is_nil(state.hello_serial) ->
         stop_for_protocol_error({:hello_failed, :resource_limit}, finish_frame(state))
@@ -1396,8 +1393,7 @@ defmodule Rebus.Connection do
      %{
        state
        | guid: guid,
-         inbound_segments: if(rest == <<>>, do: [], else: [{byte_size(rest), rest}]),
-         inbound_size: byte_size(rest)
+         inbound: Inbound.new(rest)
      }, {:continue, setup_continuation(state)}}
   end
 
@@ -1809,7 +1805,7 @@ defmodule Rebus.Connection do
         # ownership.
         stop_for_protocol_error(:invalid_unix_fds, state)
 
-      state.inbound_size != 0 or state.inbound_unix_fds != [] ->
+      Inbound.pending?(state.inbound) or state.inbound_unix_fds != [] ->
         _ = UnixFD.close_all(fds)
         quarantine_ancillary_frame(data, state, continuation)
 
@@ -1923,49 +1919,10 @@ defmodule Rebus.Connection do
     end
   end
 
-  defp inbound_receive_size(%__MODULE__{inbound_expected_size: nil, inbound_size: inbound_size}) do
-    max(1, min(16 - inbound_size, @max_read_chunk))
-  end
-
-  defp inbound_receive_size(%__MODULE__{
-         inbound_expected_size: expected,
-         inbound_size: inbound_size
-       }) do
-    max(1, min(expected - inbound_size, @max_read_chunk))
-  end
-
-  defp append_inbound(<<>>, %__MODULE__{} = state, continuation),
-    do: process_inbound(state, continuation)
-
   defp append_inbound(data, %__MODULE__{} = state, continuation) do
-    segments = append_segment(data, state.inbound_segments)
-
-    if length(segments) <= @max_inbound_segments do
-      state = %{
-        state
-        | inbound_segments: segments,
-          inbound_size: state.inbound_size + byte_size(data)
-      }
-
-      process_inbound(state, continuation)
-    else
-      # Segment metadata is part of the retained inbound budget. A peer that
-      # defeats rope merging with pathological fragment sizes is rejected
-      # before its BEAM-term overhead becomes unbounded.
-      stop_for_protocol_error(:message_too_large, state)
-    end
-  end
-
-  defp process_inbound(%__MODULE__{inbound_size: 0} = state, continuation),
-    do: buffer_incomplete_message(state, continuation)
-
-  defp process_inbound(%__MODULE__{inbound_expected_size: nil} = state, continuation) do
-    case Message.expected_size(inbound_prefix(state, min(state.inbound_size, 16))) do
-      {:ok, expected_size} ->
-        process_inbound(%{state | inbound_expected_size: expected_size}, continuation)
-
-      nil ->
-        buffer_incomplete_message(state, continuation)
+    case Inbound.append(state.inbound, data) do
+      {:ok, inbound} ->
+        process_inbound(%{state | inbound: inbound}, continuation)
 
       {:error, reason} ->
         stop_for_protocol_error(reason, state)
@@ -1973,100 +1930,40 @@ defmodule Rebus.Connection do
   end
 
   defp process_inbound(%__MODULE__{} = state, continuation) do
-    if state.inbound_size >= state.inbound_expected_size do
-      data = inbound_binary(state)
+    case Inbound.next(state.inbound) do
+      {:frame, data, inbound} ->
+        parse_complete_message(data, %{state | inbound: inbound}, continuation)
 
-      parse_complete_message(
-        data,
-        clear_inbound_frame(%{state | inbound_flatten_count: state.inbound_flatten_count + 1}),
-        continuation
-      )
-    else
-      buffer_incomplete_message(state, continuation)
+      {:incomplete, inbound} ->
+        buffer_incomplete_message(%{state | inbound: inbound}, continuation)
+
+      {:error, reason} ->
+        stop_for_protocol_error(reason, state)
     end
   end
-
-  defp inbound_prefix(%__MODULE__{} = state, size) do
-    state.inbound_segments
-    |> Enum.reverse()
-    |> Enum.map(&elem(&1, 1))
-    |> take_prefix(size, [])
-    |> IO.iodata_to_binary()
-  end
-
-  defp take_prefix(_segments, 0, acc), do: Enum.reverse(acc)
-  defp take_prefix([], _size, acc), do: Enum.reverse(acc)
-
-  defp take_prefix([segment | segments], size, acc) when byte_size(segment) <= size do
-    take_prefix(segments, size - byte_size(segment), [segment | acc])
-  end
-
-  defp take_prefix([segment | _segments], size, acc) do
-    Enum.reverse([binary_part(segment, 0, size) | acc])
-  end
-
-  defp inbound_binary(%__MODULE__{} = state) do
-    state.inbound_segments
-    |> Enum.reverse()
-    |> Enum.map(&elem(&1, 1))
-    |> IO.iodata_to_binary()
-  end
-
-  # Segments are newest first. Merging a segment only with smaller or equal
-  # predecessors keeps common small-fragment traffic logarithmic while
-  # preserving byte order. The explicit segment limit protects pathological
-  # decreasing fragment sizes without flattening an ever-growing buffer.
-  defp append_segment(data, segments) do
-    merge_segment(byte_size(data), data, segments)
-  end
-
-  defp merge_segment(size, data, [{previous_size, previous} | segments])
-       when previous_size <= size do
-    merge_segment(previous_size + size, previous <> data, segments)
-  end
-
-  defp merge_segment(size, data, segments), do: [{size, data} | segments]
-
-  defp retain_remainder(remainder, source) do
-    if byte_size(remainder) * 4 < byte_size(source) do
-      :binary.copy(remainder)
-    else
-      remainder
-    end
-  end
-
-  defp clear_inbound_frame(%__MODULE__{} = state),
-    do: %{state | inbound_segments: [], inbound_size: 0, inbound_expected_size: nil}
 
   # A timer exists only while a nonempty frame is incomplete. Each retained
   # fragment replaces it, so a peer that is making progress remains connected
   # while a peer that stops or dribbles too slowly cannot pin retained data.
-  defp buffer_incomplete_message(%__MODULE__{inbound_size: 0, rref: rref} = state, _continuation)
-       when not is_nil(rref) do
-    {:noreply, clear_partial_frame(state)}
-  end
-
-  defp buffer_incomplete_message(%__MODULE__{inbound_size: 0} = state, continuation) do
-    {:noreply, clear_partial_frame(state), {:continue, continuation}}
-  end
-
-  defp buffer_incomplete_message(%__MODULE__{rref: rref} = state, _continuation)
-       when not is_nil(rref) do
-    timer_ref = restart_partial_frame_timer(state)
-    {:noreply, %{state | partial_frame_timer: timer_ref}}
-  end
-
   defp buffer_incomplete_message(%__MODULE__{} = state, continuation) do
-    timer_ref = restart_partial_frame_timer(state)
-    {:noreply, %{state | partial_frame_timer: timer_ref}, {:continue, continuation}}
+    state =
+      if Inbound.pending?(state.inbound) do
+        %{state | partial_frame_timer: restart_partial_frame_timer(state)}
+      else
+        clear_partial_frame(state)
+      end
+
+    if is_nil(state.rref) do
+      {:noreply, state, {:continue, continuation}}
+    else
+      {:noreply, state}
+    end
   end
 
   defp clear_partial_frame(%__MODULE__{} = state) do
     %{
       state
-      | inbound_segments: [],
-        inbound_size: 0,
-        inbound_expected_size: nil,
+      | inbound: Inbound.clear(state.inbound),
         partial_frame_timer: cancel_partial_frame_timer(state.partial_frame_timer)
     }
   end

@@ -1,6 +1,7 @@
 defmodule Rebus.UnixFDTest do
   use ExUnit.Case, async: false
 
+  alias Rebus.Connection.Inbound
   alias Rebus.{Message, TestImpl, TestServer, UnixFD}
 
   @connection_name :rebus_unix_fd_test_connection
@@ -1081,7 +1082,7 @@ defmodule Rebus.UnixFDTest do
     # only a taint bit remains while the eight-byte prefix is buffered.
     assert eventually(fn ->
              state = :sys.get_state(connection)
-             state.inbound_fd_tainted? and state.inbound_size == byte_size(prefix)
+             state.inbound_fd_tainted? and state.inbound.size == byte_size(prefix)
            end)
 
     :ok =
@@ -1510,7 +1511,7 @@ defmodule Rebus.UnixFDTest do
                   ctrl: [%{level: :socket, type: :rights, data: <<1_000_000::native-signed-32>>}],
                   flags: []
                 }},
-               %{state | inbound_size: 1}
+               %{state | inbound: %Inbound{size: 1}}
              )
 
     # Even when SCM_RIGHTS decoding finds a malformed tail, CTRUNC wins: the

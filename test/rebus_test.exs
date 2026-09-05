@@ -5,6 +5,7 @@ defmodule RebusTest do
 
   alias Rebus.Connection
   alias Rebus.Connection.Handshake
+  alias Rebus.Connection.Inbound
   alias Rebus.Message
   alias Rebus.SignalHandler
   alias Rebus.TestImpl
@@ -1277,19 +1278,19 @@ defmodule RebusTest do
       fixed_header = <<?l, 4, 0, 1, body_length::little-32, 1::little-32, 0::little-32>>
 
       :ok = TestServer.push_raw(svr, fixed_header)
-      assert wait_until(fn -> :sys.get_state(cli).inbound_expected_size != nil end)
+      assert wait_until(fn -> :sys.get_state(cli).inbound.expected_size != nil end)
 
       assert :ok = TestServer.push_raw_fragments(svr, :binary.copy(<<0>>, 256))
 
       assert wait_until(fn ->
-               :sys.get_state(cli).inbound_size == byte_size(fixed_header) + 256
+               :sys.get_state(cli).inbound.size == byte_size(fixed_header) + 256
              end)
 
       state = :sys.get_state(cli)
 
-      assert state.inbound_size <= byte_size(fixed_header) + 256
-      assert state.inbound_expected_size == byte_size(fixed_header) + body_length
-      assert length(state.inbound_segments) <= 10
+      assert state.inbound.size <= byte_size(fixed_header) + 256
+      assert state.inbound.expected_size == byte_size(fixed_header) + body_length
+      assert length(state.inbound.segments) <= 10
       assert binary_part(inbound_data(state), 0, byte_size(fixed_header)) == fixed_header
     end
 
@@ -1331,7 +1332,7 @@ defmodule RebusTest do
                       }},
                      1_000
 
-      assert wait_until(fn -> :sys.get_state(cli).inbound_size == 0 end)
+      assert wait_until(fn -> :sys.get_state(cli).inbound.size == 0 end)
       assert :sys.get_state(cli).partial_frame_timer == nil
     end
 
@@ -1377,7 +1378,9 @@ defmodule RebusTest do
       assert :ok = TestServer.push_raw(svr, first)
 
       assert wait_until(fn ->
-               %Connection{inbound_size: size, partial_frame_timer: timer} = :sys.get_state(cli)
+               %Connection{inbound: %Inbound{size: size}, partial_frame_timer: timer} =
+                 :sys.get_state(cli)
+
                size == byte_size(first) and timer != nil
              end)
 
@@ -1386,7 +1389,8 @@ defmodule RebusTest do
       assert :ok = TestServer.push_raw(svr, second)
 
       assert wait_until(fn ->
-               %Connection{inbound_size: size, partial_frame_timer: timer} = :sys.get_state(cli)
+               %Connection{inbound: %Inbound{size: size}, partial_frame_timer: timer} =
+                 :sys.get_state(cli)
 
                size == byte_size(first) + byte_size(second) and timer != nil and
                  timer != first_timer
@@ -1400,7 +1404,7 @@ defmodule RebusTest do
       assert Process.alive?(cli)
 
       assert :ok = TestServer.push_raw(svr, rest)
-      assert wait_until(fn -> :sys.get_state(cli).inbound_size == 0 end)
+      assert wait_until(fn -> :sys.get_state(cli).inbound.size == 0 end)
       assert :sys.get_state(cli).partial_frame_timer == nil
     end
   end
@@ -1584,8 +1588,10 @@ defmodule RebusTest do
 
       state = %Connection{
         sock: sock,
-        inbound_segments: segments,
-        inbound_size: Enum.sum(Enum.map(segments, &elem(&1, 0)))
+        inbound: %Inbound{
+          segments: segments,
+          size: Enum.sum(Enum.map(segments, &elem(&1, 0)))
+        }
       }
 
       log =
@@ -1613,7 +1619,8 @@ defmodule RebusTest do
       state = %Connection{sock: sock, name: ":1.100"}
 
       assert {:noreply,
-              %Connection{rref: ^handle, inbound_size: 0, partial_frame_timer: nil} = state} =
+              %Connection{rref: ^handle, inbound: %Inbound{size: 0}, partial_frame_timer: nil} =
+                state} =
                Connection.handle_receive_result({:select, {select_info, data}}, state)
 
       assert {:noreply, ^state} = Connection.handle_continue(:recv, state)
@@ -1633,7 +1640,7 @@ defmodule RebusTest do
 
       state = %Connection{sock: sock, name: ":1.100"}
 
-      assert {:noreply, %Connection{rref: ^handle, inbound_size: 0, inbound_flatten_count: 1}} =
+      assert {:noreply, %Connection{rref: ^handle, inbound: %Inbound{size: 0, flatten_count: 1}}} =
                Connection.handle_receive_result({:select, {select_info, data}}, state)
 
       _ = :socket.close(sock)
@@ -1779,7 +1786,10 @@ defmodule RebusTest do
           send(server.pid, {:send_remainder, second})
 
           assert {:stop, {:shutdown, {:hello_failed, "org.example.SecretError"}},
-                  %Connection{inbound_size: 0, inbound_segments: [], partial_frame_timer: nil}} =
+                  %Connection{
+                    inbound: %Inbound{size: 0, segments: []},
+                    partial_frame_timer: nil
+                  }} =
                    Task.await(task)
         end)
 
@@ -1809,11 +1819,11 @@ defmodule RebusTest do
       state = %Connection{
         sock: sock,
         hello_serial: 1,
-        inbound_segments: [{byte_size(data), data}],
-        inbound_size: byte_size(data)
+        inbound: Inbound.new(data)
       }
 
-      assert {:noreply, %Connection{name: ":1.100", inbound_size: 0}, {:continue, :recv}} =
+      assert {:noreply, %Connection{name: ":1.100", inbound: %Inbound{size: 0}},
+              {:continue, :recv}} =
                Connection.handle_continue(:hello_reply_buffer, state)
     end
   end
@@ -2150,7 +2160,7 @@ defmodule RebusTest do
                      1_000
 
       assert wait_until(fn -> :sys.get_state(cli).name == ":1.100" end)
-      assert 0 == :sys.get_state(cli).inbound_size
+      assert 0 == :sys.get_state(cli).inbound.size
     end
 
     test "drains a large coalesced signal burst before a partial tail", %{svr: svr} do
@@ -2187,8 +2197,8 @@ defmodule RebusTest do
       end
 
       state = :sys.get_state(cli)
-      assert state.inbound_size < state.inbound_expected_size
-      assert length(state.inbound_segments) <= 10
+      assert state.inbound.size < state.inbound.expected_size
+      assert length(state.inbound.segments) <= 10
 
       :ok = TestServer.push_raw(svr, remainder)
 
@@ -4595,7 +4605,7 @@ defmodule RebusTest do
   end
 
   defp inbound_data(%Connection{} = state) do
-    state.inbound_segments
+    state.inbound.segments
     |> Enum.reverse()
     |> Enum.map(&elem(&1, 1))
     |> IO.iodata_to_binary()
