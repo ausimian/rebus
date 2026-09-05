@@ -50,6 +50,11 @@ defmodule Rebus.Connection do
   # as if their reply had expired before it could be written.
   @max_queued_replies 64
 
+  @default_impl %{transport: Rebus.Transport.Socket}
+
+  @typedoc false
+  @type impl :: %{transport: module()}
+
   @spec call(pid(), Message.t(), non_neg_integer()) ::
           {:ok, Message.t()} | {:error, Rebus.call_error()}
   def call(pid, %Message{} = msg, timeout)
@@ -233,10 +238,10 @@ defmodule Rebus.Connection do
     field :outbound_monitor_index, %{reference() => reference()}, default: %{}
     field :signal_handler_monitor_index, %{reference() => reference()}, default: %{}
     field :signal_handler_ref_index, %{reference() => reference()}, default: %{}
-    field :send_fun, function(), default: &:socket.send/4
-    field :sendmsg_fun, function(), default: &:socket.sendmsg/4
-    field :recvmsg_fun, function(), default: &:socket.recvmsg/5
-    field :cancel_fun, function(), default: &:socket.cancel/2
+    # Implementation modules behind the connection's side effects. Production
+    # always uses the defaults; tests substitute a module rather than reaching
+    # into per-operation state.
+    field :impl, impl(), default: @default_impl
     field :fd_claim_handoff_fun, function() | nil, default: nil
     # Deterministic transition seams used only by the FD lifecycle tests.
     field :fd_claim_delivery_fun, function() | nil, default: nil
@@ -266,6 +271,7 @@ defmodule Rebus.Connection do
     connect_waiter = Keyword.get(args, :connect_waiter)
     auth_id_runner = Keyword.get(args, :auth_id_fun, &run_auth_id/1)
     auth_username_runner = Keyword.get(args, :auth_username_fun, &run_auth_username/1)
+    impl = build_impl(Keyword.get(args, :__impl__, []))
 
     cond do
       not (is_integer(write_timeout) and write_timeout > 0) ->
@@ -308,13 +314,14 @@ defmodule Rebus.Connection do
         # reply claims. The EXIT clauses below preserve normal link semantics.
         Process.flag(:trap_exit, true)
 
-        case :socket.open(family, :stream, :default) do
+        case impl.transport.open(family, :stream, :default) do
           {:ok, sock} ->
-            _ = configure_receive_buffer(sock)
+            _ = configure_receive_buffer(impl.transport, sock)
 
             {:ok,
              %__MODULE__{
                sock: sock,
+               impl: impl,
                write_timeout: write_timeout,
                read_timeout: read_timeout,
                setup_timeout: setup_timeout,
@@ -336,11 +343,23 @@ defmodule Rebus.Connection do
     end
   end
 
+  # Implementation modules are selected through a private, undocumented
+  # `:__impl__` option. Only keys the connection itself understands are taken
+  # from it; the address-list seams travel in the same structure.
+  defp build_impl(overrides) when is_list(overrides) or is_map(overrides) do
+    Map.merge(@default_impl, Map.take(Map.new(overrides), Map.keys(@default_impl)))
+  end
+
+  defp build_impl(_overrides), do: @default_impl
+
+  defp transport(%__MODULE__{impl: %{transport: transport}}), do: transport
+
   @impl true
   def terminate(
         _reason,
         %__MODULE__{
           sock: sock,
+          impl: impl,
           partial_frame_timer: timer_ref,
           inbound_unix_fds: inbound_unix_fds,
           fd_claims: fd_claims
@@ -349,7 +368,7 @@ defmodule Rebus.Connection do
     cancel_partial_frame_timer(timer_ref)
     _ = UnixFD.close_all(inbound_unix_fds)
     close_fd_claims(fd_claims)
-    _ = :socket.close(sock)
+    _ = impl.transport.close(sock)
     :ok
   end
 
@@ -589,7 +608,7 @@ defmodule Rebus.Connection do
              member: "Hello"
            ),
          {:ok, bin} <- Message.encode(%{method | serial: state.serial}) do
-      case :socket.send(state.sock, bin, [], state.write_timeout) do
+      case transport(state).send(state.sock, bin, [], state.write_timeout) do
         :ok ->
           {:noreply, %{state | hello_serial: state.serial, serial: next_serial(state.serial)},
            {:continue, :hello_reply_buffer}}
@@ -633,7 +652,7 @@ defmodule Rebus.Connection do
   def handle_continue(:recv, %__MODULE__{rref: nil} = state) do
     cond do
       state.unix_fd_negotiated? ->
-        state.recvmsg_fun.(
+        transport(state).recvmsg(
           state.sock,
           inbound_receive_size(state),
           @max_unix_fd_control_size,
@@ -647,11 +666,11 @@ defmodule Rebus.Connection do
       # path, but receive a bounded cmsg and close any illicit rights before a
       # partial frame can retain them.
       state.unix_fd_transport? ->
-        state.recvmsg_fun.(state.sock, 0, @max_unix_fd_control_size, [], :nowait)
+        transport(state).recvmsg(state.sock, 0, @max_unix_fd_control_size, [], :nowait)
         |> handle_receive_result(state)
 
       true ->
-        handle_receive_result(:socket.recv(state.sock, 0, [], :nowait), state)
+        handle_receive_result(transport(state).recv(state.sock, 0, [], :nowait), state)
     end
   end
 
@@ -736,7 +755,7 @@ defmodule Rebus.Connection do
     if state.unix_fd_transport? do
       receive_hello_reply_recvmsg(state, deadline, timeout)
     else
-      case :socket.recv(state.sock, 0, [], timeout) do
+      case transport(state).recv(state.sock, 0, [], timeout) do
         {:ok, data} ->
           continue_hello_reply(data, state, deadline)
 
@@ -759,7 +778,7 @@ defmodule Rebus.Connection do
   # Hello reply—must observe SCM_RIGHTS. A plain recv/4 here could discard
   # ancillary metadata outside the single close-or-deliver ownership path.
   defp receive_hello_reply_recvmsg(%__MODULE__{} = state, deadline, timeout) do
-    case state.recvmsg_fun.(
+    case transport(state).recvmsg(
            state.sock,
            inbound_receive_size(state),
            recvmsg_control_size(state),
@@ -1411,7 +1430,7 @@ defmodule Rebus.Connection do
 
     with {:ok, auth_id} <- aggregate_setup_auth_id(state, deadline),
          {:ok, connect_timeout} <- remaining_setup_timeout(deadline, state.setup_timeout),
-         :ok <- connect_socket(sock, addr, connect_timeout),
+         :ok <- connect_socket(transport(state), sock, addr, connect_timeout),
          {:ok, guid, rest} <- authenticate(state, sock, auth_id, deadline, state.setup_timeout),
          :ok <- verify_expected_guid(guid, state.expected_guid),
          {:ok, unix_fd_negotiated?, rest} <-
@@ -1420,7 +1439,7 @@ defmodule Rebus.Connection do
            handshake_send_with_deadline(sock, "BEGIN \r\n", state, deadline, state.setup_timeout) do
       initialized_connection(%{state | unix_fd_negotiated?: unix_fd_negotiated?}, guid, rest)
     else
-      {:error, reason} -> stop_and_close(sock, reason)
+      {:error, reason} -> stop_and_close(transport(state), sock, reason)
     end
   end
 
@@ -1428,7 +1447,7 @@ defmodule Rebus.Connection do
     sock = state.sock
 
     with {:ok, auth_id} <- setup_auth_id(state, state.setup_timeout),
-         :ok <- connect_socket(sock, addr, state.setup_timeout),
+         :ok <- connect_socket(transport(state), sock, addr, state.setup_timeout),
          deadline = read_deadline(state.setup_timeout),
          {:ok, guid, rest} <- authenticate(state, sock, auth_id, deadline, state.setup_timeout),
          :ok <- verify_expected_guid(guid, state.expected_guid),
@@ -1438,7 +1457,7 @@ defmodule Rebus.Connection do
            handshake_send_with_deadline(sock, "BEGIN \r\n", state, deadline, state.setup_timeout) do
       initialized_connection(%{state | unix_fd_negotiated?: unix_fd_negotiated?}, guid, rest)
     else
-      {:error, reason} -> stop_and_close(sock, reason)
+      {:error, reason} -> stop_and_close(transport(state), sock, reason)
     end
   end
 
@@ -1485,7 +1504,7 @@ defmodule Rebus.Connection do
              deadline,
              maximum
            ),
-         {:ok, line, rest} <- handshake_recv_with_deadline(sock, <<>>, deadline, maximum) do
+         {:ok, line, rest} <- handshake_recv_with_deadline(state, sock, <<>>, deadline, maximum) do
       case parse_auth_response(line) do
         {:ok, guid} ->
           {:ok, guid, rest}
@@ -1574,7 +1593,7 @@ defmodule Rebus.Connection do
              deadline,
              maximum
            ),
-         {:ok, line, rest} <- handshake_recv_with_deadline(sock, rest, deadline, maximum) do
+         {:ok, line, rest} <- handshake_recv_with_deadline(state, sock, rest, deadline, maximum) do
       case line do
         "DATA " <> challenge ->
           authenticate_cookie_data(
@@ -1631,7 +1650,7 @@ defmodule Rebus.Connection do
              deadline,
              maximum
            ),
-         {:ok, line, rest} <- handshake_recv_with_deadline(sock, rest, deadline, maximum) do
+         {:ok, line, rest} <- handshake_recv_with_deadline(state, sock, rest, deadline, maximum) do
       case parse_auth_response(line) do
         {:ok, guid} -> {:ok, guid, rest}
         # A response that reached the server must not be followed by a weaker
@@ -1651,7 +1670,7 @@ defmodule Rebus.Connection do
   defp authenticate_anonymous(state, sock, rest, deadline, maximum) do
     with :ok <-
            handshake_send_with_deadline(sock, "AUTH ANONYMOUS\r\n", state, deadline, maximum),
-         {:ok, line, rest} <- handshake_recv_with_deadline(sock, rest, deadline, maximum) do
+         {:ok, line, rest} <- handshake_recv_with_deadline(state, sock, rest, deadline, maximum) do
       case parse_auth_response(line) do
         {:ok, guid} -> {:ok, guid, rest}
         {:rejected, mechanisms} -> {:error, {:auth_rejected, mechanisms}}
@@ -2205,13 +2224,13 @@ defmodule Rebus.Connection do
   defp all_bytes?(<<byte, rest::binary>>, predicate),
     do: predicate.(byte) and all_bytes?(rest, predicate)
 
-  defp stop_and_close(sock, reason) do
-    _ = :socket.close(sock)
+  defp stop_and_close(transport, sock, reason) do
+    _ = transport.close(sock)
     {:stop, normalize_socket_error(reason)}
   end
 
-  defp connect_socket(sock, addr, timeout) do
-    case :socket.connect(sock, addr, timeout) do
+  defp connect_socket(transport, sock, addr, timeout) do
+    case transport.connect(sock, addr, timeout) do
       :ok -> :ok
       {:error, :timeout} -> {:error, :read_timeout}
       {:error, reason} -> {:error, reason}
@@ -2227,54 +2246,51 @@ defmodule Rebus.Connection do
   defp unix_fd_transport_supported?(_family), do: false
 
   @doc false
-  def configure_receive_buffer(
-        sock,
-        setopt_fun \\ &:socket.setopt/3,
-        warning_fun \\ fn message -> Logger.warning(message) end
-      ) do
+  @spec configure_receive_buffer(module(), :socket.socket()) :: :tuple | :scalar | :default
+  def configure_receive_buffer(transport, sock) do
     # A zero-length receive returns the bytes currently available on every
     # supported OTP release. Keep the backing allocation independent of a
     # peer-declared D-Bus frame length. Some backends only accept the scalar
     # form, so failure to tune this hint must never make connections unavailable.
-    case setopt_fun.(sock, {:otp, :rcvbuf}, {@max_read_attempts, @max_read_chunk}) do
+    case transport.setopt(sock, {:otp, :rcvbuf}, {@max_read_attempts, @max_read_chunk}) do
       :ok ->
         :tuple
 
       {:error, _reason} ->
-        case setopt_fun.(sock, {:otp, :rcvbuf}, @max_read_chunk) do
+        case transport.setopt(sock, {:otp, :rcvbuf}, @max_read_chunk) do
           :ok ->
             :scalar
 
           {:error, _reason} ->
-            default_receive_buffer(warning_fun)
+            default_receive_buffer()
 
           _other ->
-            default_receive_buffer(warning_fun)
+            default_receive_buffer()
         end
 
       _other ->
-        default_receive_buffer(warning_fun)
+        default_receive_buffer()
     end
   end
 
-  defp default_receive_buffer(warning_fun) do
-    warning_fun.("D-Bus connection is using OTP's default receive buffer")
+  defp default_receive_buffer do
+    Logger.warning("D-Bus connection is using OTP's default receive buffer")
     :default
   end
 
-  defp handshake_recv(sock, buffer, timeout) when is_binary(buffer) do
-    receive_auth_line(sock, buffer, read_deadline(timeout), timeout)
+  defp handshake_recv(transport, sock, buffer, timeout) when is_binary(buffer) do
+    receive_auth_line(transport, sock, buffer, read_deadline(timeout), timeout)
   end
 
-  defp handshake_recv_with_deadline(sock, buffer, deadline, maximum) do
+  defp handshake_recv_with_deadline(state, sock, buffer, deadline, maximum) do
     with {:ok, timeout} <- remaining_setup_timeout(deadline, maximum) do
-      handshake_recv(sock, buffer, timeout)
+      handshake_recv(transport(state), sock, buffer, timeout)
     end
   end
 
   defp handshake_send_with_deadline(sock, data, state, deadline, maximum) do
     with {:ok, timeout} <- remaining_setup_timeout(deadline, maximum) do
-      handshake_send(sock, data, min(timeout, state.write_timeout))
+      handshake_send(transport(state), sock, data, min(timeout, state.write_timeout))
     end
   end
 
@@ -2300,7 +2316,7 @@ defmodule Rebus.Connection do
              deadline,
              maximum
            ),
-         {:ok, line, rest} <- handshake_recv_with_deadline(sock, rest, deadline, maximum) do
+         {:ok, line, rest} <- handshake_recv_with_deadline(state, sock, rest, deadline, maximum) do
       case line do
         "AGREE_UNIX_FD" -> {:ok, true, rest}
         "ERROR" <> _reason -> {:ok, false, rest}
@@ -2309,7 +2325,7 @@ defmodule Rebus.Connection do
     end
   end
 
-  defp receive_auth_line(sock, buffer, deadline, timeout) do
+  defp receive_auth_line(transport, sock, buffer, deadline, timeout) do
     # Previous reads can contain multiple auth lines. Consume one already in
     # the bounded buffer before touching the socket: the peer may legitimately
     # have closed after coalescing its next response.
@@ -2318,25 +2334,25 @@ defmodule Rebus.Connection do
         result
 
       :incomplete ->
-        receive_auth_socket_data(sock, buffer, deadline, timeout)
+        receive_auth_socket_data(transport, sock, buffer, deadline, timeout)
 
       {:error, :auth_failed} = error ->
         error
     end
   end
 
-  defp receive_auth_socket_data(sock, buffer, deadline, timeout) do
+  defp receive_auth_socket_data(transport, sock, buffer, deadline, timeout) do
     case remaining_timeout(deadline, timeout) do
       :expired ->
         {:error, :read_timeout}
 
       {:ok, receive_timeout} ->
-        case :socket.recv(sock, 0, [], receive_timeout) do
+        case transport.recv(sock, 0, [], receive_timeout) do
           {:ok, data} ->
-            consume_auth_data(sock, buffer, data, deadline, timeout)
+            consume_auth_data(transport, sock, buffer, data, deadline, timeout)
 
           {:error, {:timeout, data}} when is_binary(data) and byte_size(data) > 0 ->
-            consume_auth_data(sock, buffer, data, deadline, timeout)
+            consume_auth_data(transport, sock, buffer, data, deadline, timeout)
 
           {:error, :timeout} ->
             {:error, :read_timeout}
@@ -2350,11 +2366,11 @@ defmodule Rebus.Connection do
     end
   end
 
-  defp consume_auth_data(sock, buffer, data, deadline, timeout) do
+  defp consume_auth_data(transport, sock, buffer, data, deadline, timeout) do
     case consume_auth_buffer(buffer <> data) do
       {:ok, _line, _rest} = result -> result
       {:error, :auth_failed} = error -> error
-      :incomplete -> receive_auth_line(sock, buffer <> data, deadline, timeout)
+      :incomplete -> receive_auth_line(transport, sock, buffer <> data, deadline, timeout)
     end
   end
 
@@ -2377,8 +2393,8 @@ defmodule Rebus.Connection do
     end
   end
 
-  defp handshake_send(sock, data, timeout) do
-    case :socket.send(sock, data, [], timeout) do
+  defp handshake_send(transport, sock, data, timeout) do
+    case transport.send(sock, data, [], timeout) do
       :ok -> :ok
       {:error, reason} -> {:error, normalize_socket_error(reason)}
       _other -> {:error, :send_failed}
@@ -3630,7 +3646,7 @@ defmodule Rebus.Connection do
          %__MODULE__{} = state,
          %{uses_sendmsg?: true, fd_control: :initial, wait: nil} = write
        ) do
-    state.sendmsg_fun.(
+    transport(state).sendmsg(
       state.sock,
       %{
         iov: [write.rest],
@@ -3646,12 +3662,12 @@ defmodule Rebus.Connection do
          %{uses_sendmsg?: true, fd_control: :select_continuation, wait: {:continue, continuation}} =
            write
        ) do
-    state.sendmsg_fun.(state.sock, [write.rest], continuation, :nowait)
+    transport(state).sendmsg(state.sock, [write.rest], continuation, :nowait)
   end
 
   defp socket_send(%__MODULE__{} = state, write) do
     {rest, flags_or_cont, timeout} = socket_send_args(write.rest, write.wait)
-    state.send_fun.(state.sock, rest, flags_or_cont, timeout)
+    transport(state).send(state.sock, rest, flags_or_cont, timeout)
   end
 
   # Socket wrappers are injectable for deterministic state-machine coverage.
@@ -3670,7 +3686,7 @@ defmodule Rebus.Connection do
   end
 
   defp cancel_socket_write(state, {:select, continuation, _handle}) do
-    _ = state.cancel_fun.(state.sock, continuation)
+    _ = transport(state).cancel(state.sock, continuation)
     :ok
   rescue
     _ -> :ok
@@ -3679,7 +3695,7 @@ defmodule Rebus.Connection do
   end
 
   defp cancel_socket_write(state, {:completion, continuation, _handle}) do
-    _ = state.cancel_fun.(state.sock, continuation)
+    _ = transport(state).cancel(state.sock, continuation)
     :ok
   rescue
     _ -> :ok

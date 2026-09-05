@@ -6,6 +6,7 @@ defmodule RebusTest do
   alias Rebus.Connection
   alias Rebus.Message
   alias Rebus.SignalHandler
+  alias Rebus.TestImpl
   alias Rebus.TestServer
 
   # GitHub run 33276531794 on Elixir 1.19.1/OTP 27.1 observed a referenced
@@ -1509,84 +1510,94 @@ defmodule RebusTest do
     test "falls back safely when configuring the OTP receive buffer" do
       parent = self()
       tuple_value = {1, Connection.inbound_receive_buffer_size()}
+      warning = "D-Bus connection is using OTP's default receive buffer"
 
-      assert :tuple =
-               Connection.configure_receive_buffer(
-                 :test_socket,
-                 fn _sock, _option, value ->
-                   send(parent, {:setopt, value})
-                   :ok
-                 end,
-                 fn warning -> send(parent, {:warning, warning}) end
-               )
+      TestImpl.put(
+        setopt: fn _sock, _option, value ->
+          send(parent, {:setopt, value})
+          :ok
+        end
+      )
 
-      assert_receive {:setopt, ^tuple_value}
-      refute_receive {:warning, _}
-
-      assert :scalar =
-               Connection.configure_receive_buffer(
-                 :test_socket,
-                 fn _sock, _option, value ->
-                   send(parent, {:setopt, value})
-                   if is_tuple(value), do: {:error, :invalid}, else: :ok
-                 end,
-                 fn warning -> send(parent, {:warning, warning}) end
-               )
+      log =
+        capture_log(fn ->
+          assert :tuple = Connection.configure_receive_buffer(TestImpl, :test_socket)
+        end)
 
       assert_receive {:setopt, ^tuple_value}
-      assert_receive {:setopt, 65_536}
-      refute_receive {:warning, _}
+      refute log =~ warning
 
-      assert :default =
-               Connection.configure_receive_buffer(
-                 :test_socket,
-                 fn _sock, _option, value ->
-                   send(parent, {:setopt, value})
-                   {:error, :invalid}
-                 end,
-                 fn warning -> send(parent, {:warning, warning}) end
-               )
+      TestImpl.put(
+        setopt: fn _sock, _option, value ->
+          send(parent, {:setopt, value})
+          if is_tuple(value), do: {:error, :invalid}, else: :ok
+        end
+      )
+
+      log =
+        capture_log(fn ->
+          assert :scalar = Connection.configure_receive_buffer(TestImpl, :test_socket)
+        end)
 
       assert_receive {:setopt, ^tuple_value}
       assert_receive {:setopt, 65_536}
-      assert_receive {:warning, "D-Bus connection is using OTP's default receive buffer"}
+      refute log =~ warning
 
-      assert :default =
-               Connection.configure_receive_buffer(
-                 :test_socket,
-                 fn _sock, _option, value ->
-                   send(parent, {:setopt, value})
-                   :unexpected
-                 end,
-                 fn warning -> send(parent, {:warning, warning}) end
-               )
+      TestImpl.put(
+        setopt: fn _sock, _option, value ->
+          send(parent, {:setopt, value})
+          {:error, :invalid}
+        end
+      )
+
+      log =
+        capture_log(fn ->
+          assert :default = Connection.configure_receive_buffer(TestImpl, :test_socket)
+        end)
+
+      assert_receive {:setopt, ^tuple_value}
+      assert_receive {:setopt, 65_536}
+      assert log =~ warning
+
+      TestImpl.put(
+        setopt: fn _sock, _option, value ->
+          send(parent, {:setopt, value})
+          :unexpected
+        end
+      )
+
+      log =
+        capture_log(fn ->
+          assert :default = Connection.configure_receive_buffer(TestImpl, :test_socket)
+        end)
 
       assert_receive {:setopt, ^tuple_value}
       refute_receive {:setopt, 65_536}
-      assert_receive {:warning, "D-Bus connection is using OTP's default receive buffer"}
+      assert log =~ warning
 
-      assert :default =
-               Connection.configure_receive_buffer(
-                 :test_socket,
-                 fn _sock, _option, value ->
-                   send(parent, {:setopt, value})
-                   if is_tuple(value), do: {:error, :invalid}, else: :unexpected
-                 end,
-                 fn warning -> send(parent, {:warning, warning}) end
-               )
+      TestImpl.put(
+        setopt: fn _sock, _option, value ->
+          send(parent, {:setopt, value})
+          if is_tuple(value), do: {:error, :invalid}, else: :unexpected
+        end
+      )
+
+      log =
+        capture_log(fn ->
+          assert :default = Connection.configure_receive_buffer(TestImpl, :test_socket)
+        end)
 
       assert_receive {:setopt, ^tuple_value}
       assert_receive {:setopt, 65_536}
-      assert_receive {:warning, "D-Bus connection is using OTP's default receive buffer"}
+      assert log =~ warning
     end
 
-    test "uses the production warning callback for receive-buffer fallback" do
+    test "keeps the socket out of the receive-buffer fallback warning" do
+      TestImpl.put(setopt: fn _sock, _option, _value -> {:error, :invalid} end)
+
       log =
         capture_log(fn ->
-          assert :default =
-                   Connection.configure_receive_buffer(:test_socket, fn _sock, _option, _value ->
-                     {:error, :invalid}
-                   end)
+          assert :default = Connection.configure_receive_buffer(TestImpl, :test_socket)
         end)
 
       assert log =~ "D-Bus connection is using OTP's default receive buffer"
@@ -3630,16 +3641,14 @@ defmodule RebusTest do
       {:select_info, :send, handle} = continuation
       calls = :atomics.new(1, [])
 
-      :sys.replace_state(cli, fn state ->
-        %{
-          state
-          | send_fun: fn _sock, rest, flags_or_cont, timeout ->
-              call = :atomics.add_get(calls, 1, 1)
-              send(parent, {:outbound_send, call, rest, flags_or_cont, timeout})
-              if call == 1, do: {:select, continuation}, else: :ok
-            end
-        }
-      end)
+      :ok =
+        TestImpl.install(cli,
+          send: fn _sock, rest, flags_or_cont, timeout ->
+            call = :atomics.add_get(calls, 1, 1)
+            send(parent, {:outbound_send, call, rest, flags_or_cont, timeout})
+            if call == 1, do: {:select, continuation}, else: :ok
+          end
+        )
 
       signal = Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Selected")
       task = Task.async(fn -> Rebus.send(cli, signal, 500) end)
@@ -3654,16 +3663,14 @@ defmodule RebusTest do
       parent = self()
       continuation = {:select_info, :send, make_ref()}
 
-      :sys.replace_state(cli, fn state ->
-        %{
-          state
-          | send_fun: fn _, _, _, _ -> {:select, continuation} end,
-            cancel_fun: fn _sock, info ->
-              send(parent, {:cancelled_write, info})
-              :ok
-            end
-        }
-      end)
+      :ok =
+        TestImpl.install(cli,
+          send: fn _, _, _, _ -> {:select, continuation} end,
+          cancel: fn _sock, info ->
+            send(parent, {:cancelled_write, info})
+            :ok
+          end
+        )
 
       signal =
         Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Cancelled")
@@ -3677,23 +3684,21 @@ defmodule RebusTest do
       parent = self()
       calls = :atomics.new(1, [])
 
-      :sys.replace_state(cli, fn state ->
-        %{
-          state
-          | send_fun: fn _sock, rest, _flags, _timeout ->
-              case :atomics.add_get(calls, 1, 1) do
-                1 ->
-                  tail = binary_part(rest, 1, byte_size(rest) - 1)
-                  send(parent, {:first_tail, tail})
-                  {:ok, tail}
+      :ok =
+        TestImpl.install(cli,
+          send: fn _sock, rest, _flags, _timeout ->
+            case :atomics.add_get(calls, 1, 1) do
+              1 ->
+                tail = binary_part(rest, 1, byte_size(rest) - 1)
+                send(parent, {:first_tail, tail})
+                {:ok, tail}
 
-                2 ->
-                  send(parent, {:second_tail, rest})
-                  :ok
-              end
+              2 ->
+                send(parent, {:second_tail, rest})
+                :ok
             end
-        }
-      end)
+          end
+        )
 
       signal = Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Partial")
       assert :ok = Rebus.send(cli, signal, 500)
@@ -3707,23 +3712,21 @@ defmodule RebusTest do
       {:select_info, :send, handle} = continuation
       calls = :atomics.new(1, [])
 
-      :sys.replace_state(cli, fn state ->
-        %{
-          state
-          | send_fun: fn _sock, rest, flags, timeout ->
-              case :atomics.add_get(calls, 1, 1) do
-                1 ->
-                  tail = binary_part(rest, 1, byte_size(rest) - 1)
-                  send(parent, {:selected_tail, tail})
-                  {:select, {continuation, tail}}
+      :ok =
+        TestImpl.install(cli,
+          send: fn _sock, rest, flags, timeout ->
+            case :atomics.add_get(calls, 1, 1) do
+              1 ->
+                tail = binary_part(rest, 1, byte_size(rest) - 1)
+                send(parent, {:selected_tail, tail})
+                {:select, {continuation, tail}}
 
-                2 ->
-                  send(parent, {:resumed_tail, rest, flags, timeout})
-                  :ok
-              end
+              2 ->
+                send(parent, {:resumed_tail, rest, flags, timeout})
+                :ok
             end
-        }
-      end)
+          end
+        )
 
       signal =
         Message.new!(:signal, path: "/", interface: "org.example.Test", member: "SelectPartial")
@@ -3739,9 +3742,7 @@ defmodule RebusTest do
       completion = {:completion_info, :send, make_ref()}
       {:completion_info, :send, handle} = completion
 
-      :sys.replace_state(cli, fn state ->
-        %{state | send_fun: fn _, _, _, _ -> {:completion, completion} end}
-      end)
+      :ok = TestImpl.install(cli, send: fn _, _, _, _ -> {:completion, completion} end)
 
       signal =
         Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Completion")
@@ -3758,20 +3759,18 @@ defmodule RebusTest do
       {:completion_info, :send, handle} = completion
       calls = :atomics.new(1, [])
 
-      :sys.replace_state(cli, fn state ->
-        %{
-          state
-          | send_fun: fn _, rest, _, _ ->
-              if :atomics.add_get(calls, 1, 1) == 1 do
-                send(parent, {:completion_rest, rest})
-                {:completion, completion}
-              else
-                send(parent, {:completion_tail, rest})
-                :ok
-              end
+      :ok =
+        TestImpl.install(cli,
+          send: fn _, rest, _, _ ->
+            if :atomics.add_get(calls, 1, 1) == 1 do
+              send(parent, {:completion_rest, rest})
+              {:completion, completion}
+            else
+              send(parent, {:completion_tail, rest})
+              :ok
             end
-        }
-      end)
+          end
+        )
 
       signal =
         Message.new!(:signal,
@@ -3792,19 +3791,18 @@ defmodule RebusTest do
       parent = self()
       continuation = {:select_info, :send, make_ref()}
 
-      :sys.replace_state(cli, fn state ->
-        %{
-          state
-          | write_timeout: 20,
-            send_fun: fn _, rest, _, _ ->
-              {:select, {continuation, binary_part(rest, 1, byte_size(rest) - 1)}}
-            end,
-            cancel_fun: fn _, info ->
-              send(parent, {:cancelled_write, info})
-              :ok
-            end
-        }
-      end)
+      _ = :sys.replace_state(cli, fn state -> %{state | write_timeout: 20} end)
+
+      :ok =
+        TestImpl.install(cli,
+          send: fn _, rest, _, _ ->
+            {:select, {continuation, binary_part(rest, 1, byte_size(rest) - 1)}}
+          end,
+          cancel: fn _, info ->
+            send(parent, {:cancelled_write, info})
+            :ok
+          end
+        )
 
       signal =
         Message.new!(:signal, path: "/", interface: "org.example.Test", member: "TimeoutPartial")
@@ -3823,16 +3821,14 @@ defmodule RebusTest do
       {:select_info, :send, handle} = continuation
       calls = :atomics.new(1, [])
 
-      :sys.replace_state(cli, fn state ->
-        %{
-          state
-          | send_fun: fn _, _rest, _flags, _timeout ->
-              call = :atomics.add_get(calls, 1, 1)
-              send(parent, {:queued_down_send, call})
-              if call == 1, do: {:select, continuation}, else: :ok
-            end
-        }
-      end)
+      :ok =
+        TestImpl.install(cli,
+          send: fn _, _rest, _flags, _timeout ->
+            call = :atomics.add_get(calls, 1, 1)
+            send(parent, {:queued_down_send, call})
+            if call == 1, do: {:select, continuation}, else: :ok
+          end
+        )
 
       signal =
         Message.new!(:signal, path: "/", interface: "org.example.Test", member: "QueuedDown")
@@ -3868,23 +3864,21 @@ defmodule RebusTest do
       {:select_info, :send, handle} = continuation
       calls = :atomics.new(1, [])
 
-      :sys.replace_state(cli, fn state ->
-        %{
-          state
-          | send_fun: fn _, rest, _flags, _timeout ->
-              case :atomics.add_get(calls, 1, 1) do
-                1 ->
-                  tail = binary_part(rest, 1, byte_size(rest) - 1)
-                  send(parent, {:partial_down_tail, tail})
-                  {:select, {continuation, tail}}
+      :ok =
+        TestImpl.install(cli,
+          send: fn _, rest, _flags, _timeout ->
+            case :atomics.add_get(calls, 1, 1) do
+              1 ->
+                tail = binary_part(rest, 1, byte_size(rest) - 1)
+                send(parent, {:partial_down_tail, tail})
+                {:select, {continuation, tail}}
 
-                _ ->
-                  send(parent, {:partial_down_resume, rest})
-                  :ok
-              end
+              _ ->
+                send(parent, {:partial_down_resume, rest})
+                :ok
             end
-        }
-      end)
+          end
+        )
 
       signal =
         Message.new!(:signal, path: "/", interface: "org.example.Test", member: "PartialDown")
@@ -4247,9 +4241,10 @@ defmodule RebusTest do
       # already the active write) and later calls go unanswered.
       continuation = {:select_info, :send, make_ref()}
 
-      :sys.replace_state(cli, fn state ->
-        %{state | send_fun: fn _sock, _rest, _flags, _timeout -> {:select, continuation} end}
-      end)
+      :ok =
+        TestImpl.install(cli,
+          send: fn _sock, _rest, _flags, _timeout -> {:select, continuation} end
+        )
 
       log =
         capture_log(fn ->
