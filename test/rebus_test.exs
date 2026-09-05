@@ -1697,6 +1697,21 @@ defmodule RebusTest do
                Connection.sanitize_protocol_reason({:malformed_reply, :missing_reply_serial})
     end
 
+    test "sanitizes hello error names that are not valid D-Bus error names" do
+      # D-Bus specification, "Valid Names": error names share the interface
+      # name grammar, so a single element or an over-long name is invalid.
+      assert {:hello_failed, "org.example.Error.Failed"} ==
+               Connection.sanitize_protocol_reason({:hello_failed, "org.example.Error.Failed"})
+
+      assert {:hello_failed, :invalid_error_name} ==
+               Connection.sanitize_protocol_reason({:hello_failed, "Failed"})
+
+      assert {:hello_failed, :invalid_error_name} ==
+               Connection.sanitize_protocol_reason(
+                 {:hello_failed, "org." <> String.duplicate("a", 252)}
+               )
+    end
+
     test "logs and stops for an owned socket abort" do
       {:ok, sock} = :socket.open(:inet, :stream, :default)
       handle = make_ref()
@@ -1988,15 +2003,18 @@ defmodule RebusTest do
     end
 
     test "classifies an oversized error name without logging it", %{svr: svr} do
+      # D-Bus specification, "Valid Names": "The maximum length of a name is
+      # 255 characters", so a 256-byte error name is now rejected while the
+      # frame is decoded rather than after it is accepted as a message.
       oversized_name = "org." <> String.duplicate("a", 252)
 
       log =
-        assert_hello_error_reason(svr, :invalid_error_name, fn reply_serial ->
-          raw_error_reply(reply_serial, %{error_name: oversized_name})
+        assert_hello_error_reason(svr, :invalid_message, fn reply_serial ->
+          raw_error_reply_binary(reply_serial, %{error_name: oversized_name})
         end)
 
       refute log =~ oversized_name
-      assert log =~ "D-Bus connection protocol stopped: {:hello_failed, :invalid_error_name}"
+      assert log =~ "D-Bus connection protocol stopped: :invalid_message"
     end
 
     test "returns a clean error for an empty Hello reply", %{svr: svr} do
@@ -4051,10 +4069,6 @@ defmodule RebusTest do
     refute log =~ "%Rebus.Connection"
   end
 
-  defp raw_error_reply(reply_serial, header_fields) do
-    raw_reply(:error, Map.put(header_fields, :reply_serial, reply_serial))
-  end
-
   defp raw_error_reply_binary(reply_serial, header_fields) do
     fields =
       header_fields
@@ -4158,18 +4172,6 @@ defmodule RebusTest do
 
     <<?l, 4, 0, 1, byte_size(body)::little-32, 1::little-32, header::binary, padding::binary,
       body::binary>>
-  end
-
-  defp raw_reply(type, header_fields) do
-    %Message{
-      type: type,
-      flags: [],
-      version: 1,
-      body_length: 0,
-      serial: 1,
-      header_fields: header_fields,
-      body: []
-    }
   end
 
   defp start_fragmented_socket_server(first) do

@@ -8,6 +8,7 @@ defmodule Rebus.Connection do
   alias Rebus.Message
   alias Rebus.SignalHandler
   alias Rebus.UnixFD
+  alias Rebus.WireValue
   require Logger
 
   @default_write_timeout 5_000
@@ -2552,7 +2553,7 @@ defmodule Rebus.Connection do
        when is_binary(name) do
     # Preserve compatibility with peers that include extra decoded values, but
     # retain only the validated unique-name result.
-    if valid_unique_name?(name),
+    if WireValue.valid_unique_name?(name),
       do: {:ok, :binary.copy(name)},
       else: {:error, {:hello_failed, :invalid_unique_name}}
   end
@@ -2581,7 +2582,7 @@ defmodule Rebus.Connection do
         :missing_error_name
 
       {:ok, error_name} ->
-        if valid_error_name?(error_name), do: error_name, else: :invalid_error_name
+        if WireValue.valid_error_name?(error_name), do: error_name, else: :invalid_error_name
     end
   end
 
@@ -2620,7 +2621,7 @@ defmodule Rebus.Connection do
         {:hello_failed, reason}
 
       {:hello_failed, error_name} when is_binary(error_name) ->
-        if valid_error_name?(error_name),
+        if WireValue.valid_error_name?(error_name),
           do: {:hello_failed, :binary.copy(error_name)},
           else: {:hello_failed, :invalid_error_name}
 
@@ -2651,48 +2652,6 @@ defmodule Rebus.Connection do
       _reason ->
         :protocol_error
     end
-  end
-
-  defp valid_error_name?(name) when is_binary(name) and byte_size(name) <= 255 do
-    case :binary.split(name, ".", [:global]) do
-      [_, _ | _] = parts -> Enum.all?(parts, &valid_error_name_element?/1)
-      _ -> false
-    end
-  end
-
-  defp valid_error_name?(_name), do: false
-
-  defp valid_error_name_element?(<<first, rest::binary>>)
-       when first in ?A..?Z or first in ?a..?z or first == ?_ do
-    valid_error_name_tail?(rest)
-  end
-
-  defp valid_error_name_element?(_element), do: false
-
-  defp valid_error_name_tail?(<<>>), do: true
-
-  defp valid_error_name_tail?(<<char, rest::binary>>)
-       when char in ?A..?Z or char in ?a..?z or char in ?0..?9 or char == ?_ do
-    valid_error_name_tail?(rest)
-  end
-
-  defp valid_error_name_tail?(_rest), do: false
-
-  defp valid_unique_name?(<<":", rest::binary>> = name) when byte_size(name) <= 255 do
-    case :binary.split(rest, ".", [:global]) do
-      [_, _ | _] = parts -> Enum.all?(parts, &valid_unique_name_element?/1)
-      _ -> false
-    end
-  end
-
-  defp valid_unique_name?(_name), do: false
-
-  defp valid_unique_name_element?(<<>>), do: false
-
-  defp valid_unique_name_element?(element) do
-    Enum.all?(:binary.bin_to_list(element), fn char ->
-      char in ?A..?Z or char in ?a..?z or char in ?0..?9 or char in [?_, ?-]
-    end)
   end
 
   defp iolist?(data) do

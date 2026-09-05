@@ -166,16 +166,18 @@ defmodule Rebus.MatchRule do
   end
 
   defp build_criteria(opts) do
-    with {:ok, criteria} <- put_if_valid(%{}, :sender, opts, &valid_bus_name?/1),
-         {:ok, criteria} <- put_if_valid(criteria, :interface, opts, &valid_interface_name?/1),
-         {:ok, criteria} <- put_if_valid(criteria, :member, opts, &valid_member_name?/1),
+    with {:ok, criteria} <- put_if_valid(%{}, :sender, opts, &WireValue.valid_bus_name?/1),
+         {:ok, criteria} <-
+           put_if_valid(criteria, :interface, opts, &WireValue.valid_interface_name?/1),
+         {:ok, criteria} <- put_if_valid(criteria, :member, opts, &WireValue.valid_member_name?/1),
          {:ok, criteria} <- put_if_valid(criteria, :path, opts, &WireValue.valid_object_path?/1),
          {:ok, criteria} <-
            put_if_valid(criteria, :path_namespace, opts, &WireValue.valid_object_path?/1),
-         {:ok, criteria} <- put_if_valid(criteria, :destination, opts, &valid_unique_name?/1),
+         {:ok, criteria} <-
+           put_if_valid(criteria, :destination, opts, &WireValue.valid_unique_name?/1),
          {:ok, criteria} <- put_arguments(criteria, :args, opts),
          {:ok, criteria} <- put_arguments(criteria, :arg_paths, opts) do
-      put_if_valid(criteria, :arg0namespace, opts, &valid_namespace?/1)
+      put_if_valid(criteria, :arg0namespace, opts, &WireValue.valid_namespace?/1)
     end
   end
 
@@ -374,52 +376,4 @@ defmodule Rebus.MatchRule do
   end
 
   defp path_in_namespace?(_path, _namespace), do: false
-
-  defp valid_interface_name?(name) when is_binary(name) and byte_size(name) <= 255 do
-    WireValue.valid_string?(name) and
-      name
-      |> String.split(".")
-      |> then(fn parts -> length(parts) >= 2 and Enum.all?(parts, &valid_name_element?/1) end)
-  end
-
-  defp valid_interface_name?(_name), do: false
-
-  defp valid_member_name?(name) when is_binary(name) and byte_size(name) <= 255,
-    do: WireValue.valid_string?(name) and valid_name_element?(name)
-
-  defp valid_member_name?(_name), do: false
-
-  defp valid_bus_name?(name) when is_binary(name) and byte_size(name) <= 255 do
-    WireValue.valid_string?(name) and
-      if String.starts_with?(name, ":") do
-        String.match?(name, ~r/\A:[A-Za-z0-9._-]+\z/)
-      else
-        name
-        |> String.split(".")
-        |> then(fn parts ->
-          length(parts) >= 2 and Enum.all?(parts, &valid_bus_name_element?/1)
-        end)
-      end
-  end
-
-  defp valid_bus_name?(_name), do: false
-
-  defp valid_unique_name?(name) when is_binary(name) and byte_size(name) <= 255,
-    do: WireValue.valid_string?(name) and String.match?(name, ~r/\A:[A-Za-z0-9._-]+\z/)
-
-  defp valid_unique_name?(_name), do: false
-
-  defp valid_namespace?(name) when is_binary(name) and byte_size(name) <= 255 do
-    WireValue.valid_string?(name) and
-      name
-      |> String.split(".")
-      |> Enum.all?(&valid_bus_name_element?/1)
-  end
-
-  defp valid_namespace?(_name), do: false
-
-  defp valid_bus_name_element?(element),
-    do: String.match?(element, ~r/\A[A-Za-z_-][A-Za-z0-9_-]*\z/)
-
-  defp valid_name_element?(element), do: String.match?(element, ~r/\A[A-Za-z_][A-Za-z0-9_]*\z/)
 end

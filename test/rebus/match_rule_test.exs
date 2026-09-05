@@ -31,6 +31,26 @@ defmodule Rebus.MatchRuleTest do
                MatchRule.new(args: %{0 => String.duplicate("x", 1_100)})
     end
 
+    test "validates names against the D-Bus specification's name grammar" do
+      # D-Bus specification, "Valid Names": "Bus names must contain at least
+      # one '.' (period) character (and thus at least two elements)", and a
+      # match rule's destination is a unique connection name.
+      assert {:error, :invalid_match_value} = MatchRule.new(destination: ":1")
+      assert {:ok, _rule} = MatchRule.new(destination: ":1.7")
+
+      assert {:error, :invalid_match_value} = MatchRule.new(sender: ":1")
+      assert {:ok, _rule} = MatchRule.new(sender: ":1.7")
+
+      assert {:error, :invalid_match_value} = MatchRule.new(interface: "Foo")
+      assert {:ok, _rule} = MatchRule.new(interface: "org.example.Foo")
+
+      assert {:error, :invalid_match_value} = MatchRule.new(member: "org.example.Changed")
+      assert {:ok, _rule} = MatchRule.new(member: "Changed")
+
+      assert {:error, :invalid_match_value} = MatchRule.new(arg0namespace: ":1.7")
+      assert {:ok, _rule} = MatchRule.new(arg0namespace: "org")
+    end
+
     test "filters only safely supported criteria after bus routing" do
       rule =
         MatchRule.new!(
