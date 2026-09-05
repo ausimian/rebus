@@ -1214,7 +1214,7 @@ defmodule Rebus do
   """
   @spec send(pid(), Rebus.Message.t()) :: :ok | {:error, error_reason()}
   def send(conn, %Rebus.Message{} = message) when is_pid(conn),
-    do: Rebus.Connection.send(conn, message)
+    do: Rebus.Connection.dispatch(conn, message)
 
   @doc """
   Sends a message with a custom dispatch timeout in milliseconds.
@@ -1224,7 +1224,7 @@ defmodule Rebus do
   @spec send(pid(), Rebus.Message.t(), non_neg_integer()) :: :ok | {:error, error_reason()}
   def send(conn, %Rebus.Message{} = message, timeout)
       when is_pid(conn) and is_integer(timeout) and timeout >= 0 do
-    Rebus.Connection.send(conn, message, timeout)
+    Rebus.Connection.dispatch(conn, message, timeout)
   end
 
   @doc """

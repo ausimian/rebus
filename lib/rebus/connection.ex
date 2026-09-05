@@ -58,8 +58,8 @@ defmodule Rebus.Connection do
       {:error, :disconnected}
   end
 
-  @spec send(pid(), Message.t(), non_neg_integer()) :: :ok | {:error, term()}
-  def send(pid, %Message{} = msg, dispatch_timeout \\ @default_write_timeout)
+  @spec dispatch(pid(), Message.t(), non_neg_integer()) :: :ok | {:error, term()}
+  def dispatch(pid, %Message{} = msg, dispatch_timeout \\ @default_write_timeout)
       when is_pid(pid) and is_integer(dispatch_timeout) and dispatch_timeout >= 0 do
     if node(pid) == node() do
       request_ref = make_ref()
@@ -832,7 +832,7 @@ defmodule Rebus.Connection do
           run_fd_claim_hook(state.fd_claim_delivery_fun)
 
           if fd_claim_live?(claim) and Process.alive?(pid) do
-            Kernel.send(delivery_alias, {:rebus_fd_reply, claim_ref, delivery_ref, msg})
+            send(delivery_alias, {:rebus_fd_reply, claim_ref, delivery_ref, msg})
 
             {:reply, :ok,
              %{
@@ -1492,7 +1492,7 @@ defmodule Rebus.Connection do
   defp ascii_lower(byte), do: byte
 
   defp notify_connect_waiter({pid, ref}, result) when is_pid(pid) and is_reference(ref),
-    do: Kernel.send(pid, {ref, result})
+    do: send(pid, {ref, result})
 
   defp notify_connect_waiter(nil, _result), do: :ok
 
@@ -1509,7 +1509,7 @@ defmodule Rebus.Connection do
         # queued monitor event first, then send the acknowledgement before
         # releasing the monitor: a caller that dies after this send owns the
         # normal established-connection lifecycle, while a prior death wins.
-        Kernel.send(pid, {connect_ref, :accepted})
+        send(pid, {connect_ref, :accepted})
         {:ok, release_connect_waiter(state)}
     end
   end
@@ -1839,7 +1839,7 @@ defmodule Rebus.Connection do
 
     pid =
       spawn_link(fn ->
-        Kernel.send(delivery_alias, {ref, safe_cookie_response(username, uid, challenge)})
+        send(delivery_alias, {ref, safe_cookie_response(username, uid, challenge)})
       end)
 
     monitor_ref = Process.monitor(pid)
