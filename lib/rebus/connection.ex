@@ -12,6 +12,7 @@ defmodule Rebus.Connection do
   alias Rebus.Connection.Setup
   alias Rebus.Connection.SocketError
   alias Rebus.Connection.Writer
+  alias Rebus.Connection.Writer.Active
   alias Rebus.MatchRule
   alias Rebus.Message
   alias Rebus.SafeCall
@@ -383,7 +384,8 @@ defmodule Rebus.Connection do
   # A writable socket must not prevent us from continuing to drain inbound replies.
   def handle_info(
         {:"$socket", s, :select, h},
-        %__MODULE__{sock: s, writer: %Writer{active: %{wait: {:select, continuation, h}}}} = state
+        %__MODULE__{sock: s, writer: %Writer{active: %Active{wait: {:select, continuation, h}}}} =
+          state
       ) do
     state.writer
     |> Writer.resume_select(continuation, writer_context(state))
@@ -434,14 +436,14 @@ defmodule Rebus.Connection do
 
   def handle_info(
         {:write_timeout, request_ref},
-        %__MODULE__{writer: %Writer{active: %{request_ref: request_ref}}} = state
+        %__MODULE__{writer: %Writer{active: %Active{request_ref: request_ref}}} = state
       ) do
     state.writer |> Writer.write_timeout(writer_context(state)) |> writer_result(state)
   end
 
   def handle_info(
         {:"$socket", s, :abort, {h, reason}},
-        %__MODULE__{sock: s, writer: %Writer{active: %{wait: {:select, _continuation, h}}}} =
+        %__MODULE__{sock: s, writer: %Writer{active: %Active{wait: {:select, _continuation, h}}}} =
           state
       ),
       do: stop_for_transport_error(reason, state)
