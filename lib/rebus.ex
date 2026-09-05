@@ -29,7 +29,7 @@ defmodule Rebus do
         member: "ListNames"
       )
 
-      %Rebus.Message{type: :method_return, body: [names]} = Rebus.call(conn, message)
+      {:ok, %Rebus.Message{type: :method_return, body: [names]}} = Rebus.call(conn, message)
 
       signal = Rebus.Message.new!(:signal,
         path: "/org/example/Status",
@@ -43,7 +43,7 @@ defmodule Rebus do
 
       # Add a signal handler to receive all signals.
       case Rebus.add_signal_handler(conn) do
-        ref when is_reference(ref) -> Rebus.delete_signal_handler(conn, ref)
+        {:ok, ref} -> Rebus.delete_signal_handler(conn, ref)
         {:error, reason} -> {:error, reason}
       end
 
@@ -76,8 +76,9 @@ defmodule Rebus do
   ## Error Handling
 
   `connect/2` returns `{:ok, connection}` or `{:error, reason}`. `call/3`
-  returns a `%Rebus.Message{}` reply directly on success, while `send/2` and
-  `send/3` return `:ok`. Public operation failures are returned as
+  returns `{:ok, %Rebus.Message{}}` for a successful reply and
+  `{:error, %Rebus.Message{type: :error}}` for a D-Bus error reply, while
+  `send/2` and `send/3` return `:ok`. Public operation failures are returned as
   `{:error, reason}` tuples.
 
   ## Unix file descriptors
@@ -131,6 +132,16 @@ defmodule Rebus do
           | :unix_fd_send_failed
           | :fd_claim_expired
           | {:invalid_message_type, Rebus.Message.message_type()}
+
+  @typedoc """
+  Failure reasons returned by `call/3`.
+
+  A D-Bus error reply from the peer is a definitive answer rather than a
+  transport failure, so it is returned as the complete
+  `%Rebus.Message{type: :error}`. Everything else is a local or transport
+  failure reason.
+  """
+  @type call_error :: Rebus.Message.t() | error_reason()
 
   @type match_error_reason ::
           :timeout
@@ -1119,13 +1130,15 @@ defmodule Rebus do
   end
 
   @doc """
-  Same as `connect/2`, but raises an exception on failure.
+  Same as `connect/2`, but raises `ArgumentError` on failure.
+
+  The exception message carries the reason `connect/2` would have returned.
   """
   @spec connect!(address(), keyword()) :: pid()
   def connect!(address, opts \\ []) do
     case connect(address, opts) do
       {:ok, pid} -> pid
-      {:error, reason} -> raise "Failed to connect to D-Bus: #{inspect(reason)}"
+      {:error, reason} -> raise ArgumentError, "failed to connect to D-Bus: #{inspect(reason)}"
     end
   end
 
@@ -1133,9 +1146,11 @@ defmodule Rebus do
   Sends a method call and waits for its correlated reply.
 
   `call/3` accepts only method calls that expect replies and returns the complete
-  `%Rebus.Message{}` reply. A D-Bus error reply is
-  returned as `%Rebus.Message{type: :error}` so callers can inspect its
-  `:error_name` header and body. If no reply arrives before `timeout` milliseconds,
+  reply as `{:ok, %Rebus.Message{type: :method_return}}`. A D-Bus error reply is
+  returned as `{:error, %Rebus.Message{type: :error}}` so callers can inspect its
+  `:error_name` header and body. Both shapes carry the complete message,
+  including any received descriptors in `:unix_fds`, which the caller owns and
+  must close exactly once. If no reply arrives before `timeout` milliseconds,
   it returns `{:error, :timeout}` and removes the request from the connection's
   pending-reply state. Messages that cannot be encoded return
   `{:error, :encode_failed}`. Invalid operations return
@@ -1180,13 +1195,13 @@ defmodule Rebus do
         member: "ListNames"
       )
 
-      %Rebus.Message{type: :method_return, body: [names]} = Rebus.call(conn, message)
+      {:ok, %Rebus.Message{type: :method_return, body: [names]}} = Rebus.call(conn, message)
 
       # Use a custom timeout in milliseconds.
       {:error, :timeout} = Rebus.call(conn, message, 1_000)
   """
   @spec call(pid(), Rebus.Message.t(), non_neg_integer()) ::
-          Rebus.Message.t() | {:error, error_reason()}
+          {:ok, Rebus.Message.t()} | {:error, call_error()}
   def call(conn, %Rebus.Message{} = message, timeout \\ 5_000)
       when is_pid(conn) and is_integer(timeout) and timeout >= 0 do
     Rebus.Connection.call(conn, message, timeout)
@@ -1335,7 +1350,7 @@ defmodule Rebus do
 
   ## Return Values
 
-  - `reference()` - A unique reference that identifies this signal handler
+  - `{:ok, reference()}` - A unique reference that identifies this signal handler
   - `{:error, :not_connected}` - Connection establishment has not completed.
   - `{:error, :timeout}` - The connection did not service the request promptly.
   - `{:error, :disconnected}` - The connection has stopped.
@@ -1345,10 +1360,10 @@ defmodule Rebus do
       {:ok, conn} = Rebus.connect(%{family: :local, path: "/tmp/my-dbus"})
 
       case Rebus.add_signal_handler(conn) do
-        ref when is_reference(ref) ->
+        {:ok, ref} ->
           # The calling process will now receive messages like:
           # {^ref, %Rebus.Message{type: :signal, ...}}
-          ref
+          {:ok, ref}
 
         {:error, reason} ->
           # Retry or handle the unavailable connection.
@@ -1389,7 +1404,7 @@ defmodule Rebus do
   or `{:error, :disconnected}` if it has stopped.
   """
   @spec add_signal_handler(pid()) ::
-          reference() | {:error, :not_connected | :timeout | :disconnected}
+          {:ok, reference()} | {:error, :not_connected | :timeout | :disconnected}
   defdelegate add_signal_handler(conn), to: Rebus.Connection
 
   @doc """
@@ -1414,7 +1429,7 @@ defmodule Rebus do
 
       {:ok, conn} = Rebus.connect(%{family: :local, path: "/tmp/my-dbus"})
 
-      with ref when is_reference(ref) <- Rebus.add_signal_handler(conn),
+      with {:ok, ref} <- Rebus.add_signal_handler(conn),
            :ok <- Rebus.delete_signal_handler(conn, ref) do
         :ok
       else

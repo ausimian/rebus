@@ -1176,7 +1176,7 @@ defmodule Rebus.MatchSubscription.Worker do
     handler_ref = make_ref()
 
     case Connection.add_signal_handler(conn, owner, handler_ref, rule, timeout) do
-      ^handler_ref -> {:ok, handler_ref}
+      {:ok, ^handler_ref} = ok -> ok
       {:error, _reason} = error -> error
     end
   end
@@ -1188,9 +1188,15 @@ defmodule Rebus.MatchSubscription.Worker do
   end
 
   defp invoke_bus_method(conn, member, rule, deadline) do
-    with {:ok, timeout} <- remaining_timeout(deadline),
-         %Message{} = reply <- Rebus.call(conn, bus_message(member, rule), timeout) do
-      bus_reply_result(reply)
+    with {:ok, timeout} <- remaining_timeout(deadline) do
+      # A D-Bus error reply now arrives as {:error, %Message{}}. Both reply
+      # shapes must reach bus_reply_result/1 so any received descriptors are
+      # closed before the reason is classified.
+      case Rebus.call(conn, bus_message(member, rule), timeout) do
+        {:ok, %Message{} = reply} -> bus_reply_result(reply)
+        {:error, %Message{} = reply} -> bus_reply_result(reply)
+        {:error, _reason} = error -> error
+      end
     end
   end
 

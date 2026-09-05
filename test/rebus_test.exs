@@ -150,7 +150,7 @@ defmodule RebusTest do
       :ok =
         TestServer.push(svr, Message.new!(:method_return, reply_serial: follow_up_request.serial))
 
-      assert %Message{type: :method_return} = Task.await(follow_up_task, 1_000)
+      assert {:ok, %Message{type: :method_return}} = Task.await(follow_up_task, 1_000)
     end
 
     test "reports the validated error name when an error reply is resource-limited", %{svr: svr} do
@@ -319,7 +319,7 @@ defmodule RebusTest do
       {:ok, addr_b} = TestServer.get_listen_addr(svr_b)
       {:ok, conn_a} = Rebus.connect(addr_a)
       {:ok, conn_b} = Rebus.connect(addr_b)
-      ref_b = Rebus.add_signal_handler(conn_b)
+      {:ok, ref_b} = Rebus.add_signal_handler(conn_b)
 
       assert :ok = Rebus.delete_signal_handler(conn_a, ref_b)
 
@@ -489,7 +489,7 @@ defmodule RebusTest do
 
     test "connect! raises on failure" do
       # Try to connect to non-existent socket
-      assert_raise RuntimeError, ~r/Failed to connect to D-Bus/, fn ->
+      assert_raise ArgumentError, ~r/^failed to connect to D-Bus: /, fn ->
         Rebus.connect!(%{family: :inet, addr: {{127, 0, 0, 1}, 9999}})
       end
     end
@@ -628,7 +628,7 @@ defmodule RebusTest do
                      500
 
       :ok = TestServer.push(svr, Message.new!(:method_return, reply_serial: request.serial))
-      assert %Message{type: :method_return} = Task.await(call_task, 1_000)
+      assert {:ok, %Message{type: :method_return}} = Task.await(call_task, 1_000)
     end
 
     test "fails a resource-limited Hello reply promptly instead of waiting for its timeout", %{
@@ -701,7 +701,7 @@ defmodule RebusTest do
 
       assert_receive {^svr, %Message{header_fields: %{member: "RetryCall"}} = request}, 1_000
       :ok = TestServer.push(svr, Message.new!(:method_return, reply_serial: request.serial))
-      assert %Message{type: :method_return} = Task.await(retry_task, 1_000)
+      assert {:ok, %Message{type: :method_return}} = Task.await(retry_task, 1_000)
 
       retry_send = %{
         initial_send
@@ -1340,7 +1340,7 @@ defmodule RebusTest do
 
     test "decodes a one-byte fragmented inbound frame", %{svr: svr} do
       cli = connect_until_ready(svr)
-      ref = Rebus.add_signal_handler(cli)
+      {:ok, ref} = Rebus.add_signal_handler(cli)
 
       message =
         Message.new!(:signal,
@@ -2253,7 +2253,7 @@ defmodule RebusTest do
 
     test "drains a large coalesced signal burst before a partial tail", %{svr: svr} do
       cli = connect_until_ready(svr)
-      ref = Rebus.add_signal_handler(cli)
+      {:ok, ref} = Rebus.add_signal_handler(cli)
 
       messages =
         for index <- 1..101 do
@@ -2300,7 +2300,7 @@ defmodule RebusTest do
 
     test "survives an inbound method call", %{svr: svr} do
       cli = connect_until_ready(svr)
-      ref = Rebus.add_signal_handler(cli)
+      {:ok, ref} = Rebus.add_signal_handler(cli)
 
       method_call =
         Message.new!(:method_call,
@@ -3323,7 +3323,7 @@ defmodule RebusTest do
 
       TestServer.push(svr, reply)
 
-      resp = Task.await(task)
+      assert {:ok, resp} = Task.await(task)
       assert resp.body == ["response"]
     end
 
@@ -3347,8 +3347,12 @@ defmodule RebusTest do
 
       :ok = TestServer.push(svr, error)
 
-      assert %Message{type: :error, header_fields: %{error_name: "org.example.Failed"}} =
-               Task.await(task)
+      assert {:error,
+              %Message{
+                type: :error,
+                header_fields: %{error_name: "org.example.Failed"},
+                body: ["failed"]
+              }} = Task.await(task)
     end
 
     test "cleans pending calls that time out", %{cli: cli, svr: svr} do
@@ -3477,8 +3481,8 @@ defmodule RebusTest do
           )
         )
 
-      assert %Message{body: ["first reply"]} = Task.await(first_task)
-      assert %Message{body: ["second reply"]} = Task.await(second_task)
+      assert {:ok, %Message{body: ["first reply"]}} = Task.await(first_task)
+      assert {:ok, %Message{body: ["second reply"]}} = Task.await(second_task)
     end
 
     test "rejects operation and message combinations it cannot honour", %{cli: cli} do
@@ -3540,8 +3544,8 @@ defmodule RebusTest do
       :ok =
         TestServer.push(svr, Message.new!(:method_return, reply_serial: first_received.serial))
 
-      assert %Message{serial: _} = Task.await(first_task)
-      assert %Message{serial: _} = Task.await(second_task)
+      assert {:ok, %Message{serial: _}} = Task.await(first_task)
+      assert {:ok, %Message{serial: _}} = Task.await(second_task)
     end
 
     test "stops the connection when a send fails", %{cli: cli} do
@@ -3895,13 +3899,19 @@ defmodule RebusTest do
   describe "Signals" do
     setup [:server_setup, :client_setup]
 
+    test "registration returns an ok tuple carrying the handler reference", %{cli: cli} do
+      assert {:ok, ref} = Rebus.add_signal_handler(cli)
+      assert is_reference(ref)
+      assert :ok = Rebus.delete_signal_handler(cli, ref)
+    end
+
     test "are received", %{cli: cli, svr: svr} do
       # add a remove a signal handler to test that works
-      ref = Rebus.add_signal_handler(cli)
+      {:ok, ref} = Rebus.add_signal_handler(cli)
       Rebus.delete_signal_handler(cli, ref)
 
       # Add one back
-      ref = Rebus.add_signal_handler(cli)
+      {:ok, ref} = Rebus.add_signal_handler(cli)
 
       # Send the NameAcquired signal
       signal =

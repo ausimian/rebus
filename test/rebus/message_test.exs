@@ -370,64 +370,56 @@ defmodule Rebus.MessageTest do
     end
 
     test "validates required fields for method call" do
-      assert {:error, reason} = Message.new(:method_call, interface: "org.example.Test")
-      assert reason =~ "Missing required field: path"
+      assert {:error, {:missing_header_field, :path}} =
+               Message.new(:method_call, interface: "org.example.Test")
     end
 
     test "validates required fields for signal" do
-      assert {:error, reason} = Message.new(:signal, path: "/test")
-      assert reason =~ "Missing required field: interface"
+      assert {:error, {:missing_header_field, :interface}} = Message.new(:signal, path: "/test")
     end
 
     test "validates required fields for error" do
-      assert {:error, reason} = Message.new(:error, error_name: "test.Error")
-      assert reason =~ "Missing required field: reply_serial"
+      assert {:error, {:missing_header_field, :reply_serial}} =
+               Message.new(:error, error_name: "test.Error")
     end
 
     test "validates required fields for method return" do
-      assert {:error, reason} = Message.new(:method_return, body: [42])
-      assert reason =~ "Missing required field: reply_serial"
+      assert {:error, {:missing_header_field, :reply_serial}} =
+               Message.new(:method_return, body: [42])
     end
 
     test "rejects invalid message type" do
-      assert {:error, reason} = Message.new(:invalid_type, path: "/test")
-      assert reason =~ "Invalid message type"
+      assert {:error, :invalid_type} = Message.new(:invalid_type, path: "/test")
     end
 
     test "rejects invalid flags" do
-      assert {:error, reason} =
+      assert {:error, :invalid_flags} =
                Message.new(:signal,
                  path: "/test",
                  interface: "org.example.Test",
                  member: "Test",
                  flags: [:invalid_flag]
                )
-
-      assert reason =~ "Invalid flags"
     end
 
     test "validates object paths" do
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :path}} =
                Message.new(:signal,
                  path: "invalid_path",
                  interface: "org.example.Test",
                  member: "Test"
                )
-
-      assert reason =~ "Invalid object path"
     end
 
     test "rejects single-element interface names required to have two elements" do
       # D-Bus specification, "Valid Names": interface names are "composed of 2
       # or more elements separated by a period ('.') character".
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :interface}} =
                Message.new(:signal,
                  path: "/test",
                  interface: "invalid",
                  member: "Test"
                )
-
-      assert reason =~ "Invalid interface name"
 
       assert {:ok, _} =
                Message.new(:signal,
@@ -439,22 +431,20 @@ defmodule Rebus.MessageTest do
 
     test "validates interface names" do
       # Test with completely invalid interface name
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :interface}} =
                Message.new(:signal,
                  path: "/test",
                  # Cannot start with number
                  interface: "123invalid",
                  member: "Test"
                )
-
-      assert reason =~ "Invalid interface name"
     end
 
     test "validates error names with the interface name grammar" do
       # D-Bus specification, "Valid Names": "Error names have the same
       # restrictions as interface names", so a single element is invalid.
-      assert {:error, reason} = Message.new(:error, error_name: "Failed", reply_serial: 1)
-      assert reason =~ "Invalid error name"
+      assert {:error, {:invalid_header_field, :error_name}} =
+               Message.new(:error, error_name: "Failed", reply_serial: 1)
 
       assert {:ok, _} =
                Message.new(:error, error_name: "org.example.Error.Failed", reply_serial: 1)
@@ -463,27 +453,22 @@ defmodule Rebus.MessageTest do
     test "validates destination and sender as bus names" do
       # D-Bus specification, "Valid Names": "Bus names must contain at least
       # one '.' (period) character (and thus at least two elements)."
-      assert {:error, reason} = signal_with(destination: ":1")
-      assert reason =~ "Invalid destination"
+      assert {:error, {:invalid_header_field, :destination}} = signal_with(destination: ":1")
       assert {:ok, _} = signal_with(destination: ":1.7")
       assert {:ok, _} = signal_with(destination: "org.example.Service")
 
-      assert {:error, reason} = signal_with(sender: ":1")
-      assert reason =~ "Invalid sender"
-      assert {:error, reason} = signal_with(sender: "org")
-      assert reason =~ "Invalid sender"
+      assert {:error, {:invalid_header_field, :sender}} = signal_with(sender: ":1")
+      assert {:error, {:invalid_header_field, :sender}} = signal_with(sender: "org")
       assert {:ok, _} = signal_with(sender: ":1.42")
     end
 
     test "validates member names" do
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :member}} =
                Message.new(:signal,
                  path: "/test",
                  interface: "test.interface",
                  member: "123invalid"
                )
-
-      assert reason =~ "Invalid member name"
     end
   end
 
@@ -502,6 +487,47 @@ defmodule Rebus.MessageTest do
     test "raises on error" do
       assert_raise ArgumentError, fn ->
         Message.new!(:method_call, interface: "org.example.Test")
+      end
+    end
+
+    test "builds a readable message for each reason without the offending value" do
+      assert_raise ArgumentError, "missing required header field :path", fn ->
+        Message.new!(:method_call, interface: "org.example.Test")
+      end
+
+      assert_raise ArgumentError, "invalid value for header field :interface", fn ->
+        Message.new!(:signal, path: "/test", interface: "not-an-interface", member: "Test")
+      end
+
+      assert_raise ArgumentError, "invalid message type", fn ->
+        Message.new!(:bogus, path: "/test")
+      end
+
+      assert_raise ArgumentError, "invalid message flags", fn ->
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "Test",
+          flags: [:bogus]
+        )
+      end
+
+      assert_raise ArgumentError, "unsupported D-Bus protocol version", fn ->
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "Test",
+          version: 2
+        )
+      end
+
+      assert_raise ArgumentError, "invalid message signature", fn ->
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "Test",
+          signature: "secret-value"
+        )
       end
     end
   end
@@ -697,8 +723,7 @@ defmodule Rebus.MessageTest do
         body_length: 0
       }
 
-      assert {:error, reason} = Message.validate(message)
-      assert reason =~ "Missing required field: path"
+      assert {:error, {:missing_header_field, :path}} = Message.validate(message)
     end
 
     test "rejects invalid signature format" do
@@ -717,110 +742,92 @@ defmodule Rebus.MessageTest do
         body_length: 0
       }
 
-      assert {:error, reason} = Message.validate(message)
-      assert reason =~ "Invalid signature format"
+      assert {:error, :invalid_signature} = Message.validate(message)
     end
   end
 
   describe "new/2 error handling" do
     test "rejects invalid message type" do
-      assert {:error, reason} = Message.new(:invalid_type, path: "/test")
-      assert reason =~ "Invalid message type"
+      assert {:error, :invalid_type} = Message.new(:invalid_type, path: "/test")
     end
 
     test "rejects invalid signature type (non-binary)" do
-      assert {:error, reason} =
+      assert {:error, :invalid_signature} =
                Message.new(:signal,
                  path: "/test",
                  interface: "test.interface",
                  member: "Test",
                  signature: 123
                )
-
-      assert reason =~ "Signature must be a string, got: 123"
     end
 
     test "rejects invalid body type (non-list)" do
-      assert {:error, reason} =
+      assert {:error, :invalid_body} =
                Message.new(:signal,
                  path: "/test",
                  interface: "test.interface",
                  member: "Test",
                  body: "not a list"
                )
-
-      assert reason =~ "Body must be a list, got: \"not a list\""
     end
 
     test "rejects invalid flags type (non-list)" do
-      assert {:error, reason} =
+      assert {:error, :invalid_flags} =
                Message.new(:signal,
                  path: "/test",
                  interface: "test.interface",
                  member: "Test",
                  flags: "not a list"
                )
-
-      assert reason =~ "Flags must be a list, got: \"not a list\""
     end
 
     test "rejects invalid version" do
-      assert {:error, reason} =
+      assert {:error, :invalid_version} =
                Message.new(:signal,
                  path: "/test",
                  interface: "test.interface",
                  member: "Test",
                  version: 2
                )
-
-      assert reason =~ "Unsupported protocol version: 2"
     end
 
     test "rejects invalid flags" do
-      assert {:error, reason} =
+      assert {:error, :invalid_flags} =
                Message.new(:signal,
                  path: "/test",
                  interface: "test.interface",
                  member: "Test",
                  flags: [:invalid_flag]
                )
-
-      assert reason =~ "Invalid flags: [:invalid_flag]"
     end
 
     test "rejects invalid header field types" do
       # Test invalid path
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :path}} =
                Message.new(:signal,
                  path: "invalid-path-no-leading-slash",
                  interface: "test.interface",
                  member: "Test"
                )
 
-      assert reason =~ "Invalid object path"
-
       # Test invalid interface
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :interface}} =
                Message.new(:signal,
                  path: "/test",
                  interface: "invalid interface name with spaces",
                  member: "Test"
                )
 
-      assert reason =~ "Invalid interface name"
-
       # Test invalid member
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :member}} =
                Message.new(:signal,
                  path: "/test",
                  interface: "test.interface",
                  member: "invalid-member-name"
                )
 
-      assert reason =~ "Invalid member name"
-
       # Test invalid destination
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :destination}} =
                Message.new(:method_call,
                  path: "/test",
                  interface: "test.interface",
@@ -828,27 +835,21 @@ defmodule Rebus.MessageTest do
                  destination: "invalid destination"
                )
 
-      assert reason =~ "Invalid destination"
-
       # Test invalid error_name
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :error_name}} =
                Message.new(:error,
                  error_name: "invalid error name",
                  reply_serial: 123
                )
 
-      assert reason =~ "Invalid error name"
-
       # Test invalid sender
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :sender}} =
                Message.new(:signal,
                  path: "/test",
                  interface: "test.interface",
                  member: "Test",
                  sender: "invalid sender"
                )
-
-      assert reason =~ "Invalid sender"
     end
   end
 
@@ -898,15 +899,13 @@ defmodule Rebus.MessageTest do
     end
 
     test "rejects invalid inferred signatures at construction" do
-      assert {:error, reason} =
+      assert {:error, :invalid_signature} =
                Message.new(:signal,
                  path: "/test",
                  interface: "test.interface",
                  member: "Test",
                  body: List.duplicate(1, 300)
                )
-
-      assert reason =~ "Invalid signature format"
 
       nested = Enum.reduce(1..33, 1, fn _, value -> [value] end)
 
@@ -982,8 +981,7 @@ defmodule Rebus.MessageTest do
       }
 
       assert {:error, :invalid_header_fields} = Message.encode(message)
-      assert {:error, reason} = Message.validate(message)
-      assert reason =~ "Invalid value for field path"
+      assert {:error, {:invalid_header_field, :path}} = Message.validate(message)
     end
 
     test "validate/1 rejects unknown and non-map header fields" do
@@ -1002,8 +1000,10 @@ defmodule Rebus.MessageTest do
         body: []
       }
 
-      assert {:error, "Invalid header field"} = Message.validate(message)
-      assert {:error, "Invalid header fields"} = Message.validate(%{message | header_fields: []})
+      assert {:error, {:unknown_header_field, :unknown}} = Message.validate(message)
+
+      assert {:error, :invalid_header_fields} =
+               Message.validate(%{message | header_fields: []})
     end
 
     test "new! names the signature without including body data" do
@@ -1036,7 +1036,7 @@ defmodule Rebus.MessageTest do
 
     test "rejects invalid signature grammar without raising" do
       for signature <- ["is)", "}", "["] do
-        assert {:error, reason} =
+        assert {:error, :invalid_signature} =
                  Message.new(:signal,
                    path: "/test",
                    interface: "test.interface",
@@ -1044,8 +1044,6 @@ defmodule Rebus.MessageTest do
                    signature: signature,
                    body: []
                  )
-
-        assert reason =~ "Invalid signature format"
 
         message = %Message{
           type: :signal,
@@ -1063,10 +1061,9 @@ defmodule Rebus.MessageTest do
         }
 
         assert {:error, :invalid_header_fields} = Message.encode(message)
-        assert {:error, validation_reason} = Message.validate(message)
-        assert validation_reason =~ "Invalid signature format"
+        assert {:error, :invalid_signature} = Message.validate(message)
 
-        assert_raise ArgumentError, ~r/Invalid signature format/, fn ->
+        assert_raise ArgumentError, "invalid message signature", fn ->
           Message.new!(:signal,
             path: "/test",
             interface: "test.interface",
@@ -1101,10 +1098,8 @@ defmodule Rebus.MessageTest do
                )
 
       for name <- ["org.1service", "org..service", "org.service!"] do
-        assert {:error, reason} =
+        assert {:error, {:invalid_header_field, :destination}} =
                  Message.new(:method_call, path: "/test", member: "Test", destination: name)
-
-        assert reason =~ "Invalid destination"
       end
     end
   end
@@ -1422,40 +1417,36 @@ defmodule Rebus.MessageTest do
 
   describe "additional edge cases for coverage" do
     test "validates unix_fds field type" do
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :unix_fds}} =
                Message.new(:signal,
                  path: "/test",
                  interface: "test.interface",
                  member: "Test",
                  unix_fds: "invalid"
                )
-
-      assert reason =~ "Invalid value for field unix_fds"
     end
 
     test "validates reply_serial field type" do
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :reply_serial}} =
                Message.new(:method_return,
                  reply_serial: "invalid"
                )
-
-      assert reason =~ "Invalid value for field reply_serial"
     end
 
     test "handles method_return validation" do
       # Test missing reply_serial for method_return
-      assert {:error, reason} = Message.new(:method_return, body: [])
-      assert reason =~ "Missing required field: reply_serial"
+      assert {:error, {:missing_header_field, :reply_serial}} =
+               Message.new(:method_return, body: [])
     end
 
     test "handles error message validation" do
       # Test missing error_name for error message
-      assert {:error, reason} = Message.new(:error, reply_serial: 123)
-      assert reason =~ "Missing required field: error_name"
+      assert {:error, {:missing_header_field, :error_name}} =
+               Message.new(:error, reply_serial: 123)
 
       # Test missing reply_serial for error message
-      assert {:error, reason} = Message.new(:error, error_name: "com.example.Error")
-      assert reason =~ "Missing required field: reply_serial"
+      assert {:error, {:missing_header_field, :reply_serial}} =
+               Message.new(:error, error_name: "com.example.Error")
     end
 
     test "handles decode with big endian" do
@@ -1525,56 +1516,46 @@ defmodule Rebus.MessageTest do
 
     test "validates invalid object paths" do
       # Test path that doesn't start with /
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :path}} =
                Message.new(:signal,
                  path: "invalid/path",
                  interface: "test.interface",
                  member: "Test"
                )
 
-      assert reason =~ "Invalid object path"
-
       # Test empty path
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :path}} =
                Message.new(:signal,
                  path: "",
                  interface: "test.interface",
                  member: "Test"
                )
 
-      assert reason =~ "Invalid object path"
-
       # Test path with invalid characters
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :path}} =
                Message.new(:signal,
                  path: "/test/path with spaces",
                  interface: "test.interface",
                  member: "Test"
                )
-
-      assert reason =~ "Invalid object path"
     end
 
     test "validates interface and member names with invalid characters" do
       # Test interface with invalid characters
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :interface}} =
                Message.new(:signal,
                  path: "/test",
                  interface: "test.interface-with-dash",
                  member: "Test"
                )
 
-      assert reason =~ "Invalid interface name"
-
       # Test member with invalid characters
-      assert {:error, reason} =
+      assert {:error, {:invalid_header_field, :member}} =
                Message.new(:signal,
                  path: "/test",
                  interface: "test.interface",
                  member: "Test-with-dash"
                )
-
-      assert reason =~ "Invalid member name"
     end
   end
 
