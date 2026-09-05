@@ -331,6 +331,17 @@ Rebus includes comprehensive testing infrastructure:
 - **Code coverage reporting** with test utilities excluded from metrics
 - **Property-based testing** for robust validation
 
+### Integration tests
+
+`test/integration` runs against a real `dbus-daemon` instead of the in-process
+test server. It is tagged `:integration` and excluded from `mix test`. On a
+Linux host with D-Bus installed, run `dbus-run-session -- mix test --only
+integration`; the private session bus keeps the suite off any bus already
+running. Elsewhere (macOS included) `mix test.integration` runs that same
+command inside the container defined by `docker/Dockerfile`, which needs
+Docker. Without `DBUS_SESSION_BUS_ADDRESS` the suite skips with a message
+rather than failing.
+
 ## Installation
 
 Add `rebus` to your list of dependencies in `mix.exs`:
