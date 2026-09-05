@@ -293,6 +293,8 @@ defmodule Rebus.AddressList do
     end
   end
 
+  # Attempt diagnostics are debug level only, and carry ordinals, transport,
+  # slice and a bounded reason. They never carry an address, host, path or GUID.
   defp log_address_attempt(%Walk{} = walk, transport, timeout, reason) do
     safe_reason = safe_address_failure_reason(reason)
 
@@ -320,6 +322,11 @@ defmodule Rebus.AddressList do
   # The floor is the full 50 ms only when the remaining budget can afford it for
   # every outstanding attempt; otherwise it drops to 1 ms. A slice never exceeds
   # the remaining time.
+  #
+  # `attempt_count` is what the caller still has to try. Before a TCP entry is
+  # resolved that is its unresolved families plus the later connectable
+  # entries; afterwards it is the capped resolved IPs plus those entries. The
+  # auth-ID lookup counts itself alongside every connectable entry.
   defp fair_address_attempt_timeout(remaining, attempt_count) do
     attempt_count = max(attempt_count, 1)
     fair_share = max(1, div(remaining, attempt_count))

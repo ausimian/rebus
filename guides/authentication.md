@@ -72,8 +72,17 @@ Such an endpoint is not a message bus, so it also needs `bus: false`:
 list and try each supported entry in order until one connects. An entry may
 carry a `guid=` value. Rebus compares it with the identity the server reports
 during authentication, and a mismatch is final rather than a reason to try the
-next entry. See `Rebus.connect/2` for the complete address, option and timeout
-contract.
+next entry.
+
+An entry is `unix:path=`, `unix:abstract=`, or `tcp:host=,port=` with an
+optional `family=ipv4` or `family=ipv6`. Values use D-Bus percent escapes. A
+TCP entry without a family tries up to four resolved IPv6 addresses, then up
+to four IPv4 ones, before moving to the next entry. A syntactically valid
+unsupported transport is skipped so a later entry can still be used, while a
+malformed entry rejects the whole list. `Rebus.BusAddress` documents the
+syntax and its limits.
+
+See `Rebus.connect/2` for the complete address, option and timeout contract.
 
 ## Errors
 
