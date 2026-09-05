@@ -6,6 +6,7 @@ defmodule RebusTest do
   alias Rebus.Connection
   alias Rebus.Connection.Handshake
   alias Rebus.Connection.Inbound
+  alias Rebus.Connection.Writer
   alias Rebus.Message
   alias Rebus.SignalHandler
   alias Rebus.TestImpl
@@ -147,7 +148,7 @@ defmodule RebusTest do
                state = :sys.get_state(cli)
 
                state.pending == %{} and state.request_index == %{} and state.monitor_index == %{} and
-                 map_size(state.outbound_monitor_index) == 0
+                 map_size(state.writer.monitor_index) == 0
              end)
 
       assert Process.alive?(cli)
@@ -1064,7 +1065,7 @@ defmodule RebusTest do
         )
 
       assert_receive {:setup_ready, ^cli}, 1_000
-      :sys.replace_state(cli, fn state -> %{state | serial: 42} end)
+      :sys.replace_state(cli, fn state -> %{state | writer: %{state.writer | serial: 42}} end)
       send(cli, {connect_ref, :accepted})
       hello = await_hello(svr)
       assert hello.serial == 42
@@ -1421,64 +1422,64 @@ defmodule RebusTest do
 
   describe "Connection callbacks" do
     test "allocates serials within a bounded range" do
-      assert {:ok, 2} = Connection.allocate_serial(1, %{1 => :pending}, 2)
-      assert {:ok, 1} = Connection.allocate_serial(2, %{2 => :pending}, 2)
+      assert {:ok, 2} = Writer.allocate_serial(1, %{1 => :pending}, 2)
+      assert {:ok, 1} = Writer.allocate_serial(2, %{2 => :pending}, 2)
 
       assert {:error, :serial_exhausted} =
-               Connection.allocate_serial(1, %{1 => :pending, 2 => :pending}, 2)
+               Writer.allocate_serial(1, %{1 => :pending, 2 => :pending}, 2)
     end
 
     test "classifies socket send results without exposing payloads" do
-      assert :ok = Connection.classify_send_result(:ok, 3)
-      assert {:error, :timeout} = Connection.classify_send_result({:error, {:timeout, "abc"}}, 3)
+      assert :ok = Writer.classify_send_result(:ok, 3)
+      assert {:error, :timeout} = Writer.classify_send_result({:error, {:timeout, "abc"}}, 3)
 
       assert {:error, {:send_fatal, :timeout}} =
-               Connection.classify_send_result({:error, {:timeout, "a"}}, 3)
+               Writer.classify_send_result({:error, {:timeout, "a"}}, 3)
 
       assert {:error, {:send_fatal, :closed}} =
-               Connection.classify_send_result({:error, {:closed, "abc"}}, 3)
+               Writer.classify_send_result({:error, {:closed, "abc"}}, 3)
 
       assert {:error, {:send_fatal, :closed}} =
-               Connection.classify_send_result({:error, :closed}, 3)
+               Writer.classify_send_result({:error, :closed}, 3)
 
       assert {:error, {:send_fatal, :timeout}} =
-               Connection.classify_send_result({:error, {:timeout, %{}}}, 3)
+               Writer.classify_send_result({:error, {:timeout, %{}}}, 3)
 
       assert {:error, {:send_fatal, :send_failed}} =
-               Connection.classify_send_result({:error, {"weird", "abc"}}, 3)
+               Writer.classify_send_result({:error, {"weird", "abc"}}, 3)
 
-      assert {:continue, "bc"} = Connection.classify_send_result({:ok, "bc"}, 3)
+      assert {:continue, "bc"} = Writer.classify_send_result({:ok, "bc"}, 3)
 
       assert {:error, {:send_fatal, :send_failed}} =
-               Connection.classify_send_result({:ok, ["bc"]}, 3)
+               Writer.classify_send_result({:ok, ["bc"]}, 3)
 
       assert {:error, {:send_fatal, :timeout}} =
-               Connection.classify_send_result({:error, {:timeout, "bc"}}, 3)
+               Writer.classify_send_result({:error, {:timeout, "bc"}}, 3)
 
       select_info = {:select_info, :send, make_ref()}
       completion_info = {:completion_info, :send, make_ref()}
 
       assert {:select, ^select_info, nil} =
-               Connection.classify_send_result({:select, select_info}, 3)
+               Writer.classify_send_result({:select, select_info}, 3)
 
       assert {:select, ^select_info, "bc"} =
-               Connection.classify_send_result({:select, {select_info, "bc"}}, 3)
+               Writer.classify_send_result({:select, {select_info, "bc"}}, 3)
 
       # The completion backend is not supported: its result shape now reaches
       # the unknown-result fallback and fails the write closed.
       assert {:error, {:send_fatal, :send_failed}} =
-               Connection.classify_send_result({:completion, completion_info}, 3)
+               Writer.classify_send_result({:completion, completion_info}, 3)
 
       assert {:error, {:send_fatal, :send_failed}} =
-               Connection.classify_send_result({:unexpected, :socket_shape}, 3)
+               Writer.classify_send_result({:unexpected, :socket_shape}, 3)
     end
 
     test "builds nonblocking socket continuation arguments" do
       continuation = {:select_info, :send, make_ref()}
-      assert {"rest", [], :nowait} = Connection.socket_send_args("rest", nil)
+      assert {"rest", [], :nowait} = Writer.socket_send_args("rest", nil)
 
       assert {"rest", ^continuation, :nowait} =
-               Connection.socket_send_args("rest", {:continue, continuation})
+               Writer.socket_send_args("rest", {:continue, continuation})
     end
 
     test "falls back safely when configuring the OTP receive buffer" do
@@ -3464,7 +3465,12 @@ defmodule RebusTest do
       assert_receive {^svr, %Message{} = first_received}, 1_000
 
       :ok = :sys.suspend(cli)
-      _ = :sys.replace_state(cli, fn state -> %{state | serial: 4_294_967_295} end)
+
+      _ =
+        :sys.replace_state(cli, fn state ->
+          %{state | writer: %{state.writer | serial: 4_294_967_295}}
+        end)
+
       :ok = :sys.resume(cli)
 
       signal =
@@ -3601,7 +3607,7 @@ defmodule RebusTest do
 
       assert {:error, :timeout} = Rebus.send(cli, signal, 20)
       assert_receive {:cancelled_write, ^continuation}, 500
-      assert :sys.get_state(cli).active_write == nil
+      assert :sys.get_state(cli).writer.active == nil
     end
 
     test "continues an immediate partial outbound write with its exact binary tail", %{cli: cli} do
@@ -3711,9 +3717,9 @@ defmodule RebusTest do
       first = Task.async(fn -> Rebus.send(cli, signal, 500) end)
       assert_receive {:queued_down_send, 1}
       second = Task.async(fn -> Rebus.send(cli, signal, 500) end)
-      assert wait_until(fn -> :queue.len(:sys.get_state(cli).write_queue) == 1 end)
+      assert wait_until(fn -> :queue.len(:sys.get_state(cli).writer.queue) == 1 end)
       _ = Task.shutdown(second, :brutal_kill)
-      assert wait_until(fn -> MapSet.size(:sys.get_state(cli).cancelled_requests) == 1 end)
+      assert wait_until(fn -> MapSet.size(:sys.get_state(cli).writer.cancelled_refs) == 1 end)
 
       send(cli, {:"$socket", :sys.get_state(cli).sock, :select, handle})
       assert_receive {:queued_down_send, 2}
@@ -3723,9 +3729,9 @@ defmodule RebusTest do
       assert wait_until(fn ->
                state = :sys.get_state(cli)
 
-               :queue.is_empty(state.write_queue) and MapSet.size(state.queued_requests) == 0 and
-                 MapSet.size(state.cancelled_requests) == 0 and
-                 map_size(state.outbound_monitor_index) == 0
+               :queue.is_empty(state.writer.queue) and MapSet.size(state.writer.queued_refs) == 0 and
+                 MapSet.size(state.writer.cancelled_refs) == 0 and
+                 map_size(state.writer.monitor_index) == 0
              end)
 
       assert Process.alive?(cli)
@@ -3761,7 +3767,7 @@ defmodule RebusTest do
       task = Task.async(fn -> Rebus.send(cli, signal, 500) end)
       assert_receive {:partial_down_tail, tail}
       _ = Task.shutdown(task, :brutal_kill)
-      assert wait_until(fn -> MapSet.size(:sys.get_state(cli).cancelled_requests) == 1 end)
+      assert wait_until(fn -> MapSet.size(:sys.get_state(cli).writer.cancelled_refs) == 1 end)
 
       send(cli, {:"$socket", :sys.get_state(cli).sock, :select, handle})
       assert_receive {:partial_down_resume, ^tail}
@@ -3769,9 +3775,9 @@ defmodule RebusTest do
       assert wait_until(fn ->
                state = :sys.get_state(cli)
 
-               state.active_write == nil and state.pending == %{} and state.request_index == %{} and
-                 state.monitor_index == %{} and map_size(state.outbound_monitor_index) == 0 and
-                 MapSet.size(state.cancelled_requests) == 0
+               state.writer.active == nil and state.pending == %{} and state.request_index == %{} and
+                 state.monitor_index == %{} and map_size(state.writer.monitor_index) == 0 and
+                 MapSet.size(state.writer.cancelled_refs) == 0
              end)
 
       assert Process.alive?(cli)
@@ -4125,9 +4131,9 @@ defmodule RebusTest do
         capture_log(fn ->
           for _ <- 1..80, do: TestServer.push(svr, unhandled_call())
 
-          assert wait_until(fn -> :sys.get_state(cli).queued_replies >= 63 end)
+          assert wait_until(fn -> :sys.get_state(cli).writer.replies >= 63 end)
           Process.sleep(50)
-          assert :sys.get_state(cli).queued_replies <= 64
+          assert :sys.get_state(cli).writer.replies <= 64
           assert Process.alive?(cli)
         end)
 
