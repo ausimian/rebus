@@ -118,6 +118,11 @@ defmodule Rebus do
           | :socket.sockaddr_in6()
           | :socket.sockaddr_un()
 
+  @typedoc """
+  Failure reasons returned by `call/3`, `send/2` and `send/3`.
+
+  Each function documents the subset it can return.
+  """
   @type error_reason ::
           :timeout
           | {:reply_dropped, :method_return | {:error, binary()}}
@@ -144,6 +149,12 @@ defmodule Rebus do
   """
   @type call_error :: Rebus.Message.t() | error_reason()
 
+  @typedoc """
+  Failure reasons returned by `add_match/3` and `remove_match/3`.
+
+  See [Signal subscriptions and match rules](match_rules.html) for what each
+  one means.
+  """
   @type match_error_reason ::
           :timeout
           | :not_connected
@@ -336,43 +347,37 @@ defmodule Rebus do
   @doc """
   Sends a method call and waits for its correlated reply.
 
-  `call/3` accepts only method calls that expect replies and returns the complete
-  reply as `{:ok, %Rebus.Message{type: :method_return}}`. A D-Bus error reply is
-  returned as `{:error, %Rebus.Message{type: :error}}` so callers can inspect its
-  `:error_name` header and body. Both shapes carry the complete message,
-  including any received descriptors in `:unix_fds`, which the caller owns and
-  must close exactly once. If no reply arrives before `timeout` milliseconds,
-  it returns `{:error, :timeout}` and removes the request from the connection's
-  pending-reply state. Messages that cannot be encoded return
-  `{:error, :encode_failed}`. Invalid operations return
-  `{:error, :no_reply_expected}` or `{:error, {:invalid_message_type, type}}`.
-  A closed connection returns `{:error, :disconnected}`. A timed-out call may
-  already have reached the peer, so callers must treat it as delivery-ambiguous.
-  The exception is a PID discovered with `Process.whereis(name)` before its
-  corresponding `connect/2` returns: while setup is blocked on authentication or
-  Hello I/O, the request can time out before the connection reads it. That frame
-  was definitely not written and is safe to retry after `connect/2` succeeds.
-  `{:error, :serial_exhausted}` means all valid D-Bus serials are in use.
-  `{:error, :not_connected}` means setup has not yet been accepted.
-  `{:error, :unix_fd_send_failed}` means an outbound borrowed descriptor could
-  not be passed before any bytes of that frame were accepted; the connection
-  remains usable and the descriptor remains owned by its sender.
-  A reply carrying descriptors can return after `timeout`, because `call/3`
-  waits for descriptor ownership to be settled rather than left undecided.
-  `{:error, :fd_claim_expired}` then means Rebus closed those descriptors, and
-  `{:error, :disconnected}` that the connection stopped first; see
-  [Unix file descriptor passing](unix_fds.html).
-  `{:error, {:reply_dropped, :method_return}}` means the peer definitely
-  received the request and produced a successful reply, but its payload
-  exceeded a local decoding resource cap and was discarded.
-  `{:error, {:reply_dropped, {:error, error_name}}}` means the peer definitely
-  produced that D-Bus error reply; depending on the operation and error, the
-  requested operation may not have executed. Neither outcome is
-  delivery-ambiguous: decide whether to retry from the operation and error
-  semantics, never by blindly retrying.
+  Only a method call that expects a reply is accepted, and `timeout` is in
+  milliseconds. Both result shapes carry the complete message, including any
+  received descriptors in `:unix_fds`. A D-Bus error reply from the peer is
+  returned as `{:error, %Rebus.Message{type: :error}}`, so read its
+  `:error_name` header and body from there.
 
-  Connections must be local to the calling node; remote connection PIDs return
-  `{:error, :remote_connection_unsupported}`.
+  ## Return values
+
+  - `{:ok, %Rebus.Message{type: :method_return}}` - the peer replied
+    successfully.
+  - `{:error, %Rebus.Message{type: :error}}` - the peer returned a D-Bus error
+    reply.
+  - `{:error, :timeout}` - no reply arrived in time, and the request may
+    already have reached the peer. A request sent to a named PID whose
+    `connect/2` has not yet returned was never written and is safe to retry.
+  - `{:error, {:reply_dropped, :method_return}}` - the peer replied
+    successfully, but the reply was too large to decode and was discarded.
+  - `{:error, {:reply_dropped, {:error, error_name}}}` - the peer returned that
+    D-Bus error reply, which was discarded for the same reason. Neither dropped
+    shape is delivery-ambiguous, so decide whether to retry from what the
+    operation does.
+  - `{:error, :fd_claim_expired}` - the reply carried descriptors and Rebus
+    closed them instead of handing them over.
+  - `{:error, :disconnected}` - the connection stopped before the reply, or
+    before its descriptors transferred. A call carrying descriptors can return
+    after `timeout`; see
+    [Unix file descriptor passing](unix_fds.html).
+  - Nothing was written for `:encode_failed`, `:no_reply_expected`,
+    `{:invalid_message_type, type}`, `:not_connected`, `:serial_exhausted`,
+    `:unix_fd_unsupported`, `:unix_fd_not_negotiated`, `:unix_fd_send_failed`
+    and `:remote_connection_unsupported`.
 
   ## Examples
 
@@ -398,22 +403,21 @@ defmodule Rebus do
   @doc """
   Sends a message without waiting for a reply.
 
-  Use this for signals and method calls whose flags include `:no_reply_expected`.
-  Reply-expecting method calls return `{:error, :reply_expected}`. It returns
-  `:ok` once the message has been handed to the socket, or
-  `{:error, :encode_failed}` if the message cannot be encoded. A closed
-  connection returns `{:error, :disconnected}`. `{:error, :timeout}` means the
-  message may already have reached the peer, so it must not be blindly retried.
-  The exception is a PID discovered with `Process.whereis(name)` before its
-  corresponding `connect/2` returns: while setup is blocked on authentication or
-  Hello I/O, the send can time out before the connection reads it. That frame was
-  definitely not written and is safe to retry after `connect/2` succeeds.
-  `{:error, :serial_exhausted}` means all valid D-Bus serials are in use.
-  `{:error, :not_connected}` means setup has not yet been accepted.
-  `send/2` has a fixed five-second caller dispatch timeout; use `send/3` when
-  the caller needs a different bound. This is distinct from the connection's
-  `:write_timeout`, which bounds socket readiness for a frame.
-  Remote connection PIDs return `{:error, :remote_connection_unsupported}`.
+  Use this for signals and for method calls flagged `:no_reply_expected`.
+  `send/2` allows five seconds for the connection to accept the message;
+  `send/3` takes that timeout as an argument.
+
+  ## Return values
+
+  - `:ok` - the frame was handed to the socket.
+  - `{:error, :timeout}` - the message may already have reached the peer. A
+    message sent to a named PID whose `connect/2` has not yet returned was
+    never written and is safe to retry.
+  - `{:error, :disconnected}` - the connection stopped.
+  - Nothing was written for `:encode_failed`, `:reply_expected`,
+    `{:invalid_message_type, type}`, `:not_connected`, `:serial_exhausted`,
+    `:unix_fd_unsupported`, `:unix_fd_not_negotiated`, `:unix_fd_send_failed`
+    and `:remote_connection_unsupported`.
   """
   @spec send(pid(), Rebus.Message.t()) :: :ok | {:error, error_reason()}
   def send(conn, %Rebus.Message{} = message) when is_pid(conn),
@@ -422,7 +426,9 @@ defmodule Rebus do
   @doc """
   Sends a message with a custom dispatch timeout in milliseconds.
 
-  A timeout is delivery-ambiguous: the message may already have reached the peer.
+  Accepts the same messages as `send/2` and returns the same values. The
+  timeout bounds how long the connection has to accept the message.
+  `{:error, :timeout}` is delivery-ambiguous.
   """
   @spec send(pid(), Rebus.Message.t(), non_neg_integer()) :: :ok | {:error, error_reason()}
   def send(conn, %Rebus.Message{} = message, timeout)
