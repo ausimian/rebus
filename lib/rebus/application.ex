@@ -8,7 +8,6 @@ defmodule Rebus.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      {Rebus.SignalHandler, []},
       {DynamicSupervisor, strategy: :one_for_one, name: Rebus.ConnectionSupervisor},
       {Registry, keys: :unique, name: Rebus.MatchSubscription.Registry},
       {Task.Supervisor, name: Rebus.MatchSubscription.TaskSupervisor},

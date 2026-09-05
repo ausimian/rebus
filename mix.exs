@@ -91,9 +91,6 @@ defmodule Rebus.MixProject do
       source_ref: @version,
       source_url: @source_url,
       extras: ["README.md", "CHANGELOG.md", "LICENSE.md"],
-      # Rebus.SignalHandler is an internal module named in the README's
-      # architecture overview; it has no page to link to.
-      skip_code_autolink_to: ["Rebus.SignalHandler"],
       groups_for_modules: [
         Core: [
           Rebus,

@@ -7,7 +7,6 @@ defmodule RebusTest do
   alias Rebus.Connection.Handshake
   alias Rebus.Connection.Inbound
   alias Rebus.Message
-  alias Rebus.SignalHandler
   alias Rebus.TestImpl
   alias Rebus.TestServer
 
@@ -52,10 +51,7 @@ defmodule RebusTest do
 
     test "drops resource-limited frames and continues coalesced signals", %{svr: svr} do
       cli = connect_until_ready(svr)
-      ref = make_ref()
-
-      :ok = :gen_event.add_sup_handler(SignalHandler, {SignalHandler, ref}, {cli, self(), ref})
-      on_exit(fn -> :gen_event.delete_handler(SignalHandler, {SignalHandler, ref}, nil) end)
+      {:ok, ref} = Rebus.add_signal_handler(cli)
 
       payload_sentinel = "resource-limit-body-sentinel"
       limited_data = raw_resource_limited_signal()
@@ -89,18 +85,7 @@ defmodule RebusTest do
 
     test "drops a resource-limited reply, fails its caller, and keeps parsing", %{svr: svr} do
       cli = connect_until_ready(svr)
-      signal_ref = make_ref()
-
-      :ok =
-        :gen_event.add_sup_handler(
-          SignalHandler,
-          {SignalHandler, signal_ref},
-          {cli, self(), signal_ref}
-        )
-
-      on_exit(fn ->
-        :gen_event.delete_handler(SignalHandler, {SignalHandler, signal_ref}, nil)
-      end)
+      {:ok, signal_ref} = Rebus.add_signal_handler(cli)
 
       method =
         Message.new!(:method_call,
@@ -215,10 +200,7 @@ defmodule RebusTest do
 
     test "drops a header-limited frame without closing the connection", %{svr: svr} do
       cli = connect_until_ready(svr)
-      ref = make_ref()
-
-      :ok = :gen_event.add_sup_handler(SignalHandler, {SignalHandler, ref}, {cli, self(), ref})
-      on_exit(fn -> :gen_event.delete_handler(SignalHandler, {SignalHandler, ref}, nil) end)
+      {:ok, ref} = Rebus.add_signal_handler(cli)
 
       limited_data = raw_header_resource_limited_signal()
 
@@ -762,8 +744,8 @@ defmodule RebusTest do
 
       handle_hello(hello, svr)
       assert {:ok, ^cli} = Task.await(connect_task, 1_000)
-      assert :sys.get_state(cli).signal_handler_monitor_index == %{}
-      refute Enum.any?(:gen_event.which_handlers(SignalHandler), &match?({SignalHandler, _}, &1))
+      assert :sys.get_state(cli).handlers == %{}
+      assert :sys.get_state(cli).handler_monitor_index == %{}
 
       :ok =
         TestServer.push(
@@ -1409,16 +1391,6 @@ defmodule RebusTest do
     end
   end
 
-  describe "signal handler callbacks" do
-    test "ignores unrecognised events and replies to handler calls" do
-      state = {self(), self(), make_ref()}
-
-      assert {:ok, ^state} = SignalHandler.handle_event(:unrecognised, state)
-      assert {:ok, ^state} = SignalHandler.handle_info(:unrecognised, state)
-      assert {:ok, :ok, ^state} = SignalHandler.handle_call(:status, state)
-    end
-  end
-
   describe "Connection callbacks" do
     test "falls back safely when configuring the OTP receive buffer" do
       parent = self()
@@ -2051,16 +2023,6 @@ defmodule RebusTest do
 
     test "drains a coalesced method call and signal after a Hello reply", %{svr: svr} do
       {cli, hello} = connect_until_hello(svr)
-      ref = make_ref()
-
-      :ok =
-        :gen_event.add_sup_handler(
-          SignalHandler,
-          {SignalHandler, ref},
-          {cli, self(), ref}
-        )
-
-      on_exit(fn -> :gen_event.delete_handler(SignalHandler, {SignalHandler, ref}, nil) end)
 
       hello_reply =
         Message.new!(:method_return,
@@ -2089,16 +2051,32 @@ defmodule RebusTest do
       {:ok, method_call_data} = Message.encode(method_call)
       {:ok, signal_data} = Message.encode(signal)
 
+      # The Hello reply, a method call and a signal arrive in one buffer, so
+      # parsing has to continue across the transition to an established
+      # connection.
       :ok =
         TestServer.push_raw(
           svr,
           IO.iodata_to_binary([hello_data, method_call_data, signal_data])
         )
 
+      assert wait_until(fn -> :sys.get_state(cli).name == ":1.100" end)
+      assert 0 == :sys.get_state(cli).inbound.size
+
+      # Signal handlers are only accepted once the connection is established,
+      # so delivery from a coalesced buffer is asserted on a second write that
+      # again carries a method call and a signal together.
+      {:ok, ref} = Rebus.add_signal_handler(cli)
+
+      :ok =
+        TestServer.push_raw(
+          svr,
+          IO.iodata_to_binary([method_call_data, signal_data])
+        )
+
       assert_receive {^ref, %Message{type: :signal, body: ["delivered without another write"]}},
                      1_000
 
-      assert wait_until(fn -> :sys.get_state(cli).name == ":1.100" end)
       assert 0 == :sys.get_state(cli).inbound.size
     end
 

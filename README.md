@@ -153,7 +153,6 @@ Rebus is built with a modular architecture:
 - **`Rebus.Message`** - Message creation, encoding, decoding, and validation
 - **`Rebus.Encoder`** - D-Bus wire format encoding with proper alignment
 - **`Rebus.Decoder`** - D-Bus wire format decoding with struct boundary tracking
-- **`Rebus.SignalHandler`** - Event-based signal distribution to registered handlers
 
 ## Supported platforms
 
