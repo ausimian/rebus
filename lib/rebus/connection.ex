@@ -206,81 +206,98 @@ defmodule Rebus.Connection do
   @impl true
   def init({opts, internal}) do
     %{family: family} = addr = Map.fetch!(internal, :addr)
-    write_timeout = Keyword.get(opts, :write_timeout, @default_write_timeout)
+    settings = init_settings(opts, internal)
+
+    case validate_settings(settings) do
+      :ok -> open_socket(settings, family, addr)
+      {:stop, _reason} = stop -> stop
+    end
+  end
+
+  defp init_settings(opts, internal) do
     timeout = Keyword.get(opts, :timeout, @default_read_timeout)
-    read_timeout = Keyword.get(opts, :read_timeout, @default_read_timeout)
 
-    setup_timeout =
-      Map.get(internal, :setup_timeout, Keyword.get(opts, :read_timeout, timeout))
+    %{
+      write_timeout: Keyword.get(opts, :write_timeout, @default_write_timeout),
+      timeout: timeout,
+      read_timeout: Keyword.get(opts, :read_timeout, @default_read_timeout),
+      setup_timeout: Map.get(internal, :setup_timeout, Keyword.get(opts, :read_timeout, timeout)),
+      aggregate_setup_timeout?: Map.has_key?(internal, :setup_timeout),
+      expected_guid: Map.get(internal, :expected_guid),
+      precomputed_auth_id: Map.get(internal, :precomputed_auth_id),
+      allow_anonymous?: Keyword.get(opts, :allow_anonymous, false),
+      bus?: Keyword.get(opts, :bus, true),
+      name: Keyword.get(opts, :name),
+      connect_waiter: Map.get(internal, :connect_waiter),
+      impl: Map.get_lazy(internal, :impl, &Rebus.Impl.default/0)
+    }
+  end
 
-    aggregate_setup_timeout? = Map.has_key?(internal, :setup_timeout)
-    expected_guid = Map.get(internal, :expected_guid)
-    precomputed_auth_id = Map.get(internal, :precomputed_auth_id)
-    allow_anonymous? = Keyword.get(opts, :allow_anonymous, false)
-    bus? = Keyword.get(opts, :bus, true)
-    name = Keyword.get(opts, :name)
-    connect_waiter = Map.get(internal, :connect_waiter)
-    impl = Map.get_lazy(internal, :impl, &Rebus.Impl.default/0)
+  # The order of these clauses fixes which error a caller sees when more than
+  # one option is invalid, so they are checked one at a time rather than
+  # collected.
+  defp validate_settings(settings) do
+    with :ok <- validate_timeout(:invalid_write_timeout, settings.write_timeout),
+         :ok <- validate_timeout(:invalid_timeout, settings.timeout),
+         :ok <- validate_timeout(:invalid_read_timeout, settings.read_timeout),
+         :ok <- validate_timeout(:invalid_setup_timeout, settings.setup_timeout),
+         :ok <- validate_expected_guid(settings.expected_guid),
+         :ok <- validate_precomputed_auth_id(settings.precomputed_auth_id),
+         :ok <- validate_flag(:invalid_allow_anonymous, settings.allow_anonymous?),
+         :ok <- validate_flag(:invalid_bus_option, settings.bus?) do
+      validate_registered_name(settings.name)
+    end
+  end
 
-    cond do
-      not (is_integer(write_timeout) and write_timeout > 0) ->
-        {:stop, :invalid_write_timeout}
+  defp validate_timeout(_reason, value) when is_integer(value) and value > 0, do: :ok
+  defp validate_timeout(reason, _value), do: {:stop, reason}
 
-      not (is_integer(timeout) and timeout > 0) ->
-        {:stop, :invalid_timeout}
+  defp validate_expected_guid(nil), do: :ok
 
-      not (is_integer(read_timeout) and read_timeout > 0) ->
-        {:stop, :invalid_read_timeout}
+  defp validate_expected_guid(guid),
+    do: if(Handshake.valid_guid?(guid), do: :ok, else: {:stop, :invalid_expected_guid})
 
-      not (is_integer(setup_timeout) and setup_timeout > 0) ->
-        {:stop, :invalid_setup_timeout}
+  defp validate_precomputed_auth_id(nil), do: :ok
+  defp validate_precomputed_auth_id(auth_id) when is_binary(auth_id), do: :ok
+  defp validate_precomputed_auth_id(_auth_id), do: {:stop, :invalid_precomputed_auth_id}
 
-      not (is_nil(expected_guid) or Handshake.valid_guid?(expected_guid)) ->
-        {:stop, :invalid_expected_guid}
+  defp validate_flag(_reason, value) when is_boolean(value), do: :ok
+  defp validate_flag(reason, _value), do: {:stop, reason}
 
-      not (is_nil(precomputed_auth_id) or is_binary(precomputed_auth_id)) ->
-        {:stop, :invalid_precomputed_auth_id}
+  defp validate_registered_name(name) when is_nil(name) or is_atom(name), do: :ok
+  defp validate_registered_name(_name), do: {:stop, :invalid_name}
 
-      not is_boolean(allow_anonymous?) ->
-        {:stop, :invalid_allow_anonymous}
+  defp open_socket(settings, family, addr) do
+    # DynamicSupervisor stops children with an exit signal. Trap it so the
+    # GenServer loop can return :stop and therefore invoke terminate/2,
+    # which closes raw SCM_RIGHTS descriptors retained in partial frames or
+    # reply claims. The EXIT clauses below preserve normal link semantics.
+    Process.flag(:trap_exit, true)
+    impl = settings.impl
 
-      not is_boolean(bus?) ->
-        {:stop, :invalid_bus_option}
+    case impl.transport.open(family, :stream, :default) do
+      {:ok, sock} ->
+        _ = configure_receive_buffer(impl.transport, sock)
 
-      not (is_nil(name) or is_atom(name)) ->
-        {:stop, :invalid_name}
+        {:ok,
+         %__MODULE__{
+           sock: sock,
+           impl: impl,
+           write_timeout: settings.write_timeout,
+           read_timeout: settings.read_timeout,
+           setup_timeout: settings.setup_timeout,
+           aggregate_setup_timeout?: settings.aggregate_setup_timeout?,
+           expected_guid: settings.expected_guid,
+           precomputed_auth_id: settings.precomputed_auth_id,
+           allow_anonymous?: settings.allow_anonymous?,
+           bus?: settings.bus?,
+           connect_waiter: settings.connect_waiter,
+           connect_waiter_monitor: Setup.monitor_connect_waiter(settings.connect_waiter),
+           unix_fd_transport?: Setup.unix_fd_transport_supported?(family)
+         }, {:continue, {:setup, addr}}}
 
-      true ->
-        # DynamicSupervisor stops children with an exit signal. Trap it so the
-        # GenServer loop can return :stop and therefore invoke terminate/2,
-        # which closes raw SCM_RIGHTS descriptors retained in partial frames or
-        # reply claims. The EXIT clauses below preserve normal link semantics.
-        Process.flag(:trap_exit, true)
-
-        case impl.transport.open(family, :stream, :default) do
-          {:ok, sock} ->
-            _ = configure_receive_buffer(impl.transport, sock)
-
-            {:ok,
-             %__MODULE__{
-               sock: sock,
-               impl: impl,
-               write_timeout: write_timeout,
-               read_timeout: read_timeout,
-               setup_timeout: setup_timeout,
-               aggregate_setup_timeout?: aggregate_setup_timeout?,
-               expected_guid: expected_guid,
-               precomputed_auth_id: precomputed_auth_id,
-               allow_anonymous?: allow_anonymous?,
-               bus?: bus?,
-               connect_waiter: connect_waiter,
-               connect_waiter_monitor: Setup.monitor_connect_waiter(connect_waiter),
-               unix_fd_transport?: Setup.unix_fd_transport_supported?(family)
-             }, {:continue, {:setup, addr}}}
-
-          {:error, reason} ->
-            {:stop, normalize_socket_error(reason)}
-        end
+      {:error, reason} ->
+        {:stop, normalize_socket_error(reason)}
     end
   end
 
@@ -407,39 +424,52 @@ defmodule Rebus.Connection do
 
   def handle_info(_message, %__MODULE__{} = state), do: {:noreply, state}
 
+  # A monitored caller can be waiting in exactly one place: the pending-reply
+  # table, the write queue, or an unacknowledged FD claim. They are searched in
+  # that order, and a reference found nowhere is a monitor this connection no
+  # longer cares about.
   defp handle_down_for_request(ref, %__MODULE__{} = state) do
     case Map.pop(state.monitor_index, ref) do
-      {nil, _index} ->
-        case Writer.pop_monitor(state.writer, ref) do
-          :error ->
-            case FDClaims.fetch_by_monitor(state.fd_claims, ref) do
-              {:ok, claim_ref} ->
-                {:noreply, drop_fd_claim(state, claim_ref, close?: true, monitor_down?: true)}
+      {nil, _index} -> down_for_queued_write(ref, state)
+      {serial, monitor_index} -> down_for_pending_reply(serial, monitor_index, state)
+    end
+  end
 
-              :error ->
-                {:noreply, state}
-            end
+  defp down_for_pending_reply(serial, monitor_index, %__MODULE__{} = state) do
+    {entry, pending} = Map.pop(state.pending, serial)
+    {_from, timer_ref, request_ref, _monitor_ref, _deadline} = entry
+    _ = Process.cancel_timer(timer_ref)
 
-          {request_ref, writer} ->
-            state = %{state | writer: writer}
+    {:noreply,
+     %{
+       state
+       | pending: pending,
+         monitor_index: monitor_index,
+         request_index: Map.delete(state.request_index, request_ref)
+     }}
+  end
 
-            writer
-            |> Writer.cancel_monitored(request_ref, writer_context(state))
-            |> writer_result(state)
-        end
+  defp down_for_queued_write(ref, %__MODULE__{} = state) do
+    case Writer.pop_monitor(state.writer, ref) do
+      :error ->
+        down_for_fd_claim(ref, state)
 
-      {serial, monitor_index} ->
-        {entry, pending} = Map.pop(state.pending, serial)
-        {_from, timer_ref, request_ref, _monitor_ref, _deadline} = entry
-        _ = Process.cancel_timer(timer_ref)
+      {request_ref, writer} ->
+        state = %{state | writer: writer}
 
-        {:noreply,
-         %{
-           state
-           | pending: pending,
-             monitor_index: monitor_index,
-             request_index: Map.delete(state.request_index, request_ref)
-         }}
+        writer
+        |> Writer.cancel_monitored(request_ref, writer_context(state))
+        |> writer_result(state)
+    end
+  end
+
+  defp down_for_fd_claim(ref, %__MODULE__{} = state) do
+    case FDClaims.fetch_by_monitor(state.fd_claims, ref) do
+      {:ok, claim_ref} ->
+        {:noreply, drop_fd_claim(state, claim_ref, close?: true, monitor_down?: true)}
+
+      :error ->
+        {:noreply, state}
     end
   end
 
