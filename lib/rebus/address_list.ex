@@ -7,6 +7,8 @@ defmodule Rebus.AddressList do
   # fair-share slicing, failure diagnostics, and the retryable/terminal error
   # classification.
 
+  alias Rebus.Connection.Handshake
+
   require Logger
 
   @default_connection_timeout 5_000
@@ -98,7 +100,7 @@ defmodule Rebus.AddressList do
     else
       with {:ok, timeout} <-
              address_attempt_timeout(deadline, candidate_count + 1, impl.clock, nil) do
-        Rebus.Connection.get_auth_id(timeout, impl.identity)
+        Handshake.get_auth_id(timeout, impl.identity)
       end
     end
   end

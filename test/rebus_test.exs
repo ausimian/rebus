@@ -4,6 +4,7 @@ defmodule RebusTest do
   import ExUnit.CaptureLog
 
   alias Rebus.Connection
+  alias Rebus.Connection.Handshake
   alias Rebus.Message
   alias Rebus.SignalHandler
   alias Rebus.TestImpl
@@ -373,7 +374,7 @@ defmodule RebusTest do
     test "normalizes bounded auth identity lookup outcomes", %{svr: svr} do
       {:ok, addr} = TestServer.get_listen_addr(svr)
 
-      auth_id = fn lookup -> Connection.get_auth_id(100, TestImpl.identity(auth_id: lookup)) end
+      auth_id = fn lookup -> Handshake.get_auth_id(100, TestImpl.identity(auth_id: lookup)) end
 
       assert {:ok, "353031"} = auth_id.(fn _timeout -> {:ok, "501\n"} end)
       assert {:error, :auth_id_unavailable} = auth_id.(fn _ -> {:error, :exit_status} end)
@@ -421,7 +422,7 @@ defmodule RebusTest do
 
     test "normalizes internal username lookup outcomes" do
       username = fn lookup ->
-        Connection.get_auth_username(100, TestImpl.identity(username: lookup))
+        Handshake.get_auth_username(100, TestImpl.identity(username: lookup))
       end
 
       assert {:ok, "rebus-user"} = username.(fn _timeout -> {:ok, "rebus-user\n"} end)
