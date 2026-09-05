@@ -14,6 +14,9 @@ defmodule Rebus.TestImpl do
 
   @table :rebus_test_impl
 
+  @spec table() :: atom()
+  def table, do: @table
+
   @spec setup!() :: :ok
   def setup! do
     case :ets.whereis(@table) do
@@ -199,6 +202,42 @@ defmodule Rebus.TestImpl.Identity do
   @impl Rebus.Identity
   def username(timeout),
     do: Rebus.TestImpl.dispatch(:username, Rebus.Identity.Posix, :username, [timeout])
+end
+
+defmodule Rebus.TestImpl.CachedIdentity do
+  @moduledoc false
+
+  # A keyless identity double for the connection fixtures that do not exercise
+  # the identity lookup itself. `Rebus.Identity.Posix` spawns `id` through a
+  # port on every connection, which the suite pays a few hundred times; this
+  # runs the same lookup once per VM and replays its exact result, so the
+  # EXTERNAL handshake still carries the real local credentials.
+  #
+  # Tests that drive the lookup itself name their own identity module, which
+  # the fixtures leave in place.
+
+  @behaviour Rebus.Identity
+
+  @impl Rebus.Identity
+  def auth_id(timeout), do: cached(:auth_id, timeout)
+
+  @impl Rebus.Identity
+  def username(timeout), do: cached(:username, timeout)
+
+  defp cached(function, timeout) do
+    table = Rebus.TestImpl.table()
+    key = {__MODULE__, function}
+
+    case :ets.lookup(table, key) do
+      [{^key, result}] ->
+        result
+
+      [] ->
+        result = apply(Rebus.Identity.Posix, function, [timeout])
+        true = :ets.insert(table, {key, result})
+        result
+    end
+  end
 end
 
 defmodule Rebus.TestImpl.Resolver do

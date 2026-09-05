@@ -24,7 +24,14 @@ defmodule Rebus.UnixFDTest do
       })
 
     {:ok, address} = TestServer.get_listen_addr(server)
-    {:ok, connection} = Rebus.connect(address, name: @connection_name)
+
+    # No test in this module drives the identity lookup, so the connection
+    # replays a cached `id -u` instead of spawning a port of its own.
+    {:ok, connection} =
+      Rebus.connect(address,
+        name: @connection_name,
+        __impl__: %{identity: TestImpl.CachedIdentity}
+      )
 
     on_exit(fn ->
       if Process.alive?(connection), do: Rebus.close(connection)
@@ -1028,7 +1035,10 @@ defmodule Rebus.UnixFDTest do
       })
 
     {:ok, address} = TestServer.get_listen_addr(server)
-    {:ok, connection} = Rebus.connect(address)
+
+    {:ok, connection} =
+      Rebus.connect(address, __impl__: %{identity: TestImpl.CachedIdentity})
+
     on_exit(fn -> if Process.alive?(connection), do: Rebus.close(connection) end)
 
     message =
@@ -1109,7 +1119,10 @@ defmodule Rebus.UnixFDTest do
   test "rejects FD writes on TCP before writing an ambiguous frame" do
     {:ok, server} = start_supervised({TestServer, tap: self()}, id: :unix_fd_tcp_server)
     {:ok, address} = TestServer.get_listen_addr(server)
-    {:ok, connection} = Rebus.connect(address)
+
+    {:ok, connection} =
+      Rebus.connect(address, __impl__: %{identity: TestImpl.CachedIdentity})
+
     on_exit(fn -> if Process.alive?(connection), do: Rebus.close(connection) end)
 
     message =
