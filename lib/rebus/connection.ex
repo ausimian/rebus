@@ -47,6 +47,9 @@ defmodule Rebus.Connection do
       {:error, :disconnected}
   end
 
+  # The dispatch timeout bounds how long the caller waits for this connection
+  # to accept the message. It is distinct from `:write_timeout`, which bounds
+  # how long the socket has to accept the bytes of a frame.
   @spec dispatch(pid(), Message.t(), non_neg_integer()) :: :ok | {:error, term()}
   def dispatch(pid, %Message{} = msg, dispatch_timeout \\ @default_write_timeout)
       when is_pid(pid) and is_integer(dispatch_timeout) and dispatch_timeout >= 0 do

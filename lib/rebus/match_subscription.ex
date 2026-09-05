@@ -5,6 +5,10 @@ defmodule Rebus.MatchSubscription do
   alias Rebus.MatchRule
   alias Rebus.MatchSubscription.Worker
 
+  # The caller's timeout is one budget for the whole operation: installing or
+  # removing the local handler, and the AddMatch or RemoveMatch reply. The
+  # worker is given a slightly longer bound so its own deadline reply wins the
+  # race against the caller giving up.
   @call_overhead 100
   @state_table Rebus.MatchSubscription.State
 
