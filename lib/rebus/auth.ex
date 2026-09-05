@@ -141,22 +141,20 @@ defmodule Rebus.Auth do
   defp safe_stat_size?(_stat, :directory), do: true
 
   defp read_bounded_file(path) do
-    try do
-      with {:ok, file} <- :file.open(String.to_charlist(path), [:read, :binary, :raw]) do
-        result =
-          case :file.read(file, @max_cookie_file_size + 1) do
-            {:ok, contents} when byte_size(contents) <= @max_cookie_file_size -> {:ok, contents}
-            _ -> {:error, :auth_cookie_unavailable}
-          end
+    with {:ok, file} <- :file.open(String.to_charlist(path), [:read, :binary, :raw]) do
+      result =
+        case :file.read(file, @max_cookie_file_size + 1) do
+          {:ok, contents} when byte_size(contents) <= @max_cookie_file_size -> {:ok, contents}
+          _ -> {:error, :auth_cookie_unavailable}
+        end
 
-        :ok = :file.close(file)
-        result
-      end
-    rescue
-      _exception -> {:error, :auth_cookie_unavailable}
-    catch
-      _kind, _reason -> {:error, :auth_cookie_unavailable}
+      :ok = :file.close(file)
+      result
     end
+  rescue
+    _exception -> {:error, :auth_cookie_unavailable}
+  catch
+    _kind, _reason -> {:error, :auth_cookie_unavailable}
   end
 
   defp find_cookie(contents, wanted_id) do

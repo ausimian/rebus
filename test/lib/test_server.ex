@@ -389,11 +389,9 @@ defmodule Rebus.TestServer do
   defp maybe_reply_hello(_msg, state), do: state
 
   defp iodata_to_binary(iodata) do
-    try do
-      {:ok, IO.iodata_to_binary(iodata)}
-    rescue
-      ArgumentError -> :error
-    end
+    {:ok, IO.iodata_to_binary(iodata)}
+  rescue
+    ArgumentError -> :error
   end
 
   defp rights_fds(ctrl) do

@@ -105,8 +105,7 @@
           {Credo.Check.Readability.ParenthesesOnZeroArityDefs, []},
           {Credo.Check.Readability.PipeIntoAnonymousFunctions, []},
           {Credo.Check.Readability.PredicateFunctionNames, []},
-          # Re-enable when #83 lands.
-          {Credo.Check.Readability.PreferImplicitTry, false},
+          {Credo.Check.Readability.PreferImplicitTry, []},
           {Credo.Check.Readability.RedundantBlankLines, []},
           {Credo.Check.Readability.Semicolons, []},
           {Credo.Check.Readability.SpaceAfterCommas, []},

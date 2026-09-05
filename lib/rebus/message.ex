@@ -1104,27 +1104,25 @@ defmodule Rebus.Message do
   defp encode_body([], "", _endianness), do: {:ok, []}
 
   defp encode_body(body, signature, endianness) do
-    try do
-      {:ok, Encoder.encode(signature, body, endianness)}
-    rescue
-      ResourceLimitError ->
-        {:error, :resource_limit}
+    {:ok, Encoder.encode(signature, body, endianness)}
+  rescue
+    ResourceLimitError ->
+      {:error, :resource_limit}
 
-      ArgumentError ->
-        {:error, :invalid_body}
+    ArgumentError ->
+      {:error, :invalid_body}
 
-      CaseClauseError ->
-        {:error, :invalid_body}
+    CaseClauseError ->
+      {:error, :invalid_body}
 
-      FunctionClauseError ->
-        {:error, :invalid_body}
+    FunctionClauseError ->
+      {:error, :invalid_body}
 
-      KeyError ->
-        {:error, :invalid_body}
+    KeyError ->
+      {:error, :invalid_body}
 
-      MatchError ->
-        {:error, :invalid_body}
-    end
+    MatchError ->
+      {:error, :invalid_body}
   end
 
   defp validate_body_signature([], ""), do: :ok
@@ -1148,25 +1146,23 @@ defmodule Rebus.Message do
   defp encode_header_fields(header_fields, endianness) do
     # Convert header fields to the format expected by encoder:
     # Array of structs where each struct is [field_code, variant]
-    try do
-      fields_data =
-        Enum.map(header_fields, fn {field, value} ->
-          field_code = Map.fetch!(@field_codes, field)
-          field_type = Map.fetch!(@field_types, field)
+    fields_data =
+      Enum.map(header_fields, fn {field, value} ->
+        field_code = Map.fetch!(@field_codes, field)
+        field_type = Map.fetch!(@field_types, field)
 
-          # Each struct entry should be a list: [byte_field_code, variant_tuple]
-          [field_code, {field_type, value}]
-        end)
+        # Each struct entry should be a list: [byte_field_code, variant_tuple]
+        [field_code, {field_type, value}]
+      end)
 
-      {:ok, Encoder.encode_at_position("a(yv)", [fields_data], endianness, 12)}
-    rescue
-      ResourceLimitError -> {:error, :resource_limit}
-      ArgumentError -> {:error, :invalid_header_fields}
-      CaseClauseError -> {:error, :invalid_header_fields}
-      FunctionClauseError -> {:error, :invalid_header_fields}
-      KeyError -> {:error, :invalid_header_fields}
-      MatchError -> {:error, :invalid_header_fields}
-    end
+    {:ok, Encoder.encode_at_position("a(yv)", [fields_data], endianness, 12)}
+  rescue
+    ResourceLimitError -> {:error, :resource_limit}
+    ArgumentError -> {:error, :invalid_header_fields}
+    CaseClauseError -> {:error, :invalid_header_fields}
+    FunctionClauseError -> {:error, :invalid_header_fields}
+    KeyError -> {:error, :invalid_header_fields}
+    MatchError -> {:error, :invalid_header_fields}
   end
 
   defp encode_flags_byte(flags) do
@@ -1321,21 +1317,19 @@ defmodule Rebus.Message do
   defp decode_body("", _body_binary, _endianness), do: {:error, :invalid_message}
 
   defp decode_body(signature, body_binary, endianness) do
-    try do
-      case Decoder.decode_with_position(signature, body_binary, endianness) do
-        {body, consumed} when consumed == byte_size(body_binary) -> {:ok, body}
-        _ -> {:error, :invalid_message}
-      end
-    rescue
-      ResourceLimitError ->
-        {:error, :resource_limit}
-
-      ArgumentError ->
-        {:error, :invalid_message}
-
-      _error in [CaseClauseError, FunctionClauseError, MatchError] ->
-        {:error, :invalid_message}
+    case Decoder.decode_with_position(signature, body_binary, endianness) do
+      {body, consumed} when consumed == byte_size(body_binary) -> {:ok, body}
+      _ -> {:error, :invalid_message}
     end
+  rescue
+    ResourceLimitError ->
+      {:error, :resource_limit}
+
+    ArgumentError ->
+      {:error, :invalid_message}
+
+    _error in [CaseClauseError, FunctionClauseError, MatchError] ->
+      {:error, :invalid_message}
   end
 
   defp validate_signature_format(signature) when is_binary(signature) do
