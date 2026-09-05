@@ -342,10 +342,11 @@ defmodule Rebus.AuthTest do
                DynamicSupervisor.start_child(
                  Rebus.ConnectionSupervisor,
                  {Connection,
-                  addr: anonymous_addr,
-                  name: anonymous_name,
-                  allow_anonymous: true,
-                  __impl__: %{identity: unavailable_username}}
+                  {[name: anonymous_name, allow_anonymous: true],
+                   %{
+                     addr: anonymous_addr,
+                     impl: Rebus.Impl.build(identity: unavailable_username)
+                   }}}
                )
 
       assert_receive :anonymous_established, 1_000
@@ -376,9 +377,8 @@ defmodule Rebus.AuthTest do
                DynamicSupervisor.start_child(
                  Rebus.ConnectionSupervisor,
                  {Connection,
-                  addr: rejecting_addr,
-                  name: rejecting_name,
-                  __impl__: %{identity: blocked_username}}
+                  {[name: rejecting_name],
+                   %{addr: rejecting_addr, impl: Rebus.Impl.build(identity: blocked_username)}}}
                )
 
       monitor_ref = Process.monitor(rejected_connection)

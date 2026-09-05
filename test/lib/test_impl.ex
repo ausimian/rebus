@@ -91,6 +91,33 @@ defmodule Rebus.TestImpl do
     __MODULE__.Identity
   end
 
+  @doc """
+  Registers resolver overrides for the caller and returns the stub module.
+  """
+  @spec resolver(keyword() | map()) :: module()
+  def resolver(overrides) do
+    :ok = put(self(), overrides)
+    __MODULE__.Resolver
+  end
+
+  @doc """
+  Registers clock overrides for the caller and returns the stub module.
+  """
+  @spec clock(keyword() | map()) :: module()
+  def clock(overrides) do
+    :ok = put(self(), overrides)
+    __MODULE__.Clock
+  end
+
+  @doc """
+  Registers connector overrides for the caller and returns the stub module.
+  """
+  @spec connector(keyword() | map()) :: module()
+  def connector(overrides) do
+    :ok = put(self(), overrides)
+    __MODULE__.Connector
+  end
+
   @spec overrides(pid() | atom()) :: map()
   def overrides(key) do
     case :ets.lookup(@table, key) do
@@ -173,4 +200,39 @@ defmodule Rebus.TestImpl.Identity do
   @impl Rebus.Identity
   def username(timeout),
     do: Rebus.TestImpl.dispatch(:username, Rebus.Identity.Posix, :username, [timeout])
+end
+
+defmodule Rebus.TestImpl.Resolver do
+  @moduledoc false
+
+  @behaviour Rebus.Resolver
+
+  @impl Rebus.Resolver
+  def getaddrs(host, family, timeout),
+    do:
+      Rebus.TestImpl.dispatch(:getaddrs, Rebus.Resolver.Inet, :getaddrs, [host, family, timeout])
+end
+
+defmodule Rebus.TestImpl.Clock do
+  @moduledoc false
+
+  @behaviour Rebus.Clock
+
+  @impl Rebus.Clock
+  def monotonic_time,
+    do: Rebus.TestImpl.dispatch(:monotonic_time, Rebus.Clock.System, :monotonic_time, [])
+end
+
+defmodule Rebus.TestImpl.Connector do
+  @moduledoc false
+
+  @behaviour Rebus.Connector
+
+  @impl Rebus.Connector
+  def connect(address, args),
+    do:
+      Rebus.TestImpl.dispatch(:connect_candidate, Rebus.Connector.Supervised, :connect, [
+        address,
+        args
+      ])
 end

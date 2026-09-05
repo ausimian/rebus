@@ -50,11 +50,6 @@ defmodule Rebus.Connection do
   # as if their reply had expired before it could be written.
   @max_queued_replies 64
 
-  @default_impl %{transport: Rebus.Transport.Socket, identity: Rebus.Identity.Posix}
-
-  @typedoc false
-  @type impl :: %{transport: module(), identity: module()}
-
   @spec call(pid(), Message.t(), non_neg_integer()) ::
           {:ok, Message.t()} | {:error, Rebus.call_error()}
   def call(pid, %Message{} = msg, timeout)
@@ -162,10 +157,16 @@ defmodule Rebus.Connection do
     safe_setup_call(conn, {:delete_signal_handler, ref}, nil, timeout)
   end
 
+  # Connections are started with the caller's public options and, separately,
+  # the internal arguments Rebus itself computes: the resolved address, the
+  # connect waiter, the address-list auth ID, per-candidate setup timeout and
+  # expected GUID, and the implementation modules. Keeping them apart means no
+  # internal name has to be reserved in, or stripped from, the public keyword
+  # list.
   @doc false
-  @spec start_link(keyword()) :: :ignore | {:error, any()} | {:ok, pid()}
-  def start_link(args) do
-    case Keyword.get(args, :name) do
+  @spec start_link({keyword(), map()}) :: :ignore | {:error, any()} | {:ok, pid()}
+  def start_link({opts, internal} = args) when is_list(opts) and is_map(internal) do
+    case Keyword.get(opts, :name) do
       nil -> GenServer.start_link(__MODULE__, args)
       name when is_atom(name) -> GenServer.start_link(__MODULE__, args, name: name)
       _name -> {:error, :invalid_name}
@@ -239,7 +240,7 @@ defmodule Rebus.Connection do
     # Implementation modules behind the connection's side effects. Production
     # always uses the defaults; tests substitute a module rather than reaching
     # into per-operation state.
-    field :impl, impl(), default: @default_impl
+    field :impl, Rebus.Impl.t(), default: Rebus.Impl.default()
     field :fd_claim_handoff_fun, function() | nil, default: nil
     # Deterministic transition seams used only by the FD lifecycle tests.
     field :fd_claim_delivery_fun, function() | nil, default: nil
@@ -251,23 +252,23 @@ defmodule Rebus.Connection do
   end
 
   @impl true
-  def init(args) do
-    %{family: family} = addr = Keyword.fetch!(args, :addr)
-    write_timeout = Keyword.get(args, :write_timeout, @default_write_timeout)
-    timeout = Keyword.get(args, :timeout, @default_read_timeout)
-    read_timeout = Keyword.get(args, :read_timeout, @default_read_timeout)
+  def init({opts, internal}) do
+    %{family: family} = addr = Map.fetch!(internal, :addr)
+    write_timeout = Keyword.get(opts, :write_timeout, @default_write_timeout)
+    timeout = Keyword.get(opts, :timeout, @default_read_timeout)
+    read_timeout = Keyword.get(opts, :read_timeout, @default_read_timeout)
 
     setup_timeout =
-      Keyword.get(args, :address_list_setup_timeout, Keyword.get(args, :read_timeout, timeout))
+      Map.get(internal, :setup_timeout, Keyword.get(opts, :read_timeout, timeout))
 
-    aggregate_setup_timeout? = Keyword.has_key?(args, :address_list_setup_timeout)
-    expected_guid = Keyword.get(args, :expected_guid)
-    precomputed_auth_id = Keyword.get(args, :precomputed_auth_id)
-    allow_anonymous? = Keyword.get(args, :allow_anonymous, false)
-    bus? = Keyword.get(args, :bus, true)
-    name = Keyword.get(args, :name)
-    connect_waiter = Keyword.get(args, :connect_waiter)
-    impl = build_impl(Keyword.get(args, :__impl__, []))
+    aggregate_setup_timeout? = Map.has_key?(internal, :setup_timeout)
+    expected_guid = Map.get(internal, :expected_guid)
+    precomputed_auth_id = Map.get(internal, :precomputed_auth_id)
+    allow_anonymous? = Keyword.get(opts, :allow_anonymous, false)
+    bus? = Keyword.get(opts, :bus, true)
+    name = Keyword.get(opts, :name)
+    connect_waiter = Map.get(internal, :connect_waiter)
+    impl = Map.get_lazy(internal, :impl, &Rebus.Impl.default/0)
 
     cond do
       not (is_integer(write_timeout) and write_timeout > 0) ->
@@ -330,15 +331,6 @@ defmodule Rebus.Connection do
         end
     end
   end
-
-  # Implementation modules are selected through a private, undocumented
-  # `:__impl__` option. Only keys the connection itself understands are taken
-  # from it; the address-list seams travel in the same structure.
-  defp build_impl(overrides) when is_list(overrides) or is_map(overrides) do
-    Map.merge(@default_impl, Map.take(Map.new(overrides), Map.keys(@default_impl)))
-  end
-
-  defp build_impl(_overrides), do: @default_impl
 
   defp transport(%__MODULE__{impl: %{transport: transport}}), do: transport
 
