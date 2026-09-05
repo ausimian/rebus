@@ -250,15 +250,7 @@ defmodule Rebus.Connection.Writer do
   # The write-timeout timer of the active write fired. Only the caller of the
   # matching operation is affected while nothing has entered the stream.
   @spec write_timeout(t(), context()) :: result()
-  def write_timeout(%__MODULE__{active: write} = writer, ctx) do
-    if write.partial? do
-      {:stop, :timeout, writer}
-    else
-      # No bytes have entered the stream, so this frame can be safely abandoned.
-      reply_if_live(write, {:error, :timeout}, writer)
-      advance(drop_active(writer, ctx, cancel?: true), ctx)
-    end
-  end
+  def write_timeout(%__MODULE__{} = writer, ctx), do: fail_active(writer, :timeout, ctx)
 
   @spec cancel(t(), reference(), context()) :: result()
   def cancel(
@@ -281,12 +273,13 @@ defmodule Rebus.Connection.Writer do
   # taken out of the index by `pop_monitor/2`, so the request is known to be
   # queued or active and needs no membership test.
   @spec cancel_monitored(t(), reference(), context()) :: result()
+  # Same head as `cancel/3`'s first clause, so this lands there and nowhere else.
   def cancel_monitored(
         %__MODULE__{active: %Active{request_ref: request_ref, partial?: false}} = writer,
         request_ref,
         ctx
       ),
-      do: advance(drop_active(writer, ctx, cancel?: true), ctx)
+      do: cancel(writer, request_ref, ctx)
 
   def cancel_monitored(%__MODULE__{} = writer, request_ref, _ctx),
     do: {:ok, mark_cancelled(writer, request_ref)}
@@ -389,12 +382,19 @@ defmodule Rebus.Connection.Writer do
         {:stop, reason, writer}
 
       {:error, reason} ->
-        if write.partial? do
-          {:stop, reason, writer}
-        else
-          reply_if_live(write, {:error, reason}, writer)
-          advance(drop_active(writer, ctx, cancel?: true), ctx)
-        end
+        fail_active(writer, reason, ctx)
+    end
+  end
+
+  # The active frame failed before reaching the peer. Once bytes have entered
+  # the stream the framing is lost and only the connection can be torn down;
+  # otherwise the frame is abandoned, its caller told, and the queue advanced.
+  defp fail_active(%__MODULE__{active: write} = writer, reason, ctx) do
+    if write.partial? do
+      {:stop, reason, writer}
+    else
+      reply_if_live(write, {:error, reason}, writer)
+      advance(drop_active(writer, ctx, cancel?: true), ctx)
     end
   end
 
@@ -601,7 +601,7 @@ defmodule Rebus.Connection.Writer do
       do: {:select, select_info, nil}
 
   def classify_send_result({:error, {:timeout, rest}}, payload_length) do
-    if SocketError.iolist?(rest) and IO.iodata_length(rest) == payload_length,
+    if nothing_accepted?(rest, payload_length),
       do: {:error, :timeout},
       else: {:error, {:send_fatal, :timeout}}
   end
@@ -648,13 +648,19 @@ defmodule Rebus.Connection.Writer do
 
   defp classify_sendmsg_result({:error, {reason, rest}}, payload_length)
        when reason in @fd_send_errors do
-    if SocketError.iolist?(rest) and IO.iodata_length(rest) == payload_length,
+    if nothing_accepted?(rest, payload_length),
       do: {:error, :unix_fd_send_failed},
       else: {:error, {:send_fatal, reason}}
   end
 
   defp classify_sendmsg_result(other, payload_length),
     do: classify_send_result(other, payload_length)
+
+  # OTP returns the unaccepted tail alongside the error. Only when the whole
+  # payload is still unaccepted did the attempt leave the stream untouched, and
+  # only then can the frame be failed without breaking D-Bus framing.
+  defp nothing_accepted?(rest, payload_length),
+    do: SocketError.iolist?(rest) and IO.iodata_length(rest) == payload_length
 
   defp send_rest_binary(rest) do
     {:ok, IO.iodata_to_binary(rest)}
@@ -727,26 +733,17 @@ defmodule Rebus.Connection.Writer do
 
   defp cancel_socket_write(_ctx, _wait), do: :ok
 
+  # `Message.encode/2` is total: it rescues its encoder internally and its
+  # encode-path validators only return `{:error, _}`. This is belt-and-braces,
+  # so a defect there degrades to `:encode_failed` instead of crashing the
+  # connection.
   defp encode_message(%Message{} = msg) do
     case Message.encode(msg) do
       {:ok, bin} ->
         {:ok, bin}
 
-      {:error, reason}
-      when reason in [
-             :invalid_body,
-             :invalid_header_fields,
-             :invalid_message,
-             :message_too_large
-           ] ->
+      {:error, reason} ->
         Logger.warning("D-Bus message encoding failed: #{inspect(reason)}", reason: reason)
-        {:error, :encode_failed}
-
-      {:error, _reason} ->
-        Logger.warning("D-Bus message encoding failed: :invalid_message",
-          reason: :invalid_message
-        )
-
         {:error, :encode_failed}
     end
   rescue
@@ -782,8 +779,8 @@ defmodule Rebus.Connection.Writer do
     end
   end
 
-  defp next_serial(@max_serial), do: 1
-  defp next_serial(serial), do: serial + 1
+  defp next_serial(serial), do: next_serial(serial, @max_serial)
+
   defp next_serial(max_serial, max_serial), do: 1
   defp next_serial(serial, _max_serial), do: serial + 1
 end
