@@ -14,6 +14,7 @@ defmodule Rebus.Connection do
   alias Rebus.Connection.Writer
   alias Rebus.MatchRule
   alias Rebus.Message
+  alias Rebus.SafeCall
   alias Rebus.UnixFD
   alias Rebus.WireValue
   require Logger
@@ -36,16 +37,10 @@ defmodule Rebus.Connection do
   end
 
   defp call_for_reply(pid, msg, deadline, request_ref, timeout) do
-    pid
-    |> GenServer.call({:call, msg, deadline, request_ref}, timeout)
-    |> FDClaims.Client.receive_claim(pid, deadline)
-  catch
-    :exit, {:timeout, _call} ->
-      GenServer.cast(pid, {:cancel, request_ref})
-      {:error, :timeout}
-
-    :exit, _reason ->
-      {:error, :disconnected}
+    SafeCall.call(pid, {:call, msg, deadline, request_ref}, timeout,
+      cancel: {:cancel, request_ref},
+      then: &FDClaims.Client.receive_claim(&1, pid, deadline)
+    )
   end
 
   # The dispatch timeout bounds how long the caller waits for this connection
@@ -65,14 +60,9 @@ defmodule Rebus.Connection do
   end
 
   defp call_for_dispatch(pid, msg, deadline, request_ref, dispatch_timeout) do
-    GenServer.call(pid, {:send, msg, deadline, request_ref}, dispatch_timeout)
-  catch
-    :exit, {:timeout, _call} ->
-      GenServer.cast(pid, {:cancel, request_ref})
-      {:error, :timeout}
-
-    :exit, _reason ->
-      {:error, :disconnected}
+    SafeCall.call(pid, {:send, msg, deadline, request_ref}, dispatch_timeout,
+      cancel: {:cancel, request_ref}
+    )
   end
 
   # Whether this connection completed the message-bus handshake. A connection
@@ -675,16 +665,8 @@ defmodule Rebus.Connection do
     end
   end
 
-  defp safe_setup_call(conn, message, cancellation \\ nil, timeout \\ @default_read_timeout) do
-    GenServer.call(conn, message, timeout)
-  catch
-    :exit, {:timeout, _call} ->
-      if cancellation, do: GenServer.cast(conn, cancellation)
-      {:error, :timeout}
-
-    :exit, _reason ->
-      {:error, :disconnected}
-  end
+  defp safe_setup_call(conn, message, cancellation \\ nil, timeout \\ @default_read_timeout),
+    do: SafeCall.call(conn, message, timeout, cancel: cancellation)
 
   defp remove_signal_handler(%__MODULE__{} = state, handler_ref) do
     case Map.pop(state.handlers, handler_ref) do

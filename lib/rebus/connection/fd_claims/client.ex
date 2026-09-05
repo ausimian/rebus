@@ -16,6 +16,7 @@ defmodule Rebus.Connection.FDClaims.Client do
 
   alias Rebus.Connection.FDClaims
   alias Rebus.Message
+  alias Rebus.SafeCall
 
   @doc false
   @spec receive_claim(term(), pid(), integer()) :: term()
@@ -76,19 +77,16 @@ defmodule Rebus.Connection.FDClaims.Client do
   end
 
   defp claim(conn, claim_ref, delivery_ref, delivery_alias, timeout) do
-    case GenServer.call(
-           conn,
-           {:claim_fd_reply, claim_ref, delivery_ref, delivery_alias},
-           timeout
-         ) do
-      :ok -> :ok
-      {:error, _reason} = error -> error
-      _unexpected -> {:error, :fd_claim_expired}
-    end
-  catch
-    :exit, {:timeout, _call} -> {:error, :timeout}
-    :exit, _reason -> {:error, :disconnected}
+    conn
+    |> SafeCall.call({:claim_fd_reply, claim_ref, delivery_ref, delivery_alias}, timeout)
+    |> claim_result()
   end
+
+  # Anything the connection cannot answer definitively leaves the claim to
+  # expire, which closes its descriptors.
+  defp claim_result(:ok), do: :ok
+  defp claim_result({:error, _reason} = error), do: error
+  defp claim_result(_unexpected), do: {:error, :fd_claim_expired}
 
   defp acknowledge(conn, claim_ref, delivery_ref, deadline) do
     case remaining_timeout(deadline) do
@@ -101,14 +99,11 @@ defmodule Rebus.Connection.FDClaims.Client do
   end
 
   defp call_ack(conn, claim_ref, delivery_ref, timeout) do
-    case GenServer.call(conn, {:ack_fd_reply, claim_ref, delivery_ref}, timeout) do
-      :ok -> :ok
-      {:error, _reason} = error -> error
-      _unexpected -> {:error, :fd_claim_expired}
-    end
-  catch
-    :exit, {:timeout, _call} -> resolve(conn, claim_ref, delivery_ref)
-    :exit, _reason -> {:error, :disconnected}
+    conn
+    |> SafeCall.call({:ack_fd_reply, claim_ref, delivery_ref}, timeout,
+      on_timeout: fn -> resolve(conn, claim_ref, delivery_ref) end
+    )
+    |> claim_result()
   end
 
   @doc false
