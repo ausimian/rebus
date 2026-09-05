@@ -321,12 +321,14 @@ defmodule Rebus.MatchRule do
   end
 
   defp argument_matches?(criteria, %Message{} = message) do
-    with {:ok, types} <- Signature.parse(Message.signature(message)) do
-      exact_argument_matches?(Map.get(criteria, :args, %{}), message.body, types) and
-        path_argument_matches?(Map.get(criteria, :arg_paths, %{}), message.body, types) and
-        arg0namespace_matches?(Map.get(criteria, :arg0namespace), message.body, types)
-    else
-      _ -> false
+    case Signature.parse(Message.signature(message)) do
+      {:ok, types} ->
+        exact_argument_matches?(Map.get(criteria, :args, %{}), message.body, types) and
+          path_argument_matches?(Map.get(criteria, :arg_paths, %{}), message.body, types) and
+          arg0namespace_matches?(Map.get(criteria, :arg0namespace), message.body, types)
+
+      _ ->
+        false
     end
   end
 

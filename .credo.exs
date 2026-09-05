@@ -114,8 +114,7 @@
           {Credo.Check.Readability.TrailingWhiteSpace, []},
           {Credo.Check.Readability.UnnecessaryAliasExpansion, []},
           {Credo.Check.Readability.VariableNames, []},
-          # Re-enable when #83 lands.
-          {Credo.Check.Readability.WithSingleClause, false},
+          {Credo.Check.Readability.WithSingleClause, []},
 
           #
           ## Refactoring Opportunities

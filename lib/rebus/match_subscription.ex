@@ -1099,24 +1099,26 @@ defmodule Rebus.MatchSubscription.Worker do
   end
 
   defp remove_operation(conn, rule, ref, handler, final?, deadline) do
-    with :ok <- ensure_handler_removed(conn, ref, handler, deadline) do
-      if final? do
-        case invoke_bus_method(conn, "RemoveMatch", rule, deadline) do
-          :ok ->
-            {:removed, ref, :final}
+    case ensure_handler_removed(conn, ref, handler, deadline) do
+      :ok ->
+        if final? do
+          case invoke_bus_method(conn, "RemoveMatch", rule, deadline) do
+            :ok ->
+              {:removed, ref, :final}
 
-          error ->
-            cond do
-              match_rule_not_found?(error) -> {:removed, ref, :final}
-              definitive_bus_error?(error) -> {:remove_definitive_error, ref, error}
-              true -> {:remove_ambiguous, ref, error}
-            end
+            error ->
+              cond do
+                match_rule_not_found?(error) -> {:removed, ref, :final}
+                definitive_bus_error?(error) -> {:remove_definitive_error, ref, error}
+                true -> {:remove_ambiguous, ref, error}
+              end
+          end
+        else
+          {:removed, ref, :nonfinal}
         end
-      else
-        {:removed, ref, :nonfinal}
-      end
-    else
-      {:error, _reason} = error -> {:remove_failed, error, :active}
+
+      {:error, _reason} = error ->
+        {:remove_failed, error, :active}
     end
   end
 

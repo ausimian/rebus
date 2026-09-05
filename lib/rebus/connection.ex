@@ -1385,9 +1385,8 @@ defmodule Rebus.Connection do
         "REJECTED" <> _rest ->
           # A mechanism rejection is terminal: do not silently lower the
           # authentication level after starting DBUS_COOKIE_SHA1.
-          with {:rejected, advertised} <- parse_auth_response(line) do
-            {:error, {:auth_rejected, advertised}}
-          else
+          case parse_auth_response(line) do
+            {:rejected, advertised} -> {:error, {:auth_rejected, advertised}}
             {:error, reason} -> {:error, reason}
           end
 
@@ -3057,14 +3056,16 @@ defmodule Rebus.Connection do
   defp classify_sendmsg_result(result, payload_length) do
     case result do
       {:ok, rest} ->
-        with {:ok, rest} <- send_rest_binary(rest),
-             do: {:continue, rest},
-             else: (_ -> {:error, {:send_fatal, :send_failed}})
+        case send_rest_binary(rest) do
+          {:ok, rest} -> {:continue, rest}
+          _ -> {:error, {:send_fatal, :send_failed}}
+        end
 
       {:select, {select_info, rest}} when is_sendmsg_select_info(select_info) ->
-        with {:ok, rest} <- send_rest_binary(rest),
-             do: {:select, select_info, rest},
-             else: (_ -> {:error, {:send_fatal, :send_failed}})
+        case send_rest_binary(rest) do
+          {:ok, rest} -> {:select, select_info, rest}
+          _ -> {:error, {:send_fatal, :send_failed}}
+        end
 
       {:select, select_info} when is_sendmsg_select_info(select_info) ->
         {:select, select_info, nil}

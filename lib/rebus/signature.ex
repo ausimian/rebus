@@ -169,9 +169,8 @@ defmodule Rebus.Signature do
     do: {:error, :invalid_signature}
 
   defp parse_dict([key | rest], arrays, structs, total) when key in ~c"ybnqiuxtdsogh" do
-    with {:ok, value, [?} | remaining]} <- parse_type(rest, arrays, structs + 1, total + 1, true) do
-      {:ok, {:dict_entry, basic_type(key), value}, remaining}
-    else
+    case parse_type(rest, arrays, structs + 1, total + 1, true) do
+      {:ok, value, [?} | remaining]} -> {:ok, {:dict_entry, basic_type(key), value}, remaining}
       _ -> {:error, :invalid_signature}
     end
   end

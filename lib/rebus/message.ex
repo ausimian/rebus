@@ -930,9 +930,8 @@ defmodule Rebus.Message do
 
   defp validate_unix_fd_value({:variant, _}, {nested_signature, value}, fd_count)
        when is_binary(nested_signature) do
-    with {:ok, [type]} <- Signature.parse(nested_signature) do
-      validate_unix_fd_value(type, value, fd_count)
-    else
+    case Signature.parse(nested_signature) do
+      {:ok, [type]} -> validate_unix_fd_value(type, value, fd_count)
       _ -> {:error, :invalid_unix_fds}
     end
   end
