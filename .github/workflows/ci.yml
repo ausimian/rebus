@@ -37,19 +37,13 @@ jobs:
       - name: Install dependencies
         run: mix deps.get
 
-      # Rebus has not defined a `mix precommit` alias yet. Keep this pinned
-      # gate equivalent to its local convention until it does.
-      - name: Check for unused dependencies
-        run: mix deps.unlock --unused
-
+      # `mix precommit` runs `mix format`, which rewrites files rather than
+      # failing. Check formatting first so CI still gates on it.
       - name: Check formatting
         run: mix format --check-formatted
 
-      - name: Compile
-        run: mix compile --warnings-as-errors
-
-      - name: Run tests
-        run: mix test
+      - name: Run precommit
+        run: mix precommit
 
   test:
     name: Test (Linux, Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }})${{ matrix.cover && ' + coverage' || '' }}
