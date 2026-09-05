@@ -968,6 +968,45 @@ defmodule Rebus.MatchRuleTest do
       send(owner, :stop)
     end
 
+    test "reaps persisted rows for a connection that dies with no worker", %{
+      server: server,
+      connection: connection
+    } do
+      rule = test_rule()
+      owner = subscribe_owner(self(), connection, rule)
+      add = assert_add_match(server, rule)
+      :ok = TestServer.push(server, method_return(add.serial))
+      _ref = assert_subscription(owner)
+
+      assert Rebus.MatchSubscription.persisted?(connection)
+      assert persisted_rows(connection, :rule) != []
+      assert persisted_rows(connection, :subscription) != []
+
+      worker = subscription_worker(connection)
+      supervisor = Process.whereis(Rebus.MatchSubscription)
+
+      kill_and_await_restart(supervisor, [worker], [{Rebus.MatchSubscription, supervisor}])
+
+      # Nothing watches the connection now: its worker died with the
+      # supervisor and none is started until the next call.
+      assert wait_until(fn ->
+               Registry.lookup(Rebus.MatchSubscription.Registry, connection) == []
+             end)
+
+      assert Rebus.MatchSubscription.persisted?(connection)
+
+      :ok = Rebus.close(connection)
+
+      # `delete_state/1` drops the meta row first, so wait for all three
+      # rather than letting the later assertions race the rest of the delete.
+      assert wait_until(fn -> reaped?(connection) end)
+      refute :ets.member(state_table(), {:meta, connection})
+      assert persisted_rows(connection, :rule) == []
+      assert persisted_rows(connection, :subscription) == []
+
+      send(owner, :stop)
+    end
+
     test "resets a supervisor-owned connection when subscription state is lost", %{
       connection: connection
     } do
@@ -1851,6 +1890,16 @@ defmodule Rebus.MatchRuleTest do
   end
 
   defp state_table, do: Store.table()
+
+  defp persisted_rows(connection, kind) do
+    :ets.match_object(state_table(), {{kind, connection, :_}, :_})
+  end
+
+  defp reaped?(connection) do
+    not :ets.member(state_table(), {:meta, connection}) and
+      persisted_rows(connection, :rule) == [] and
+      persisted_rows(connection, :subscription) == []
+  end
 
   # Kills `pid`, waits for the processes in `dead` that `rest_for_one` takes
   # with it, and for every `{name, pid}` in `replaced` to be re-registered
