@@ -48,7 +48,8 @@ defmodule Rebus.Decoder do
 
   ## Raises
 
-  Raises `ArgumentError` for an invalid signature, and
+  Raises `ArgumentError` for an invalid signature, for a boolean whose wire
+  value is neither 0 nor 1, and for non-zero alignment padding, and
   `Rebus.ResourceLimitError` when the signature or data exceeds a local
   nesting, structural, or scalar-array limit.
 
