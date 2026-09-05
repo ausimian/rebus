@@ -689,9 +689,8 @@ defmodule Rebus.Message do
          :ok <- validate_header_field_types(message.header_fields),
          :ok <- validate_required_fields(message.type, message.header_fields),
          :ok <- validate_signature_format(signature),
-         :ok <- validate_body_signature(message.body, signature),
-         :ok <- validate_unix_fds(message) do
-      :ok
+         :ok <- validate_body_signature(message.body, signature) do
+      validate_unix_fds(message)
     end
   end
 

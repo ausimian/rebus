@@ -135,8 +135,7 @@
           {Credo.Check.Refactor.NegatedConditionsWithElse, []},
           # Re-enable when #82 lands.
           {Credo.Check.Refactor.Nesting, false},
-          # Re-enable when #83 lands.
-          {Credo.Check.Refactor.RedundantWithClauseResult, false},
+          {Credo.Check.Refactor.RedundantWithClauseResult, []},
           {Credo.Check.Refactor.RejectReject, []},
           {Credo.Check.Refactor.UnlessWithElse, []},
           {Credo.Check.Refactor.WithClauses, []},

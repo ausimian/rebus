@@ -507,9 +507,8 @@ defmodule Rebus do
       {:error, :unsupported_bus_transport}
     else
       with {:ok, timeout} <-
-             address_attempt_timeout(deadline, candidate_count + 1, monotonic_time, nil),
-           {:ok, auth_id} <- Rebus.Connection.get_auth_id(timeout, auth_id_runner) do
-        {:ok, auth_id}
+             address_attempt_timeout(deadline, candidate_count + 1, monotonic_time, nil) do
+        Rebus.Connection.get_auth_id(timeout, auth_id_runner)
       end
     end
   end

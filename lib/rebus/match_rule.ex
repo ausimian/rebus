@@ -174,9 +174,8 @@ defmodule Rebus.MatchRule do
            put_if_valid(criteria, :path_namespace, opts, &WireValue.valid_object_path?/1),
          {:ok, criteria} <- put_if_valid(criteria, :destination, opts, &valid_unique_name?/1),
          {:ok, criteria} <- put_arguments(criteria, :args, opts),
-         {:ok, criteria} <- put_arguments(criteria, :arg_paths, opts),
-         {:ok, criteria} <- put_if_valid(criteria, :arg0namespace, opts, &valid_namespace?/1) do
-      {:ok, criteria}
+         {:ok, criteria} <- put_arguments(criteria, :arg_paths, opts) do
+      put_if_valid(criteria, :arg0namespace, opts, &valid_namespace?/1)
     end
   end
 

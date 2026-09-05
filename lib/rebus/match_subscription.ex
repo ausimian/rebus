@@ -1182,11 +1182,8 @@ defmodule Rebus.MatchSubscription.Worker do
   end
 
   defp delete_local_handler(conn, handler_ref, deadline) do
-    with {:ok, timeout} <- remaining_timeout(deadline),
-         :ok <- Connection.delete_signal_handler(conn, handler_ref, timeout) do
-      :ok
-    else
-      {:error, _reason} = error -> error
+    with {:ok, timeout} <- remaining_timeout(deadline) do
+      Connection.delete_signal_handler(conn, handler_ref, timeout)
     end
   end
 
@@ -1194,8 +1191,6 @@ defmodule Rebus.MatchSubscription.Worker do
     with {:ok, timeout} <- remaining_timeout(deadline),
          %Message{} = reply <- Rebus.call(conn, bus_message(member, rule), timeout) do
       bus_reply_result(reply)
-    else
-      {:error, _reason} = error -> error
     end
   end
 
