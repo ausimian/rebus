@@ -1,0 +1,7 @@
+# The integration image copies no source; keeping the build context small just
+# avoids shipping host artefacts to the daemon.
+.git
+_build
+cover
+deps
+doc

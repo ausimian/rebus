@@ -1,0 +1,18 @@
+#!/bin/sh
+#
+# Runs the real-bus integration suite against a dbus-daemon inside Docker.
+#
+# The repository is bind-mounted, and the container compiles into
+# _build/docker-test so its Linux artefacts never mix with the host's _build.
+set -eu
+
+image="${REBUS_INTEGRATION_IMAGE:-rebus-integration}"
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+docker build -t "$image" -f "$root/docker/Dockerfile" "$root"
+
+exec docker run --rm \
+    -v "$root":/app \
+    -w /app \
+    "$image" \
+    sh -c 'mix deps.get && dbus-run-session -- mix test --only integration'

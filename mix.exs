@@ -74,7 +74,10 @@ defmodule Rebus.MixProject do
         "format",
         "credo --strict",
         "test"
-      ]
+      ],
+      # The integration suite needs a real dbus-daemon, which macOS does not
+      # have; this runs it in the container defined by docker/Dockerfile.
+      "test.integration": ["cmd bin/integration-test"]
     ]
   end
 

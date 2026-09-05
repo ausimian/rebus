@@ -45,6 +45,49 @@ jobs:
       - name: Run precommit
         run: mix precommit
 
+  integration:
+    name: Integration (real dbus-daemon, Elixir 1.19.5 / OTP 28.3)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: '1.19.5'
+          otp-version: '28.3'
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
+
+      - name: Restore dependencies and build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-${{ runner.arch }}-mix-integration-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-mix-integration-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      # ubuntu-24.04 already ships dbus; install it only if the runner image
+      # ever drops it.
+      - name: Ensure dbus-run-session is available
+        run: |
+          if ! command -v dbus-run-session >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends dbus
+          fi
+
+      # A private session bus, so nothing touches a bus the runner already has.
+      - name: Run the integration suite
+        run: dbus-run-session -- mix test --only integration
+
   test:
     name: Test (Linux, Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }})${{ matrix.cover && ' + coverage' || '' }}
     runs-on: ubuntu-24.04
