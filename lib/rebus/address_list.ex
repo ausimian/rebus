@@ -13,6 +13,51 @@ defmodule Rebus.AddressList do
   @max_tcp_addresses_per_family 4
   @minimum_address_attempt_timeout 50
 
+  defmodule Walk do
+    @moduledoc false
+
+    # The state threaded through every step of one address-list walk.
+    #
+    # - `conn` is the `{caller_options, internal_arguments}` pair a candidate
+    #   connection is started with. Per-attempt internal arguments are layered
+    #   onto it just before each connect, never onto the caller's options.
+    # - `deadline` is the single monotonic setup deadline shared by the auth-ID
+    #   lookup and every resolver and pre-Hello attempt.
+    # - `impl` holds the implementation modules (clock, resolver, connector,
+    #   identity) the walk calls out through.
+    # - `last_error` is the most recent retryable failure, or `nil` while no
+    #   attempt has failed. It shapes both the timeout error and the final one.
+    # - `candidate_ordinal` and `ip_ordinal` are the debug-diagnostic positions
+    #   of the current D-Bus entry and, within a TCP entry, its resolved IP.
+    #   `ip_ordinal` is 0 for a Unix candidate and for TCP resolution itself.
+    # - `remaining_candidate_count` is how many connectable D-Bus entries follow
+    #   the current one; it is a share of the deadline the current entry must
+    #   leave unspent.
+
+    @enforce_keys [:conn, :deadline, :impl]
+    defstruct [
+      :conn,
+      :deadline,
+      :impl,
+      last_error: nil,
+      candidate_ordinal: 1,
+      ip_ordinal: 0,
+      remaining_candidate_count: 0
+    ]
+
+    @type t :: %__MODULE__{
+            conn: {keyword(), map()},
+            deadline: integer(),
+            impl: Rebus.Impl.t(),
+            last_error: term(),
+            candidate_ordinal: pos_integer(),
+            ip_ordinal: non_neg_integer(),
+            remaining_candidate_count: non_neg_integer()
+          }
+  end
+
+  alias Rebus.AddressList.Walk
+
   @doc """
   Walks a parsed bus-address candidate list until one connection is established.
   """
@@ -27,14 +72,11 @@ defmodule Rebus.AddressList do
 
       case resolve_list_auth_id(candidates, deadline, impl) do
         {:ok, auth_id} ->
-          connect_bus_candidates(
-            candidates,
-            {opts, %{impl: impl, precomputed_auth_id: auth_id}},
-            deadline,
-            impl,
-            nil,
-            1
-          )
+          connect_candidates(candidates, %Walk{
+            conn: {opts, %{impl: impl, precomputed_auth_id: auth_id}},
+            deadline: deadline,
+            impl: impl
+          })
 
         {:error, {:address_list_timeout, reason}} ->
           {:error, reason}
@@ -61,61 +103,17 @@ defmodule Rebus.AddressList do
     end
   end
 
-  defp connect_bus_candidates(
-         [],
-         _conn,
-         _deadline,
-         _impl,
-         nil,
-         _candidate_ordinal
-       ),
-       do: {:error, :unsupported_bus_transport}
+  defp connect_candidates([], %Walk{last_error: nil}),
+    do: {:error, :unsupported_bus_transport}
 
-  defp connect_bus_candidates(
-         [],
-         _conn,
-         _deadline,
-         _impl,
-         error,
-         _candidate_ordinal
-       ),
-       do: final_address_list_error(error)
+  defp connect_candidates([], %Walk{last_error: error}),
+    do: final_address_list_error(error)
 
-  defp connect_bus_candidates(
-         [:unsupported | candidates],
-         conn,
-         deadline,
-         impl,
-         last_error,
-         candidate_ordinal
-       ) do
-    connect_bus_candidates(
-      candidates,
-      conn,
-      deadline,
-      impl,
-      last_error,
-      candidate_ordinal + 1
-    )
-  end
+  defp connect_candidates([:unsupported | candidates], %Walk{} = walk),
+    do: connect_candidates(candidates, next_candidate(walk))
 
-  defp connect_bus_candidates(
-         [candidate | candidates],
-         conn,
-         deadline,
-         impl,
-         last_error,
-         candidate_ordinal
-       ) do
-    case connect_bus_candidate(
-           candidate,
-           candidates,
-           conn,
-           deadline,
-           impl,
-           last_error,
-           candidate_ordinal
-         ) do
+  defp connect_candidates([candidate | candidates], %Walk{} = walk) do
+    case connect_candidate(candidate, candidates, walk) do
       {:ok, _pid} = result ->
         result
 
@@ -124,288 +122,119 @@ defmodule Rebus.AddressList do
 
       {:error, reason} = error ->
         if retryable_bus_address_error?(reason) do
-          connect_bus_candidates(
-            candidates,
-            conn,
-            deadline,
-            impl,
-            reason,
-            candidate_ordinal + 1
-          )
+          connect_candidates(candidates, walk |> put_last_error(reason) |> next_candidate())
         else
           error
         end
     end
   end
 
-  defp connect_bus_candidate(
-         {:local, path, expected_guid},
-         remaining_candidates,
-         conn,
-         deadline,
-         impl,
-         last_error,
-         candidate_ordinal
-       ) do
-    with {:ok, timeout} <-
-           address_attempt_timeout(
-             deadline,
-             1 + connectable_candidate_count(remaining_candidates),
-             impl.clock,
-             last_error
-           ) do
-      connect_with_address_diagnostic(
-        impl,
-        %{family: :local, path: path},
-        conn
-        |> put_internal(:setup_timeout, timeout)
-        |> put_internal(:expected_guid, expected_guid),
-        candidate_ordinal,
-        0,
+  defp connect_candidate({:local, path, expected_guid}, remaining_candidates, %Walk{} = walk) do
+    walk = %{walk | remaining_candidate_count: connectable_candidate_count(remaining_candidates)}
+
+    with {:ok, timeout} <- attempt_timeout(walk, 1 + walk.remaining_candidate_count) do
+      %{family: :local, path: path}
+      |> connect_with_address_diagnostic(
+        put_attempt(walk, timeout, expected_guid),
         :unix,
         timeout
       )
     end
   end
 
-  defp connect_bus_candidate(
+  defp connect_candidate(
          {:tcp, host, port, family, expected_guid},
          remaining_candidates,
-         conn,
-         deadline,
-         impl,
-         last_error,
-         candidate_ordinal
+         %Walk{} = walk
        ) do
-    with {:ok, addresses} <-
-           resolve_tcp_addresses(
-             host,
-             family,
-             deadline,
-             impl,
-             connectable_candidate_count(remaining_candidates),
-             last_error,
-             candidate_ordinal
-           ) do
-      connect_tcp_addresses(
-        addresses,
-        port,
-        expected_guid,
-        conn,
-        deadline,
-        impl,
-        connectable_candidate_count(remaining_candidates),
-        last_error,
-        candidate_ordinal,
-        1
-      )
+    walk = %{walk | remaining_candidate_count: connectable_candidate_count(remaining_candidates)}
+
+    with {:ok, addresses} <- resolve_tcp_addresses(host, family, walk) do
+      connect_tcp_addresses(addresses, {port, expected_guid}, first_ip(walk))
     end
   end
 
-  defp resolve_tcp_addresses(
-         host,
-         family,
-         deadline,
-         impl,
-         remaining_candidate_count,
-         last_error,
-         candidate_ordinal
-       ) do
+  defp resolve_tcp_addresses(host, family, %Walk{} = walk) do
     families = if family == :unspec, do: [:inet6, :inet], else: [family]
 
-    resolve_tcp_families(
-      host,
-      families,
-      deadline,
-      impl,
-      remaining_candidate_count,
-      [],
-      [],
-      last_error,
-      candidate_ordinal
-    )
+    resolve_tcp_families(host, families, {[], []}, walk)
   end
 
   # Dialyzer analyses the dev build, where the implementation gate is closed and
   # the resolver is always `Rebus.Resolver.Inet`; from that alone it proves the
   # out-of-contract result clause and the non-atom reason clause unreachable.
   # The behaviour admits any error term, and the test build reaches both.
-  @dialyzer {:no_match, [resolve_tcp_families: 9, safe_resolver_reason: 1]}
+  @dialyzer {:no_match, [resolve_tcp_families: 4, safe_resolver_reason: 1]}
 
-  defp resolve_tcp_families(
-         _host,
-         [],
-         _deadline,
-         _impl,
-         _remaining_candidate_count,
-         [],
-         reasons,
-         _last_error,
-         _candidate_ordinal
-       ),
-       do: {:error, {:tcp_resolution_failed, List.first(reasons) || :no_addresses}}
+  # A resolution failure is remembered only for the remaining resolver families:
+  # the caller keeps walking with the `last_error` it already held.
+  defp resolve_tcp_families(_host, [], {[], reasons}, %Walk{}),
+    do: {:error, {:tcp_resolution_failed, List.first(reasons) || :no_addresses}}
 
-  defp resolve_tcp_families(
-         _host,
-         [],
-         _deadline,
-         _impl,
-         _remaining_candidate_count,
-         addresses,
-         _reasons,
-         _last_error,
-         _candidate_ordinal
-       ),
-       do: {:ok, addresses}
+  defp resolve_tcp_families(_host, [], {addresses, _reasons}, %Walk{}),
+    do: {:ok, addresses}
 
-  defp resolve_tcp_families(
-         host,
-         [family | families],
-         deadline,
-         impl,
-         remaining_candidate_count,
-         addresses,
-         reasons,
-         last_error,
-         candidate_ordinal
-       ) do
+  defp resolve_tcp_families(host, [family | families], {addresses, reasons}, %Walk{} = walk) do
     with {:ok, timeout} <-
-           address_attempt_timeout(
-             deadline,
-             length([family | families]) + remaining_candidate_count,
-             impl.clock,
-             last_error
-           ) do
-      case impl.resolver.getaddrs(host, family, timeout) do
+           attempt_timeout(walk, length([family | families]) + walk.remaining_candidate_count) do
+      case walk.impl.resolver.getaddrs(host, family, timeout) do
         {:ok, resolved} when is_list(resolved) ->
           resolved_addresses =
             resolved
             |> Enum.take(@max_tcp_addresses_per_family)
             |> Enum.map(&{family, &1})
 
-          resolve_tcp_families(
-            host,
-            families,
-            deadline,
-            impl,
-            remaining_candidate_count,
-            addresses ++ resolved_addresses,
-            reasons,
-            last_error,
-            candidate_ordinal
-          )
+          resolve_tcp_families(host, families, {addresses ++ resolved_addresses, reasons}, walk)
 
         {:error, reason} ->
           safe_reason = safe_resolver_reason(reason)
-
-          log_address_attempt(
-            candidate_ordinal,
-            0,
-            :tcp,
-            timeout,
-            {:tcp_resolution_failed, safe_reason}
-          )
+          failure = {:tcp_resolution_failed, safe_reason}
+          log_address_attempt(walk, :tcp, timeout, failure)
 
           resolve_tcp_families(
             host,
             families,
-            deadline,
-            impl,
-            remaining_candidate_count,
-            addresses,
-            [safe_reason | reasons],
-            {:tcp_resolution_failed, safe_reason},
-            candidate_ordinal
+            {addresses, [safe_reason | reasons]},
+            put_last_error(walk, failure)
           )
 
         _other ->
-          log_address_attempt(candidate_ordinal, 0, :tcp, timeout, :resolution_failed)
+          log_address_attempt(walk, :tcp, timeout, :resolution_failed)
 
           resolve_tcp_families(
             host,
             families,
-            deadline,
-            impl,
-            remaining_candidate_count,
-            addresses,
-            [:resolution_failed | reasons],
-            {:tcp_resolution_failed, :resolution_failed},
-            candidate_ordinal
+            {addresses, [:resolution_failed | reasons]},
+            put_last_error(walk, {:tcp_resolution_failed, :resolution_failed})
           )
       end
     end
   end
 
-  defp connect_tcp_addresses(
-         [],
-         _port,
-         _expected_guid,
-         _conn,
-         _deadline,
-         _impl,
-         _remaining_candidate_count,
-         nil,
-         _candidate_ordinal,
-         _ip_ordinal
-       ),
-       do: {:error, {:tcp_resolution_failed, :no_addresses}}
+  defp connect_tcp_addresses([], _endpoint, %Walk{last_error: nil}),
+    do: {:error, {:tcp_resolution_failed, :no_addresses}}
 
-  defp connect_tcp_addresses(
-         [],
-         _port,
-         _expected_guid,
-         _conn,
-         _deadline,
-         _impl,
-         remaining_candidate_count,
-         error,
-         _candidate_ordinal,
-         _ip_ordinal
-       )
-       when remaining_candidate_count > 0,
+  defp connect_tcp_addresses([], _endpoint, %Walk{
+         last_error: error,
+         remaining_candidate_count: remaining
+       })
+       when remaining > 0,
        do: {:error, error}
 
-  defp connect_tcp_addresses(
-         [],
-         _port,
-         _expected_guid,
-         _conn,
-         _deadline,
-         _impl,
-         _remaining_candidate_count,
-         error,
-         _candidate_ordinal,
-         _ip_ordinal
-       ),
-       do: final_address_list_error(error)
+  defp connect_tcp_addresses([], _endpoint, %Walk{last_error: error}),
+    do: final_address_list_error(error)
 
   defp connect_tcp_addresses(
          [{family, address} | addresses],
-         port,
-         expected_guid,
-         conn,
-         deadline,
-         impl,
-         remaining_candidate_count,
-         last_error,
-         candidate_ordinal,
-         ip_ordinal
+         {port, expected_guid} = endpoint,
+         %Walk{} = walk
        ) do
-    with {:ok, timeout} <-
-           address_attempt_timeout(
-             deadline,
-             length(addresses) + 1 + remaining_candidate_count,
-             impl.clock,
-             last_error
-           ) do
+    attempt_count = length(addresses) + 1 + walk.remaining_candidate_count
+
+    with {:ok, timeout} <- attempt_timeout(walk, attempt_count) do
       case connect_with_address_diagnostic(
-             impl,
              %{family: family, addr: address, port: port},
-             conn
-             |> put_internal(:setup_timeout, timeout)
-             |> put_internal(:expected_guid, expected_guid),
-             candidate_ordinal,
-             ip_ordinal,
+             put_attempt(walk, timeout, expected_guid),
              :tcp,
              timeout
            ) do
@@ -416,15 +245,8 @@ defmodule Rebus.AddressList do
           if retryable_bus_address_error?(reason) do
             connect_tcp_addresses(
               addresses,
-              port,
-              expected_guid,
-              conn,
-              deadline,
-              impl,
-              remaining_candidate_count,
-              reason,
-              candidate_ordinal,
-              ip_ordinal + 1
+              endpoint,
+              walk |> put_last_error(reason) |> next_ip()
             )
           else
             error
@@ -433,10 +255,22 @@ defmodule Rebus.AddressList do
     end
   end
 
+  defp next_candidate(%Walk{} = walk),
+    do: %{walk | candidate_ordinal: walk.candidate_ordinal + 1, ip_ordinal: 0}
+
+  defp first_ip(%Walk{} = walk), do: %{walk | ip_ordinal: 1}
+
+  defp next_ip(%Walk{} = walk), do: %{walk | ip_ordinal: walk.ip_ordinal + 1}
+
+  defp put_last_error(%Walk{} = walk, reason), do: %{walk | last_error: reason}
+
   # The internal arguments a candidate connection is started with never travel
   # in the caller's option list.
-  defp put_internal({conn_opts, internal}, key, value),
-    do: {conn_opts, Map.put(internal, key, value)}
+  defp put_attempt(%Walk{conn: {conn_opts, internal}} = walk, timeout, expected_guid) do
+    internal = Map.merge(internal, %{setup_timeout: timeout, expected_guid: expected_guid})
+
+    %{walk | conn: {conn_opts, internal}}
+  end
 
   defp connectable_candidate_count(candidates) do
     Enum.count(candidates, &connectable_candidate?/1)
@@ -446,18 +280,10 @@ defmodule Rebus.AddressList do
   defp connectable_candidate?({:tcp, _host, _port, _family, _expected_guid}), do: true
   defp connectable_candidate?(_candidate), do: false
 
-  defp connect_with_address_diagnostic(
-         impl,
-         address,
-         conn,
-         candidate_ordinal,
-         ip_ordinal,
-         transport,
-         timeout
-       ) do
-    case impl.connector.connect(address, conn) do
+  defp connect_with_address_diagnostic(address, %Walk{} = walk, transport, timeout) do
+    case walk.impl.connector.connect(address, walk.conn) do
       {:error, reason} = error ->
-        log_address_attempt(candidate_ordinal, ip_ordinal, transport, timeout, reason)
+        log_address_attempt(walk, transport, timeout, reason)
         error
 
       result ->
@@ -465,14 +291,17 @@ defmodule Rebus.AddressList do
     end
   end
 
-  defp log_address_attempt(candidate_ordinal, ip_ordinal, transport, timeout, reason) do
+  defp log_address_attempt(%Walk{} = walk, transport, timeout, reason) do
     safe_reason = safe_address_failure_reason(reason)
 
     Logger.debug(fn ->
-      "D-Bus address attempt candidate=#{candidate_ordinal} ip=#{ip_ordinal} " <>
+      "D-Bus address attempt candidate=#{walk.candidate_ordinal} ip=#{walk.ip_ordinal} " <>
         "transport=#{transport} slice_ms=#{timeout} reason=#{safe_reason}"
     end)
   end
+
+  defp attempt_timeout(%Walk{} = walk, attempt_count),
+    do: address_attempt_timeout(walk.deadline, attempt_count, walk.impl.clock, walk.last_error)
 
   defp address_attempt_timeout(deadline, attempt_count, clock, last_error) do
     case remaining_address_list_timeout(deadline, clock) do
@@ -484,6 +313,11 @@ defmodule Rebus.AddressList do
     end
   end
 
+  # Each outstanding attempt gets an equal share of what is left of the shared
+  # deadline, raised to a floor so a late attempt is not given a useless slice.
+  # The floor is the full 50 ms only when the remaining budget can afford it for
+  # every outstanding attempt; otherwise it drops to 1 ms. A slice never exceeds
+  # the remaining time.
   defp fair_address_attempt_timeout(remaining, attempt_count) do
     attempt_count = max(attempt_count, 1)
     fair_share = max(1, div(remaining, attempt_count))
