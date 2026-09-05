@@ -1766,7 +1766,7 @@ defmodule Rebus.MatchRuleTest do
     assert_receive {^connect_ref, :accepted}
     assert_receive {^server, %Message{header_fields: %{member: "Hello"}}}
 
-    {:ok, worker} = Rebus.MatchSubscription.Worker.start_link(connection)
+    {:ok, worker} = Worker.start_link(connection)
     {connection, worker}
   end
 

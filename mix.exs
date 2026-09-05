@@ -1,16 +1,19 @@
 defmodule Rebus.MixProject do
   use Mix.Project
 
+  @version "0.2.0"
   @source_url "https://github.com/ausimian/rebus"
 
   def project do
     [
       app: :rebus,
-      version: "0.2.0",
-      elixir: "~> 1.17",
+      version: System.get_env("VERSION_OVERRIDE", @version),
+      elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
+      aliases: aliases(),
       deps: deps(),
       description: description(),
+      docs: docs(),
       package: package(),
       source_url: @source_url,
       elixirc_paths: elixirc_paths(Mix.env()),
@@ -21,6 +24,12 @@ defmodule Rebus.MixProject do
           {:no_warn,
            "_build/plts/dialyzer-#{System.otp_release()}-#{System.version()}-#{Mix.env()}.plt"}
       ]
+    ]
+  end
+
+  def cli do
+    [
+      preferred_envs: [precommit: :test]
     ]
   end
 
@@ -39,14 +48,57 @@ defmodule Rebus.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:ex_doc, "~> 0.31", only: :dev, runtime: false},
+      {:ex_doc, ">= 0.0.0", only: :dev, runtime: false},
+      {:publisho, "~> 1.0", only: :dev, runtime: false},
       {:typedstruct, "~> 0.5.0", runtime: false}
+    ]
+  end
+
+  defp aliases do
+    [
+      precommit: [
+        "compile --warnings-as-errors",
+        "deps.unlock --unused",
+        "format",
+        "credo --strict",
+        "test"
+      ]
     ]
   end
 
   defp description do
     "An Elixir implementation of the D-Bus message protocol."
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      source_ref: @version,
+      source_url: @source_url,
+      extras: ["README.md", "CHANGELOG.md", "LICENSE.md"],
+      # Rebus.SignalHandler is an internal module named in the README's
+      # architecture overview; it has no page to link to.
+      skip_code_autolink_to: ["Rebus.SignalHandler"],
+      groups_for_modules: [
+        Core: [
+          Rebus,
+          Rebus.Message,
+          Rebus.MatchRule,
+          Rebus.UnixFD
+        ],
+        "Wire format": [
+          Rebus.Encoder,
+          Rebus.Decoder,
+          Rebus.Signature,
+          Rebus.BusAddress
+        ],
+        Errors: [
+          Rebus.ResourceLimitError
+        ]
+      ]
+    ]
   end
 
   defp package do

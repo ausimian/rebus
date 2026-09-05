@@ -137,7 +137,7 @@ defmodule Rebus.DecoderTest do
       # 65000 in little endian
       data = <<232, 253>>
       result = Decoder.decode("q", data)
-      assert result == [65000]
+      assert result == [65_000]
     end
 
     test "decodes int64" do
@@ -665,18 +665,18 @@ defmodule Rebus.DecoderTest do
       assert result_byte == [255]
 
       # Test maximum uint16 value
-      encoded_uint16 = Encoder.encode("q", [65535])
+      encoded_uint16 = Encoder.encode("q", [65_535])
       data_uint16 = IO.iodata_to_binary(encoded_uint16)
       result_uint16 = Decoder.decode("q", data_uint16)
-      assert result_uint16 == [65535]
+      assert result_uint16 == [65_535]
     end
 
     test "decodes negative int values at boundaries" do
       # Test minimum int16
-      encoded_int16 = Encoder.encode("n", [-32768])
+      encoded_int16 = Encoder.encode("n", [-32_768])
       data_int16 = IO.iodata_to_binary(encoded_int16)
       result_int16 = Decoder.decode("n", data_int16)
-      assert result_int16 == [-32768]
+      assert result_int16 == [-32_768]
 
       # Test minimum int32
       encoded_int32 = Encoder.encode("i", [-2_147_483_648])

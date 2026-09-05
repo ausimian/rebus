@@ -85,8 +85,8 @@ defmodule Rebus.Message do
 
   use TypedStruct
 
-  alias Rebus.Encoder
   alias Rebus.Decoder
+  alias Rebus.Encoder
   alias Rebus.ResourceLimitError
   alias Rebus.Signature
   alias Rebus.WireValue
@@ -809,9 +809,7 @@ defmodule Rebus.Message do
 
   defp generate_signature(body) do
     # This is a simple signature generation - in practice you'd want more sophisticated logic
-    body
-    |> Enum.map(&infer_type/1)
-    |> Enum.join("")
+    Enum.map_join(body, "", &infer_type/1)
   end
 
   defp infer_type(value)
@@ -1052,7 +1050,7 @@ defmodule Rebus.Message do
   defp valid_interface_name?(name) when is_binary(name) do
     if WireValue.valid_string?(name) do
       parts = String.split(name, ".")
-      length(parts) >= 1 and Enum.all?(parts, &valid_name_element/1)
+      parts != [] and Enum.all?(parts, &valid_name_element/1)
     else
       false
     end
