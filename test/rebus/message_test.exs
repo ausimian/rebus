@@ -1107,6 +1107,21 @@ defmodule Rebus.MessageTest do
   end
 
   describe "decode/1 error handling" do
+    test "rejects a body boolean that is neither 0 nor 1" do
+      fields = [
+        [1, {"o", "/test"}],
+        [2, {"s", "test.interface"}],
+        [3, {"s", "Test"}],
+        [8, {"g", "b"}]
+      ]
+
+      assert {:ok, message} = Message.decode(wire_message(fields, <<1::little-32>>))
+      assert message.body == [true]
+
+      assert {:error, :invalid_message} =
+               Message.decode(wire_message(fields, <<2::little-32>>))
+    end
+
     test "rejects invalid endianness flag" do
       # Create a message with invalid endianness (not 'l' or 'B')
       invalid_data = <<99, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0>>

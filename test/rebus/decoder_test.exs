@@ -219,6 +219,34 @@ defmodule Rebus.DecoderTest do
     end
   end
 
+  describe "strict wire validation" do
+    test "decodes the only two booleans the specification allows" do
+      assert [false] = Decoder.decode("b", <<0::little-32>>)
+      assert [true] = Decoder.decode("b", <<1::little-32>>)
+      assert [false] = Decoder.decode("b", <<0::big-32>>, :big)
+      assert [true] = Decoder.decode("b", <<1::big-32>>, :big)
+    end
+
+    test "rejects a boolean that is neither 0 nor 1" do
+      assert_raise ArgumentError, "D-Bus boolean must be 0 or 1", fn ->
+        Decoder.decode("b", <<2::little-32>>)
+      end
+
+      assert_raise ArgumentError, "D-Bus boolean must be 0 or 1", fn ->
+        Decoder.decode("b", <<0xFFFFFFFF::little-32>>)
+      end
+    end
+
+    test "rejects an out-of-range boolean inside an array" do
+      assert [[true, false]] =
+               Decoder.decode("ab", <<8::little-32, 1::little-32, 0::little-32>>)
+
+      assert_raise ArgumentError, "D-Bus boolean must be 0 or 1", fn ->
+        Decoder.decode("ab", <<8::little-32, 1::little-32, 2::little-32>>)
+      end
+    end
+  end
+
   describe "endianness" do
     test "decodes with big endian" do
       data = <<0x12, 0x34, 0x56, 0x78>>

@@ -171,8 +171,13 @@ defmodule Rebus.Decoder do
   end
 
   defp decode_single({:boolean, _}, state) do
-    {value, new_state} = decode_uint32(state)
-    {value != 0, new_state}
+    # The specification only permits 0 and 1 on the wire; anything else is a
+    # malformed message, as libdbus also treats it.
+    case decode_uint32(state) do
+      {0, new_state} -> {false, new_state}
+      {1, new_state} -> {true, new_state}
+      {_other, _new_state} -> raise ArgumentError, "D-Bus boolean must be 0 or 1"
+    end
   end
 
   defp decode_single({:int16, _}, state) do
