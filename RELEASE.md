@@ -141,6 +141,9 @@
 
 ### Fixed
 
+- Validate D-Bus interface, member, error and bus names consistently against
+  the specification; single-element interface or unique names such as `Foo` or
+  `:1` are now rejected everywhere.
 - Filter directed signals for a well-known match `sender` by exact sender
   header, preventing a peer's unique name from satisfying that predicate while
   preserving legitimate bus-driver signals.
