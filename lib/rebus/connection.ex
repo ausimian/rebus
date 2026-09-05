@@ -7,6 +7,7 @@ defmodule Rebus.Connection do
   alias Rebus.Connection.FDClaims
   alias Rebus.Connection.Handshake
   alias Rebus.Connection.Inbound
+  alias Rebus.Connection.Pending
   alias Rebus.Connection.Rights
   alias Rebus.Connection.Setup
   alias Rebus.Connection.SocketError
@@ -180,15 +181,9 @@ defmodule Rebus.Connection do
     # serial counter that numbers them.
     field :writer, Writer.t(), default: Writer.new()
 
-    field :pending,
-          %{
-            non_neg_integer() =>
-              {:gen_statem.from(), reference(), reference(), reference(), integer()}
-          },
-          default: %{}
-
-    field :request_index, %{reference() => non_neg_integer()}, default: %{}
-    field :monitor_index, %{reference() => non_neg_integer()}, default: %{}
+    # The method calls waiting for a reply, and the indexes that find one by
+    # request reference or by the monitor on its caller.
+    field :pending, Pending.t(), default: Pending.new()
     # Replies whose descriptors have been handed to a caller but not yet
     # acknowledged, and the terminal outcomes retained just after.
     field :fd_claims, FDClaims.t(), default: FDClaims.new()
@@ -432,24 +427,10 @@ defmodule Rebus.Connection do
   # that order, and a reference found nowhere is a monitor this connection no
   # longer cares about.
   defp handle_down_for_request(ref, %__MODULE__{} = state) do
-    case Map.pop(state.monitor_index, ref) do
-      {nil, _index} -> down_for_queued_write(ref, state)
-      {serial, monitor_index} -> down_for_pending_reply(serial, monitor_index, state)
+    case Pending.pop_by_monitor(state.pending, ref) do
+      {nil, _pending} -> down_for_queued_write(ref, state)
+      {_entry, pending} -> {:noreply, %{state | pending: pending}}
     end
-  end
-
-  defp down_for_pending_reply(serial, monitor_index, %__MODULE__{} = state) do
-    {entry, pending} = Map.pop(state.pending, serial)
-    {_from, timer_ref, request_ref, _monitor_ref, _deadline} = entry
-    _ = Process.cancel_timer(timer_ref)
-
-    {:noreply,
-     %{
-       state
-       | pending: pending,
-         monitor_index: monitor_index,
-         request_index: Map.delete(state.request_index, request_ref)
-     }}
   end
 
   defp down_for_queued_write(ref, %__MODULE__{} = state) do
@@ -670,36 +651,28 @@ defmodule Rebus.Connection do
 
   @impl true
   def handle_cast({:cancel, request_ref}, %__MODULE__{} = state) do
-    case Map.pop(state.request_index, request_ref) do
-      {nil, _index} ->
-        case FDClaims.fetch_by_request(state.fd_claims, request_ref) do
-          {:ok, claim_ref} ->
-            {:noreply, drop_fd_claim(state, claim_ref, close?: true)}
-
-          :error ->
-            state.writer
-            |> Writer.cancel(request_ref, writer_context(state))
-            |> writer_result(state)
-        end
-
-      {serial, request_index} ->
-        {entry, pending} = Map.pop(state.pending, serial)
-        {_from, timer_ref, _request_ref, monitor_ref, _deadline} = entry
-        _ = Process.cancel_timer(timer_ref)
-        Process.demonitor(monitor_ref, [:flush])
-
-        {:noreply,
-         %{
-           state
-           | pending: pending,
-             request_index: request_index,
-             monitor_index: Map.delete(state.monitor_index, monitor_ref)
-         }}
+    case Pending.pop_by_request(state.pending, request_ref) do
+      {nil, _pending} -> cancel_claim_or_write(request_ref, state)
+      {_entry, pending} -> {:noreply, %{state | pending: pending}}
     end
   end
 
   def handle_cast({:cancel_signal_handler, handler_ref}, %__MODULE__{} = state) do
     {:noreply, remove_signal_handler(state, handler_ref)}
+  end
+
+  # A request that is not waiting for a reply is either an unacknowledged FD
+  # claim or a frame still queued or being written.
+  defp cancel_claim_or_write(request_ref, %__MODULE__{} = state) do
+    case FDClaims.fetch_by_request(state.fd_claims, request_ref) do
+      {:ok, claim_ref} ->
+        {:noreply, drop_fd_claim(state, claim_ref, close?: true)}
+
+      :error ->
+        state.writer
+        |> Writer.cancel(request_ref, writer_context(state))
+        |> writer_result(state)
+    end
   end
 
   defp safe_setup_call(conn, message, cancellation \\ nil, timeout \\ @default_read_timeout) do
@@ -867,7 +840,7 @@ defmodule Rebus.Connection do
       transport: state.impl.transport,
       hooks: state.impl.hooks,
       write_timeout: state.write_timeout,
-      pending: state.pending,
+      pending: Pending.entries(state.pending),
       validate: &validate_outbound_fd_transport(&1, state)
     }
   end
@@ -897,34 +870,15 @@ defmodule Rebus.Connection do
   defp writer_result({:stop, reason, writer}, %__MODULE__{} = state),
     do: stop_for_transport_error(reason, %{state | writer: writer})
 
-  defp register_pending(%__MODULE__{} = state, entry) do
-    %{
-      state
-      | pending:
-          Map.put(
-            state.pending,
-            entry.serial,
-            {entry.from, entry.timer_ref, entry.request_ref, entry.monitor_ref, entry.deadline}
-          ),
-        request_index: Map.put(state.request_index, entry.request_ref, entry.serial),
-        monitor_index: Map.put(state.monitor_index, entry.monitor_ref, entry.serial)
-    }
-  end
+  defp register_pending(%__MODULE__{} = state, entry),
+    do: %{state | pending: Pending.put(state.pending, entry)}
 
   defp fail_pending(%__MODULE__{} = state) do
     writer = Writer.abandon_all(state.writer)
 
-    Enum.each(state.pending, fn {_serial, {from, timer_ref, _request_ref, monitor_ref, _deadline}} ->
-      _ = Process.cancel_timer(timer_ref)
-      Process.demonitor(monitor_ref, [:flush])
-      GenServer.reply(from, {:error, :disconnected})
-    end)
-
     %{
       state
-      | pending: %{},
-        request_index: %{},
-        monitor_index: %{},
+      | pending: Pending.fail_all(state.pending),
         fd_claims: FDClaims.fail_all(state.fd_claims),
         writer: writer
     }
