@@ -4215,7 +4215,7 @@ defmodule RebusTest do
   defp connect_peer(svr, opts \\ []) do
     :ok = TestServer.set_auto_hello(svr, false)
     {:ok, addr} = TestServer.get_listen_addr(svr)
-    {:ok, cli} = Rebus.connect(addr, Keyword.put(opts, :bus, false))
+    {:ok, cli} = Rebus.connect(addr, opts |> Keyword.put(:bus, false) |> cached_identity())
     cli
   end
 
@@ -4228,7 +4228,7 @@ defmodule RebusTest do
 
   defp client_setup(%{svr: svr}) do
     {:ok, addr} = TestServer.get_listen_addr(svr)
-    {:ok, cli} = Rebus.connect(addr)
+    {:ok, cli} = Rebus.connect(addr, cached_identity([]))
 
     await_hello(svr)
 
@@ -4297,7 +4297,7 @@ defmodule RebusTest do
       TestServer.set_auto_hello(svr, true, Keyword.get(fixture_opts, :send_name_acquired?, true))
 
     {:ok, addr} = TestServer.get_listen_addr(svr)
-    {:ok, cli} = Rebus.connect(addr, connect_opts)
+    {:ok, cli} = Rebus.connect(addr, cached_identity(connect_opts))
     assert await_hello(svr).serial == 1
     cli
   end
@@ -4335,12 +4335,36 @@ defmodule RebusTest do
   defp connection_args(addr, opts) do
     {internal, opts} = Keyword.split(opts, @internal_connection_options)
 
+    impl =
+      internal
+      |> Keyword.get(:impl, %{})
+      |> cached_identity_overrides()
+      |> Rebus.Impl.build()
+
     internal =
       internal
-      |> Keyword.replace_lazy(:impl, &Rebus.Impl.build/1)
+      |> Keyword.put(:impl, impl)
       |> Keyword.put(:addr, addr)
 
     {opts, Map.new(internal)}
+  end
+
+  # `Rebus.Identity.Posix` spawns `id -u` through a port on every connection.
+  # Fixtures serve connections that never drive that lookup, so they replay a
+  # cached result instead; a test that names its own identity keeps it.
+  defp cached_identity(opts) do
+    Keyword.update(
+      opts,
+      :__impl__,
+      %{identity: TestImpl.CachedIdentity},
+      &cached_identity_overrides/1
+    )
+  end
+
+  defp cached_identity_overrides(overrides) do
+    overrides
+    |> Map.new()
+    |> Map.put_new(:identity, TestImpl.CachedIdentity)
   end
 
   # The address-list walk selects its resolver, connector, identity and clock

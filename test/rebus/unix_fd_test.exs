@@ -24,7 +24,14 @@ defmodule Rebus.UnixFDTest do
       })
 
     {:ok, address} = TestServer.get_listen_addr(server)
-    {:ok, connection} = Rebus.connect(address, name: @connection_name)
+
+    # No test in this module drives the identity lookup, so the connection
+    # replays a cached `id -u` instead of spawning a port of its own.
+    {:ok, connection} =
+      Rebus.connect(address,
+        name: @connection_name,
+        __impl__: %{identity: TestImpl.CachedIdentity}
+      )
 
     on_exit(fn ->
       if Process.alive?(connection), do: Rebus.close(connection)
@@ -1028,7 +1035,10 @@ defmodule Rebus.UnixFDTest do
       })
 
     {:ok, address} = TestServer.get_listen_addr(server)
-    {:ok, connection} = Rebus.connect(address)
+
+    {:ok, connection} =
+      Rebus.connect(address, __impl__: %{identity: TestImpl.CachedIdentity})
+
     on_exit(fn -> if Process.alive?(connection), do: Rebus.close(connection) end)
 
     message =
@@ -1109,7 +1119,10 @@ defmodule Rebus.UnixFDTest do
   test "rejects FD writes on TCP before writing an ambiguous frame" do
     {:ok, server} = start_supervised({TestServer, tap: self()}, id: :unix_fd_tcp_server)
     {:ok, address} = TestServer.get_listen_addr(server)
-    {:ok, connection} = Rebus.connect(address)
+
+    {:ok, connection} =
+      Rebus.connect(address, __impl__: %{identity: TestImpl.CachedIdentity})
+
     on_exit(fn -> if Process.alive?(connection), do: Rebus.close(connection) end)
 
     message =
@@ -1574,35 +1587,47 @@ defmodule Rebus.UnixFDTest do
              )
   end
 
+  # The set of descriptors this OS process holds open. Both `/proc/self/fd` and
+  # `/dev/fd` answer for the reading process only, which is what the leak
+  # assertions compare. `lsof` answers the same question but costs about 700ms
+  # per call once the whole suite has run in this VM, against about 30µs for a
+  # directory listing, so it is only a last resort on a Unix without `/dev/fd`.
   defp fd_set! do
     case :os.type() do
-      {:unix, :linux} ->
-        "/proc/self/fd"
-        |> File.ls!()
-        |> MapSet.new()
-
-      {:unix, _} ->
-        lsof = System.find_executable("lsof") || flunk("lsof is required for Unix FD leak tests")
-
-        lsof
-        |> System.cmd(["-Fn", "-p", to_string(:os.getpid())])
-        |> elem(0)
-        |> String.split("\n", trim: true)
-        |> Enum.flat_map(fn
-          <<"f", descriptor::binary>> ->
-            case Integer.parse(descriptor) do
-              {fd, ""} -> [Integer.to_string(fd)]
-              _ -> []
-            end
-
-          _ ->
-            []
-        end)
-        |> MapSet.new()
-
-      _ ->
-        flunk("Unix FD leak test ran on an unsupported platform")
+      {:unix, :linux} -> listed_fd_set!("/proc/self/fd")
+      {:unix, _bsd} -> bsd_fd_set!()
+      _other -> flunk("Unix FD leak test ran on an unsupported platform")
     end
+  end
+
+  defp bsd_fd_set! do
+    if File.dir?("/dev/fd"), do: listed_fd_set!("/dev/fd"), else: lsof_fd_set!()
+  end
+
+  defp listed_fd_set!(directory) do
+    directory
+    |> File.ls!()
+    |> MapSet.new()
+  end
+
+  defp lsof_fd_set! do
+    lsof = System.find_executable("lsof") || flunk("lsof is required for Unix FD leak tests")
+
+    lsof
+    |> System.cmd(["-Fn", "-p", to_string(:os.getpid())])
+    |> elem(0)
+    |> String.split("\n", trim: true)
+    |> Enum.flat_map(fn
+      <<"f", descriptor::binary>> ->
+        case Integer.parse(descriptor) do
+          {fd, ""} -> [Integer.to_string(fd)]
+          _not_a_descriptor -> []
+        end
+
+      _other_field ->
+        []
+    end)
+    |> MapSet.new()
   end
 
   defp local_socket_pair! do
