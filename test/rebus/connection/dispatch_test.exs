@@ -7,6 +7,7 @@ defmodule Rebus.Connection.DispatchTest do
   alias Rebus.Connection.Dispatch
   alias Rebus.Connection.FDClaims
   alias Rebus.Connection.Inbound
+  alias Rebus.Connection.Pending
   alias Rebus.Connection.Rights
   alias Rebus.Connection.Writer
   alias Rebus.MatchRule
@@ -26,9 +27,9 @@ defmodule Rebus.Connection.DispatchTest do
       reply = Message.new!(:method_return, reply_serial: 11, signature: "s", body: ["ok"])
 
       assert {:continue, :recv, %Connection{} = state} = dispatch(reply, state)
-      assert state.pending == %{}
-      refute Map.has_key?(state.request_index, request_ref)
-      refute Map.has_key?(state.monitor_index, monitor_ref)
+      assert state.pending == Pending.new()
+      refute Map.has_key?(state.pending.request_index, request_ref)
+      refute Map.has_key?(state.pending.monitor_index, monitor_ref)
       assert_received {^tag, %Message{type: :method_return, body: ["ok"]}}
     end
 
@@ -37,7 +38,8 @@ defmodule Rebus.Connection.DispatchTest do
 
       log =
         capture_log(fn ->
-          assert {:continue, :recv, %Connection{pending: %{}}} = dispatch(reply, connection())
+          assert {:continue, :recv, %Connection{pending: pending}} = dispatch(reply, connection())
+          assert pending == Pending.new()
         end)
 
       assert log =~ "Ignoring late or orphaned D-Bus reply for serial 9"
@@ -64,7 +66,7 @@ defmodule Rebus.Connection.DispatchTest do
         )
 
       assert {:continue, :recv, %Connection{} = state} = dispatch(reply, state)
-      assert state.pending == %{}
+      assert state.pending == Pending.new()
       assert_received {^tag, {:fd_claim, claim_ref}}
       assert {:ok, ^claim_ref} = FDClaims.fetch_by_request(state.fd_claims, request_ref)
 
@@ -79,11 +81,13 @@ defmodule Rebus.Connection.DispatchTest do
 
       log =
         capture_log(fn ->
-          assert {:continue, :recv, %Connection{pending: %{}}} =
+          assert {:continue, :recv, %Connection{pending: pending}} =
                    Dispatch.process_inbound(
                      %{state | inbound: Inbound.new(resource_limited_reply(11))},
                      :recv
                    )
+
+          assert pending == Pending.new()
         end)
 
       assert log =~ "D-Bus frame dropped: :resource_limit"
@@ -97,10 +101,10 @@ defmodule Rebus.Connection.DispatchTest do
       %{tag: tag, request_ref: request_ref} = entry = caller()
       state = pending(connection(), 11, entry)
 
-      assert {:ok, %Connection{pending: %{}, request_index: index}} =
+      assert {:ok, %Connection{pending: pending}} =
                Dispatch.request_timeout(11, request_ref, state)
 
-      assert index == %{}
+      assert pending == Pending.new()
       assert_received {^tag, {:error, :timeout}}
     end
 
@@ -315,13 +319,14 @@ defmodule Rebus.Connection.DispatchTest do
     %{
       state
       | pending:
-          Map.put(
-            state.pending,
-            serial,
-            {entry.from, entry.timer_ref, entry.request_ref, entry.monitor_ref, entry.deadline}
-          ),
-        request_index: Map.put(state.request_index, entry.request_ref, serial),
-        monitor_index: Map.put(state.monitor_index, entry.monitor_ref, serial)
+          Pending.put(state.pending, %Pending.Entry{
+            serial: serial,
+            from: entry.from,
+            timer_ref: entry.timer_ref,
+            request_ref: entry.request_ref,
+            monitor_ref: entry.monitor_ref,
+            deadline: entry.deadline
+          })
     }
   end
 

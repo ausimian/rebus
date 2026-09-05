@@ -7,18 +7,66 @@ defmodule Rebus.Connection do
   alias Rebus.Connection.FDClaims
   alias Rebus.Connection.Handshake
   alias Rebus.Connection.Inbound
+  alias Rebus.Connection.Pending
   alias Rebus.Connection.Rights
   alias Rebus.Connection.Setup
   alias Rebus.Connection.SocketError
   alias Rebus.Connection.Writer
   alias Rebus.MatchRule
   alias Rebus.Message
+  alias Rebus.SafeCall
   alias Rebus.UnixFD
   alias Rebus.WireValue
   require Logger
 
   @default_write_timeout 5_000
   @default_read_timeout 5_000
+
+  # The settings a connection carries verbatim into its state. Most are read
+  # only while the connection is being set up.
+  @setting_fields [
+    :impl,
+    :write_timeout,
+    :read_timeout,
+    :setup_timeout,
+    :aggregate_setup_timeout?,
+    :expected_guid,
+    :precomputed_auth_id,
+    :allow_anonymous?,
+    :bus?,
+    :connect_waiter
+  ]
+
+  # The peer-supplied reasons a connection reports verbatim. Each list is
+  # spelled once and serves both the type below it and the guard in
+  # `sanitize_protocol_reason/1` that admits it; every other reason becomes
+  # `:protocol_error` or `:invalid_error_name`.
+  @protocol_reasons [
+    :insufficient_data,
+    :invalid_endianness,
+    :invalid_message,
+    :invalid_message_type,
+    :invalid_unix_fds,
+    :unix_fd_truncated,
+    :message_too_large,
+    :read_timeout,
+    :resource_limit,
+    :unsupported_protocol_version
+  ]
+
+  @hello_failed_reasons [
+    :missing_unique_name,
+    :missing_error_name,
+    :invalid_error_name,
+    :invalid_unique_name,
+    :resource_limit
+  ]
+
+  @type protocol_reason ::
+          unquote(Enum.reduce(Enum.reverse(@protocol_reasons), &{:|, [], [&1, &2]}))
+
+  @type hello_failed_reason ::
+          unquote(Enum.reduce(Enum.reverse(@hello_failed_reasons), &{:|, [], [&1, &2]}))
 
   @spec call(pid(), Message.t(), non_neg_integer()) ::
           {:ok, Message.t()} | {:error, Rebus.call_error()}
@@ -35,16 +83,10 @@ defmodule Rebus.Connection do
   end
 
   defp call_for_reply(pid, msg, deadline, request_ref, timeout) do
-    pid
-    |> GenServer.call({:call, msg, deadline, request_ref}, timeout)
-    |> FDClaims.Client.receive_claim(pid, deadline)
-  catch
-    :exit, {:timeout, _call} ->
-      GenServer.cast(pid, {:cancel, request_ref})
-      {:error, :timeout}
-
-    :exit, _reason ->
-      {:error, :disconnected}
+    SafeCall.call(pid, {:call, msg, deadline, request_ref}, timeout,
+      cancel: {:cancel, request_ref},
+      then: &FDClaims.Client.receive_claim(&1, pid, deadline)
+    )
   end
 
   # The dispatch timeout bounds how long the caller waits for this connection
@@ -64,14 +106,9 @@ defmodule Rebus.Connection do
   end
 
   defp call_for_dispatch(pid, msg, deadline, request_ref, dispatch_timeout) do
-    GenServer.call(pid, {:send, msg, deadline, request_ref}, dispatch_timeout)
-  catch
-    :exit, {:timeout, _call} ->
-      GenServer.cast(pid, {:cancel, request_ref})
-      {:error, :timeout}
-
-    :exit, _reason ->
-      {:error, :disconnected}
+    SafeCall.call(pid, {:send, msg, deadline, request_ref}, dispatch_timeout,
+      cancel: {:cancel, request_ref}
+    )
   end
 
   # Whether this connection completed the message-bus handshake. A connection
@@ -180,15 +217,9 @@ defmodule Rebus.Connection do
     # serial counter that numbers them.
     field :writer, Writer.t(), default: Writer.new()
 
-    field :pending,
-          %{
-            non_neg_integer() =>
-              {:gen_statem.from(), reference(), reference(), reference(), integer()}
-          },
-          default: %{}
-
-    field :request_index, %{reference() => non_neg_integer()}, default: %{}
-    field :monitor_index, %{reference() => non_neg_integer()}, default: %{}
+    # The method calls waiting for a reply, and the indexes that find one by
+    # request reference or by the monitor on its caller.
+    field :pending, Pending.t(), default: Pending.new()
     # Replies whose descriptors have been handed to a caller but not yet
     # acknowledged, and the terminal outcomes retained just after.
     field :fd_claims, FDClaims.t(), default: FDClaims.new()
@@ -282,22 +313,21 @@ defmodule Rebus.Connection do
       {:ok, sock} ->
         _ = configure_receive_buffer(impl.transport, sock)
 
-        {:ok,
-         %__MODULE__{
-           sock: sock,
-           impl: impl,
-           write_timeout: settings.write_timeout,
-           read_timeout: settings.read_timeout,
-           setup_timeout: settings.setup_timeout,
-           aggregate_setup_timeout?: settings.aggregate_setup_timeout?,
-           expected_guid: settings.expected_guid,
-           precomputed_auth_id: settings.precomputed_auth_id,
-           allow_anonymous?: settings.allow_anonymous?,
-           bus?: settings.bus?,
-           connect_waiter: settings.connect_waiter,
-           connect_waiter_monitor: Setup.monitor_connect_waiter(settings.connect_waiter),
-           unix_fd_transport?: Setup.unix_fd_transport_supported?(family)
-         }, {:continue, {:setup, addr}}}
+        # Every setting whose name is also a struct field is copied wholesale;
+        # the rest of the settings map is either validated only (`timeout`) or
+        # means something else on the struct (`name` is the registered process
+        # name, not the unique bus name).
+        state =
+          struct!(
+            %__MODULE__{
+              sock: sock,
+              connect_waiter_monitor: Setup.monitor_connect_waiter(settings.connect_waiter),
+              unix_fd_transport?: Setup.unix_fd_transport_supported?(family)
+            },
+            Map.take(settings, @setting_fields)
+          )
+
+        {:ok, state, {:continue, {:setup, addr}}}
 
       {:error, reason} ->
         {:stop, normalize_socket_error(reason)}
@@ -432,24 +462,10 @@ defmodule Rebus.Connection do
   # that order, and a reference found nowhere is a monitor this connection no
   # longer cares about.
   defp handle_down_for_request(ref, %__MODULE__{} = state) do
-    case Map.pop(state.monitor_index, ref) do
-      {nil, _index} -> down_for_queued_write(ref, state)
-      {serial, monitor_index} -> down_for_pending_reply(serial, monitor_index, state)
+    case Pending.pop_by_monitor(state.pending, ref) do
+      {nil, _pending} -> down_for_queued_write(ref, state)
+      {_entry, pending} -> {:noreply, %{state | pending: pending}}
     end
-  end
-
-  defp down_for_pending_reply(serial, monitor_index, %__MODULE__{} = state) do
-    {entry, pending} = Map.pop(state.pending, serial)
-    {_from, timer_ref, request_ref, _monitor_ref, _deadline} = entry
-    _ = Process.cancel_timer(timer_ref)
-
-    {:noreply,
-     %{
-       state
-       | pending: pending,
-         monitor_index: monitor_index,
-         request_index: Map.delete(state.request_index, request_ref)
-     }}
   end
 
   defp down_for_queued_write(ref, %__MODULE__{} = state) do
@@ -670,31 +686,9 @@ defmodule Rebus.Connection do
 
   @impl true
   def handle_cast({:cancel, request_ref}, %__MODULE__{} = state) do
-    case Map.pop(state.request_index, request_ref) do
-      {nil, _index} ->
-        case FDClaims.fetch_by_request(state.fd_claims, request_ref) do
-          {:ok, claim_ref} ->
-            {:noreply, drop_fd_claim(state, claim_ref, close?: true)}
-
-          :error ->
-            state.writer
-            |> Writer.cancel(request_ref, writer_context(state))
-            |> writer_result(state)
-        end
-
-      {serial, request_index} ->
-        {entry, pending} = Map.pop(state.pending, serial)
-        {_from, timer_ref, _request_ref, monitor_ref, _deadline} = entry
-        _ = Process.cancel_timer(timer_ref)
-        Process.demonitor(monitor_ref, [:flush])
-
-        {:noreply,
-         %{
-           state
-           | pending: pending,
-             request_index: request_index,
-             monitor_index: Map.delete(state.monitor_index, monitor_ref)
-         }}
+    case Pending.pop_by_request(state.pending, request_ref) do
+      {nil, _pending} -> cancel_claim_or_write(request_ref, state)
+      {_entry, pending} -> {:noreply, %{state | pending: pending}}
     end
   end
 
@@ -702,16 +696,22 @@ defmodule Rebus.Connection do
     {:noreply, remove_signal_handler(state, handler_ref)}
   end
 
-  defp safe_setup_call(conn, message, cancellation \\ nil, timeout \\ @default_read_timeout) do
-    GenServer.call(conn, message, timeout)
-  catch
-    :exit, {:timeout, _call} ->
-      if cancellation, do: GenServer.cast(conn, cancellation)
-      {:error, :timeout}
+  # A request that is not waiting for a reply is either an unacknowledged FD
+  # claim or a frame still queued or being written.
+  defp cancel_claim_or_write(request_ref, %__MODULE__{} = state) do
+    case FDClaims.fetch_by_request(state.fd_claims, request_ref) do
+      {:ok, claim_ref} ->
+        {:noreply, drop_fd_claim(state, claim_ref, close?: true)}
 
-    :exit, _reason ->
-      {:error, :disconnected}
+      :error ->
+        state.writer
+        |> Writer.cancel(request_ref, writer_context(state))
+        |> writer_result(state)
+    end
   end
+
+  defp safe_setup_call(conn, message, cancellation \\ nil, timeout \\ @default_read_timeout),
+    do: SafeCall.call(conn, message, timeout, cancel: cancellation)
 
   defp remove_signal_handler(%__MODULE__{} = state, handler_ref) do
     case Map.pop(state.handlers, handler_ref) do
@@ -762,36 +762,14 @@ defmodule Rebus.Connection do
 
   @doc false
   @spec sanitize_protocol_reason(term()) ::
-          :insufficient_data
-          | :invalid_endianness
-          | :invalid_message
-          | :invalid_message_type
-          | :invalid_unix_fds
-          | :unix_fd_truncated
-          | :message_too_large
-          | :read_timeout
-          | :resource_limit
-          | :unsupported_protocol_version
+          protocol_reason()
           | :protocol_error
-          | {:hello_failed,
-             binary()
-             | :invalid_error_name
-             | :invalid_unique_name
-             | :missing_error_name
-             | :missing_unique_name
-             | :resource_limit}
+          | {:hello_failed, binary() | hello_failed_reason()}
           | {:malformed_reply, :missing_reply_serial}
           | {:unexpected_handshake_message, Message.message_type()}
   def sanitize_protocol_reason(reason) do
     case reason do
-      {:hello_failed, reason}
-      when reason in [
-             :missing_unique_name,
-             :missing_error_name,
-             :invalid_error_name,
-             :invalid_unique_name,
-             :resource_limit
-           ] ->
+      {:hello_failed, reason} when reason in @hello_failed_reasons ->
         {:hello_failed, reason}
 
       {:hello_failed, error_name} when is_binary(error_name) ->
@@ -808,19 +786,7 @@ defmodule Rebus.Connection do
       {:malformed_reply, :missing_reply_serial} ->
         {:malformed_reply, :missing_reply_serial}
 
-      reason
-      when reason in [
-             :insufficient_data,
-             :invalid_endianness,
-             :invalid_message,
-             :invalid_message_type,
-             :invalid_unix_fds,
-             :unix_fd_truncated,
-             :message_too_large,
-             :read_timeout,
-             :resource_limit,
-             :unsupported_protocol_version
-           ] ->
+      reason when reason in @protocol_reasons ->
         reason
 
       _reason ->
@@ -853,7 +819,10 @@ defmodule Rebus.Connection do
   defp validate_outbound_fd_transport(%Message{}, %__MODULE__{}), do: :ok
 
   # Everything a claim operation borrows from the connection for one call.
-  defp fd_claims_context(%__MODULE__{impl: %{hooks: hooks}}), do: %{hooks: hooks}
+  # `Rebus.Connection.Dispatch` opens claims of its own and asks for it here.
+  @doc false
+  @spec fd_claims_context(t()) :: FDClaims.context()
+  def fd_claims_context(%__MODULE__{impl: %{hooks: hooks}}), do: %{hooks: hooks}
 
   defp drop_fd_claim(%__MODULE__{} = state, claim_ref, opts),
     do: %{state | fd_claims: FDClaims.drop(state.fd_claims, claim_ref, opts)}
@@ -867,7 +836,7 @@ defmodule Rebus.Connection do
       transport: state.impl.transport,
       hooks: state.impl.hooks,
       write_timeout: state.write_timeout,
-      pending: state.pending,
+      pending: Pending.entries(state.pending),
       validate: &validate_outbound_fd_transport(&1, state)
     }
   end
@@ -897,34 +866,15 @@ defmodule Rebus.Connection do
   defp writer_result({:stop, reason, writer}, %__MODULE__{} = state),
     do: stop_for_transport_error(reason, %{state | writer: writer})
 
-  defp register_pending(%__MODULE__{} = state, entry) do
-    %{
-      state
-      | pending:
-          Map.put(
-            state.pending,
-            entry.serial,
-            {entry.from, entry.timer_ref, entry.request_ref, entry.monitor_ref, entry.deadline}
-          ),
-        request_index: Map.put(state.request_index, entry.request_ref, entry.serial),
-        monitor_index: Map.put(state.monitor_index, entry.monitor_ref, entry.serial)
-    }
-  end
+  defp register_pending(%__MODULE__{} = state, entry),
+    do: %{state | pending: Pending.put(state.pending, entry)}
 
   defp fail_pending(%__MODULE__{} = state) do
     writer = Writer.abandon_all(state.writer)
 
-    Enum.each(state.pending, fn {_serial, {from, timer_ref, _request_ref, monitor_ref, _deadline}} ->
-      _ = Process.cancel_timer(timer_ref)
-      Process.demonitor(monitor_ref, [:flush])
-      GenServer.reply(from, {:error, :disconnected})
-    end)
-
     %{
       state
-      | pending: %{},
-        request_index: %{},
-        monitor_index: %{},
+      | pending: Pending.fail_all(state.pending),
         fd_claims: FDClaims.fail_all(state.fd_claims),
         writer: writer
     }

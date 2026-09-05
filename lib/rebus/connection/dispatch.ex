@@ -9,14 +9,15 @@ defmodule Rebus.Connection.Dispatch do
   # service-side API.
   #
   # It works on the connection struct directly — reply correlation writes the
-  # pending table and its two indexes — but it is not a `GenServer`. Every
-  # entry point answers with a `t:result/0`, and the connection maps that to a
-  # callback return in a single place, so the framing recursion never has to
-  # know which callback it was entered from.
+  # pending table — but it is not a `GenServer`. Every entry point answers with
+  # a `t:result/0`, and the connection maps that to a callback return in a
+  # single place, so the framing recursion never has to know which callback it
+  # was entered from.
 
   alias Rebus.Connection
   alias Rebus.Connection.FDClaims
   alias Rebus.Connection.Inbound
+  alias Rebus.Connection.Pending
   alias Rebus.Connection.Rights
   alias Rebus.Connection.Setup
   alias Rebus.Connection.Writer
@@ -170,14 +171,13 @@ defmodule Rebus.Connection.Dispatch do
   @doc false
   @spec request_timeout(non_neg_integer(), reference(), Connection.t()) :: result()
   def request_timeout(serial, request_ref, %Connection{} = state) do
-    case Map.fetch(state.pending, serial) do
-      {:ok, {from, _timer_ref, ^request_ref, monitor_ref, _deadline}} ->
-        {_pending_entry, pending} = Map.pop(state.pending, serial)
-        Process.demonitor(monitor_ref, [:flush])
-        GenServer.reply(from, {:error, :timeout})
-        {:ok, remove_indexes(%{state | pending: pending}, request_ref, monitor_ref)}
+    case Pending.fetch_by_serial(state.pending, serial) do
+      {:ok, %Pending.Entry{request_ref: ^request_ref}} ->
+        {entry, pending} = Pending.pop_by_serial(state.pending, serial)
+        Pending.fail(entry, {:error, :timeout})
+        {:ok, %{state | pending: pending}}
 
-      _ ->
+      _stale ->
         {:ok, state}
     end
   end
@@ -581,25 +581,23 @@ defmodule Rebus.Connection.Dispatch do
   end
 
   defp correlate_reply(%Message{} = msg, reply_serial, %Connection{} = state) do
-    case Map.pop(state.pending, reply_serial) do
+    case Pending.pop_by_serial(state.pending, reply_serial) do
       {nil, _pending} ->
         close_message_fds(msg)
         Logger.info("Ignoring late or orphaned D-Bus reply for serial #{reply_serial}")
         state
 
-      {{from, timer_ref, request_ref, monitor_ref, deadline}, pending} ->
-        _ = Process.cancel_timer(timer_ref)
-
-        deliver_reply(
-          msg,
-          %{from: from, request_ref: request_ref, monitor_ref: monitor_ref, deadline: deadline},
-          %{state | pending: pending}
-        )
+      {entry, pending} ->
+        deliver_reply(msg, entry, %{state | pending: pending})
     end
   end
 
-  defp deliver_reply(%Message{unix_fds: []} = msg, entry, %Connection{} = state) do
-    Process.demonitor(entry.monitor_ref, [:flush])
+  defp deliver_reply(
+         %Message{unix_fds: []} = msg,
+         %Pending.Entry{} = entry,
+         %Connection{} = state
+       ) do
+    Pending.release_monitor(entry)
 
     if live_from?(entry.from) do
       GenServer.reply(entry.from, msg)
@@ -607,30 +605,31 @@ defmodule Rebus.Connection.Dispatch do
       close_message_fds(msg)
     end
 
-    remove_indexes(state, entry.request_ref, entry.monitor_ref)
+    state
   end
 
-  defp deliver_reply(%Message{} = msg, entry, %Connection{} = state) do
+  # The claim keeps the monitor this entry took on its caller, so the reply is
+  # handed over without releasing it.
+  defp deliver_reply(%Message{} = msg, %Pending.Entry{} = entry, %Connection{} = state) do
     claims =
       FDClaims.open(
         state.fd_claims,
-        Map.put(entry, :msg, msg),
-        fd_claims_context(state)
+        %{
+          msg: msg,
+          from: entry.from,
+          request_ref: entry.request_ref,
+          monitor_ref: entry.monitor_ref,
+          deadline: entry.deadline
+        },
+        Connection.fd_claims_context(state)
       )
 
-    remove_indexes(
-      %{state | fd_claims: claims},
-      entry.request_ref,
-      entry.monitor_ref
-    )
+    %{state | fd_claims: claims}
   end
 
+  # A pending entry is only ever registered for a call that arrived through
+  # `handle_call/3`, so its `from` is always a `t:GenServer.from/0`.
   defp live_from?({pid, _tag}) when is_pid(pid), do: Process.alive?(pid)
-  defp live_from?(_from), do: false
-
-  # Everything a claim operation borrows from the connection for one call. The
-  # connection builds the same map for the claim calls it serves itself.
-  defp fd_claims_context(%Connection{impl: %{hooks: hooks}}), do: %{hooks: hooks}
 
   defp drop_resource_limited_reply(
          %{type: :method_return, reply_serial: reply_serial},
@@ -651,25 +650,15 @@ defmodule Rebus.Connection.Dispatch do
   defp drop_resource_limited_reply(_envelope, %Connection{} = state), do: {:ok, state}
 
   defp drop_resource_limited_pending(reply_serial, reply_kind, %Connection{} = state) do
-    case Map.pop(state.pending, reply_serial) do
+    case Pending.pop_by_serial(state.pending, reply_serial) do
       {nil, _pending} ->
         Logger.info("Ignoring late or orphaned D-Bus reply for serial #{reply_serial}")
         {:ok, state}
 
-      {{from, timer_ref, request_ref, monitor_ref, _deadline}, pending} ->
-        _ = Process.cancel_timer(timer_ref)
-        Process.demonitor(monitor_ref, [:flush])
-        GenServer.reply(from, {:error, {:reply_dropped, reply_kind}})
-        {:ok, remove_indexes(%{state | pending: pending}, request_ref, monitor_ref)}
+      {entry, pending} ->
+        Pending.fail(entry, {:error, {:reply_dropped, reply_kind}})
+        {:ok, %{state | pending: pending}}
     end
-  end
-
-  defp remove_indexes(state, request_ref, monitor_ref) do
-    %{
-      state
-      | request_index: Map.delete(state.request_index, request_ref),
-        monitor_index: Map.delete(state.monitor_index, monitor_ref)
-    }
   end
 
   defp transport(%Connection{impl: %{transport: transport}}), do: transport

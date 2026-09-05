@@ -168,6 +168,7 @@ defmodule Rebus.MatchSubscription.Worker do
   alias Rebus.MatchRule
   alias Rebus.MatchSubscription
   alias Rebus.Message
+  alias Rebus.SafeCall
   alias Rebus.UnixFD
 
   @cleanup_timeout 1_000
@@ -195,18 +196,11 @@ defmodule Rebus.MatchSubscription.Worker do
   def call(worker, request, deadline, overhead) do
     case remaining_timeout(deadline) do
       {:ok, timeout} when timeout > 0 ->
-        safe_worker_call(worker, request, timeout + overhead)
+        SafeCall.call(worker, request, timeout + overhead)
 
       _expired ->
         {:error, :timeout}
     end
-  end
-
-  defp safe_worker_call(worker, request, timeout) do
-    GenServer.call(worker, request, timeout)
-  catch
-    :exit, {:timeout, _call} -> {:error, :timeout}
-    :exit, _reason -> {:error, :disconnected}
   end
 
   @impl true

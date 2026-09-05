@@ -17,6 +17,7 @@ defmodule Rebus.Connection.Writer do
 
   use TypedStruct
 
+  alias Rebus.Connection.Pending
   alias Rebus.Connection.SocketError
   alias Rebus.Message
 
@@ -80,7 +81,7 @@ defmodule Rebus.Connection.Writer do
           required(:transport) => module(),
           required(:hooks) => module(),
           required(:write_timeout) => pos_integer(),
-          required(:pending) => %{non_neg_integer() => tuple()},
+          required(:pending) => %{non_neg_integer() => Pending.Entry.t()},
           required(:validate) => (Message.t() -> :ok | {:error, term()})
         }
 
@@ -96,17 +97,8 @@ defmodule Rebus.Connection.Writer do
   @type result ::
           {:ok, t()}
           | {:continue, t()}
-          | {:call_written, pending_entry(), t()}
+          | {:call_written, Pending.Entry.t(), t()}
           | {:stop, term(), t()}
-
-  @type pending_entry :: %{
-          serial: pos_integer(),
-          from: GenServer.from(),
-          timer_ref: reference(),
-          request_ref: reference(),
-          monitor_ref: reference() | nil,
-          deadline: integer()
-        }
 
   # `:queue.new/0` is called rather than left to the field default so the queue
   # keeps its opaque type instead of the literal a compile-time default bakes in.
@@ -451,7 +443,7 @@ defmodule Rebus.Connection.Writer do
 
         writer = %{writer | monitor_index: Map.delete(writer.monitor_index, write.monitor_ref)}
 
-        entry = %{
+        entry = %Pending.Entry{
           serial: write.serial,
           from: write.from,
           timer_ref: timer_ref,

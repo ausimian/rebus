@@ -6,6 +6,7 @@ defmodule RebusTest do
   alias Rebus.Connection
   alias Rebus.Connection.Handshake
   alias Rebus.Connection.Inbound
+  alias Rebus.Connection.Pending
   alias Rebus.Message
   alias Rebus.TestImpl
   alias Rebus.TestServer
@@ -97,8 +98,8 @@ defmodule RebusTest do
       call_task = Task.async(fn -> Rebus.call(cli, method, 5_000) end)
       assert_receive {^svr, %Message{header_fields: %{member: "LimitedReply"}} = request}, 1_000
 
-      [{_serial, {_from, timer_ref, _request_ref, _monitor_ref, _deadline}}] =
-        :sys.get_state(cli).pending |> Map.to_list()
+      [{_serial, %Pending.Entry{timer_ref: timer_ref}}] =
+        :sys.get_state(cli).pending |> Pending.entries() |> Map.to_list()
 
       limited_reply = raw_resource_limited_reply(request.serial)
 
@@ -131,8 +132,7 @@ defmodule RebusTest do
       assert wait_until(fn ->
                state = :sys.get_state(cli)
 
-               state.pending == %{} and state.request_index == %{} and state.monitor_index == %{} and
-                 map_size(state.writer.monitor_index) == 0
+               state.pending == Pending.new() and map_size(state.writer.monitor_index) == 0
              end)
 
       assert Process.alive?(cli)
@@ -171,8 +171,8 @@ defmodule RebusTest do
       assert_receive {^svr, %Message{header_fields: %{member: "LimitedErrorReply"}} = request},
                      1_000
 
-      [{_serial, {_from, timer_ref, _request_ref, _monitor_ref, _deadline}}] =
-        :sys.get_state(cli).pending |> Map.to_list()
+      [{_serial, %Pending.Entry{timer_ref: timer_ref}}] =
+        :sys.get_state(cli).pending |> Pending.entries() |> Map.to_list()
 
       error_name = "org.example.ResourceLimited"
       limited_reply = raw_resource_limited_error_reply(request.serial, error_name)
@@ -192,7 +192,7 @@ defmodule RebusTest do
       assert wait_until(fn ->
                state = :sys.get_state(cli)
 
-               state.pending == %{} and state.request_index == %{} and state.monitor_index == %{}
+               state.pending == Pending.new()
              end)
 
       assert Process.alive?(cli)
@@ -3289,15 +3289,13 @@ defmodule RebusTest do
       task = Task.async(fn -> Rebus.call(cli, method, 500) end)
       assert_receive {^svr, %Message{header_fields: %{member: "NeverReplies"}}}, 1_000
 
-      [{serial, {_from, _timer_ref, request_ref, _monitor_ref, _deadline}}] =
-        :sys.get_state(cli).pending |> Map.to_list()
+      [{serial, %Pending.Entry{request_ref: request_ref}}] =
+        :sys.get_state(cli).pending |> Pending.entries() |> Map.to_list()
 
       send(cli, {:request_timeout, serial, request_ref})
 
       assert {:error, :timeout} = Task.await(task)
-      assert :sys.get_state(cli).pending == %{}
-      assert :sys.get_state(cli).request_index == %{}
-      assert :sys.get_state(cli).monitor_index == %{}
+      assert :sys.get_state(cli).pending == Pending.new()
       assert Process.alive?(cli)
     end
 
@@ -3311,7 +3309,7 @@ defmodule RebusTest do
 
       :ok = :sys.resume(cli)
       refute_receive {^svr, %Message{header_fields: %{member: "Queued"}}}, 50
-      assert :sys.get_state(cli).pending == %{}
+      assert :sys.get_state(cli).pending == Pending.new()
     end
 
     test "does not stop a shared connection for a tiny call timeout", %{cli: cli, svr: svr} do
@@ -3354,12 +3352,10 @@ defmodule RebusTest do
       task = Task.async(fn -> Rebus.call(cli, method, 5_000) end)
 
       assert_receive {^svr, %Message{header_fields: %{member: "CallerDies"}}}, 1_000
-      assert map_size(:sys.get_state(cli).pending) == 1
+      assert map_size(Pending.entries(:sys.get_state(cli).pending)) == 1
       _ = Task.shutdown(task, :brutal_kill)
 
-      assert wait_until(fn -> :sys.get_state(cli).pending == %{} end)
-      assert :sys.get_state(cli).request_index == %{}
-      assert :sys.get_state(cli).monitor_index == %{}
+      assert wait_until(fn -> :sys.get_state(cli).pending == Pending.new() end)
       assert Process.alive?(cli)
     end
 
@@ -3756,8 +3752,8 @@ defmodule RebusTest do
       assert wait_until(fn ->
                state = :sys.get_state(cli)
 
-               state.writer.active == nil and state.pending == %{} and state.request_index == %{} and
-                 state.monitor_index == %{} and map_size(state.writer.monitor_index) == 0 and
+               state.writer.active == nil and state.pending == Pending.new() and
+                 map_size(state.writer.monitor_index) == 0 and
                  MapSet.size(state.writer.cancelled_refs) == 0
              end)
 
