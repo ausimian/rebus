@@ -35,13 +35,22 @@ defmodule Rebus.Impl do
   def default, do: @default
 
   if @test_seams? do
+    @doc """
+    Reads the private `:__impl__` option out of a caller's options.
+    """
+    @spec from_options(keyword()) :: t()
+    def from_options(opts), do: build(Keyword.get(opts, :__impl__, []))
+
+    @doc """
+    Merges implementation overrides over the defaults, ignoring unknown keys.
+    """
     @spec build(term()) :: t()
     def build(overrides) when is_list(overrides) or is_map(overrides),
       do: Map.merge(@default, Map.take(Map.new(overrides), Map.keys(@default)))
 
     def build(_overrides), do: @default
   else
-    @spec build(term()) :: t()
-    def build(_overrides), do: @default
+    @spec from_options(keyword()) :: t()
+    def from_options(_opts), do: @default
   end
 end

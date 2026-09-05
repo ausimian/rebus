@@ -422,9 +422,10 @@ defmodule Rebus do
     impl.connector.connect(addr, {opts, %{impl: impl}})
   end
 
-  # Implementation modules are chosen through the private `:__impl__` option,
-  # which `Rebus.Impl.build/1` reads only in this project's own test build.
-  defp build_impl(opts), do: Rebus.Impl.build(Keyword.get(opts, :__impl__, []))
+  # Implementation modules are chosen through the private `:__impl__` option.
+  # Outside this project's own test build `Rebus.Impl.from_options/1` compiles
+  # to a clause that ignores its argument, so nothing reads the option.
+  defp build_impl(opts), do: Rebus.Impl.from_options(opts)
 
   # `:system` and `:session` name message buses, so they cannot be peer-to-peer
   # endpoints. Reject the option before any address lookup or I/O so the error

@@ -50,5 +50,12 @@ defmodule Rebus.SeamsTest do
 
       assert Impl.build(:not_an_override) == Impl.default()
     end
+
+    test "reads the private option out of a caller's options" do
+      assert %{transport: Rebus.TestImpl} =
+               Impl.from_options(timeout: 100, __impl__: %{transport: Rebus.TestImpl})
+
+      assert Impl.from_options(timeout: 100) == Impl.default()
+    end
   end
 end
