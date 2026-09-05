@@ -12,7 +12,6 @@ defmodule Rebus.Connection do
   alias Rebus.MachineId
   alias Rebus.MatchRule
   alias Rebus.Message
-  alias Rebus.SignalHandler
   alias Rebus.UnixFD
   alias Rebus.WireValue
   require Logger
@@ -202,8 +201,14 @@ defmodule Rebus.Connection do
     # Replies whose descriptors have been handed to a caller but not yet
     # acknowledged, and the terminal outcomes retained just after.
     field :fd_claims, FDClaims.t(), default: FDClaims.new()
-    field :signal_handler_monitor_index, %{reference() => reference()}, default: %{}
-    field :signal_handler_ref_index, %{reference() => reference()}, default: %{}
+    # Signal handlers registered against this connection. Delivery and match
+    # filtering happen in the connection process itself, so a signal arriving
+    # here can never reach a handler installed on another connection.
+    field :handlers,
+          %{reference() => %{pid: pid(), monitor_ref: reference(), rule: MatchRule.t() | nil}},
+          default: %{}
+
+    field :handler_monitor_index, %{reference() => reference()}, default: %{}
     # Implementation modules behind the connection's side effects. Production
     # always uses the defaults; tests substitute a module rather than reaching
     # into per-operation state.
@@ -357,27 +362,18 @@ defmodule Rebus.Connection do
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %__MODULE__{} = state) do
-    case Map.pop(state.signal_handler_monitor_index, ref) do
-      {handler_ref, signal_handler_monitor_index} when is_reference(handler_ref) ->
-        :gen_event.delete_handler(SignalHandler, {SignalHandler, handler_ref}, nil)
-
+    case Map.pop(state.handler_monitor_index, ref) do
+      {handler_ref, handler_monitor_index} when is_reference(handler_ref) ->
         {:noreply,
          %{
            state
-           | signal_handler_monitor_index: signal_handler_monitor_index,
-             signal_handler_ref_index: Map.delete(state.signal_handler_ref_index, handler_ref)
+           | handlers: Map.delete(state.handlers, handler_ref),
+             handler_monitor_index: handler_monitor_index
          }}
 
-      {nil, _signal_handler_monitor_index} ->
+      {nil, _handler_monitor_index} ->
         handle_down_for_request(ref, state)
     end
-  end
-
-  def handle_info({:gen_event_EXIT, {SignalHandler, ref}, _reason}, %__MODULE__{} = state) do
-    # Because handlers are added via :gen_event.add_sup_handler/3, we receive
-    # `:gen_event_EXIT` messages when they are removed. We can use this to clean
-    # up the monitor
-    {:noreply, remove_signal_handler_monitor(state, ref)}
   end
 
   def handle_info({:request_timeout, serial, request_ref}, %__MODULE__{} = state) do
@@ -842,25 +838,16 @@ defmodule Rebus.Connection do
   defp add_signal_handler(%__MODULE__{} = state, pid, handler_ref, rule) do
     monitor_ref = Process.monitor(pid)
 
-    handler_state =
-      if is_nil(rule),
-        do: {self(), pid, handler_ref},
-        else: {self(), pid, handler_ref, rule}
-
-    :ok =
-      :gen_event.add_sup_handler(
-        SignalHandler,
-        {SignalHandler, handler_ref},
-        handler_state
-      )
-
     {:reply, {:ok, handler_ref},
      %{
        state
-       | signal_handler_monitor_index:
-           Map.put(state.signal_handler_monitor_index, monitor_ref, handler_ref),
-         signal_handler_ref_index:
-           Map.put(state.signal_handler_ref_index, handler_ref, monitor_ref)
+       | handlers:
+           Map.put(state.handlers, handler_ref, %{
+             pid: pid,
+             monitor_ref: monitor_ref,
+             rule: rule
+           }),
+         handler_monitor_index: Map.put(state.handler_monitor_index, monitor_ref, handler_ref)
      }}
   end
 
@@ -1320,38 +1307,18 @@ defmodule Rebus.Connection do
     do: %{state | connect_waiter: nil, connect_accepted?: false}
 
   defp remove_signal_handler(%__MODULE__{} = state, handler_ref) do
-    case pop_signal_handler_monitor(state, handler_ref) do
-      {:ok, state} ->
-        :gen_event.delete_handler(SignalHandler, {SignalHandler, handler_ref}, nil)
-        state
-
-      :error ->
-        state
-    end
-  end
-
-  defp remove_signal_handler_monitor(%__MODULE__{} = state, handler_ref) do
-    case pop_signal_handler_monitor(state, handler_ref) do
-      {:ok, state} -> state
-      :error -> state
-    end
-  end
-
-  defp pop_signal_handler_monitor(%__MODULE__{} = state, handler_ref) do
-    case Map.pop(state.signal_handler_ref_index, handler_ref) do
-      {monitor_ref, signal_handler_ref_index} when is_reference(monitor_ref) ->
+    case Map.pop(state.handlers, handler_ref) do
+      {%{monitor_ref: monitor_ref}, handlers} ->
         Process.demonitor(monitor_ref, [:flush])
 
-        {:ok,
-         %{
-           state
-           | signal_handler_monitor_index:
-               Map.delete(state.signal_handler_monitor_index, monitor_ref),
-             signal_handler_ref_index: signal_handler_ref_index
-         }}
+        %{
+          state
+          | handlers: handlers,
+            handler_monitor_index: Map.delete(state.handler_monitor_index, monitor_ref)
+        }
 
-      {nil, _signal_handler_ref_index} ->
-        :error
+      {nil, _handlers} ->
+        state
     end
   end
 
@@ -1661,7 +1628,7 @@ defmodule Rebus.Connection do
   # NameAcquired signal. Match the absent name explicitly rather than letting
   # `nil` participate in the header comparison below.
   defp notify(%Message{} = msg, %__MODULE__{name: nil} = state) do
-    Rebus.SignalHandler.notify(msg)
+    dispatch_signal(msg, state)
     state
   end
 
@@ -1672,10 +1639,21 @@ defmodule Rebus.Connection do
         :ok
 
       _ ->
-        Rebus.SignalHandler.notify(msg)
+        dispatch_signal(msg, state)
     end
 
     state
+  end
+
+  # Handlers live in this connection's state, so the match rule of a
+  # subscription is evaluated here, in the connection process, and only for
+  # the signals this connection received.
+  defp dispatch_signal(%Message{} = msg, %__MODULE__{handlers: handlers}) do
+    Enum.each(handlers, fn {handler_ref, %{pid: pid, rule: rule}} ->
+      if is_nil(rule) or MatchRule.matches?(rule, msg) do
+        send(pid, {handler_ref, msg})
+      end
+    end)
   end
 
   defp reply(%Message{} = msg, %__MODULE__{} = state) do

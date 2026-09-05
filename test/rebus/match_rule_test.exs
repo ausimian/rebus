@@ -569,7 +569,7 @@ defmodule Rebus.MatchRuleTest do
       :ok = :sys.resume(connection)
 
       assert wait_until(fn ->
-               not Map.has_key?(:sys.get_state(connection).signal_handler_ref_index, ref)
+               not Map.has_key?(:sys.get_state(connection).handlers, ref)
              end)
 
       :ok = TestServer.push(server, test_signal("changed"))
@@ -776,7 +776,7 @@ defmodule Rebus.MatchRuleTest do
       :ok = TestServer.push(server, method_return(cleanup.serial))
 
       assert wait_until(fn ->
-               :sys.get_state(connection).signal_handler_ref_index == %{}
+               :sys.get_state(connection).handlers == %{}
              end)
 
       assert wait_until(fn -> rule_status(connection, rule) == nil end)

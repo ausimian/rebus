@@ -172,6 +172,9 @@
 
 ### Fixed
 
+- Deliver signals from the connection that received them, so a crash of Rebus's
+  internal signal or match-subscription processes no longer stops established
+  connections.
 - Validate D-Bus interface, member, error and bus names consistently against
   the specification; single-element interface or unique names such as `Foo` or
   `:1` are now rejected everywhere.

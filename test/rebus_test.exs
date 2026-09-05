@@ -7,7 +7,6 @@ defmodule RebusTest do
   alias Rebus.Connection.Handshake
   alias Rebus.Connection.Inbound
   alias Rebus.Message
-  alias Rebus.SignalHandler
   alias Rebus.TestImpl
   alias Rebus.TestServer
 
@@ -52,10 +51,7 @@ defmodule RebusTest do
 
     test "drops resource-limited frames and continues coalesced signals", %{svr: svr} do
       cli = connect_until_ready(svr)
-      ref = make_ref()
-
-      :ok = :gen_event.add_sup_handler(SignalHandler, {SignalHandler, ref}, {cli, self(), ref})
-      on_exit(fn -> :gen_event.delete_handler(SignalHandler, {SignalHandler, ref}, nil) end)
+      {:ok, ref} = Rebus.add_signal_handler(cli)
 
       payload_sentinel = "resource-limit-body-sentinel"
       limited_data = raw_resource_limited_signal()
@@ -89,18 +85,7 @@ defmodule RebusTest do
 
     test "drops a resource-limited reply, fails its caller, and keeps parsing", %{svr: svr} do
       cli = connect_until_ready(svr)
-      signal_ref = make_ref()
-
-      :ok =
-        :gen_event.add_sup_handler(
-          SignalHandler,
-          {SignalHandler, signal_ref},
-          {cli, self(), signal_ref}
-        )
-
-      on_exit(fn ->
-        :gen_event.delete_handler(SignalHandler, {SignalHandler, signal_ref}, nil)
-      end)
+      {:ok, signal_ref} = Rebus.add_signal_handler(cli)
 
       method =
         Message.new!(:method_call,
@@ -215,10 +200,7 @@ defmodule RebusTest do
 
     test "drops a header-limited frame without closing the connection", %{svr: svr} do
       cli = connect_until_ready(svr)
-      ref = make_ref()
-
-      :ok = :gen_event.add_sup_handler(SignalHandler, {SignalHandler, ref}, {cli, self(), ref})
-      on_exit(fn -> :gen_event.delete_handler(SignalHandler, {SignalHandler, ref}, nil) end)
+      {:ok, ref} = Rebus.add_signal_handler(cli)
 
       limited_data = raw_header_resource_limited_signal()
 
@@ -762,8 +744,8 @@ defmodule RebusTest do
 
       handle_hello(hello, svr)
       assert {:ok, ^cli} = Task.await(connect_task, 1_000)
-      assert :sys.get_state(cli).signal_handler_monitor_index == %{}
-      refute Enum.any?(:gen_event.which_handlers(SignalHandler), &match?({SignalHandler, _}, &1))
+      assert :sys.get_state(cli).handlers == %{}
+      assert :sys.get_state(cli).handler_monitor_index == %{}
 
       :ok =
         TestServer.push(
@@ -1409,16 +1391,6 @@ defmodule RebusTest do
     end
   end
 
-  describe "signal handler callbacks" do
-    test "ignores unrecognised events and replies to handler calls" do
-      state = {self(), self(), make_ref()}
-
-      assert {:ok, ^state} = SignalHandler.handle_event(:unrecognised, state)
-      assert {:ok, ^state} = SignalHandler.handle_info(:unrecognised, state)
-      assert {:ok, :ok, ^state} = SignalHandler.handle_call(:status, state)
-    end
-  end
-
   describe "Connection callbacks" do
     test "falls back safely when configuring the OTP receive buffer" do
       parent = self()
@@ -2051,16 +2023,6 @@ defmodule RebusTest do
 
     test "drains a coalesced method call and signal after a Hello reply", %{svr: svr} do
       {cli, hello} = connect_until_hello(svr)
-      ref = make_ref()
-
-      :ok =
-        :gen_event.add_sup_handler(
-          SignalHandler,
-          {SignalHandler, ref},
-          {cli, self(), ref}
-        )
-
-      on_exit(fn -> :gen_event.delete_handler(SignalHandler, {SignalHandler, ref}, nil) end)
 
       hello_reply =
         Message.new!(:method_return,
@@ -2089,16 +2051,32 @@ defmodule RebusTest do
       {:ok, method_call_data} = Message.encode(method_call)
       {:ok, signal_data} = Message.encode(signal)
 
+      # The Hello reply, a method call and a signal arrive in one buffer, so
+      # parsing has to continue across the transition to an established
+      # connection.
       :ok =
         TestServer.push_raw(
           svr,
           IO.iodata_to_binary([hello_data, method_call_data, signal_data])
         )
 
+      assert wait_until(fn -> :sys.get_state(cli).name == ":1.100" end)
+      assert 0 == :sys.get_state(cli).inbound.size
+
+      # Signal handlers are only accepted once the connection is established,
+      # so delivery from a coalesced buffer is asserted on a second write that
+      # again carries a method call and a signal together.
+      {:ok, ref} = Rebus.add_signal_handler(cli)
+
+      :ok =
+        TestServer.push_raw(
+          svr,
+          IO.iodata_to_binary([method_call_data, signal_data])
+        )
+
       assert_receive {^ref, %Message{type: :signal, body: ["delivered without another write"]}},
                      1_000
 
-      assert wait_until(fn -> :sys.get_state(cli).name == ":1.100" end)
       assert 0 == :sys.get_state(cli).inbound.size
     end
 
@@ -3757,6 +3735,111 @@ defmodule RebusTest do
 
       assert_receive {^ref, %Message{body: ["foobar"]}}, 1_000
     end
+
+    test "reach only handlers registered on the receiving connection", %{cli: cli_a, svr: svr_a} do
+      {:ok, svr_b} =
+        start_supervised({Rebus.TestServer, tap: self()}, id: :signal_isolation_server)
+
+      cli_b = connect_until_ready(svr_b)
+
+      {:ok, ref_a} = Rebus.add_signal_handler(cli_a)
+      {:ok, ref_b} = Rebus.add_signal_handler(cli_b)
+
+      :ok = TestServer.push(svr_a, test_signal("only for a"))
+
+      assert_receive {^ref_a, %Message{body: ["only for a"]}}, 1_000
+      refute_receive {^ref_b, %Message{}}, 300
+
+      :ok = TestServer.push(svr_b, test_signal("only for b"))
+
+      assert_receive {^ref_b, %Message{body: ["only for b"]}}, 1_000
+      refute_receive {^ref_a, %Message{}}, 300
+    end
+
+    test "keep flowing when the match-subscription task supervisor is killed", %{
+      cli: cli_a,
+      svr: svr_a
+    } do
+      {:ok, svr_b} =
+        start_supervised({Rebus.TestServer, tap: self()}, id: :task_supervisor_restart_server)
+
+      cli_b = connect_until_ready(svr_b)
+
+      {:ok, ref_a} = Rebus.add_signal_handler(cli_a)
+      {:ok, ref_b} = Rebus.add_signal_handler(cli_b)
+
+      registry = Process.whereis(Rebus.MatchSubscription.Registry)
+      task_supervisor = Process.whereis(Rebus.MatchSubscription.TaskSupervisor)
+      workers = Process.whereis(Rebus.MatchSubscription)
+
+      capture_log(fn ->
+        Process.exit(task_supervisor, :kill)
+
+        # `rest_for_one` restarts the task supervisor and everything started
+        # after it, so the worker supervisor comes back under a new pid too.
+        assert wait_until(fn ->
+                 restarted_tasks = Process.whereis(Rebus.MatchSubscription.TaskSupervisor)
+                 restarted_workers = Process.whereis(Rebus.MatchSubscription)
+
+                 is_pid(restarted_tasks) and restarted_tasks != task_supervisor and
+                   is_pid(restarted_workers) and restarted_workers != workers
+               end)
+      end)
+
+      # The registry is started before the task supervisor, so it is untouched.
+      assert Process.whereis(Rebus.MatchSubscription.Registry) == registry
+
+      assert Process.alive?(cli_a)
+      assert Process.alive?(cli_b)
+
+      :ok = TestServer.push(svr_a, test_signal("after the crash"))
+      :ok = TestServer.push(svr_b, test_signal("after the crash"))
+
+      assert_receive {^ref_a, %Message{body: ["after the crash"]}}, 1_000
+      assert_receive {^ref_b, %Message{body: ["after the crash"]}}, 1_000
+
+      rule = Rebus.MatchRule.new!(type: :signal, interface: "org.example.Test")
+      subscription = Task.async(fn -> Rebus.add_match(cli_a, rule, 2_000) end)
+
+      assert_receive {^svr_a, %Message{header_fields: %{member: "AddMatch"}} = add}, 1_000
+      :ok = TestServer.push(svr_a, Message.new!(:method_return, reply_serial: add.serial))
+
+      assert {:ok, match_ref} = Task.await(subscription, 2_000)
+      assert is_reference(match_ref)
+    end
+
+    test "stop reaching a handler whose owner exits", %{cli: cli, svr: svr} do
+      {:ok, kept_ref} = Rebus.add_signal_handler(cli)
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          {:ok, ref} = Rebus.add_signal_handler(cli)
+          send(parent, {:registered, ref})
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      assert_receive {:registered, owned_ref}, 1_000
+      assert Map.has_key?(:sys.get_state(cli).handlers, owned_ref)
+
+      owner_monitor = Process.monitor(owner)
+      send(owner, :stop)
+      assert_receive {:DOWN, ^owner_monitor, :process, ^owner, _reason}, 1_000
+
+      assert wait_until(fn ->
+               state = :sys.get_state(cli)
+
+               not Map.has_key?(state.handlers, owned_ref) and
+                 Map.has_key?(state.handlers, kept_ref)
+             end)
+
+      :ok = TestServer.push(svr, test_signal("still delivered"))
+
+      assert_receive {^kept_ref, %Message{body: ["still delivered"]}}, 1_000
+    end
   end
 
   describe "Peer-to-peer connections" do
@@ -4590,6 +4673,19 @@ defmodule RebusTest do
       Process.sleep(10)
       wait_until(predicate, attempts - 1)
     end
+  end
+
+  defp test_signal(body) do
+    Rebus.Message.new!(
+      :signal,
+      sender: "org.freedesktop.DBus",
+      path: "/org/freedesktop/DBus",
+      interface: "org.example.Test",
+      member: "IsolationSignal",
+      signature: "s",
+      flags: [],
+      body: [body]
+    )
   end
 
   defp socket_path do
