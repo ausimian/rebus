@@ -15,6 +15,21 @@ defmodule RebusTest do
   @max_copied_referenced_bytes 256
   @test_bus_guid "30313233343536373839414243444546"
 
+  # This module runs synchronously, so the only connections alive when a test
+  # starts belong to the previous test and are still tearing down after its
+  # supervised server stopped. Their "transport stopped: :closed" warnings
+  # would otherwise land in this test's captured log. Wait for the supervisor
+  # to drain before starting; best effort, so a slow teardown cannot fail a
+  # test on its own.
+  setup do
+    wait_until(
+      fn -> DynamicSupervisor.which_children(Rebus.ConnectionSupervisor) == [] end,
+      300
+    )
+
+    :ok
+  end
+
   describe "Connections" do
     setup [:server_setup]
 
@@ -4233,8 +4248,14 @@ defmodule RebusTest do
         end)
 
       # Many calls are refused, but the refusal is logged once per saturation
-      # episode so a flooding peer cannot also flood the log.
-      assert length(String.split(log, ":reply_queue_full")) - 1 == 1
+      # episode so a flooding peer cannot also flood the log. The writer is
+      # stalled for good, so the only dequeue that can ever happen is the one
+      # that made the first reply the active write. If the frames arrive in one
+      # coalesced read, that dequeue precedes saturation and there is a single
+      # episode; if they arrive in several reads, the dequeue can fall after
+      # saturation and start a second episode. Either way, far fewer than the
+      # sixteen refusals.
+      assert (length(String.split(log, ":reply_queue_full")) - 1) in 1..2
     end
 
     test "are answered while a caller reply is still outstanding", %{svr: svr, cli: cli} do
