@@ -66,6 +66,13 @@ defmodule Rebus do
 
       config :rebus, :system_bus_address, "unix:path=/run/dbus/system_bus_socket"
 
+  `:match_recovery_max_rules` caps how many distinct match rules a single
+  connection may hold whose bus-side state is uncertain. The default is 64, and
+  a connection that reaches the cap is closed. See
+  [Signal subscriptions and match rules](match_rules.html).
+
+      config :rebus, :match_recovery_max_rules, 64
+
   ## Architecture
 
   When you connect to a D-Bus bus using `connect/2`, Rebus creates a supervised

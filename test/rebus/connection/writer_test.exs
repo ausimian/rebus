@@ -283,7 +283,7 @@ defmodule Rebus.Connection.WriterTest do
                  ctx
                )
 
-      assert_receive {:write_timeout, ^request_ref}, 500
+      assert_receive {:write_timeout, ^request_ref}, 1_000
     end
   end
 

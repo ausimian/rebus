@@ -48,12 +48,9 @@ defmodule Rebus.Decoder do
 
   ## Raises
 
-  Raises `ArgumentError` for an invalid signature. Raises
-  `Rebus.ResourceLimitError` when local resource limits are exceeded: 32 array
-  levels, 32 struct levels, 64 total container levels, 100,000 structural
-  terms, or 1,000,000 fixed-width scalar-array elements. `Rebus.Message`
-  applies the structural and scalar limits independently to its header and body
-  decodes.
+  Raises `ArgumentError` for an invalid signature, and
+  `Rebus.ResourceLimitError` when the signature or data exceeds a local
+  nesting, structural, or scalar-array limit.
 
   ## Examples
 
@@ -105,8 +102,8 @@ defmodule Rebus.Decoder do
   every byte in a bounded frame.
 
   D-Bus infinities are represented by atoms and NaNs by canonical `:nan`.
-  Raises `Rebus.ResourceLimitError` when the 100,000 structural-term or
-  1,000,000 fixed-width-scalar budget is exceeded.
+  Raises `Rebus.ResourceLimitError` when a local structural or scalar-array
+  limit is exceeded.
   """
   @spec decode_with_position(binary(), binary(), endianness()) :: {[any()], non_neg_integer()}
   def decode_with_position(signature, data, endianness \\ :little) do
@@ -135,12 +132,7 @@ defmodule Rebus.Decoder do
     {values, final_state.position}
   end
 
-  @doc """
-  Decode data with a specific starting position for alignment calculations.
-
-  This is useful when the data being decoded was encoded at a specific position
-  in a larger message, and alignment must be calculated relative to that position.
-  """
+  @doc false
   @spec decode_at_position(binary(), binary(), endianness(), non_neg_integer()) :: list()
   def decode_at_position(signature, data, endianness, starting_position) do
     # Create state with the starting position for proper alignment calculations

@@ -47,9 +47,8 @@ defmodule Rebus.Encoder do
   Returns an iodata structure containing the encoded binary data that can be
   converted to binary using `IO.iodata_to_binary/1`.
 
-  Encoding accepts at most 1,000,000 fixed-width scalar elements in total per
-  encode operation, matching the decoder's scalar-array cap. The budget is
-  shared cumulatively across every fixed-width scalar array in that operation.
+  Raises `Rebus.ResourceLimitError` when an encode operation exceeds the local
+  fixed-width scalar-array limit.
 
   ## Examples
 
@@ -103,12 +102,7 @@ defmodule Rebus.Encoder do
     encode_at_position(signature, data, endianness, 0)
   end
 
-  @doc """
-  Encode data with a specific starting position for alignment calculations.
-
-  This is useful when the encoded data will be inserted at a specific position
-  in a larger message, and alignment must be calculated relative to that position.
-  """
+  @doc false
   @spec encode_at_position(binary(), [any()], endianness(), non_neg_integer()) :: iodata()
   def encode_at_position(signature, data, endianness, starting_position) do
     state =

@@ -50,32 +50,35 @@ defmodule Rebus.Message do
 
   ## Examples
 
-      # Create a method call message
-      iex> Rebus.Message.new(:method_call,
-      ...>   path: "/com/example/Object",
-      ...>   interface: "com.example.Interface",
-      ...>   member: "Method",
-      ...>   destination: "com.example.Service",
-      ...>   body: [42, "hello"],
-      ...>   signature: "is"
-      ...> )
+      # A method call
+      {:ok, message} =
+        Rebus.Message.new(:method_call,
+          path: "/com/example/Object",
+          interface: "com.example.Interface",
+          member: "Method",
+          destination: "com.example.Service",
+          body: [42, "hello"],
+          signature: "is"
+        )
 
-      # Create a signal message
-      iex> Rebus.Message.new(:signal,
-      ...>   path: "/com/example/Object",
-      ...>   interface: "com.example.Interface",
-      ...>   member: "SignalName",
-      ...>   body: ["value"],
-      ...>   signature: "s"
-      ...> )
+      # A signal
+      {:ok, message} =
+        Rebus.Message.new(:signal,
+          path: "/com/example/Object",
+          interface: "com.example.Interface",
+          member: "SignalName",
+          body: ["value"],
+          signature: "s"
+        )
 
-      # Create an error reply
-      iex> Rebus.Message.new(:error,
-      ...>   error_name: "com.example.Error.Failed",
-      ...>   reply_serial: 123,
-      ...>   body: ["Error message"],
-      ...>   signature: "s"
-      ...> )
+      # An error reply
+      {:ok, message} =
+        Rebus.Message.new(:error,
+          error_name: "com.example.Error.Failed",
+          reply_serial: 123,
+          body: ["Error message"],
+          signature: "s"
+        )
   """
 
   use TypedStruct
@@ -283,11 +286,12 @@ defmodule Rebus.Message do
 
   ## Examples
 
-      iex> Rebus.Message.new(:method_call,
+      iex> {:ok, message} = Rebus.Message.new(:method_call,
       ...>   path: "/com/example/Object",
       ...>   member: "TestMethod"
       ...> )
-      {:ok, %Rebus.Message{type: :method_call, ...}}
+      iex> message.type
+      :method_call
 
   ## Errors
 
@@ -487,7 +491,7 @@ defmodule Rebus.Message do
 
       iex> message = Rebus.Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Test")
       iex> {:ok, encoded} = Rebus.Message.encode(message)
-      iex> {:ok, decoded} = Rebus.Message.decode(encoded)
+      iex> {:ok, decoded} = Rebus.Message.decode(IO.iodata_to_binary(encoded))
       iex> decoded.type
       :signal
 

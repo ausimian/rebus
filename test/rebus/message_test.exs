@@ -2,6 +2,8 @@ defmodule Rebus.MessageTest do
   use ExUnit.Case, async: true
   alias Rebus.Message
 
+  doctest Rebus.Message
+
   # Helper function to encode message and return binary for decoding
   defp encode_to_binary(message, endianness \\ :little) do
     case Message.encode(message, endianness) do

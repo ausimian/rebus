@@ -15,20 +15,26 @@ defmodule Rebus.Signature do
   @max_struct_depth 32
   @max_total_depth 64
 
+  @doc false
   @spec max_total_depth() :: pos_integer()
   def max_total_depth, do: @max_total_depth
 
+  @doc false
   @spec max_array_depth() :: pos_integer()
   def max_array_depth, do: @max_array_depth
 
+  @doc false
   @spec max_struct_depth() :: pos_integer()
   def max_struct_depth, do: @max_struct_depth
 
+  @typedoc false
   @type nesting_state :: map()
 
+  @doc false
   @spec new_nesting_state() :: nesting_state()
   def new_nesting_state, do: %{array_depth: 0, struct_depth: 0, total_depth: 0}
 
+  @doc false
   @spec validate_nesting!(any(), nesting_state()) :: :ok
   def validate_nesting!(types, state) when is_list(types) do
     Enum.each(types, &validate_nesting!(&1, state))
@@ -53,6 +59,7 @@ defmodule Rebus.Signature do
 
   def validate_nesting!(_type, _state), do: :ok
 
+  @doc false
   @spec enter_container!(map(), :array | :struct | :dict_entry | :variant) :: map()
   def enter_container!(%{total_depth: total_depth} = state, :variant)
       when total_depth < @max_total_depth,
@@ -69,6 +76,7 @@ defmodule Rebus.Signature do
 
   def enter_container!(_state, _kind), do: raise(ResourceLimitError, limit: :nesting)
 
+  @doc false
   @spec leave_container(map(), nesting_state()) :: map()
   def leave_container(state, parent_state) do
     %{
