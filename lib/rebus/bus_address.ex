@@ -141,12 +141,14 @@ defmodule Rebus.BusAddress do
     if length(entries) > @max_parameters do
       error(:too_many_parameters)
     else
-      Enum.reduce_while(entries, {:ok, %{}}, fn parameter, {:ok, pairs} ->
-        case parse_parameter(parameter, pairs) do
-          {:ok, parsed} -> {:cont, {:ok, parsed}}
-          {:error, _reason} = error -> {:halt, error}
-        end
-      end)
+      Enum.reduce_while(entries, {:ok, %{}}, &put_parsed_parameter/2)
+    end
+  end
+
+  defp put_parsed_parameter(parameter, {:ok, pairs}) do
+    case parse_parameter(parameter, pairs) do
+      {:ok, parsed} -> {:cont, {:ok, parsed}}
+      {:error, _reason} = error -> {:halt, error}
     end
   end
 
@@ -159,22 +161,26 @@ defmodule Rebus.BusAddress do
         value_size = byte_size(parameter) - separator - 1
         value = binary_part(parameter, separator + 1, value_size)
 
-        cond do
-          byte_size(value) > @max_value_length ->
-            error(:too_long)
-
-          Map.has_key?(pairs, key) ->
-            error(:duplicate_key)
-
-          true ->
-            with :ok <- validate_token(key, :invalid_key),
-                 {:ok, decoded} <- decode_value(value) do
-              {:ok, Map.put(pairs, key, decoded)}
-            end
-        end
+        put_parameter(pairs, key, value)
 
       _ ->
         error(:invalid_entry)
+    end
+  end
+
+  defp put_parameter(pairs, key, value) do
+    cond do
+      byte_size(value) > @max_value_length ->
+        error(:too_long)
+
+      Map.has_key?(pairs, key) ->
+        error(:duplicate_key)
+
+      true ->
+        with :ok <- validate_token(key, :invalid_key),
+             {:ok, decoded} <- decode_value(value) do
+          {:ok, Map.put(pairs, key, decoded)}
+        end
     end
   end
 

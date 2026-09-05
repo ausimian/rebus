@@ -136,28 +136,25 @@ defmodule Rebus.Connection.FDClaims do
           claim = rearm(claim_ref, claim)
           context.hooks.fd_claim_delivery()
 
-          if live?(claim) and Process.alive?(pid) do
-            send(delivery_alias, {:rebus_fd_reply, claim_ref, delivery_ref, msg})
-
-            {:ok,
-             %{
-               claims
-               | claims:
-                   Map.put(claims.claims, claim_ref, %{
-                     claim
-                     | delivery_ref: delivery_ref,
-                       delivery_alias: delivery_alias
-                   })
-             }}
-          else
-            {{:error, :fd_claim_expired}, drop(claims, claim_ref, close?: true, outcome: :closed)}
-          end
+          deliver_claim(claims, claim_ref, claim, msg, delivery_ref, delivery_alias)
         else
           {{:error, :fd_claim_expired}, drop(claims, claim_ref, close?: true, outcome: :closed)}
         end
 
       _ ->
         {{:error, :fd_claim_expired}, claims}
+    end
+  end
+
+  defp deliver_claim(claims, claim_ref, claim, msg, delivery_ref, delivery_alias) do
+    if live?(claim) and Process.alive?(claim.pid) do
+      send(delivery_alias, {:rebus_fd_reply, claim_ref, delivery_ref, msg})
+
+      claim = %{claim | delivery_ref: delivery_ref, delivery_alias: delivery_alias}
+
+      {:ok, %{claims | claims: Map.put(claims.claims, claim_ref, claim)}}
+    else
+      {{:error, :fd_claim_expired}, drop(claims, claim_ref, close?: true, outcome: :closed)}
     end
   end
 
@@ -254,31 +251,42 @@ defmodule Rebus.Connection.FDClaims do
       {nil, _claims} ->
         claims
 
-      {%{msg: msg, request_ref: request_ref, monitor_ref: monitor_ref, timer_ref: timer_ref},
-       remaining} ->
-        _ = Process.cancel_timer(timer_ref)
+      {claim, remaining} ->
+        drop_claim(claims, claim_ref, claim, remaining, opts)
+    end
+  end
 
-        close? = Keyword.get(opts, :close?, false)
-        if close?, do: close_message_fds(msg)
+  defp drop_claim(
+         %__MODULE__{} = claims,
+         claim_ref,
+         %{msg: msg, request_ref: request_ref, monitor_ref: monitor_ref, timer_ref: timer_ref},
+         remaining,
+         opts
+       ) do
+    _ = Process.cancel_timer(timer_ref)
 
-        unless Keyword.get(opts, :monitor_down?, false) do
-          Process.demonitor(monitor_ref, [:flush])
-        end
+    close? = Keyword.get(opts, :close?, false)
+    if close?, do: close_message_fds(msg)
 
-        claims = %{
-          claims
-          | claims: remaining,
-            request_index: Map.delete(claims.request_index, request_ref),
-            monitor_index: Map.delete(claims.monitor_index, monitor_ref)
-        }
+    unless Keyword.get(opts, :monitor_down?, false) do
+      Process.demonitor(monitor_ref, [:flush])
+    end
 
-        case Keyword.get(opts, :outcome, if(close?, do: :closed, else: nil)) do
-          outcome when outcome in [:acknowledged, :closed] ->
-            put_outcome(claims, claim_ref, outcome)
+    claims = %{
+      claims
+      | claims: remaining,
+        request_index: Map.delete(claims.request_index, request_ref),
+        monitor_index: Map.delete(claims.monitor_index, monitor_ref)
+    }
 
-          _ ->
-            claims
-        end
+    default_outcome = if close?, do: :closed, else: nil
+
+    case Keyword.get(opts, :outcome, default_outcome) do
+      outcome when outcome in [:acknowledged, :closed] ->
+        put_outcome(claims, claim_ref, outcome)
+
+      _ ->
+        claims
     end
   end
 

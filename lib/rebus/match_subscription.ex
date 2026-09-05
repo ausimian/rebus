@@ -134,17 +134,21 @@ defmodule Rebus.MatchSubscription do
         Worker.call(worker, {:remove, ref, deadline}, deadline, @call_overhead)
 
       [] ->
-        if persisted?(conn) do
-          with {:ok, worker} <- worker_for(conn) do
-            Worker.call(worker, {:remove, ref, deadline}, deadline, @call_overhead)
-          end
-        else
-          # References are idempotent and scoped to their original connection.
-          :ok
-        end
+        call_remove_without_worker(conn, ref, deadline)
     end
   catch
     :exit, _reason -> {:error, :disconnected}
+  end
+
+  defp call_remove_without_worker(conn, ref, deadline) do
+    if persisted?(conn) do
+      with {:ok, worker} <- worker_for(conn) do
+        Worker.call(worker, {:remove, ref, deadline}, deadline, @call_overhead)
+      end
+    else
+      # References are idempotent and scoped to their original connection.
+      :ok
+    end
   end
 
   defp worker_for(conn) do
@@ -437,15 +441,7 @@ defmodule Rebus.MatchSubscription.Worker do
         # branch means an operation died before reporting a safe outcome, so
         # reset the connection rather than guessing about a handler or
         # bus-rule state.
-        case take_operation(state, token) do
-          {nil, state} ->
-            {:noreply, state}
-
-          {%{key: key, request_id: request_id}, state} ->
-            state = reply_request_if_present(state, request_id, {:error, :disconnected})
-            log_recovery(:operation_lost)
-            {:noreply, state |> request_connection_reset(key) |> persist_state()}
-        end
+        operation_down(state, token)
 
       monitor_ref == state.connection_monitor ->
         # A disconnected bus drops all server-side match state. Do not try to
@@ -455,6 +451,18 @@ defmodule Rebus.MatchSubscription.Worker do
 
       true ->
         {:noreply, state}
+    end
+  end
+
+  defp operation_down(state, token) do
+    case take_operation(state, token) do
+      {nil, state} ->
+        {:noreply, state}
+
+      {%{key: key, request_id: request_id}, state} ->
+        state = reply_request_if_present(state, request_id, {:error, :disconnected})
+        log_recovery(:operation_lost)
+        {:noreply, state |> request_connection_reset(key) |> persist_state()}
     end
   end
 
@@ -482,28 +490,36 @@ defmodule Rebus.MatchSubscription.Worker do
         state
 
       rule ->
-        {request_id, queue} = next_live_request(rule.queue, state.requests)
-        state = put_rule(state, key, %{rule | queue: queue})
+        dispatch_next_request(state, key, rule)
+    end
+  end
 
-        case request_id && Map.get(state.requests, request_id) do
-          nil ->
-            maybe_idle_rule(state, key)
+  defp dispatch_next_request(state, key, rule) do
+    {request_id, queue} = next_live_request(rule.queue, state.requests)
+    state = put_rule(state, key, %{rule | queue: queue})
 
-          %{kind: :add} = request when rule.status == :installing ->
-            start_add_new(state, key, request_id, request)
+    case request_id && Map.get(state.requests, request_id) do
+      nil ->
+        maybe_idle_rule(state, key)
 
-          %{kind: :add} = request when rule.status == :active ->
-            start_add_existing(state, key, request_id, request)
+      %{kind: :add} = request when rule.status == :installing ->
+        start_add_new(state, key, request_id, request)
 
-          %{kind: :remove, ref: ref} = request when rule.status == :active ->
-            case Map.fetch(state.subscriptions, ref) do
-              {:ok, subscription} -> start_remove(state, key, request_id, request, subscription)
-              :error -> dispatch_rule(reply_request(state, request_id, :ok), key)
-            end
+      %{kind: :add} = request when rule.status == :active ->
+        start_add_existing(state, key, request_id, request)
 
-          %{kind: :remove} ->
-            dispatch_rule(reply_request(state, request_id, :ok), key)
-        end
+      %{kind: :remove, ref: ref} = request when rule.status == :active ->
+        dispatch_remove(state, key, request_id, request, ref)
+
+      %{kind: :remove} ->
+        dispatch_rule(reply_request(state, request_id, :ok), key)
+    end
+  end
+
+  defp dispatch_remove(state, key, request_id, request, ref) do
+    case Map.fetch(state.subscriptions, ref) do
+      {:ok, subscription} -> start_remove(state, key, request_id, request, subscription)
+      :error -> dispatch_rule(reply_request(state, request_id, :ok), key)
     end
   end
 
@@ -946,21 +962,23 @@ defmodule Rebus.MatchSubscription.Worker do
     else
       case :queue.out(state.initial_cleanup_queue) do
         {{:value, key}, queue} ->
-          state = %{state | initial_cleanup_queue: queue}
-
-          case Map.get(state.rules, key) do
-            %{status: :cleaning, operation: nil} ->
-              state
-              |> start_recovery_attempt(key)
-              |> start_next_initial_cleanup()
-
-            _ ->
-              start_next_initial_cleanup(state)
-          end
+          resume_initial_cleanup(%{state | initial_cleanup_queue: queue}, key)
 
         {:empty, _queue} ->
           state
       end
+    end
+  end
+
+  defp resume_initial_cleanup(state, key) do
+    case Map.get(state.rules, key) do
+      %{status: :cleaning, operation: nil} ->
+        state
+        |> start_recovery_attempt(key)
+        |> start_next_initial_cleanup()
+
+      _ ->
+        start_next_initial_cleanup(state)
     end
   end
 
@@ -1049,14 +1067,7 @@ defmodule Rebus.MatchSubscription.Worker do
 
         state = delete_rule(state, key)
 
-        {add_requests, state} =
-          Enum.reduce(queue, {[], state}, fn request_id, {adds, acc} ->
-            case Map.get(acc.requests, request_id) do
-              %{kind: :add} -> {[request_id | adds], acc}
-              %{kind: :remove} -> {adds, reply_request(acc, request_id, :ok)}
-              nil -> {adds, acc}
-            end
-          end)
+        {add_requests, state} = Enum.reduce(queue, {[], state}, &split_pending_request/2)
 
         case Enum.reverse(add_requests) do
           [] ->
@@ -1070,6 +1081,16 @@ defmodule Rebus.MatchSubscription.Worker do
     end
   end
 
+  # Splits a rule's queued requests: pending adds are kept for the reinstalled
+  # rule, while pending removes are already satisfied by the clearing.
+  defp split_pending_request(request_id, {adds, state}) do
+    case Map.get(state.requests, request_id) do
+      %{kind: :add} -> {[request_id | adds], state}
+      %{kind: :remove} -> {adds, reply_request(state, request_id, :ok)}
+      nil -> {adds, state}
+    end
+  end
+
   defp request_connection_reset(state, _key) do
     # Never include a rule or signal payload in observability. A connection
     # reset is bounded and makes the bus discard all match state for it. Its
@@ -1079,30 +1100,34 @@ defmodule Rebus.MatchSubscription.Worker do
       state
     else
       Logger.warning("D-Bus match cleanup closing connection")
-      token = make_ref()
-      worker = self()
-      conn = state.conn
+      start_reset_task(state)
+    end
+  end
 
-      case Task.Supervisor.start_child(Rebus.MatchSubscription.TaskSupervisor, fn ->
-             result = Rebus.close(conn)
+  defp start_reset_task(state) do
+    token = make_ref()
+    worker = self()
+    conn = state.conn
 
-             send(worker, {:connection_reset_result, token, result})
-           end) do
-        {:ok, pid} ->
-          %{
-            state
-            | resetting?: true,
-              state_lost?: true,
-              reset_token: token,
-              reset_task_monitor: Process.monitor(pid)
-          }
+    case Task.Supervisor.start_child(Rebus.MatchSubscription.TaskSupervisor, fn ->
+           result = Rebus.close(conn)
 
-        {:error, _reason} ->
-          # No task ran, therefore no reset outcome is known. Keep existing
-          # connection authority intact and make the lost state explicit.
-          log_reset(:task_start_failed)
-          %{state | state_lost?: true}
-      end
+           send(worker, {:connection_reset_result, token, result})
+         end) do
+      {:ok, pid} ->
+        %{
+          state
+          | resetting?: true,
+            state_lost?: true,
+            reset_token: token,
+            reset_task_monitor: Process.monitor(pid)
+        }
+
+      {:error, _reason} ->
+        # No task ran, therefore no reset outcome is known. Keep existing
+        # connection authority intact and make the lost state explicit.
+        log_reset(:task_start_failed)
+        %{state | state_lost?: true}
     end
   end
 
@@ -1137,44 +1162,46 @@ defmodule Rebus.MatchSubscription.Worker do
   defp remove_operation(conn, rule, ref, handler, final?, deadline) do
     case ensure_handler_removed(conn, ref, handler, deadline) do
       :ok ->
-        if final? do
-          case invoke_bus_method(conn, "RemoveMatch", rule, deadline) do
-            :ok ->
-              {:removed, ref, :final}
-
-            error ->
-              cond do
-                match_rule_not_found?(error) -> {:removed, ref, :final}
-                definitive_bus_error?(error) -> {:remove_definitive_error, ref, error}
-                true -> {:remove_ambiguous, ref, error}
-              end
-          end
-        else
-          {:removed, ref, :nonfinal}
-        end
+        remove_bus_rule(conn, rule, ref, final?, deadline)
 
       {:error, _reason} = error ->
         {:remove_failed, error, :active}
     end
   end
 
+  defp remove_bus_rule(_conn, _rule, ref, false, _deadline), do: {:removed, ref, :nonfinal}
+
+  defp remove_bus_rule(conn, rule, ref, true, deadline) do
+    case invoke_bus_method(conn, "RemoveMatch", rule, deadline) do
+      :ok ->
+        {:removed, ref, :final}
+
+      error ->
+        cond do
+          match_rule_not_found?(error) -> {:removed, ref, :final}
+          definitive_bus_error?(error) -> {:remove_definitive_error, ref, error}
+          true -> {:remove_ambiguous, ref, error}
+        end
+    end
+  end
+
   defp recover_operation(conn, rule, deadline) do
     case remove_pending_handlers(conn, rule.pending_handlers, deadline) do
       :ok ->
-        case rule.recovery_kind do
-          :handlers ->
-            :handlers_cleared
-
-          :rule ->
-            case remove_remote_rule(conn, rule, deadline) do
-              :ok -> :cleared
-              {:definitive, error} -> {:definitive_bus_error, error}
-              :ambiguous -> {:retry, :remote}
-            end
-        end
+        recover_rule_state(conn, rule, deadline)
 
       {:error, _reason} ->
         {:retry, :handlers}
+    end
+  end
+
+  defp recover_rule_state(_conn, %{recovery_kind: :handlers}, _deadline), do: :handlers_cleared
+
+  defp recover_rule_state(conn, %{recovery_kind: :rule} = rule, deadline) do
+    case remove_remote_rule(conn, rule, deadline) do
+      :ok -> :cleared
+      {:definitive, error} -> {:definitive_bus_error, error}
+      :ambiguous -> {:retry, :remote}
     end
   end
 

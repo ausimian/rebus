@@ -77,53 +77,45 @@ defmodule Rebus.TestServer do
     family = opts[:family] || :inet
     path = opts[:path]
 
-    case family do
-      family when family in [:inet, :inet6] ->
-        {:ok, sock} = :socket.open(family, :stream, :default)
-        :ok = :socket.bind(sock, %{family: family, addr: loopback_address(family), port: 0})
-        :ok = :socket.listen(sock, 5)
+    {:ok, sock} = listen(family, path)
 
-        {:ok,
-         %__MODULE__{
-           svr_sock: sock,
-           tap: opts[:tap],
-           family: family,
-           auth_response: opts[:auth_response] || "OK 30313233343536373839414243444546\r\n",
-           auth_response_fragments: opts[:auth_response_fragments],
-           auth_fragment_delay: opts[:auth_fragment_delay] || 0,
-           partial_auth: opts[:partial_auth],
-           close_after_begin: opts[:close_after_begin] || false,
-           silent_auth: opts[:silent_auth] || false,
-           notify_auth: opts[:notify_auth] || false,
-           auto_hello: Keyword.get(opts, :auto_hello, true),
-           auto_hello_name_acquired?: Keyword.get(opts, :auto_hello_name_acquired?, true),
-           unix_fd_response: Keyword.get(opts, :unix_fd_response, "AGREE_UNIX_FD\r\n")
-         }, {:continue, :accept}}
+    {:ok, new_state(sock, family, path, opts), {:continue, :accept}}
+  end
 
-      :local ->
-        {:ok, sock} = :socket.open(:local, :stream, :default)
-        # For Unix sockets, the path should be passed as binary
-        :ok = :socket.bind(sock, %{family: :local, path: path})
-        :ok = :socket.listen(sock, 5)
+  defp listen(family, _path) when family in [:inet, :inet6] do
+    {:ok, sock} = :socket.open(family, :stream, :default)
+    :ok = :socket.bind(sock, %{family: family, addr: loopback_address(family), port: 0})
+    :ok = :socket.listen(sock, 5)
 
-        {:ok,
-         %__MODULE__{
-           svr_sock: sock,
-           tap: opts[:tap],
-           family: family,
-           path: path,
-           auth_response: opts[:auth_response] || "OK 30313233343536373839414243444546\r\n",
-           auth_response_fragments: opts[:auth_response_fragments],
-           auth_fragment_delay: opts[:auth_fragment_delay] || 0,
-           partial_auth: opts[:partial_auth],
-           close_after_begin: opts[:close_after_begin] || false,
-           silent_auth: opts[:silent_auth] || false,
-           notify_auth: opts[:notify_auth] || false,
-           auto_hello: Keyword.get(opts, :auto_hello, true),
-           auto_hello_name_acquired?: Keyword.get(opts, :auto_hello_name_acquired?, true),
-           unix_fd_response: Keyword.get(opts, :unix_fd_response, "AGREE_UNIX_FD\r\n")
-         }, {:continue, :accept}}
-    end
+    {:ok, sock}
+  end
+
+  defp listen(:local, path) do
+    {:ok, sock} = :socket.open(:local, :stream, :default)
+    # For Unix sockets, the path should be passed as binary
+    :ok = :socket.bind(sock, %{family: :local, path: path})
+    :ok = :socket.listen(sock, 5)
+
+    {:ok, sock}
+  end
+
+  defp new_state(sock, family, path, opts) do
+    %__MODULE__{
+      svr_sock: sock,
+      tap: opts[:tap],
+      family: family,
+      path: path,
+      auth_response: opts[:auth_response] || "OK 30313233343536373839414243444546\r\n",
+      auth_response_fragments: opts[:auth_response_fragments],
+      auth_fragment_delay: opts[:auth_fragment_delay] || 0,
+      partial_auth: opts[:partial_auth],
+      close_after_begin: opts[:close_after_begin] || false,
+      silent_auth: opts[:silent_auth] || false,
+      notify_auth: opts[:notify_auth] || false,
+      auto_hello: Keyword.get(opts, :auto_hello, true),
+      auto_hello_name_acquired?: Keyword.get(opts, :auto_hello_name_acquired?, true),
+      unix_fd_response: Keyword.get(opts, :unix_fd_response, "AGREE_UNIX_FD\r\n")
+    }
   end
 
   @impl true
@@ -134,42 +126,7 @@ defmodule Rebus.TestServer do
 
         if state.notify_auth, do: send(state.tap, {self(), :auth_received})
 
-        cond do
-          state.silent_auth ->
-            send(state.tap, {self(), :auth_received})
-            {:noreply, %{state | cli_sock: cli}}
-
-          is_binary(state.partial_auth) ->
-            :ok = :socket.send(cli, state.partial_auth)
-            send(state.tap, {self(), :auth_received})
-            {:noreply, %{state | cli_sock: cli}}
-
-          true ->
-            send_auth_response(cli, state)
-
-            case state.auth_response do
-              <<"OK ", _::binary>> ->
-                case receive_begin(cli, state) do
-                  {:ok, "BEGIN \r\n"} ->
-                    if state.close_after_begin do
-                      :ok = :socket.close(cli)
-                      {:noreply, %{state | cli_sock: nil}, {:continue, :accept}}
-                    else
-                      {:noreply, %{state | cli_sock: cli}, {:continue, :recv}}
-                    end
-
-                  {:error, :closed} ->
-                    send(state.tap, {self(), :client_closed})
-                    {:noreply, %{state | cli_sock: nil}, {:continue, :accept}}
-
-                  _ ->
-                    observe_client_close(cli, state)
-                end
-
-              _ ->
-                observe_client_close(cli, state)
-            end
-        end
+        authenticate(cli, state)
 
       {:select, {:select_info, :accept, handle}} ->
         {:noreply, %{state | handle: handle}}
@@ -209,6 +166,50 @@ defmodule Rebus.TestServer do
       {:error, reason} ->
         {:stop, reason, state}
     end
+  end
+
+  defp authenticate(cli, %__MODULE__{silent_auth: true} = state) do
+    send(state.tap, {self(), :auth_received})
+    {:noreply, %{state | cli_sock: cli}}
+  end
+
+  defp authenticate(cli, %__MODULE__{partial_auth: partial_auth} = state)
+       when is_binary(partial_auth) do
+    :ok = :socket.send(cli, partial_auth)
+    send(state.tap, {self(), :auth_received})
+    {:noreply, %{state | cli_sock: cli}}
+  end
+
+  defp authenticate(cli, %__MODULE__{} = state) do
+    send_auth_response(cli, state)
+
+    case state.auth_response do
+      <<"OK ", _::binary>> -> await_begin(cli, state)
+      _ -> observe_client_close(cli, state)
+    end
+  end
+
+  defp await_begin(cli, %__MODULE__{} = state) do
+    case receive_begin(cli, state) do
+      {:ok, "BEGIN \r\n"} ->
+        begin_session(cli, state)
+
+      {:error, :closed} ->
+        send(state.tap, {self(), :client_closed})
+        {:noreply, %{state | cli_sock: nil}, {:continue, :accept}}
+
+      _ ->
+        observe_client_close(cli, state)
+    end
+  end
+
+  defp begin_session(cli, %__MODULE__{close_after_begin: true} = state) do
+    :ok = :socket.close(cli)
+    {:noreply, %{state | cli_sock: nil}, {:continue, :accept}}
+  end
+
+  defp begin_session(cli, %__MODULE__{} = state) do
+    {:noreply, %{state | cli_sock: cli}, {:continue, :recv}}
   end
 
   @impl true

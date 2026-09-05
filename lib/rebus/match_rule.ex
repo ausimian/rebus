@@ -193,7 +193,7 @@ defmodule Rebus.MatchRule do
 
       {:ok, values} ->
         with {:ok, values} <- normalize_arguments(values),
-             true <- Enum.all?(values, fn {_index, value} -> WireValue.valid_string?(value) end) do
+             true <- Enum.all?(values, &valid_argument_value?/1) do
           {:ok, Map.put(criteria, key, Map.new(values))}
         else
           false -> {:error, :invalid_match_value}
@@ -201,6 +201,8 @@ defmodule Rebus.MatchRule do
         end
     end
   end
+
+  defp valid_argument_value?({_index, value}), do: WireValue.valid_string?(value)
 
   defp normalize_arguments(values) when is_map(values),
     do: normalize_arguments(Map.to_list(values))

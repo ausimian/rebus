@@ -234,26 +234,23 @@ defmodule Rebus.AddressList do
     attempt_count = length(addresses) + 1 + walk.remaining_candidate_count
 
     with {:ok, timeout} <- attempt_timeout(walk, attempt_count) do
-      case connect_with_address_diagnostic(
-             %{family: family, addr: address, port: port},
-             put_attempt(walk, timeout, expected_guid),
-             :tcp,
-             timeout
-           ) do
-        {:ok, _pid} = result ->
-          result
+      %{family: family, addr: address, port: port}
+      |> connect_with_address_diagnostic(
+        put_attempt(walk, timeout, expected_guid),
+        :tcp,
+        timeout
+      )
+      |> retry_next_tcp_address(addresses, endpoint, walk)
+    end
+  end
 
-        {:error, reason} = error ->
-          if retryable_bus_address_error?(reason) do
-            connect_tcp_addresses(
-              addresses,
-              endpoint,
-              walk |> put_last_error(reason) |> next_ip()
-            )
-          else
-            error
-          end
-      end
+  defp retry_next_tcp_address({:ok, _pid} = result, _addresses, _endpoint, _walk), do: result
+
+  defp retry_next_tcp_address({:error, reason} = error, addresses, endpoint, walk) do
+    if retryable_bus_address_error?(reason) do
+      connect_tcp_addresses(addresses, endpoint, walk |> put_last_error(reason) |> next_ip())
+    else
+      error
     end
   end
 

@@ -121,11 +121,7 @@
           #
           {Credo.Check.Refactor.Apply, []},
           {Credo.Check.Refactor.CondStatements, []},
-          # `Rebus.Connection` and the modules split out of it are clean under
-          # this check as of #82. Re-enabling it needs the pre-existing
-          # findings in Rebus.Message, Rebus.MatchSubscription, Rebus.Auth,
-          # Rebus.Connection.Writer and Rebus.Connection.Handshake cleared.
-          {Credo.Check.Refactor.CyclomaticComplexity, false},
+          {Credo.Check.Refactor.CyclomaticComplexity, []},
           {Credo.Check.Refactor.FilterCount, []},
           {Credo.Check.Refactor.FilterFilter, []},
           {Credo.Check.Refactor.FunctionArity, []},
@@ -134,13 +130,7 @@
           {Credo.Check.Refactor.MatchInCondition, []},
           {Credo.Check.Refactor.NegatedConditionsInUnless, []},
           {Credo.Check.Refactor.NegatedConditionsWithElse, []},
-          # `Rebus.Connection` and the modules split out of it are clean under
-          # this check as of #82. Re-enabling it needs the pre-existing
-          # findings in Rebus.MatchSubscription, Rebus.Message, Rebus.Auth,
-          # Rebus.BusAddress, Rebus.AddressList, Rebus.MatchRule,
-          # Rebus.Connection.FDClaims, Rebus.Connection.Handshake and
-          # Rebus.Connection.Writer cleared.
-          {Credo.Check.Refactor.Nesting, false},
+          {Credo.Check.Refactor.Nesting, []},
           {Credo.Check.Refactor.RedundantWithClauseResult, []},
           {Credo.Check.Refactor.RejectReject, []},
           {Credo.Check.Refactor.UnlessWithElse, []},
