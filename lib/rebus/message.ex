@@ -586,37 +586,42 @@ defmodule Rebus.Message do
     header_length = 12 + header_fields_size
     header_padded_length = div(header_length + 7, 8) * 8
 
-    # Extract body from the remaining data after padding
-    # Subtract fixed header size
+    # The body starts after the padding, relative to the end of the fixed
+    # header. Like libdbus, the padding is matched as NUL rather than skipped.
     body_start = header_padded_length - 12
+    padding_bits = (body_start - header_fields_size) * 8
 
-    if byte_size(rest) == body_start + body_length do
-      <<_::binary-size(^body_start), body_binary::binary-size(^body_length), _::binary>> = rest
+    case rest do
+      <<_::binary-size(^header_fields_size), 0::size(^padding_bits),
+        body_binary::binary-size(^body_length)>> ->
+        # Decode body if present
+        signature = Map.get(header_fields, :signature, "")
 
-      # Decode body if present
-      signature = Map.get(header_fields, :signature, "")
+        case decode_body(signature, body_binary, endianness) do
+          {:ok, body} ->
+            {:ok,
+             %__MODULE__{
+               type: type,
+               flags: flags,
+               version: version_byte,
+               body_length: body_length,
+               serial: serial,
+               header_fields: header_fields,
+               body: body
+             }}
 
-      case decode_body(signature, body_binary, endianness) do
-        {:ok, body} ->
-          {:ok,
-           %__MODULE__{
-             type: type,
-             flags: flags,
-             version: version_byte,
-             body_length: body_length,
-             serial: serial,
-             header_fields: header_fields,
-             body: body
-           }}
+          {:error, :resource_limit} ->
+            {:error, :resource_limit, resource_limit_envelope(type, header_fields)}
 
-        {:error, :resource_limit} ->
-          {:error, :resource_limit, resource_limit_envelope(type, header_fields)}
+          {:error, reason} ->
+            {:error, reason}
+        end
 
-        {:error, reason} ->
-          {:error, reason}
-      end
-    else
-      {:error, :insufficient_data}
+      <<_::binary-size(^body_start), _::binary-size(^body_length)>> ->
+        {:error, :invalid_message}
+
+      _ ->
+        {:error, :insufficient_data}
     end
   end
 
