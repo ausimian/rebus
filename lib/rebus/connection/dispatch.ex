@@ -263,44 +263,41 @@ defmodule Rebus.Connection.Dispatch do
     {timer_ref, token}
   end
 
+  # One pass over a receive buffer carries two values that never change: the
+  # continuation the entry point must return, and the flat binary every
+  # remainder is a sub-binary of.
   defp parse_complete_message(data, %Connection{} = state, continuation) do
-    parse_flat_messages(data, state, continuation, data)
+    parse_flat_messages(data, state, %{continuation: continuation, source: data})
   end
 
   # `data` is already flat when a complete frame is available. Parse every
   # coalesced frame directly from its sub-binary remainder, retaining only the
   # final incomplete tail. This avoids re-flattening a receive buffer per frame.
-  defp parse_flat_messages(<<>>, %Connection{} = state, continuation, _source) do
-    process_inbound(state, continuation)
+  defp parse_flat_messages(<<>>, %Connection{} = state, cursor) do
+    process_inbound(state, cursor.continuation)
   end
 
-  defp parse_flat_messages(data, %Connection{} = state, continuation, source) do
+  defp parse_flat_messages(data, %Connection{} = state, cursor) do
     case Message.parse_inbound(data) do
       nil ->
-        append_inbound(Inbound.retain_remainder(data, source), state, continuation)
+        append_inbound(Inbound.retain_remainder(data, cursor.source), state, cursor.continuation)
 
       # Anything but nil either consumed a frame or ends the connection, so
       # the partial-frame timer is cancelled once here rather than on every
       # way out.
       parsed ->
-        parse_complete_frame(parsed, finish_frame(state), continuation, source)
+        parse_complete_frame(parsed, finish_frame(state), cursor)
     end
   end
 
-  defp parse_complete_frame(
-         {:ok, %Message{} = msg, rest},
-         %Connection{} = state,
-         continuation,
-         source
-       ) do
-    parse_attached_message(msg, rest, state, continuation, source)
+  defp parse_complete_frame({:ok, %Message{} = msg, rest}, %Connection{} = state, cursor) do
+    parse_attached_message(msg, rest, state, cursor)
   end
 
   defp parse_complete_frame(
          {:error, :resource_limit, _envelope, _rest},
          %Connection{hello_serial: hello_serial} = state,
-         _continuation,
-         _source
+         _cursor
        )
        when not is_nil(hello_serial) do
     {:protocol_error, {:hello_failed, :resource_limit}, state}
@@ -311,26 +308,25 @@ defmodule Rebus.Connection.Dispatch do
   defp parse_complete_frame(
          {:error, :resource_limit, envelope, rest},
          %Connection{} = state,
-         continuation,
-         source
+         cursor
        ) do
     Logger.warning("D-Bus frame dropped: :resource_limit", reason: :resource_limit)
     state = discard_inbound_unix_fds(state)
     {:ok, state} = drop_resource_limited_reply(envelope, state)
-    parse_flat_messages(rest, state, continuation, source)
+    parse_flat_messages(rest, state, cursor)
   end
 
-  defp parse_complete_frame({:error, reason}, %Connection{} = state, _continuation, _source) do
+  defp parse_complete_frame({:error, reason}, %Connection{} = state, _cursor) do
     {:protocol_error, reason, state}
   end
 
-  defp parse_attached_message(%Message{} = msg, rest, %Connection{} = state, continuation, source) do
+  defp parse_attached_message(%Message{} = msg, rest, %Connection{} = state, cursor) do
     case attach_inbound_fds(msg, state) do
       {:ok, msg, state} ->
-        dispatch_inbound_message(msg, rest, state, continuation, source)
+        dispatch_inbound_message(msg, rest, state, cursor)
 
       {:error, reason, state} ->
-        drop_recoverable_fd_frame(reason, rest, state, continuation, source)
+        drop_recoverable_fd_frame(reason, rest, state, cursor)
     end
   end
 
@@ -349,18 +345,17 @@ defmodule Rebus.Connection.Dispatch do
   # ancillary data have been collected. The stream boundary is therefore known:
   # close the descriptors, drop only this frame, and continue with a coalesced
   # successor rather than letting a peer kill unrelated calls or handlers.
-  defp drop_recoverable_fd_frame(reason, rest, state, continuation, source) do
+  defp drop_recoverable_fd_frame(reason, rest, state, cursor) do
     reason = Rights.drop_reason(reason)
     Logger.warning("D-Bus FD frame dropped: #{inspect(reason)}", reason: reason)
-    parse_flat_messages(rest, state, continuation, source)
+    parse_flat_messages(rest, state, cursor)
   end
 
   defp dispatch_inbound_message(
          %Message{} = msg,
          rest,
          %Connection{hello_serial: hello_serial} = state,
-         _continuation,
-         source
+         cursor
        )
        when not is_nil(hello_serial) do
     # dbus-daemon's bus/dispatch.c replies to Hello before emitting the
@@ -370,20 +365,14 @@ defmodule Rebus.Connection.Dispatch do
       close_message_fds(msg)
       {:protocol_error, :invalid_unix_fds, state}
     else
-      dispatch_hello_reply(Setup.hello_reply_result(msg, hello_serial), rest, state, source)
+      dispatch_hello_reply(Setup.hello_reply_result(msg, hello_serial), rest, state, cursor)
     end
   end
 
-  defp dispatch_inbound_message(
-         %Message{type: type} = msg,
-         rest,
-         %Connection{} = state,
-         continuation,
-         source
-       )
+  defp dispatch_inbound_message(%Message{type: type} = msg, rest, %Connection{} = state, cursor)
        when type in [:method_return, :error] do
     case reply(msg, state) do
-      {:ok, state} -> parse_flat_messages(rest, state, continuation, source)
+      {:ok, state} -> parse_flat_messages(rest, state, cursor)
       {:error, reason} -> {:protocol_error, reason, state}
     end
   end
@@ -392,18 +381,17 @@ defmodule Rebus.Connection.Dispatch do
          %Message{type: :signal} = msg,
          rest,
          %Connection{} = state,
-         continuation,
-         source
+         cursor
        ) do
     # Signals may have multiple subscribers. Without a per-subscriber dup(2)
     # primitive, one raw descriptor cannot be transferred safely to all of
     # them, so FD-bearing signals are rejected and closed.
     if msg.unix_fds == [] do
-      parse_flat_messages(rest, notify(msg, state), continuation, source)
+      parse_flat_messages(rest, notify(msg, state), cursor)
     else
       close_message_fds(msg)
       Logger.warning("D-Bus FD frame dropped: :signal_ownership", reason: :signal_ownership)
-      parse_flat_messages(rest, state, continuation, source)
+      parse_flat_messages(rest, state, cursor)
     end
   end
 
@@ -411,33 +399,37 @@ defmodule Rebus.Connection.Dispatch do
          %Message{type: :method_call} = msg,
          rest,
          %Connection{} = state,
-         continuation,
-         source
+         cursor
        ) do
     # No method served by this connection takes a descriptor, so any received
     # descriptor is closed before the call is answered.
     close_message_fds(msg)
-    parse_flat_messages(rest, answer_method_call(msg, state), continuation, source)
+    parse_flat_messages(rest, answer_method_call(msg, state), cursor)
   end
 
-  defp dispatch_inbound_message(%Message{} = msg, rest, state, continuation, source) do
+  defp dispatch_inbound_message(%Message{} = msg, rest, state, cursor) do
     close_message_fds(msg)
-    parse_flat_messages(rest, state, continuation, source)
+    parse_flat_messages(rest, state, cursor)
   end
 
-  defp dispatch_hello_reply({:ok, name}, rest, %Connection{} = state, source) do
+  # The reader takes over from the setup path here, so this is the one point
+  # in a pass where the continuation changes.
+  defp dispatch_hello_reply({:ok, name}, rest, %Connection{} = state, cursor) do
     case Setup.establish_connection(%{
            state
            | name: name,
              hello_serial: nil,
              established?: true
          }) do
-      {:ok, established} -> parse_flat_messages(rest, established, :recv, source)
-      {:error, :caller_gone} -> {:shutdown, :caller_gone, state}
+      {:ok, established} ->
+        parse_flat_messages(rest, established, %{cursor | continuation: :recv})
+
+      {:error, :caller_gone} ->
+        {:shutdown, :caller_gone, state}
     end
   end
 
-  defp dispatch_hello_reply({:error, reason}, _rest, %Connection{} = state, _source) do
+  defp dispatch_hello_reply({:error, reason}, _rest, %Connection{} = state, _cursor) do
     {:protocol_error, reason, state}
   end
 
