@@ -1459,7 +1459,9 @@ defmodule RebusTest do
       assert {:select, ^select_info, "bc"} =
                Connection.classify_send_result({:select, {select_info, "bc"}}, 3)
 
-      assert {:completion, ^completion_info} =
+      # The completion backend is not supported: its result shape now reaches
+      # the unknown-result fallback and fails the write closed.
+      assert {:error, {:send_fatal, :send_failed}} =
                Connection.classify_send_result({:completion, completion_info}, 3)
 
       assert {:error, {:send_fatal, :send_failed}} =
@@ -1625,20 +1627,13 @@ defmodule RebusTest do
 
       {:ok, encoded} = Message.encode(message)
       data = :binary.copy(IO.iodata_to_binary(encoded), 1_000)
-      handle = make_ref()
+      select_info = {:select_info, :recv, make_ref()}
+      {:select_info, :recv, handle} = select_info
 
-      state = %Connection{
-        sock: sock,
-        name: ":1.100",
-        rref: {:completion, handle}
-      }
+      state = %Connection{sock: sock, name: ":1.100"}
 
-      assert {:noreply, %Connection{inbound_size: 0, inbound_flatten_count: 1},
-              {:continue, :recv}} =
-               Connection.handle_info(
-                 {:"$socket", sock, :completion, {handle, {:ok, data}}},
-                 state
-               )
+      assert {:noreply, %Connection{rref: ^handle, inbound_size: 0, inbound_flatten_count: 1}} =
+               Connection.handle_receive_result({:select, {select_info, data}}, state)
 
       _ = :socket.close(sock)
     end
@@ -1707,79 +1702,6 @@ defmodule RebusTest do
 
       refute log =~ "sensitive partial data"
       assert log =~ "D-Bus connection transport stopped: :closed"
-      _ = :socket.close(sock)
-    end
-
-    test "handles completion-based reads without leaking buffered state" do
-      {:ok, sock} = :socket.open(:inet, :stream, :default)
-
-      message =
-        Message.new!(:method_call, path: "/", interface: "org.example.Test", member: "Read")
-
-      {:ok, encoded} = Message.encode(message)
-      data = IO.iodata_to_binary(encoded)
-      complete_handle = make_ref()
-
-      complete_state = %Connection{
-        sock: sock,
-        name: ":1.100",
-        rref: {:completion, complete_handle}
-      }
-
-      assert {:noreply, %Connection{rref: nil, inbound_size: 0}, {:continue, :recv}} =
-               Connection.handle_info(
-                 {:"$socket", sock, :completion, {complete_handle, {:ok, data}}},
-                 complete_state
-               )
-
-      partial_handle = make_ref()
-      partial_state = %Connection{sock: sock, rref: {:completion, partial_handle}}
-
-      assert {:noreply, %Connection{rref: nil, inbound_size: 15} = buffered, {:continue, :recv}} =
-               Connection.handle_info(
-                 {:"$socket", sock, :completion,
-                  {partial_handle, {:ok, binary_part(data, 0, 15)}}},
-                 partial_state
-               )
-
-      assert buffered.partial_frame_timer != nil
-      Connection.terminate(:normal, buffered)
-    end
-
-    test "stops cleanly for completion read errors and aborts" do
-      {:ok, sock} = :socket.open(:inet, :stream, :default)
-      error_handle = make_ref()
-      error_state = %Connection{sock: sock, rref: {:completion, error_handle}}
-
-      error_log =
-        capture_log(fn ->
-          assert {:stop, {:shutdown, :closed}, %Connection{rref: nil}} =
-                   Connection.handle_info(
-                     {:"$socket", sock, :completion,
-                      {error_handle, {:error, {:closed, "sensitive partial data"}}}},
-                     error_state
-                   )
-        end)
-
-      refute error_log =~ "sensitive partial data"
-      refute error_log =~ "%Rebus.Connection"
-
-      abort_handle = make_ref()
-      abort_state = %Connection{sock: sock, rref: {:completion, abort_handle}}
-
-      abort_log =
-        capture_log(fn ->
-          assert {:stop, {:shutdown, :closed}, ^abort_state} =
-                   Connection.handle_info(
-                     {:"$socket", sock, :abort,
-                      {abort_handle, {:closed, "sensitive partial data"}}},
-                     abort_state
-                   )
-        end)
-
-      refute abort_log =~ "sensitive partial data"
-      refute abort_log =~ "%Rebus.Connection"
-
       _ = :socket.close(sock)
     end
 
@@ -3726,55 +3648,6 @@ defmodule RebusTest do
       assert_receive {:selected_tail, tail}
       send(cli, {:"$socket", :sys.get_state(cli).sock, :select, handle})
       assert_receive {:resumed_tail, ^tail, ^continuation, :nowait}
-      assert :ok = Task.await(task)
-    end
-
-    test "completes a Windows-style completion write", %{cli: cli} do
-      completion = {:completion_info, :send, make_ref()}
-      {:completion_info, :send, handle} = completion
-
-      :ok = TestImpl.install(cli, send: fn _, _, _, _ -> {:completion, completion} end)
-
-      signal =
-        Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Completion")
-
-      task = Task.async(fn -> Rebus.send(cli, signal, 500) end)
-      assert wait_until(fn -> :sys.get_state(cli).active_write != nil end)
-      send(cli, {:"$socket", :sys.get_state(cli).sock, :completion, {handle, :ok}})
-      assert :ok = Task.await(task)
-    end
-
-    test "continues a partial completion write", %{cli: cli} do
-      parent = self()
-      completion = {:completion_info, :send, make_ref()}
-      {:completion_info, :send, handle} = completion
-      calls = :atomics.new(1, [])
-
-      :ok =
-        TestImpl.install(cli,
-          send: fn _, rest, _, _ ->
-            if :atomics.add_get(calls, 1, 1) == 1 do
-              send(parent, {:completion_rest, rest})
-              {:completion, completion}
-            else
-              send(parent, {:completion_tail, rest})
-              :ok
-            end
-          end
-        )
-
-      signal =
-        Message.new!(:signal,
-          path: "/",
-          interface: "org.example.Test",
-          member: "PartialCompletion"
-        )
-
-      task = Task.async(fn -> Rebus.send(cli, signal, 500) end)
-      assert_receive {:completion_rest, rest}
-      tail = binary_part(rest, 1, byte_size(rest) - 1)
-      send(cli, {:"$socket", :sys.get_state(cli).sock, :completion, {handle, {:ok, 1}}})
-      assert_receive {:completion_tail, ^tail}
       assert :ok = Task.await(task)
     end
 

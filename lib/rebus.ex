@@ -48,6 +48,12 @@ defmodule Rebus do
         {:error, reason} -> {:error, reason}
       end
 
+  ## Supported platforms
+
+  Rebus supports Linux and macOS, which are the platforms exercised in CI.
+  Other Unix variants are untested; Unix file descriptor passing in particular
+  is limited to Linux and macOS. Windows is not supported.
+
   ## Connection Types
 
   Rebus supports connecting to different types of D-Bus endpoints:

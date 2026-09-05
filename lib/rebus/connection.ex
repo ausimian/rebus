@@ -176,7 +176,8 @@ defmodule Rebus.Connection do
   typedstruct enforce: true do
     field :sock, :socket.socket()
     field :guid, binary() | nil, default: nil
-    field :rref, term() | nil, default: nil
+    # The pending receive select handle, or nil when no receive is outstanding.
+    field :rref, :socket.select_handle() | nil, default: nil
     field :inbound_segments, [{pos_integer(), binary()}], default: []
     field :inbound_size, non_neg_integer(), default: 0
     field :inbound_expected_size, pos_integer() | nil, default: nil
@@ -230,6 +231,9 @@ defmodule Rebus.Connection do
     field :fd_claim_outcomes, %{reference() => {:acknowledged | :closed, reference()}},
       default: %{}
 
+    # `wait` is `nil` when the socket is free to be written, `{:continue, cont}`
+    # when a registered continuation is ready to resume, and
+    # `{:select, cont, handle}` while waiting on a select notification.
     field :active_write, map() | nil, default: nil
     field :write_queue, :queue.queue(), default: :queue.new()
     field :queued_requests, MapSet.t(reference()), default: MapSet.new()
@@ -384,29 +388,8 @@ defmodule Rebus.Connection do
   end
 
   def handle_info(
-        {:"$socket", s, :completion, {h, result}},
-        %__MODULE__{sock: s, active_write: %{wait: {:completion, _continuation, h}}} = state
-      ) do
-    handle_completion_result(result, %{state | active_write: %{state.active_write | wait: nil}})
-  end
-
-  def handle_info(
-        {:"$socket", s, :completion, {h, result}},
-        %__MODULE__{sock: s, rref: {:completion, h}} = state
-      ) do
-    handle_read_completion(result, %{state | rref: nil})
-  end
-
-  def handle_info(
         {:"$socket", s, :abort, {h, reason}},
         %__MODULE__{sock: s, rref: h} = state
-      ) do
-    stop_for_transport_error(reason, state)
-  end
-
-  def handle_info(
-        {:"$socket", s, :abort, {h, reason}},
-        %__MODULE__{sock: s, rref: {:completion, h}} = state
       ) do
     stop_for_transport_error(reason, state)
   end
@@ -491,12 +474,6 @@ defmodule Rebus.Connection do
   def handle_info(
         {:"$socket", s, :abort, {h, reason}},
         %__MODULE__{sock: s, active_write: %{wait: {:select, _continuation, h}}} = state
-      ),
-      do: stop_for_transport_error(reason, state)
-
-  def handle_info(
-        {:"$socket", s, :abort, {h, reason}},
-        %__MODULE__{sock: s, active_write: %{wait: {:completion, _continuation, h}}} = state
       ),
       do: stop_for_transport_error(reason, state)
 
@@ -691,20 +668,6 @@ defmodule Rebus.Connection do
     append_recvmsg(message, %{state | rref: handle}, :recv)
   end
 
-  def handle_receive_result(
-        {:completion, {:completion_info, :recv, handle}},
-        %__MODULE__{} = state
-      ) do
-    {:noreply, %{state | rref: {:completion, handle}}}
-  end
-
-  def handle_receive_result(
-        {:completion, {:completion_info, :recvmsg, handle}},
-        %__MODULE__{} = state
-      ) do
-    {:noreply, %{state | rref: {:completion, handle}}}
-  end
-
   def handle_receive_result({:error, reason}, %__MODULE__{} = state) do
     stop_for_transport_error(reason, state)
   end
@@ -797,25 +760,6 @@ defmodule Rebus.Connection do
       result ->
         result
     end
-  end
-
-  defp handle_read_completion({:ok, data}, %__MODULE__{} = state) when is_binary(data) do
-    append_inbound(data, state, :recv)
-  end
-
-  defp handle_read_completion({:ok, message}, %__MODULE__{} = state) when is_map(message) do
-    append_recvmsg(message, state, :recv)
-  end
-
-  defp handle_read_completion({:error, reason}, %__MODULE__{} = state) do
-    stop_for_transport_error(reason, state)
-  end
-
-  # Completion-based socket backends may use a result shape that differs from
-  # the readiness backend. Treat an unknown result as a clean transport stop
-  # rather than raising and allowing GenServer to log buffered peer data.
-  defp handle_read_completion(_result, %__MODULE__{} = state) do
-    stop_for_transport_error(:receive_failed, state)
   end
 
   @impl true
@@ -3048,19 +2992,10 @@ defmodule Rebus.Connection do
             when is_tuple(info) and tuple_size(info) == 3 and elem(info, 0) == :select_info and
                    elem(info, 1) == :sendmsg and is_reference(elem(info, 2))
 
-  defguardp is_completion_info(info)
-            when is_tuple(info) and tuple_size(info) == 3 and elem(info, 0) == :completion_info and
-                   elem(info, 1) in [:send, :sendmsg] and is_reference(elem(info, 2))
-
-  defguardp is_sendmsg_completion_info(info)
-            when is_tuple(info) and tuple_size(info) == 3 and elem(info, 0) == :completion_info and
-                   elem(info, 1) == :sendmsg and is_reference(elem(info, 2))
-
   @spec classify_send_result(term(), non_neg_integer()) ::
           :ok
           | {:continue, iodata()}
           | {:select, tuple(), binary() | nil}
-          | {:completion, term()}
           | {:error, term()}
   def classify_send_result(:ok, _payload_length), do: :ok
 
@@ -3074,10 +3009,6 @@ defmodule Rebus.Connection do
   def classify_send_result({:select, select_info}, _payload_length)
       when is_select_info(select_info),
       do: {:select, select_info, nil}
-
-  def classify_send_result({:completion, completion_info}, _payload_length)
-      when is_completion_info(completion_info),
-      do: {:completion, completion_info}
 
   def classify_send_result({:error, {:timeout, rest}}, payload_length) do
     if iolist?(rest) and IO.iodata_length(rest) == payload_length,
@@ -3113,13 +3044,7 @@ defmodule Rebus.Connection do
       {:select, select_info} when is_sendmsg_select_info(select_info) ->
         {:select, select_info, nil}
 
-      {:completion, completion_info} when is_sendmsg_completion_info(completion_info) ->
-        {:completion, completion_info}
-
       {:select, _unexpected} ->
-        {:error, {:send_fatal, :send_failed}}
-
-      {:completion, _unexpected} ->
         {:error, {:send_fatal, :send_failed}}
 
       {:error, reason} when reason in [:ebadf, :einval, :eperm, :emfile, :enfile] ->
@@ -3250,9 +3175,6 @@ defmodule Rebus.Connection do
   defp advance_writes(%__MODULE__{active_write: %{wait: {:select, _, _}}} = state),
     do: {:noreply, state}
 
-  defp advance_writes(%__MODULE__{active_write: %{wait: {:completion, _, _}}} = state),
-    do: {:noreply, state}
-
   defp advance_writes(%__MODULE__{active_write: write} = state) do
     if (expired?(write) or cancelled?(write, state)) and not write.partial? do
       advance_writes(drop_active(state, cancel?: true))
@@ -3314,16 +3236,6 @@ defmodule Rebus.Connection do
            %{state | active_write: %{state.active_write | wait: {:select, continuation, handle}}}}
         end
 
-      {:completion, {:completion_info, _operation, notification_handle} = handle} ->
-        {:noreply,
-         %{
-           state
-           | active_write: %{
-               state.active_write
-               | wait: {:completion, handle, notification_handle}
-             }
-         }}
-
       {:error, {:send_fatal, reason}} ->
         stop_for_transport_error(reason, state)
 
@@ -3346,21 +3258,6 @@ defmodule Rebus.Connection do
 
   defp classify_write_result(result, %{rest: rest}),
     do: classify_send_result(result, byte_size(rest))
-
-  defp handle_completion_result(:ok, state), do: complete_active_write(state)
-
-  defp handle_completion_result({:ok, written}, %__MODULE__{active_write: write} = state)
-       when is_integer(written) and written > 0 and written < byte_size(write.rest) do
-    <<_sent::binary-size(^written), rest::binary>> = write.rest
-    state = put_active_rest(state, rest)
-    {:noreply, state, {:continue, :write}}
-  end
-
-  defp handle_completion_result({:error, reason}, state),
-    do: stop_for_transport_error(reason, state)
-
-  defp handle_completion_result(_unexpected, state),
-    do: stop_for_transport_error(:send_failed, state)
 
   defp put_active_rest(%__MODULE__{active_write: write} = state, rest) do
     partial? = write.partial? or byte_size(rest) < byte_size(write.rest)
@@ -3524,15 +3421,6 @@ defmodule Rebus.Connection do
   end
 
   defp cancel_socket_write(state, {:select, continuation, _handle}) do
-    _ = transport(state).cancel(state.sock, continuation)
-    :ok
-  rescue
-    _ -> :ok
-  catch
-    _, _ -> :ok
-  end
-
-  defp cancel_socket_write(state, {:completion, continuation, _handle}) do
     _ = transport(state).cancel(state.sock, continuation)
     :ok
   rescue

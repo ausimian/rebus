@@ -155,6 +155,12 @@ Rebus is built with a modular architecture:
 - **`Rebus.Decoder`** - D-Bus wire format decoding with struct boundary tracking
 - **`Rebus.SignalHandler`** - Event-based signal distribution to registered handlers
 
+## Supported platforms
+
+Rebus supports Linux and macOS, the platforms exercised in CI. Other Unix
+variants are untested (Unix file descriptor passing is Linux and macOS only),
+and Windows is not supported.
+
 ## Connection Types
 
 Rebus supports connecting to different types of D-Bus endpoints:

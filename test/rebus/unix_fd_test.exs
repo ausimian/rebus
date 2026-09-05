@@ -173,47 +173,6 @@ defmodule Rebus.UnixFDTest do
     assert :ok = Task.await(task, 1_000)
   end
 
-  test "switches a partial sendmsg completion tail to plain send", %{connection: connection} do
-    parent = self()
-    completion = {:completion_info, :sendmsg, make_ref()}
-    {:completion_info, :sendmsg, handle} = completion
-    {:ok, fd} = :socket.getopt(:sys.get_state(connection).sock, {:otp, :fd})
-
-    :ok =
-      TestImpl.install(connection,
-        sendmsg: fn _sock, %{iov: [rest], ctrl: ctrl}, [], :nowait ->
-          send(parent, {:sendmsg_completion_initial, rest, ctrl})
-          {:completion, completion}
-        end,
-        send: fn _sock, rest, [], :nowait ->
-          send(parent, {:sendmsg_completion_tail, rest})
-          :ok
-        end
-      )
-
-    message =
-      Message.new!(:signal,
-        path: "/test",
-        interface: "test.interface",
-        member: "CompletionFD",
-        signature: "h",
-        body: [0],
-        fds: [fd]
-      )
-
-    task = Task.async(fn -> Rebus.send(connection, message) end)
-    assert_receive {:sendmsg_completion_initial, initial, [_rights]}, 1_000
-
-    send(
-      connection,
-      {:"$socket", :sys.get_state(connection).sock, :completion, {handle, {:ok, 1}}}
-    )
-
-    assert_receive {:sendmsg_completion_tail, tail}, 1_000
-    assert tail == binary_part(initial, 1, byte_size(initial) - 1)
-    assert :ok = Task.await(task, 1_000)
-  end
-
   test "keeps accepted FD control sticky across a plain-tail select", %{connection: connection} do
     parent = self()
     send_continuation = {:select_info, :send, make_ref()}
@@ -1457,12 +1416,11 @@ defmodule Rebus.UnixFDTest do
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
   end
 
-  test "handles recvmsg select, completion, and malformed-control transitions", %{
+  test "handles recvmsg select and malformed-control transitions", %{
     connection: connection
   } do
     state = :sys.get_state(connection)
     select_handle = make_ref()
-    completion_handle = make_ref()
 
     assert {:noreply, %{rref: ^select_handle}} =
              Rebus.Connection.handle_receive_result(
@@ -1470,15 +1428,11 @@ defmodule Rebus.UnixFDTest do
                state
              )
 
-    assert {:noreply, %{rref: {:completion, ^completion_handle}}} =
+    # The completion backend is unsupported, so its receive result is an
+    # unknown shape that stops the connection instead of hanging.
+    assert {:stop, {:shutdown, :receive_failed}, _state} =
              Rebus.Connection.handle_receive_result(
-               {:completion, {:completion_info, :recvmsg, completion_handle}},
-               state
-             )
-
-    assert {:noreply, %{rref: {:completion, ^completion_handle}}} =
-             Rebus.Connection.handle_receive_result(
-               {:completion, {:completion_info, :recv, completion_handle}},
+               {:completion, {:completion_info, :recvmsg, make_ref()}},
                state
              )
 
@@ -1612,19 +1566,6 @@ defmodule Rebus.UnixFDTest do
                   flags: [:ctrunc]
                 }},
                state
-             )
-
-    assert {:stop, {:shutdown, :invalid_unix_fds}, _state} =
-             Rebus.Connection.handle_info(
-               {:"$socket", state.sock, :completion,
-                {completion_handle,
-                 {:ok,
-                  %{
-                    iov: [],
-                    ctrl: [%{level: :socket, type: :rights, data: <<1>>}],
-                    flags: []
-                  }}}},
-               %{state | rref: {:completion, completion_handle}}
              )
   end
 
