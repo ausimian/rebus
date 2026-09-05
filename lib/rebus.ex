@@ -15,7 +15,8 @@ defmodule Rebus do
   - Connecting to D-Bus message buses (system and session buses)
   - Sending method calls and receiving replies
   - Emitting and receiving signals
-  - Publishing and consuming D-Bus services
+  - Answering `org.freedesktop.DBus.Peer` and returning `UnknownMethod` for
+    other inbound method calls (there is no service-side API yet)
 
   ## Quick Start
 
@@ -72,6 +73,14 @@ defmodule Rebus do
   connection process that handles the low-level protocol details. The connection
   manages authentication, message serialization/deserialization, and maintains
   the persistent connection to the bus.
+
+  Inbound method calls are answered by the connection itself. It implements
+  `org.freedesktop.DBus.Peer` (`Ping` and `GetMachineId`) and replies to every
+  other method call with an `org.freedesktop.DBus.Error.UnknownMethod` error,
+  so a peer fails immediately instead of waiting for its own timeout. A call
+  flagged `:no_reply_expected` is dropped silently, and any descriptor received
+  with a call is closed. There is no API to serve method calls from
+  application code.
 
   ## Error Handling
 
