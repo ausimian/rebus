@@ -17,7 +17,17 @@ defmodule Rebus.MixProject do
       package: package(),
       source_url: @source_url,
       elixirc_paths: elixirc_paths(Mix.env()),
-      test_coverage: [ignore_modules: [Rebus.TestServer]],
+      test_coverage: [
+        ignore_modules: [
+          Rebus.TestServer,
+          Rebus.TestImpl,
+          Rebus.TestImpl.Clock,
+          Rebus.TestImpl.Connector,
+          Rebus.TestImpl.Hooks,
+          Rebus.TestImpl.Identity,
+          Rebus.TestImpl.Resolver
+        ]
+      ],
       dialyzer: [
         plt_core_path: "_build/plts",
         plt_file:

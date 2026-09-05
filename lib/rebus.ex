@@ -173,16 +173,6 @@ defmodule Rebus do
   @max_tcp_addresses_per_family 4
   @minimum_address_attempt_timeout 50
 
-  @publicly_ignored_connection_options [
-    :auth_id,
-    :auth_id_fun,
-    :auth_username_fun,
-    :address_list_auth_id,
-    :address_list_setup_timeout,
-    :expected_guid,
-    :precomputed_auth_id
-  ]
-
   @doc """
   Establishes a connection to a D-Bus message bus.
 
@@ -328,8 +318,9 @@ defmodule Rebus do
 
   Rebus obtains the local `EXTERNAL` auth ID once in the calling process before
   it begins a supported address list, then privately supplies that value to all
-  candidate connections. Caller-provided auth-ID and address-list setup options
-  are ignored; they cannot bypass this ownership or candidate identity checks.
+  candidate connections. That value, and the per-candidate setup budget and
+  expected GUID, reach each candidate outside the caller's options, so they
+  cannot be supplied or overridden by the caller.
   For an address list only, `:timeout` (or `:read_timeout` when supplied) is
   one aggregate budget for DNS lookup and pre-Hello socket/authentication setup
   across all candidates. Each resolver and pre-Hello setup attempt gets
@@ -427,46 +418,14 @@ defmodule Rebus do
   end
 
   def connect(%{family: family} = addr, opts) when family in [:inet, :inet6, :local] do
-    opts = strip_public_connection_options(opts)
-    start_connection(addr, opts)
+    impl = build_impl(opts)
+    impl.connector.connect(addr, {opts, %{impl: impl}})
   end
 
-  defp connect_address_candidate(%{family: family} = addr, opts)
-       when family in [:inet, :inet6, :local] do
-    case Keyword.pop(opts, :address_list_auth_id) do
-      {auth_id, candidate_opts} when is_binary(auth_id) ->
-        start_connection(addr, candidate_opts, auth_id)
-
-      _missing_auth_id ->
-        {:error, :invalid_bus_address_implementation}
-    end
-  end
-
-  defp start_connection(addr, opts, precomputed_auth_id \\ nil) do
-    connect_ref = make_ref()
-
-    args =
-      opts
-      |> Keyword.put(:addr, addr)
-      |> Keyword.put(:connect_waiter, {self(), connect_ref})
-
-    args =
-      if is_binary(precomputed_auth_id),
-        do: Keyword.put(args, :precomputed_auth_id, precomputed_auth_id),
-        else: args
-
-    child_spec = {Rebus.Connection, args}
-
-    case DynamicSupervisor.start_child(Rebus.ConnectionSupervisor, child_spec) do
-      {:ok, pid} -> await_connection(pid, connect_ref, Process.monitor(pid))
-      {:error, {:already_started, pid}} -> name_collision(pid)
-      other -> other
-    end
-  end
-
-  defp strip_public_connection_options(opts) do
-    Keyword.drop(opts, @publicly_ignored_connection_options)
-  end
+  # Implementation modules are chosen through the private `:__impl__` option.
+  # Outside this project's own test build `Rebus.Impl.from_options/1` compiles
+  # to a clause that ignores its argument, so nothing reads the option.
+  defp build_impl(opts), do: Rebus.Impl.from_options(opts)
 
   # `:system` and `:session` name message buses, so they cannot be peer-to-peer
   # endpoints. Reject the option before any address lookup or I/O so the error
@@ -486,41 +445,22 @@ defmodule Rebus do
   end
 
   @doc false
-  @spec connect_address_candidates([Rebus.BusAddress.candidate()], keyword(), keyword()) ::
+  @spec connect_address_candidates([Rebus.BusAddress.candidate()], keyword()) ::
           {:ok, pid()} | {:error, term()}
-  def connect_address_candidates(candidates, opts, implementation \\ [])
-      when is_list(candidates) and is_list(opts) and is_list(implementation) do
-    opts = strip_public_connection_options(opts)
+  def connect_address_candidates(candidates, opts)
+      when is_list(candidates) and is_list(opts) do
+    impl = build_impl(opts)
 
-    with {:ok, timeout} <- address_list_timeout(opts),
-         {:ok, resolver} <- implementation_function(implementation, :resolver, 3, &resolve_tcp/3),
-         {:ok, connector} <-
-           implementation_function(implementation, :connector, 2, &connect_address_candidate/2),
-         {:ok, auth_id_runner} <-
-           implementation_function(
-             implementation,
-             :auth_id_runner,
-             1,
-             &Rebus.Connection.run_auth_id/1
-           ),
-         {:ok, monotonic_time} <-
-           implementation_function(
-             implementation,
-             :monotonic_time,
-             0,
-             fn -> System.monotonic_time(:millisecond) end
-           ) do
-      deadline = monotonic_time.() + timeout
+    with {:ok, timeout} <- address_list_timeout(opts) do
+      deadline = impl.clock.monotonic_time() + timeout
 
-      case resolve_list_auth_id(candidates, deadline, auth_id_runner, monotonic_time) do
+      case resolve_list_auth_id(candidates, deadline, impl) do
         {:ok, auth_id} ->
           connect_bus_candidates(
             candidates,
-            Keyword.put(opts, :address_list_auth_id, auth_id),
+            {opts, %{impl: impl, precomputed_auth_id: auth_id}},
             deadline,
-            resolver,
-            connector,
-            monotonic_time,
+            impl,
             nil,
             1
           )
@@ -534,36 +474,27 @@ defmodule Rebus do
     end
   end
 
-  defp implementation_function(implementation, key, arity, default) do
-    case Keyword.get(implementation, key, default) do
-      function when is_function(function, arity) -> {:ok, function}
-      _function -> {:error, :invalid_bus_address_implementation}
-    end
-  end
-
-  defp resolve_list_auth_id([], _deadline, _auth_id_runner, _monotonic_time),
+  defp resolve_list_auth_id([], _deadline, _impl),
     do: {:error, :unsupported_bus_transport}
 
-  defp resolve_list_auth_id(candidates, deadline, auth_id_runner, monotonic_time) do
+  defp resolve_list_auth_id(candidates, deadline, impl) do
     candidate_count = connectable_candidate_count(candidates)
 
     if candidate_count == 0 do
       {:error, :unsupported_bus_transport}
     else
       with {:ok, timeout} <-
-             address_attempt_timeout(deadline, candidate_count + 1, monotonic_time, nil) do
-        Rebus.Connection.get_auth_id(timeout, auth_id_runner)
+             address_attempt_timeout(deadline, candidate_count + 1, impl.clock, nil) do
+        Rebus.Connection.get_auth_id(timeout, impl.identity)
       end
     end
   end
 
   defp connect_bus_candidates(
          [],
-         _opts,
+         _conn,
          _deadline,
-         _resolver,
-         _connector,
-         _monotonic_time,
+         _impl,
          nil,
          _candidate_ordinal
        ),
@@ -571,11 +502,9 @@ defmodule Rebus do
 
   defp connect_bus_candidates(
          [],
-         _opts,
+         _conn,
          _deadline,
-         _resolver,
-         _connector,
-         _monotonic_time,
+         _impl,
          error,
          _candidate_ordinal
        ),
@@ -583,21 +512,17 @@ defmodule Rebus do
 
   defp connect_bus_candidates(
          [:unsupported | candidates],
-         opts,
+         conn,
          deadline,
-         resolver,
-         connector,
-         monotonic_time,
+         impl,
          last_error,
          candidate_ordinal
        ) do
     connect_bus_candidates(
       candidates,
-      opts,
+      conn,
       deadline,
-      resolver,
-      connector,
-      monotonic_time,
+      impl,
       last_error,
       candidate_ordinal + 1
     )
@@ -605,22 +530,18 @@ defmodule Rebus do
 
   defp connect_bus_candidates(
          [candidate | candidates],
-         opts,
+         conn,
          deadline,
-         resolver,
-         connector,
-         monotonic_time,
+         impl,
          last_error,
          candidate_ordinal
        ) do
     case connect_bus_candidate(
            candidate,
            candidates,
-           opts,
+           conn,
            deadline,
-           resolver,
-           connector,
-           monotonic_time,
+           impl,
            last_error,
            candidate_ordinal
          ) do
@@ -634,11 +555,9 @@ defmodule Rebus do
         if retryable_bus_address_error?(reason) do
           connect_bus_candidates(
             candidates,
-            opts,
+            conn,
             deadline,
-            resolver,
-            connector,
-            monotonic_time,
+            impl,
             reason,
             candidate_ordinal + 1
           )
@@ -651,11 +570,9 @@ defmodule Rebus do
   defp connect_bus_candidate(
          {:local, path, expected_guid},
          remaining_candidates,
-         opts,
+         conn,
          deadline,
-         _resolver,
-         connector,
-         monotonic_time,
+         impl,
          last_error,
          candidate_ordinal
        ) do
@@ -663,15 +580,15 @@ defmodule Rebus do
            address_attempt_timeout(
              deadline,
              1 + connectable_candidate_count(remaining_candidates),
-             monotonic_time,
+             impl.clock,
              last_error
            ) do
       connect_with_address_diagnostic(
-        connector,
+        impl,
         %{family: :local, path: path},
-        opts
-        |> Keyword.put(:address_list_setup_timeout, timeout)
-        |> Keyword.put(:expected_guid, expected_guid),
+        conn
+        |> put_internal(:setup_timeout, timeout)
+        |> put_internal(:expected_guid, expected_guid),
         candidate_ordinal,
         0,
         :unix,
@@ -683,11 +600,9 @@ defmodule Rebus do
   defp connect_bus_candidate(
          {:tcp, host, port, family, expected_guid},
          remaining_candidates,
-         opts,
+         conn,
          deadline,
-         resolver,
-         connector,
-         monotonic_time,
+         impl,
          last_error,
          candidate_ordinal
        ) do
@@ -696,8 +611,7 @@ defmodule Rebus do
              host,
              family,
              deadline,
-             resolver,
-             monotonic_time,
+             impl,
              connectable_candidate_count(remaining_candidates),
              last_error,
              candidate_ordinal
@@ -706,10 +620,9 @@ defmodule Rebus do
         addresses,
         port,
         expected_guid,
-        opts,
+        conn,
         deadline,
-        connector,
-        monotonic_time,
+        impl,
         connectable_candidate_count(remaining_candidates),
         last_error,
         candidate_ordinal,
@@ -722,8 +635,7 @@ defmodule Rebus do
          host,
          family,
          deadline,
-         resolver,
-         monotonic_time,
+         impl,
          remaining_candidate_count,
          last_error,
          candidate_ordinal
@@ -734,8 +646,7 @@ defmodule Rebus do
       host,
       families,
       deadline,
-      resolver,
-      monotonic_time,
+      impl,
       remaining_candidate_count,
       [],
       [],
@@ -744,12 +655,17 @@ defmodule Rebus do
     )
   end
 
+  # Dialyzer analyses the dev build, where the implementation gate is closed and
+  # the resolver is always `Rebus.Resolver.Inet`; from that alone it proves the
+  # out-of-contract result clause and the non-atom reason clause unreachable.
+  # The behaviour admits any error term, and the test build reaches both.
+  @dialyzer {:no_match, [resolve_tcp_families: 9, safe_resolver_reason: 1]}
+
   defp resolve_tcp_families(
          _host,
          [],
          _deadline,
-         _resolver,
-         _monotonic_time,
+         _impl,
          _remaining_candidate_count,
          [],
          reasons,
@@ -762,8 +678,7 @@ defmodule Rebus do
          _host,
          [],
          _deadline,
-         _resolver,
-         _monotonic_time,
+         _impl,
          _remaining_candidate_count,
          addresses,
          _reasons,
@@ -776,8 +691,7 @@ defmodule Rebus do
          host,
          [family | families],
          deadline,
-         resolver,
-         monotonic_time,
+         impl,
          remaining_candidate_count,
          addresses,
          reasons,
@@ -788,10 +702,10 @@ defmodule Rebus do
            address_attempt_timeout(
              deadline,
              length([family | families]) + remaining_candidate_count,
-             monotonic_time,
+             impl.clock,
              last_error
            ) do
-      case resolver.(host, family, timeout) do
+      case impl.resolver.getaddrs(host, family, timeout) do
         {:ok, resolved} when is_list(resolved) ->
           resolved_addresses =
             resolved
@@ -802,8 +716,7 @@ defmodule Rebus do
             host,
             families,
             deadline,
-            resolver,
-            monotonic_time,
+            impl,
             remaining_candidate_count,
             addresses ++ resolved_addresses,
             reasons,
@@ -826,8 +739,7 @@ defmodule Rebus do
             host,
             families,
             deadline,
-            resolver,
-            monotonic_time,
+            impl,
             remaining_candidate_count,
             addresses,
             [safe_reason | reasons],
@@ -842,8 +754,7 @@ defmodule Rebus do
             host,
             families,
             deadline,
-            resolver,
-            monotonic_time,
+            impl,
             remaining_candidate_count,
             addresses,
             [:resolution_failed | reasons],
@@ -858,10 +769,9 @@ defmodule Rebus do
          [],
          _port,
          _expected_guid,
-         _opts,
+         _conn,
          _deadline,
-         _connector,
-         _monotonic_time,
+         _impl,
          _remaining_candidate_count,
          nil,
          _candidate_ordinal,
@@ -873,10 +783,9 @@ defmodule Rebus do
          [],
          _port,
          _expected_guid,
-         _opts,
+         _conn,
          _deadline,
-         _connector,
-         _monotonic_time,
+         _impl,
          remaining_candidate_count,
          error,
          _candidate_ordinal,
@@ -889,10 +798,9 @@ defmodule Rebus do
          [],
          _port,
          _expected_guid,
-         _opts,
+         _conn,
          _deadline,
-         _connector,
-         _monotonic_time,
+         _impl,
          _remaining_candidate_count,
          error,
          _candidate_ordinal,
@@ -904,10 +812,9 @@ defmodule Rebus do
          [{family, address} | addresses],
          port,
          expected_guid,
-         opts,
+         conn,
          deadline,
-         connector,
-         monotonic_time,
+         impl,
          remaining_candidate_count,
          last_error,
          candidate_ordinal,
@@ -917,15 +824,15 @@ defmodule Rebus do
            address_attempt_timeout(
              deadline,
              length(addresses) + 1 + remaining_candidate_count,
-             monotonic_time,
+             impl.clock,
              last_error
            ) do
       case connect_with_address_diagnostic(
-             connector,
+             impl,
              %{family: family, addr: address, port: port},
-             opts
-             |> Keyword.put(:address_list_setup_timeout, timeout)
-             |> Keyword.put(:expected_guid, expected_guid),
+             conn
+             |> put_internal(:setup_timeout, timeout)
+             |> put_internal(:expected_guid, expected_guid),
              candidate_ordinal,
              ip_ordinal,
              :tcp,
@@ -940,10 +847,9 @@ defmodule Rebus do
               addresses,
               port,
               expected_guid,
-              opts,
+              conn,
               deadline,
-              connector,
-              monotonic_time,
+              impl,
               remaining_candidate_count,
               reason,
               candidate_ordinal,
@@ -956,6 +862,11 @@ defmodule Rebus do
     end
   end
 
+  # The internal arguments a candidate connection is started with never travel
+  # in the caller's option list.
+  defp put_internal({conn_opts, internal}, key, value),
+    do: {conn_opts, Map.put(internal, key, value)}
+
   defp connectable_candidate_count(candidates) do
     Enum.count(candidates, &connectable_candidate?/1)
   end
@@ -965,15 +876,15 @@ defmodule Rebus do
   defp connectable_candidate?(_candidate), do: false
 
   defp connect_with_address_diagnostic(
-         connector,
+         impl,
          address,
-         opts,
+         conn,
          candidate_ordinal,
          ip_ordinal,
          transport,
          timeout
        ) do
-    case connector.(address, opts) do
+    case impl.connector.connect(address, conn) do
       {:error, reason} = error ->
         log_address_attempt(candidate_ordinal, ip_ordinal, transport, timeout, reason)
         error
@@ -992,8 +903,8 @@ defmodule Rebus do
     end)
   end
 
-  defp address_attempt_timeout(deadline, attempt_count, monotonic_time, last_error) do
-    case remaining_address_list_timeout(deadline, monotonic_time) do
+  defp address_attempt_timeout(deadline, attempt_count, clock, last_error) do
+    case remaining_address_list_timeout(deadline, clock) do
       {:ok, remaining} ->
         {:ok, fair_address_attempt_timeout(remaining, attempt_count)}
 
@@ -1048,17 +959,11 @@ defmodule Rebus do
     end
   end
 
-  defp remaining_address_list_timeout(deadline, monotonic_time) do
-    case deadline - monotonic_time.() do
+  defp remaining_address_list_timeout(deadline, clock) do
+    case deadline - clock.monotonic_time() do
       timeout when timeout > 0 -> {:ok, timeout}
       _timeout -> {:error, :read_timeout}
     end
-  end
-
-  defp resolve_tcp(host, family, timeout) do
-    :inet.getaddrs(:binary.bin_to_list(host), family, timeout)
-  catch
-    _kind, _reason -> {:error, :resolution_failed}
   end
 
   defp safe_resolver_reason(reason) when is_atom(reason), do: reason
@@ -1070,8 +975,6 @@ defmodule Rebus do
   defp retryable_bus_address_error?(:invalid_allow_anonymous), do: false
   defp retryable_bus_address_error?(:invalid_bus_option), do: false
   defp retryable_bus_address_error?(:invalid_name), do: false
-  defp retryable_bus_address_error?(:invalid_auth_id_fun), do: false
-  defp retryable_bus_address_error?(:invalid_auth_username_fun), do: false
   defp retryable_bus_address_error?(:auth_id_unavailable), do: false
   defp retryable_bus_address_error?(:auth_cookie_unavailable), do: false
   defp retryable_bus_address_error?(:guid_mismatch), do: false
@@ -1079,58 +982,6 @@ defmodule Rebus do
   defp retryable_bus_address_error?({:name_taken, _pid}), do: false
   defp retryable_bus_address_error?({:name_registered, _pid}), do: false
   defp retryable_bus_address_error?(_reason), do: true
-
-  defp name_collision(pid) do
-    if connection_child?(pid),
-      do: {:error, {:name_taken, pid}},
-      else: {:error, {:name_registered, pid}}
-  end
-
-  defp connection_child?(pid) do
-    Enum.any?(DynamicSupervisor.which_children(Rebus.ConnectionSupervisor), fn
-      {_id, ^pid, _type, _modules} -> true
-      _child -> false
-    end)
-  catch
-    :exit, _reason -> false
-  end
-
-  defp await_connection(pid, connect_ref, monitor_ref) do
-    receive do
-      {^connect_ref, {:ok, ^pid}} ->
-        Kernel.send(pid, {connect_ref, :accepted})
-        await_accepted_connection(pid, connect_ref, monitor_ref)
-
-      {^connect_ref, {:error, reason}} ->
-        await_failed_connection(pid, monitor_ref, reason)
-
-      {:DOWN, ^monitor_ref, :process, ^pid, {:shutdown, reason}} ->
-        {:error, reason}
-
-      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
-        {:error, reason}
-    end
-  end
-
-  defp await_failed_connection(pid, monitor_ref, reason) do
-    receive do
-      {:DOWN, ^monitor_ref, :process, ^pid, _stop_reason} -> {:error, reason}
-    end
-  end
-
-  defp await_accepted_connection(pid, connect_ref, monitor_ref) do
-    receive do
-      {^connect_ref, :accepted} ->
-        Process.demonitor(monitor_ref, [:flush])
-        {:ok, pid}
-
-      {:DOWN, ^monitor_ref, :process, ^pid, {:shutdown, reason}} ->
-        {:error, reason}
-
-      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
-        {:error, reason}
-    end
-  end
 
   @doc """
   Stops a local connection process created by `connect/2`.

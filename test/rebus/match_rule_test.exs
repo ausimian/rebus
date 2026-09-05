@@ -1775,7 +1775,7 @@ defmodule Rebus.MatchRuleTest do
     connect_ref = make_ref()
 
     {:ok, connection} =
-      Rebus.Connection.start_link(addr: address, connect_waiter: {self(), connect_ref})
+      Rebus.Connection.start_link({[], %{addr: address, connect_waiter: {self(), connect_ref}}})
 
     Process.unlink(connection)
 

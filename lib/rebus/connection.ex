@@ -157,10 +157,16 @@ defmodule Rebus.Connection do
     safe_setup_call(conn, {:delete_signal_handler, ref}, nil, timeout)
   end
 
+  # Connections are started with the caller's public options and, separately,
+  # the internal arguments Rebus itself computes: the resolved address, the
+  # connect waiter, the address-list auth ID, per-candidate setup timeout and
+  # expected GUID, and the implementation modules. Keeping them apart means no
+  # internal name has to be reserved in, or stripped from, the public keyword
+  # list.
   @doc false
-  @spec start_link(keyword()) :: :ignore | {:error, any()} | {:ok, pid()}
-  def start_link(args) do
-    case Keyword.get(args, :name) do
+  @spec start_link({keyword(), map()}) :: :ignore | {:error, any()} | {:ok, pid()}
+  def start_link({opts, internal} = args) when is_list(opts) and is_map(internal) do
+    case Keyword.get(opts, :name) do
       nil -> GenServer.start_link(__MODULE__, args)
       name when is_atom(name) -> GenServer.start_link(__MODULE__, args, name: name)
       _name -> {:error, :invalid_name}
@@ -196,8 +202,6 @@ defmodule Rebus.Connection do
     field :connect_waiter, {pid(), reference()} | nil, default: nil
     field :connect_waiter_monitor, reference() | nil, default: nil
     field :connect_accepted?, boolean(), default: false
-    field :auth_id_runner, function() | nil, default: nil
-    field :auth_username_runner, function() | nil, default: nil
     field :partial_frame_timer, {reference(), reference()} | nil, default: nil
     field :unix_fd_transport?, boolean(), default: false
     field :unix_fd_negotiated?, boolean(), default: false
@@ -233,39 +237,30 @@ defmodule Rebus.Connection do
     field :outbound_monitor_index, %{reference() => reference()}, default: %{}
     field :signal_handler_monitor_index, %{reference() => reference()}, default: %{}
     field :signal_handler_ref_index, %{reference() => reference()}, default: %{}
-    field :send_fun, function(), default: &:socket.send/4
-    field :sendmsg_fun, function(), default: &:socket.sendmsg/4
-    field :recvmsg_fun, function(), default: &:socket.recvmsg/5
-    field :cancel_fun, function(), default: &:socket.cancel/2
-    field :fd_claim_handoff_fun, function() | nil, default: nil
-    # Deterministic transition seams used only by the FD lifecycle tests.
-    field :fd_claim_delivery_fun, function() | nil, default: nil
-    field :fd_claim_ack_fun, function() | nil, default: nil
-    # Narrow deterministic-test seam. Production requests retain their public
-    # deadline exactly; tests can hold the internal timer long enough to order
-    # a caller-side alias timeout before a queued late reply.
-    field :request_timeout_slack, non_neg_integer(), default: 0
+    # Implementation modules behind the connection's side effects. Production
+    # always uses the defaults; tests substitute a module rather than reaching
+    # into per-operation state.
+    field :impl, Rebus.Impl.t(), default: Rebus.Impl.default()
   end
 
   @impl true
-  def init(args) do
-    %{family: family} = addr = Keyword.fetch!(args, :addr)
-    write_timeout = Keyword.get(args, :write_timeout, @default_write_timeout)
-    timeout = Keyword.get(args, :timeout, @default_read_timeout)
-    read_timeout = Keyword.get(args, :read_timeout, @default_read_timeout)
+  def init({opts, internal}) do
+    %{family: family} = addr = Map.fetch!(internal, :addr)
+    write_timeout = Keyword.get(opts, :write_timeout, @default_write_timeout)
+    timeout = Keyword.get(opts, :timeout, @default_read_timeout)
+    read_timeout = Keyword.get(opts, :read_timeout, @default_read_timeout)
 
     setup_timeout =
-      Keyword.get(args, :address_list_setup_timeout, Keyword.get(args, :read_timeout, timeout))
+      Map.get(internal, :setup_timeout, Keyword.get(opts, :read_timeout, timeout))
 
-    aggregate_setup_timeout? = Keyword.has_key?(args, :address_list_setup_timeout)
-    expected_guid = Keyword.get(args, :expected_guid)
-    precomputed_auth_id = Keyword.get(args, :precomputed_auth_id)
-    allow_anonymous? = Keyword.get(args, :allow_anonymous, false)
-    bus? = Keyword.get(args, :bus, true)
-    name = Keyword.get(args, :name)
-    connect_waiter = Keyword.get(args, :connect_waiter)
-    auth_id_runner = Keyword.get(args, :auth_id_fun, &run_auth_id/1)
-    auth_username_runner = Keyword.get(args, :auth_username_fun, &run_auth_username/1)
+    aggregate_setup_timeout? = Map.has_key?(internal, :setup_timeout)
+    expected_guid = Map.get(internal, :expected_guid)
+    precomputed_auth_id = Map.get(internal, :precomputed_auth_id)
+    allow_anonymous? = Keyword.get(opts, :allow_anonymous, false)
+    bus? = Keyword.get(opts, :bus, true)
+    name = Keyword.get(opts, :name)
+    connect_waiter = Map.get(internal, :connect_waiter)
+    impl = Map.get_lazy(internal, :impl, &Rebus.Impl.default/0)
 
     cond do
       not (is_integer(write_timeout) and write_timeout > 0) ->
@@ -295,12 +290,6 @@ defmodule Rebus.Connection do
       not (is_nil(name) or is_atom(name)) ->
         {:stop, :invalid_name}
 
-      not is_function(auth_id_runner, 1) ->
-        {:stop, :invalid_auth_id_fun}
-
-      not is_function(auth_username_runner, 1) ->
-        {:stop, :invalid_auth_username_fun}
-
       true ->
         # DynamicSupervisor stops children with an exit signal. Trap it so the
         # GenServer loop can return :stop and therefore invoke terminate/2,
@@ -308,13 +297,14 @@ defmodule Rebus.Connection do
         # reply claims. The EXIT clauses below preserve normal link semantics.
         Process.flag(:trap_exit, true)
 
-        case :socket.open(family, :stream, :default) do
+        case impl.transport.open(family, :stream, :default) do
           {:ok, sock} ->
-            _ = configure_receive_buffer(sock)
+            _ = configure_receive_buffer(impl.transport, sock)
 
             {:ok,
              %__MODULE__{
                sock: sock,
+               impl: impl,
                write_timeout: write_timeout,
                read_timeout: read_timeout,
                setup_timeout: setup_timeout,
@@ -325,8 +315,6 @@ defmodule Rebus.Connection do
                bus?: bus?,
                connect_waiter: connect_waiter,
                connect_waiter_monitor: monitor_connect_waiter(connect_waiter),
-               auth_id_runner: auth_id_runner,
-               auth_username_runner: auth_username_runner,
                unix_fd_transport?: unix_fd_transport_supported?(family)
              }, {:continue, {:setup, addr}}}
 
@@ -336,11 +324,14 @@ defmodule Rebus.Connection do
     end
   end
 
+  defp transport(%__MODULE__{impl: %{transport: transport}}), do: transport
+
   @impl true
   def terminate(
         _reason,
         %__MODULE__{
           sock: sock,
+          impl: impl,
           partial_frame_timer: timer_ref,
           inbound_unix_fds: inbound_unix_fds,
           fd_claims: fd_claims
@@ -349,7 +340,7 @@ defmodule Rebus.Connection do
     cancel_partial_frame_timer(timer_ref)
     _ = UnixFD.close_all(inbound_unix_fds)
     close_fd_claims(fd_claims)
-    _ = :socket.close(sock)
+    _ = impl.transport.close(sock)
     :ok
   end
 
@@ -589,7 +580,7 @@ defmodule Rebus.Connection do
              member: "Hello"
            ),
          {:ok, bin} <- Message.encode(%{method | serial: state.serial}) do
-      case :socket.send(state.sock, bin, [], state.write_timeout) do
+      case transport(state).send(state.sock, bin, [], state.write_timeout) do
         :ok ->
           {:noreply, %{state | hello_serial: state.serial, serial: next_serial(state.serial)},
            {:continue, :hello_reply_buffer}}
@@ -633,7 +624,7 @@ defmodule Rebus.Connection do
   def handle_continue(:recv, %__MODULE__{rref: nil} = state) do
     cond do
       state.unix_fd_negotiated? ->
-        state.recvmsg_fun.(
+        transport(state).recvmsg(
           state.sock,
           inbound_receive_size(state),
           @max_unix_fd_control_size,
@@ -647,11 +638,11 @@ defmodule Rebus.Connection do
       # path, but receive a bounded cmsg and close any illicit rights before a
       # partial frame can retain them.
       state.unix_fd_transport? ->
-        state.recvmsg_fun.(state.sock, 0, @max_unix_fd_control_size, [], :nowait)
+        transport(state).recvmsg(state.sock, 0, @max_unix_fd_control_size, [], :nowait)
         |> handle_receive_result(state)
 
       true ->
-        handle_receive_result(:socket.recv(state.sock, 0, [], :nowait), state)
+        handle_receive_result(transport(state).recv(state.sock, 0, [], :nowait), state)
     end
   end
 
@@ -736,7 +727,7 @@ defmodule Rebus.Connection do
     if state.unix_fd_transport? do
       receive_hello_reply_recvmsg(state, deadline, timeout)
     else
-      case :socket.recv(state.sock, 0, [], timeout) do
+      case transport(state).recv(state.sock, 0, [], timeout) do
         {:ok, data} ->
           continue_hello_reply(data, state, deadline)
 
@@ -759,7 +750,7 @@ defmodule Rebus.Connection do
   # Hello reply—must observe SCM_RIGHTS. A plain recv/4 here could discard
   # ancillary metadata outside the single close-or-deliver ownership path.
   defp receive_hello_reply_recvmsg(%__MODULE__{} = state, deadline, timeout) do
-    case state.recvmsg_fun.(
+    case transport(state).recvmsg(
            state.sock,
            inbound_receive_size(state),
            recvmsg_control_size(state),
@@ -891,7 +882,7 @@ defmodule Rebus.Connection do
       when is_reference(delivery_ref) and is_reference(delivery_alias) ->
         if fd_claim_live?(claim) and Process.alive?(pid) do
           claim = rearm_fd_claim(claim_ref, claim)
-          run_fd_claim_hook(state.fd_claim_delivery_fun)
+          state.impl.hooks.fd_claim_delivery()
 
           if fd_claim_live?(claim) and Process.alive?(pid) do
             send(delivery_alias, {:rebus_fd_reply, claim_ref, delivery_ref, msg})
@@ -923,7 +914,7 @@ defmodule Rebus.Connection do
   def handle_call({:ack_fd_reply, claim_ref, delivery_ref}, {pid, _tag}, %__MODULE__{} = state) do
     case Map.fetch(state.fd_claims, claim_ref) do
       {:ok, %{pid: ^pid, delivery_ref: ^delivery_ref} = claim} ->
-        run_fd_claim_ack_hook(state.fd_claim_ack_fun, claim)
+        state.impl.hooks.fd_claim_ack(claim)
 
         # A call alias timing out does not revoke a queued acknowledgement. It
         # is the resolver's FIFO position after this message that makes its
@@ -1411,7 +1402,7 @@ defmodule Rebus.Connection do
 
     with {:ok, auth_id} <- aggregate_setup_auth_id(state, deadline),
          {:ok, connect_timeout} <- remaining_setup_timeout(deadline, state.setup_timeout),
-         :ok <- connect_socket(sock, addr, connect_timeout),
+         :ok <- connect_socket(transport(state), sock, addr, connect_timeout),
          {:ok, guid, rest} <- authenticate(state, sock, auth_id, deadline, state.setup_timeout),
          :ok <- verify_expected_guid(guid, state.expected_guid),
          {:ok, unix_fd_negotiated?, rest} <-
@@ -1420,7 +1411,7 @@ defmodule Rebus.Connection do
            handshake_send_with_deadline(sock, "BEGIN \r\n", state, deadline, state.setup_timeout) do
       initialized_connection(%{state | unix_fd_negotiated?: unix_fd_negotiated?}, guid, rest)
     else
-      {:error, reason} -> stop_and_close(sock, reason)
+      {:error, reason} -> stop_and_close(transport(state), sock, reason)
     end
   end
 
@@ -1428,7 +1419,7 @@ defmodule Rebus.Connection do
     sock = state.sock
 
     with {:ok, auth_id} <- setup_auth_id(state, state.setup_timeout),
-         :ok <- connect_socket(sock, addr, state.setup_timeout),
+         :ok <- connect_socket(transport(state), sock, addr, state.setup_timeout),
          deadline = read_deadline(state.setup_timeout),
          {:ok, guid, rest} <- authenticate(state, sock, auth_id, deadline, state.setup_timeout),
          :ok <- verify_expected_guid(guid, state.expected_guid),
@@ -1438,7 +1429,7 @@ defmodule Rebus.Connection do
            handshake_send_with_deadline(sock, "BEGIN \r\n", state, deadline, state.setup_timeout) do
       initialized_connection(%{state | unix_fd_negotiated?: unix_fd_negotiated?}, guid, rest)
     else
-      {:error, reason} -> stop_and_close(sock, reason)
+      {:error, reason} -> stop_and_close(transport(state), sock, reason)
     end
   end
 
@@ -1461,7 +1452,7 @@ defmodule Rebus.Connection do
 
   defp aggregate_setup_auth_id(%__MODULE__{} = state, deadline) do
     with {:ok, auth_id_timeout} <- remaining_setup_timeout(deadline, state.setup_timeout) do
-      get_auth_id(auth_id_timeout, state.auth_id_runner)
+      get_auth_id(auth_id_timeout, state.impl.identity)
     end
   end
 
@@ -1469,7 +1460,7 @@ defmodule Rebus.Connection do
     do: {:ok, auth_id}
 
   defp setup_auth_id(%__MODULE__{} = state, timeout),
-    do: get_auth_id(timeout, state.auth_id_runner)
+    do: get_auth_id(timeout, state.impl.identity)
 
   # EXTERNAL remains the first authentication mechanism. If it is rejected the
   # advertised list determines a bounded, deterministic retry: cookie first,
@@ -1485,7 +1476,7 @@ defmodule Rebus.Connection do
              deadline,
              maximum
            ),
-         {:ok, line, rest} <- handshake_recv_with_deadline(sock, <<>>, deadline, maximum) do
+         {:ok, line, rest} <- handshake_recv_with_deadline(state, sock, <<>>, deadline, maximum) do
       case parse_auth_response(line) do
         {:ok, guid} ->
           {:ok, guid, rest}
@@ -1514,7 +1505,7 @@ defmodule Rebus.Connection do
 
   defp authenticate_cookie(state, sock, auth_id, mechanisms, rest, deadline, maximum) do
     with {:ok, timeout} <- remaining_setup_timeout(deadline, maximum) do
-      case get_auth_username(timeout, state.auth_username_runner) do
+      case get_auth_username(timeout, state.impl.identity) do
         {:ok, username} ->
           authenticate_cookie_with_username(
             state,
@@ -1574,7 +1565,7 @@ defmodule Rebus.Connection do
              deadline,
              maximum
            ),
-         {:ok, line, rest} <- handshake_recv_with_deadline(sock, rest, deadline, maximum) do
+         {:ok, line, rest} <- handshake_recv_with_deadline(state, sock, rest, deadline, maximum) do
       case line do
         "DATA " <> challenge ->
           authenticate_cookie_data(
@@ -1631,7 +1622,7 @@ defmodule Rebus.Connection do
              deadline,
              maximum
            ),
-         {:ok, line, rest} <- handshake_recv_with_deadline(sock, rest, deadline, maximum) do
+         {:ok, line, rest} <- handshake_recv_with_deadline(state, sock, rest, deadline, maximum) do
       case parse_auth_response(line) do
         {:ok, guid} -> {:ok, guid, rest}
         # A response that reached the server must not be followed by a weaker
@@ -1651,7 +1642,7 @@ defmodule Rebus.Connection do
   defp authenticate_anonymous(state, sock, rest, deadline, maximum) do
     with :ok <-
            handshake_send_with_deadline(sock, "AUTH ANONYMOUS\r\n", state, deadline, maximum),
-         {:ok, line, rest} <- handshake_recv_with_deadline(sock, rest, deadline, maximum) do
+         {:ok, line, rest} <- handshake_recv_with_deadline(state, sock, rest, deadline, maximum) do
       case parse_auth_response(line) do
         {:ok, guid} -> {:ok, guid, rest}
         {:rejected, mechanisms} -> {:error, {:auth_rejected, mechanisms}}
@@ -1952,10 +1943,11 @@ defmodule Rebus.Connection do
   end
 
   @doc false
-  @spec get_auth_id(pos_integer(), (pos_integer() -> {:ok, binary()} | {:error, term()})) ::
+  @spec get_auth_id(pos_integer(), module()) ::
           {:ok, binary()} | {:error, :auth_id_unavailable | :read_timeout}
-  def get_auth_id(timeout, runner \\ &run_auth_id/1) when is_integer(timeout) and timeout > 0 do
-    case safely_run_auth_id(runner, timeout) do
+  def get_auth_id(timeout, identity)
+      when is_integer(timeout) and timeout > 0 and is_atom(identity) do
+    case safely_lookup_identity(identity, :auth_id, timeout) do
       {:ok, output} when is_binary(output) and byte_size(output) <= @max_auth_id_output ->
         case String.trim(output) do
           uid when uid != <<>> ->
@@ -1976,11 +1968,11 @@ defmodule Rebus.Connection do
   end
 
   @doc false
-  @spec get_auth_username(pos_integer(), (pos_integer() -> {:ok, binary()} | {:error, term()})) ::
+  @spec get_auth_username(pos_integer(), module()) ::
           {:ok, binary()} | {:error, :auth_cookie_unavailable | :read_timeout}
-  def get_auth_username(timeout, runner \\ &run_auth_username/1)
-      when is_integer(timeout) and timeout > 0 do
-    case safely_run_auth_id(runner, timeout) do
+  def get_auth_username(timeout, identity)
+      when is_integer(timeout) and timeout > 0 and is_atom(identity) do
+    case safely_lookup_identity(identity, :username, timeout) do
       {:ok, output} when is_binary(output) and byte_size(output) <= @max_auth_id_output ->
         username = String.trim(output)
 
@@ -1994,40 +1986,6 @@ defmodule Rebus.Connection do
       _ ->
         {:error, :auth_cookie_unavailable}
     end
-  end
-
-  @doc false
-  @spec run_auth_username(
-          pos_integer(),
-          (String.t() -> String.t() | nil),
-          ({:spawn_executable, charlist()}, keyword() -> port())
-        ) :: {:ok, binary()} | {:error, term()}
-  def run_auth_username(
-        timeout,
-        executable_finder \\ &System.find_executable/1,
-        port_opener \\ &Port.open/2
-      )
-      when is_integer(timeout) and timeout > 0 and is_function(executable_finder, 1) and
-             is_function(port_opener, 2) do
-    case safely_find_executable(executable_finder) do
-      nil -> {:error, :enoent}
-      executable -> safely_open_auth_username_port(executable, port_opener, timeout)
-    end
-  end
-
-  defp safely_open_auth_username_port(executable, port_opener, timeout) do
-    port =
-      port_opener.({:spawn_executable, String.to_charlist(executable)}, [
-        :binary,
-        :exit_status,
-        args: ["-un"]
-      ])
-
-    collect_auth_id_output(port, <<>>, read_deadline(timeout), timeout)
-  rescue
-    _exception -> {:error, :port_open_failed}
-  catch
-    _kind, _reason -> {:error, :port_open_failed}
   end
 
   defp valid_auth_username?(username) when byte_size(username) in 1..64,
@@ -2103,95 +2061,12 @@ defmodule Rebus.Connection do
     end
   end
 
-  @doc false
-  @spec run_auth_id(
-          pos_integer(),
-          (String.t() -> String.t() | nil),
-          ({:spawn_executable, charlist()}, keyword() -> port())
-        ) :: {:ok, binary()} | {:error, term()}
-  def run_auth_id(
-        timeout,
-        executable_finder \\ &System.find_executable/1,
-        port_opener \\ &Port.open/2
-      )
-      when is_integer(timeout) and timeout > 0 and is_function(executable_finder, 1) and
-             is_function(port_opener, 2) do
-    case safely_find_executable(executable_finder) do
-      nil ->
-        {:error, :enoent}
-
-      executable ->
-        safely_open_auth_id_port(executable, port_opener, timeout)
-    end
-  end
-
-  defp safely_run_auth_id(runner, timeout) do
-    runner.(timeout)
+  defp safely_lookup_identity(identity, function, timeout) do
+    apply(identity, function, [timeout])
   rescue
-    _exception -> {:error, :runner_failed}
+    _exception -> {:error, :lookup_failed}
   catch
-    _kind, _reason -> {:error, :runner_failed}
-  end
-
-  defp safely_find_executable(executable_finder) do
-    executable_finder.("id")
-  rescue
-    _exception -> nil
-  catch
-    _kind, _reason -> nil
-  end
-
-  defp safely_open_auth_id_port(executable, port_opener, timeout) do
-    port =
-      port_opener.({:spawn_executable, String.to_charlist(executable)}, [
-        :binary,
-        :exit_status,
-        args: ["-u"]
-      ])
-
-    collect_auth_id_output(port, <<>>, read_deadline(timeout), timeout)
-  rescue
-    _exception -> {:error, :port_open_failed}
-  catch
-    _kind, _reason -> {:error, :port_open_failed}
-  end
-
-  defp collect_auth_id_output(port, output, deadline, maximum) do
-    case remaining_timeout(deadline, maximum) do
-      :expired ->
-        safe_close_port(port)
-        {:error, :timeout}
-
-      {:ok, timeout} ->
-        receive do
-          {^port, {:data, data}}
-          when is_binary(data) and byte_size(output) + byte_size(data) <= @max_auth_id_output ->
-            collect_auth_id_output(port, output <> data, deadline, maximum)
-
-          {^port, {:data, _data}} ->
-            safe_close_port(port)
-            {:error, :output_too_large}
-
-          {^port, {:exit_status, 0}} ->
-            {:ok, output}
-
-          {^port, {:exit_status, _status}} ->
-            {:error, :exit_status}
-
-          {:EXIT, ^port, _reason} ->
-            {:error, :port_exit}
-        after
-          timeout ->
-            safe_close_port(port)
-            {:error, :timeout}
-        end
-    end
-  end
-
-  defp safe_close_port(port) do
-    Port.close(port)
-  catch
-    _kind, _reason -> :ok
+    _kind, _reason -> {:error, :lookup_failed}
   end
 
   defp uid_bytes?(uid), do: all_bytes?(uid, &digit_byte?/1)
@@ -2205,13 +2080,13 @@ defmodule Rebus.Connection do
   defp all_bytes?(<<byte, rest::binary>>, predicate),
     do: predicate.(byte) and all_bytes?(rest, predicate)
 
-  defp stop_and_close(sock, reason) do
-    _ = :socket.close(sock)
+  defp stop_and_close(transport, sock, reason) do
+    _ = transport.close(sock)
     {:stop, normalize_socket_error(reason)}
   end
 
-  defp connect_socket(sock, addr, timeout) do
-    case :socket.connect(sock, addr, timeout) do
+  defp connect_socket(transport, sock, addr, timeout) do
+    case transport.connect(sock, addr, timeout) do
       :ok -> :ok
       {:error, :timeout} -> {:error, :read_timeout}
       {:error, reason} -> {:error, reason}
@@ -2227,54 +2102,51 @@ defmodule Rebus.Connection do
   defp unix_fd_transport_supported?(_family), do: false
 
   @doc false
-  def configure_receive_buffer(
-        sock,
-        setopt_fun \\ &:socket.setopt/3,
-        warning_fun \\ fn message -> Logger.warning(message) end
-      ) do
+  @spec configure_receive_buffer(module(), :socket.socket()) :: :tuple | :scalar | :default
+  def configure_receive_buffer(transport, sock) do
     # A zero-length receive returns the bytes currently available on every
     # supported OTP release. Keep the backing allocation independent of a
     # peer-declared D-Bus frame length. Some backends only accept the scalar
     # form, so failure to tune this hint must never make connections unavailable.
-    case setopt_fun.(sock, {:otp, :rcvbuf}, {@max_read_attempts, @max_read_chunk}) do
+    case transport.setopt(sock, {:otp, :rcvbuf}, {@max_read_attempts, @max_read_chunk}) do
       :ok ->
         :tuple
 
       {:error, _reason} ->
-        case setopt_fun.(sock, {:otp, :rcvbuf}, @max_read_chunk) do
+        case transport.setopt(sock, {:otp, :rcvbuf}, @max_read_chunk) do
           :ok ->
             :scalar
 
           {:error, _reason} ->
-            default_receive_buffer(warning_fun)
+            default_receive_buffer()
 
           _other ->
-            default_receive_buffer(warning_fun)
+            default_receive_buffer()
         end
 
       _other ->
-        default_receive_buffer(warning_fun)
+        default_receive_buffer()
     end
   end
 
-  defp default_receive_buffer(warning_fun) do
-    warning_fun.("D-Bus connection is using OTP's default receive buffer")
+  defp default_receive_buffer do
+    Logger.warning("D-Bus connection is using OTP's default receive buffer")
     :default
   end
 
-  defp handshake_recv(sock, buffer, timeout) when is_binary(buffer) do
-    receive_auth_line(sock, buffer, read_deadline(timeout), timeout)
+  defp handshake_recv(transport, sock, buffer, timeout) when is_binary(buffer) do
+    receive_auth_line(transport, sock, buffer, read_deadline(timeout), timeout)
   end
 
-  defp handshake_recv_with_deadline(sock, buffer, deadline, maximum) do
+  defp handshake_recv_with_deadline(state, sock, buffer, deadline, maximum) do
     with {:ok, timeout} <- remaining_setup_timeout(deadline, maximum) do
-      handshake_recv(sock, buffer, timeout)
+      handshake_recv(transport(state), sock, buffer, timeout)
     end
   end
 
   defp handshake_send_with_deadline(sock, data, state, deadline, maximum) do
     with {:ok, timeout} <- remaining_setup_timeout(deadline, maximum) do
-      handshake_send(sock, data, min(timeout, state.write_timeout))
+      handshake_send(transport(state), sock, data, min(timeout, state.write_timeout))
     end
   end
 
@@ -2300,7 +2172,7 @@ defmodule Rebus.Connection do
              deadline,
              maximum
            ),
-         {:ok, line, rest} <- handshake_recv_with_deadline(sock, rest, deadline, maximum) do
+         {:ok, line, rest} <- handshake_recv_with_deadline(state, sock, rest, deadline, maximum) do
       case line do
         "AGREE_UNIX_FD" -> {:ok, true, rest}
         "ERROR" <> _reason -> {:ok, false, rest}
@@ -2309,7 +2181,7 @@ defmodule Rebus.Connection do
     end
   end
 
-  defp receive_auth_line(sock, buffer, deadline, timeout) do
+  defp receive_auth_line(transport, sock, buffer, deadline, timeout) do
     # Previous reads can contain multiple auth lines. Consume one already in
     # the bounded buffer before touching the socket: the peer may legitimately
     # have closed after coalescing its next response.
@@ -2318,25 +2190,25 @@ defmodule Rebus.Connection do
         result
 
       :incomplete ->
-        receive_auth_socket_data(sock, buffer, deadline, timeout)
+        receive_auth_socket_data(transport, sock, buffer, deadline, timeout)
 
       {:error, :auth_failed} = error ->
         error
     end
   end
 
-  defp receive_auth_socket_data(sock, buffer, deadline, timeout) do
+  defp receive_auth_socket_data(transport, sock, buffer, deadline, timeout) do
     case remaining_timeout(deadline, timeout) do
       :expired ->
         {:error, :read_timeout}
 
       {:ok, receive_timeout} ->
-        case :socket.recv(sock, 0, [], receive_timeout) do
+        case transport.recv(sock, 0, [], receive_timeout) do
           {:ok, data} ->
-            consume_auth_data(sock, buffer, data, deadline, timeout)
+            consume_auth_data(transport, sock, buffer, data, deadline, timeout)
 
           {:error, {:timeout, data}} when is_binary(data) and byte_size(data) > 0 ->
-            consume_auth_data(sock, buffer, data, deadline, timeout)
+            consume_auth_data(transport, sock, buffer, data, deadline, timeout)
 
           {:error, :timeout} ->
             {:error, :read_timeout}
@@ -2350,11 +2222,11 @@ defmodule Rebus.Connection do
     end
   end
 
-  defp consume_auth_data(sock, buffer, data, deadline, timeout) do
+  defp consume_auth_data(transport, sock, buffer, data, deadline, timeout) do
     case consume_auth_buffer(buffer <> data) do
       {:ok, _line, _rest} = result -> result
       {:error, :auth_failed} = error -> error
-      :incomplete -> receive_auth_line(sock, buffer <> data, deadline, timeout)
+      :incomplete -> receive_auth_line(transport, sock, buffer <> data, deadline, timeout)
     end
   end
 
@@ -2377,8 +2249,8 @@ defmodule Rebus.Connection do
     end
   end
 
-  defp handshake_send(sock, data, timeout) do
-    case :socket.send(sock, data, [], timeout) do
+  defp handshake_send(transport, sock, data, timeout) do
+    case transport.send(sock, data, [], timeout) do
       :ok -> :ok
       {:error, reason} -> {:error, normalize_socket_error(reason)}
       _other -> {:error, :send_failed}
@@ -2649,10 +2521,6 @@ defmodule Rebus.Connection do
       buffer_incomplete_message(state, continuation)
     end
   end
-
-  @doc false
-  @spec inbound_receive_buffer_size() :: pos_integer()
-  def inbound_receive_buffer_size, do: @max_read_chunk
 
   defp inbound_prefix(%__MODULE__{} = state, size) do
     state.inbound_segments
@@ -2947,7 +2815,7 @@ defmodule Rebus.Connection do
                 deadline: claim_deadline
               }
 
-              run_fd_claim_handoff_hook(state.fd_claim_handoff_fun)
+              state.impl.hooks.fd_claim_handoff()
               GenServer.reply(from, {:fd_claim, claim_ref})
 
               {:ok,
@@ -3058,16 +2926,6 @@ defmodule Rebus.Connection do
         {outcome, %{state | fd_claim_outcomes: outcomes}}
     end
   end
-
-  defp run_fd_claim_handoff_hook(nil), do: :ok
-  defp run_fd_claim_handoff_hook(fun) when is_function(fun, 0), do: fun.()
-
-  defp run_fd_claim_hook(nil), do: :ok
-  defp run_fd_claim_hook(fun) when is_function(fun, 0), do: fun.()
-
-  defp run_fd_claim_ack_hook(nil, _claim), do: :ok
-  defp run_fd_claim_ack_hook(fun, _claim) when is_function(fun, 0), do: fun.()
-  defp run_fd_claim_ack_hook(fun, claim) when is_function(fun, 1), do: fun.(claim)
 
   defp drop_resource_limited_reply(
          %{type: :method_return, reply_serial: reply_serial},
@@ -3547,7 +3405,7 @@ defmodule Rebus.Connection do
                 Process.send_after(
                   self(),
                   {:request_timeout, write.serial, write.request_ref},
-                  remaining + state.request_timeout_slack
+                  remaining + state.impl.hooks.request_timeout_slack()
                 )
 
               state = %{
@@ -3630,7 +3488,7 @@ defmodule Rebus.Connection do
          %__MODULE__{} = state,
          %{uses_sendmsg?: true, fd_control: :initial, wait: nil} = write
        ) do
-    state.sendmsg_fun.(
+    transport(state).sendmsg(
       state.sock,
       %{
         iov: [write.rest],
@@ -3646,12 +3504,12 @@ defmodule Rebus.Connection do
          %{uses_sendmsg?: true, fd_control: :select_continuation, wait: {:continue, continuation}} =
            write
        ) do
-    state.sendmsg_fun.(state.sock, [write.rest], continuation, :nowait)
+    transport(state).sendmsg(state.sock, [write.rest], continuation, :nowait)
   end
 
   defp socket_send(%__MODULE__{} = state, write) do
     {rest, flags_or_cont, timeout} = socket_send_args(write.rest, write.wait)
-    state.send_fun.(state.sock, rest, flags_or_cont, timeout)
+    transport(state).send(state.sock, rest, flags_or_cont, timeout)
   end
 
   # Socket wrappers are injectable for deterministic state-machine coverage.
@@ -3670,7 +3528,7 @@ defmodule Rebus.Connection do
   end
 
   defp cancel_socket_write(state, {:select, continuation, _handle}) do
-    _ = state.cancel_fun.(state.sock, continuation)
+    _ = transport(state).cancel(state.sock, continuation)
     :ok
   rescue
     _ -> :ok
@@ -3679,7 +3537,7 @@ defmodule Rebus.Connection do
   end
 
   defp cancel_socket_write(state, {:completion, continuation, _handle}) do
-    _ = state.cancel_fun.(state.sock, continuation)
+    _ = transport(state).cancel(state.sock, continuation)
     :ok
   rescue
     _ -> :ok

@@ -6,6 +6,7 @@ defmodule RebusTest do
   alias Rebus.Connection
   alias Rebus.Message
   alias Rebus.SignalHandler
+  alias Rebus.TestImpl
   alias Rebus.TestServer
 
   # GitHub run 33276531794 on Elixir 1.19.1/OTP 27.1 observed a referenced
@@ -357,106 +358,69 @@ defmodule RebusTest do
     test "normalizes bounded auth identity lookup outcomes", %{svr: svr} do
       {:ok, addr} = TestServer.get_listen_addr(svr)
 
-      assert {:ok, "353031"} = Connection.get_auth_id(100, fn _timeout -> {:ok, "501\n"} end)
+      auth_id = fn lookup -> Connection.get_auth_id(100, TestImpl.identity(auth_id: lookup)) end
+
+      assert {:ok, "353031"} = auth_id.(fn _timeout -> {:ok, "501\n"} end)
+      assert {:error, :auth_id_unavailable} = auth_id.(fn _ -> {:error, :exit_status} end)
+      assert {:error, :auth_id_unavailable} = auth_id.(fn _ -> {:ok, "uid"} end)
 
       assert {:error, :auth_id_unavailable} =
-               Connection.get_auth_id(100, fn _ -> {:error, :exit_status} end)
+               auth_id.(fn _ -> {:ok, String.duplicate("1", 65)} end)
+
+      assert {:error, :read_timeout} = auth_id.(fn _ -> {:error, :timeout} end)
 
       assert {:error, :auth_id_unavailable} =
-               Connection.get_auth_id(100, fn _ -> {:ok, "uid"} end)
+               auth_id.(fn _ -> raise "auth identity lookup failed" end)
 
       assert {:error, :auth_id_unavailable} =
-               Connection.get_auth_id(100, fn _ -> {:ok, String.duplicate("1", 65)} end)
+               auth_id.(fn _ -> throw(:auth_identity_lookup_failed) end)
 
-      assert {:error, :read_timeout} = Connection.get_auth_id(100, fn _ -> {:error, :timeout} end)
-
-      assert {:error, :auth_id_unavailable} =
-               Connection.get_auth_id(100, fn _ -> raise "auth identity runner failed" end)
-
-      assert {:error, :auth_id_unavailable} =
-               Connection.get_auth_id(100, fn _ -> throw(:auth_identity_runner_failed) end)
-
-      assert {:error, :auth_id_unavailable} =
-               Connection.get_auth_id(100, fn _ ->
-                 Connection.run_auth_id(
-                   100,
-                   fn _ -> "/missing/id" end,
-                   fn _, _ -> raise "port open failed" end
-                 )
-               end)
-
-      assert {:error, :enoent} = Connection.run_auth_id(100, fn _ -> nil end)
-
-      assert {:error, :enoent} =
-               Connection.run_auth_id(100, fn _ -> raise "executable lookup failed" end)
-
-      assert {:error, :enoent} =
-               Connection.run_auth_id(100, fn _ -> throw(:executable_lookup_failed) end)
-
-      assert {:error, :port_open_failed} =
-               Connection.run_auth_id(
-                 100,
-                 fn _ -> "/missing/id" end,
-                 fn _, _ -> throw(:port_open_failed) end
-               )
+      assert {:error, :auth_id_unavailable} = auth_id.(fn _ -> {:error, :port_open_failed} end)
 
       parent = self()
+      name = :rebus_precomputed_auth_id_connection
 
-      assert {:ok, cli} =
-               Rebus.connect(addr,
-                 auth_id_fun: fn _timeout ->
-                   send(parent, :malicious_auth_id_fun)
-                   {:error, :exit_status}
-                 end,
-                 auth_username_fun: :invalid
-               )
-
-      refute_receive :malicious_auth_id_fun
-      assert :ok = Rebus.close(cli)
+      identity =
+        TestImpl.identity(name,
+          auth_id: fn _timeout ->
+            send(parent, :precomputed_auth_id_lookup)
+            {:error, :exit_status}
+          end
+        )
 
       assert {:ok, precomputed_cli} =
                DynamicSupervisor.start_child(
                  Rebus.ConnectionSupervisor,
                  {Connection,
-                  addr: addr,
-                  precomputed_auth_id: "353031",
-                  auth_id_fun: fn _timeout ->
-                    send(parent, :precomputed_auth_id_runner)
-                    {:error, :exit_status}
-                  end}
+                  connection_args(addr,
+                    name: name,
+                    precomputed_auth_id: "353031",
+                    impl: %{identity: identity}
+                  )}
                )
 
       await_hello(svr)
-      refute_receive :precomputed_auth_id_runner
+      refute_receive :precomputed_auth_id_lookup
       assert Rebus.close(precomputed_cli) in [:ok, {:error, :not_found}]
     end
 
     test "normalizes internal username lookup outcomes" do
-      assert {:ok, "rebus-user"} =
-               Connection.get_auth_username(100, fn _timeout -> {:ok, "rebus-user\n"} end)
+      username = fn lookup ->
+        Connection.get_auth_username(100, TestImpl.identity(username: lookup))
+      end
+
+      assert {:ok, "rebus-user"} = username.(fn _timeout -> {:ok, "rebus-user\n"} end)
 
       assert {:error, :auth_cookie_unavailable} =
-               Connection.get_auth_username(100, fn _timeout -> {:error, :exit_status} end)
+               username.(fn _timeout -> {:error, :exit_status} end)
 
       assert {:error, :auth_cookie_unavailable} =
-               Connection.get_auth_username(100, fn _timeout ->
-                 {:ok, String.duplicate("a", 65)}
-               end)
+               username.(fn _timeout -> {:ok, String.duplicate("a", 65)} end)
 
       assert {:error, :auth_cookie_unavailable} =
-               Connection.get_auth_username(100, fn _timeout -> {:ok, "invalid user"} end)
+               username.(fn _timeout -> {:ok, "invalid user"} end)
 
-      assert {:error, :read_timeout} =
-               Connection.get_auth_username(100, fn _timeout -> {:error, :timeout} end)
-
-      assert {:error, :enoent} = Connection.run_auth_username(100, fn _ -> nil end)
-
-      assert {:error, :port_open_failed} =
-               Connection.run_auth_username(
-                 100,
-                 fn _ -> "/missing/id" end,
-                 fn _, _ -> throw(:port_open_failed) end
-               )
+      assert {:error, :read_timeout} = username.(fn _timeout -> {:error, :timeout} end)
     end
 
     test "registers the connection under its optional name", %{svr: svr} do
@@ -475,16 +439,6 @@ defmodule RebusTest do
     test "rejects a non-atom connection name", %{svr: svr} do
       {:ok, addr} = TestServer.get_listen_addr(svr)
       assert {:error, :invalid_name} = Rebus.connect(addr, name: "rebus")
-    end
-
-    test "rejects an invalid internal authentication identity runner", %{svr: svr} do
-      {:ok, addr} = TestServer.get_listen_addr(svr)
-
-      assert {:error, :invalid_auth_id_fun} =
-               DynamicSupervisor.start_child(
-                 Rebus.ConnectionSupervisor,
-                 {Connection, addr: addr, auth_id_fun: :invalid}
-               )
     end
 
     test "connect! raises on failure" do
@@ -874,10 +828,7 @@ defmodule RebusTest do
 
     test "keeps the default inbound read timeout after a short setup timeout", %{svr: svr} do
       cli =
-        connect_until_ready_direct(svr,
-          timeout: 100,
-          auth_id_fun: fn _timeout -> {:ok, "501\n"} end
-        )
+        connect_until_ready_direct(svr, timeout: 100, precomputed_auth_id: "353031")
 
       signal =
         Message.new!(:signal,
@@ -946,7 +897,8 @@ defmodule RebusTest do
       {:ok, cli} =
         DynamicSupervisor.start_child(
           Rebus.ConnectionSupervisor,
-          {Rebus.Connection, addr: addr, name: name, connect_waiter: {waiter, connect_ref}}
+          {Rebus.Connection,
+           connection_args(addr, name: name, connect_waiter: {waiter, connect_ref})}
         )
 
       ref = Process.monitor(cli)
@@ -978,13 +930,19 @@ defmodule RebusTest do
             DynamicSupervisor.start_child(
               Rebus.ConnectionSupervisor,
               {Rebus.Connection,
-               addr: addr,
-               name: name,
-               connect_waiter: {waiter, connect_ref},
-               auth_id_fun: fn _timeout ->
-                 send(parent, :unexpected_auth_id_lookup)
-                 {:ok, "501\n"}
-               end}
+               connection_args(addr,
+                 name: name,
+                 connect_waiter: {waiter, connect_ref},
+                 impl: %{
+                   identity:
+                     TestImpl.identity(name,
+                       auth_id: fn _timeout ->
+                         send(parent, :unexpected_auth_id_lookup)
+                         {:ok, "501\n"}
+                       end
+                     )
+                 }
+               )}
             )
 
           ref = Process.monitor(cli)
@@ -1085,7 +1043,7 @@ defmodule RebusTest do
       {:ok, cli} =
         DynamicSupervisor.start_child(
           Rebus.ConnectionSupervisor,
-          {Rebus.Connection, addr: addr, connect_waiter: {waiter, connect_ref}}
+          {Rebus.Connection, connection_args(addr, connect_waiter: {waiter, connect_ref})}
         )
 
       assert_receive {:setup_ready, ^cli}, 1_000
@@ -1179,10 +1137,7 @@ defmodule RebusTest do
       log =
         capture_log(fn ->
           {cli, hello} =
-            connect_until_hello(svr,
-              read_timeout: 100,
-              auth_id_fun: fn _ -> {:ok, "501\n"} end
-            )
+            connect_until_hello(svr, read_timeout: 100, precomputed_auth_id: "353031")
 
           reply =
             Message.new!(:method_return,
@@ -1325,8 +1280,6 @@ defmodule RebusTest do
     test "caps each inbound receive allocation below the maximum frame size", %{svr: svr} do
       cli = connect_until_ready(svr)
 
-      assert Connection.inbound_receive_buffer_size() == 65_536
-
       assert {:ok, receive_buffer} = :socket.getopt(:sys.get_state(cli).sock, {:otp, :rcvbuf})
 
       buffer_size =
@@ -1335,7 +1288,7 @@ defmodule RebusTest do
           size when is_integer(size) -> size
         end
 
-      assert buffer_size == Connection.inbound_receive_buffer_size()
+      assert buffer_size == 65_536
       assert buffer_size < Message.max_message_size()
     end
 
@@ -1508,85 +1461,95 @@ defmodule RebusTest do
 
     test "falls back safely when configuring the OTP receive buffer" do
       parent = self()
-      tuple_value = {1, Connection.inbound_receive_buffer_size()}
+      tuple_value = {1, 65_536}
+      warning = "D-Bus connection is using OTP's default receive buffer"
 
-      assert :tuple =
-               Connection.configure_receive_buffer(
-                 :test_socket,
-                 fn _sock, _option, value ->
-                   send(parent, {:setopt, value})
-                   :ok
-                 end,
-                 fn warning -> send(parent, {:warning, warning}) end
-               )
+      TestImpl.put(
+        setopt: fn _sock, _option, value ->
+          send(parent, {:setopt, value})
+          :ok
+        end
+      )
 
-      assert_receive {:setopt, ^tuple_value}
-      refute_receive {:warning, _}
-
-      assert :scalar =
-               Connection.configure_receive_buffer(
-                 :test_socket,
-                 fn _sock, _option, value ->
-                   send(parent, {:setopt, value})
-                   if is_tuple(value), do: {:error, :invalid}, else: :ok
-                 end,
-                 fn warning -> send(parent, {:warning, warning}) end
-               )
+      log =
+        capture_log(fn ->
+          assert :tuple = Connection.configure_receive_buffer(TestImpl, :test_socket)
+        end)
 
       assert_receive {:setopt, ^tuple_value}
-      assert_receive {:setopt, 65_536}
-      refute_receive {:warning, _}
+      refute log =~ warning
 
-      assert :default =
-               Connection.configure_receive_buffer(
-                 :test_socket,
-                 fn _sock, _option, value ->
-                   send(parent, {:setopt, value})
-                   {:error, :invalid}
-                 end,
-                 fn warning -> send(parent, {:warning, warning}) end
-               )
+      TestImpl.put(
+        setopt: fn _sock, _option, value ->
+          send(parent, {:setopt, value})
+          if is_tuple(value), do: {:error, :invalid}, else: :ok
+        end
+      )
+
+      log =
+        capture_log(fn ->
+          assert :scalar = Connection.configure_receive_buffer(TestImpl, :test_socket)
+        end)
 
       assert_receive {:setopt, ^tuple_value}
       assert_receive {:setopt, 65_536}
-      assert_receive {:warning, "D-Bus connection is using OTP's default receive buffer"}
+      refute log =~ warning
 
-      assert :default =
-               Connection.configure_receive_buffer(
-                 :test_socket,
-                 fn _sock, _option, value ->
-                   send(parent, {:setopt, value})
-                   :unexpected
-                 end,
-                 fn warning -> send(parent, {:warning, warning}) end
-               )
+      TestImpl.put(
+        setopt: fn _sock, _option, value ->
+          send(parent, {:setopt, value})
+          {:error, :invalid}
+        end
+      )
+
+      log =
+        capture_log(fn ->
+          assert :default = Connection.configure_receive_buffer(TestImpl, :test_socket)
+        end)
+
+      assert_receive {:setopt, ^tuple_value}
+      assert_receive {:setopt, 65_536}
+      assert log =~ warning
+
+      TestImpl.put(
+        setopt: fn _sock, _option, value ->
+          send(parent, {:setopt, value})
+          :unexpected
+        end
+      )
+
+      log =
+        capture_log(fn ->
+          assert :default = Connection.configure_receive_buffer(TestImpl, :test_socket)
+        end)
 
       assert_receive {:setopt, ^tuple_value}
       refute_receive {:setopt, 65_536}
-      assert_receive {:warning, "D-Bus connection is using OTP's default receive buffer"}
+      assert log =~ warning
 
-      assert :default =
-               Connection.configure_receive_buffer(
-                 :test_socket,
-                 fn _sock, _option, value ->
-                   send(parent, {:setopt, value})
-                   if is_tuple(value), do: {:error, :invalid}, else: :unexpected
-                 end,
-                 fn warning -> send(parent, {:warning, warning}) end
-               )
+      TestImpl.put(
+        setopt: fn _sock, _option, value ->
+          send(parent, {:setopt, value})
+          if is_tuple(value), do: {:error, :invalid}, else: :unexpected
+        end
+      )
+
+      log =
+        capture_log(fn ->
+          assert :default = Connection.configure_receive_buffer(TestImpl, :test_socket)
+        end)
 
       assert_receive {:setopt, ^tuple_value}
       assert_receive {:setopt, 65_536}
-      assert_receive {:warning, "D-Bus connection is using OTP's default receive buffer"}
+      assert log =~ warning
     end
 
-    test "uses the production warning callback for receive-buffer fallback" do
+    test "keeps the socket out of the receive-buffer fallback warning" do
+      TestImpl.put(setopt: fn _sock, _option, _value -> {:error, :invalid} end)
+
       log =
         capture_log(fn ->
-          assert :default =
-                   Connection.configure_receive_buffer(:test_socket, fn _sock, _option, _value ->
-                     {:error, :invalid}
-                   end)
+          assert :default = Connection.configure_receive_buffer(TestImpl, :test_socket)
         end)
 
       assert log =~ "D-Bus connection is using OTP's default receive buffer"
@@ -2397,26 +2360,40 @@ defmodule RebusTest do
     end
 
     test ":session ignores caller-supplied address-list setup internals" do
-      parent = self()
       path = socket_path()
       {:ok, svr} = start_supervised({Rebus.TestServer, tap: self(), family: :local, path: path})
       put_session_bus_address("unix:path=#{path}")
 
+      # The connection's internal arguments no longer share a namespace with
+      # the caller's options, so these names reach nothing: had any of them
+      # been read, the bogus auth ID, one-millisecond setup budget or
+      # unmatched GUID would each have failed the connection.
       assert {:ok, _cli} =
                Rebus.connect(:session,
                  auth_id: "not-an-auth-id",
-                 auth_id_fun: fn _timeout ->
-                   send(parent, :malicious_list_auth_id_fun)
-                   {:error, :exit_status}
-                 end,
                  address_list_auth_id: "not-an-auth-id",
                  address_list_setup_timeout: 1,
+                 setup_timeout: 1,
                  expected_guid: String.duplicate("f", 32),
                  precomputed_auth_id: "not-an-auth-id"
                )
 
       await_hello(svr)
-      refute_receive :malicious_list_auth_id_fun
+    end
+
+    test "a direct address ignores caller-supplied connection internals" do
+      path = socket_path()
+      {:ok, svr} = start_supervised({Rebus.TestServer, tap: self(), family: :local, path: path})
+
+      assert {:ok, _cli} =
+               Rebus.connect(%{family: :local, path: path},
+                 expected_guid: String.duplicate("f", 32),
+                 precomputed_auth_id: "not-an-auth-id",
+                 setup_timeout: 1,
+                 connect_waiter: {self(), make_ref()}
+               )
+
+      await_hello(svr)
     end
 
     test ":session verifies a Unix socket guid without adding it to the socket address" do
@@ -2677,8 +2654,8 @@ defmodule RebusTest do
         end
       end
 
-      connector = fn address, opts ->
-        send(parent, {:connected, address, Keyword.fetch!(opts, :address_list_setup_timeout)})
+      connector = fn address, {_conn_opts, internal} ->
+        send(parent, {:connected, address, Map.fetch!(internal, :setup_timeout)})
         {:error, :econnrefused}
       end
 
@@ -2688,10 +2665,10 @@ defmodule RebusTest do
       ]
 
       assert {:error, :econnrefused} =
-               Rebus.connect_address_candidates(candidates, [timeout: 100],
-                 resolver: resolver,
-                 connector: connector,
-                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end
+               connect_candidates(candidates, [timeout: 100],
+                 resolver: TestImpl.resolver(getaddrs: resolver),
+                 connector: TestImpl.connector(connect_candidate: connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end)
                )
 
       assert_receive {:resolved, :inet6, timeout6}
@@ -2732,19 +2709,19 @@ defmodule RebusTest do
         {:ok, if(family == :inet6, do: ipv6, else: ipv4)}
       end
 
-      connector = fn address, opts ->
-        send(parent, {:attempted, address, Keyword.fetch!(opts, :address_list_setup_timeout)})
+      connector = fn address, {_conn_opts, internal} ->
+        send(parent, {:attempted, address, Map.fetch!(internal, :setup_timeout)})
         {:error, :econnrefused}
       end
 
       assert {:error, :econnrefused} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [{:tcp, "example", 12_345, :unspec, nil}],
                  [timeout: 5_000],
-                 resolver: resolver,
-                 connector: connector,
-                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
-                 monotonic_time: monotonic_time
+                 resolver: TestImpl.resolver(getaddrs: resolver),
+                 connector: TestImpl.connector(connect_candidate: connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end),
+                 clock: TestImpl.clock(monotonic_time: monotonic_time)
                )
 
       assert_receive {:resolved, :inet6, _}
@@ -2774,30 +2751,33 @@ defmodule RebusTest do
         {:ok, [{127, 0, 0, 1}, {127, 0, 0, 1}, {127, 0, 0, 2}, {127, 0, 0, 3}]}
       end
 
-      connector = fn address, opts ->
+      connector = fn address, {_conn_opts, internal} ->
         send(
           parent,
-          {:attempted, address, Keyword.fetch!(opts, :address_list_auth_id)}
+          {:attempted, address, Map.fetch!(internal, :precomputed_auth_id)}
         )
 
         if address.family == :local, do: {:ok, self()}, else: {:error, :econnrefused}
       end
 
-      auth_id_runner = fn timeout ->
-        send(parent, {:auth_id, self(), timeout})
-        {:ok, "501\n"}
-      end
+      identity =
+        TestImpl.identity(
+          auth_id: fn timeout ->
+            send(parent, {:auth_id, self(), timeout})
+            {:ok, "501\n"}
+          end
+        )
 
       assert {:ok, _pid} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [
                    {:tcp, "example", 12_345, :inet, nil},
                    {:local, "/tmp/fallback", nil}
                  ],
                  [timeout: 1_000],
-                 resolver: resolver,
-                 connector: connector,
-                 auth_id_runner: auth_id_runner
+                 resolver: TestImpl.resolver(getaddrs: resolver),
+                 connector: TestImpl.connector(connect_candidate: connector),
+                 identity: identity
                )
 
       assert_receive {:auth_id, auth_id_owner, auth_timeout}
@@ -2820,17 +2800,17 @@ defmodule RebusTest do
     test "stops before candidate setup when the list auth ID is unavailable" do
       parent = self()
 
-      connector = fn address, _opts ->
+      connector = fn address, _args ->
         send(parent, {:attempted, address})
         {:ok, self()}
       end
 
       assert {:error, :auth_id_unavailable} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [{:local, "/tmp/never-attempted", nil}],
                  [timeout: 100],
-                 connector: connector,
-                 auth_id_runner: fn _timeout -> {:error, :exit_status} end
+                 connector: TestImpl.connector(connect_candidate: connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:error, :exit_status} end)
                )
 
       refute_receive {:attempted, _}
@@ -2843,18 +2823,24 @@ defmodule RebusTest do
 
       task =
         Task.async(fn ->
-          Rebus.connect_address_candidates(
+          connect_candidates(
             [{:local, "/tmp/never-attempted", nil}],
             [timeout: 5_000],
-            connector: fn _address, _opts -> {:ok, self()} end,
-            auth_id_runner: fn _timeout ->
-              port = Port.open({:spawn_executable, String.to_charlist(executable)}, [:binary])
-              send(parent, {:auth_id_port, self(), port})
+            connector:
+              TestImpl.connector(connect_candidate: fn _address, _args -> {:ok, self()} end),
+            identity:
+              TestImpl.identity(
+                auth_id: fn _timeout ->
+                  port =
+                    Port.open({:spawn_executable, String.to_charlist(executable)}, [:binary])
 
-              receive do
-                :continue -> {:ok, "501\n"}
-              end
-            end
+                  send(parent, {:auth_id_port, self(), port})
+
+                  receive do
+                    :continue -> {:ok, "501\n"}
+                  end
+                end
+              )
           )
         end)
 
@@ -2872,19 +2858,22 @@ defmodule RebusTest do
 
       monotonic_time = fn -> Process.get(:bus_address_auth_budget_clock) end
 
-      auth_id_runner = fn timeout ->
-        send(parent, {:auth_slice, timeout})
+      identity =
+        TestImpl.identity(
+          auth_id: fn timeout ->
+            send(parent, {:auth_slice, timeout})
 
-        Process.put(
-          :bus_address_auth_budget_clock,
-          Process.get(:bus_address_auth_budget_clock) + timeout
+            Process.put(
+              :bus_address_auth_budget_clock,
+              Process.get(:bus_address_auth_budget_clock) + timeout
+            )
+
+            {:ok, "501\n"}
+          end
         )
 
-        {:ok, "501\n"}
-      end
-
-      connector = fn address, opts ->
-        timeout = Keyword.fetch!(opts, :address_list_setup_timeout)
+      connector = fn address, {_conn_opts, internal} ->
+        timeout = Map.fetch!(internal, :setup_timeout)
         send(parent, {:candidate_slice, address.path, timeout})
 
         Process.put(
@@ -2896,12 +2885,12 @@ defmodule RebusTest do
       end
 
       assert {:ok, _pid} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [{:local, "/tmp/first", nil}, {:local, "/tmp/second", nil}],
                  [timeout: 60],
-                 connector: connector,
-                 auth_id_runner: auth_id_runner,
-                 monotonic_time: monotonic_time
+                 connector: TestImpl.connector(connect_candidate: connector),
+                 identity: identity,
+                 clock: TestImpl.clock(monotonic_time: monotonic_time)
                )
 
       assert_receive {:auth_slice, 20}
@@ -2916,30 +2905,33 @@ defmodule RebusTest do
 
       monotonic_time = fn -> Process.get(:bus_address_tiny_budget_clock) end
 
-      auth_id_runner = fn timeout ->
-        send(parent, {:tiny_auth_slice, timeout})
+      identity =
+        TestImpl.identity(
+          auth_id: fn timeout ->
+            send(parent, {:tiny_auth_slice, timeout})
 
-        Process.put(
-          :bus_address_tiny_budget_clock,
-          Process.get(:bus_address_tiny_budget_clock) + timeout
+            Process.put(
+              :bus_address_tiny_budget_clock,
+              Process.get(:bus_address_tiny_budget_clock) + timeout
+            )
+
+            {:ok, "501\n"}
+          end
         )
 
-        {:ok, "501\n"}
-      end
-
-      connector = fn address, opts ->
-        timeout = Keyword.fetch!(opts, :address_list_setup_timeout)
+      connector = fn address, {_conn_opts, internal} ->
+        timeout = Map.fetch!(internal, :setup_timeout)
         send(parent, {:tiny_candidate_slice, address.path, timeout})
         {:ok, self()}
       end
 
       assert {:ok, _pid} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [{:local, "/tmp/one", nil}],
                  [timeout: 5],
-                 connector: connector,
-                 auth_id_runner: auth_id_runner,
-                 monotonic_time: monotonic_time
+                 connector: TestImpl.connector(connect_candidate: connector),
+                 identity: identity,
+                 clock: TestImpl.clock(monotonic_time: monotonic_time)
                )
 
       assert_receive {:tiny_auth_slice, auth_timeout}
@@ -2964,8 +2956,8 @@ defmodule RebusTest do
         end
       end
 
-      connector = fn address, opts ->
-        timeout = Keyword.fetch!(opts, :address_list_setup_timeout)
+      connector = fn address, {_conn_opts, internal} ->
+        timeout = Map.fetch!(internal, :setup_timeout)
         send(parent, {:attempted, address, timeout})
 
         case address.family do
@@ -2979,16 +2971,16 @@ defmodule RebusTest do
       end
 
       assert {:ok, _pid} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [
                    {:tcp, "example", 12_345, :unspec, nil},
                    {:local, "/tmp/fallback", nil}
                  ],
                  [timeout: 90],
-                 resolver: resolver,
-                 connector: connector,
-                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
-                 monotonic_time: monotonic_time
+                 resolver: TestImpl.resolver(getaddrs: resolver),
+                 connector: TestImpl.connector(connect_candidate: connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end),
+                 clock: TestImpl.clock(monotonic_time: monotonic_time)
                )
 
       assert_receive {:resolved, :inet6, 30}
@@ -3005,8 +2997,8 @@ defmodule RebusTest do
 
       monotonic_time = fn -> Process.get(:bus_address_later_candidate_clock) end
 
-      connector = fn address, opts ->
-        timeout = Keyword.fetch!(opts, :address_list_setup_timeout)
+      connector = fn address, {_conn_opts, internal} ->
+        timeout = Map.fetch!(internal, :setup_timeout)
         send(parent, {:attempted, address, timeout})
 
         case address.path do
@@ -3024,12 +3016,12 @@ defmodule RebusTest do
       end
 
       assert {:ok, _pid} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [{:local, "/tmp/first", nil}, {:local, "/tmp/second", nil}],
                  [timeout: 90],
-                 connector: connector,
-                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
-                 monotonic_time: monotonic_time
+                 connector: TestImpl.connector(connect_candidate: connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end),
+                 clock: TestImpl.clock(monotonic_time: monotonic_time)
                )
 
       assert_receive {:attempted, %{path: "/tmp/first"}, 45}
@@ -3045,22 +3037,22 @@ defmodule RebusTest do
         {:ok, [{127, 0, 0, 1}, {127, 0, 0, 2}]}
       end
 
-      connector = fn address, opts ->
-        send(parent, {:attempted, address, Keyword.fetch!(opts, :expected_guid)})
+      connector = fn address, {_conn_opts, internal} ->
+        send(parent, {:attempted, address, Map.fetch!(internal, :expected_guid)})
         {:error, :guid_mismatch}
       end
 
       assert {:error, :guid_mismatch} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [{:tcp, "example", 12_345, :inet, expected_guid}],
                  [timeout: 100],
-                 resolver: resolver,
-                 connector: connector,
-                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
+                 resolver: TestImpl.resolver(getaddrs: resolver),
+                 connector: TestImpl.connector(connect_candidate: connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end),
                  # This test controls both resolver and connector outcomes;
                  # keep its address-budget assertion independent of runner
                  # scheduling before the first deterministic attempt.
-                 monotonic_time: fn -> 0 end
+                 clock: TestImpl.clock(monotonic_time: fn -> 0 end)
                )
 
       assert_receive {:attempted, %{family: :inet, addr: {127, 0, 0, 1}}, ^expected_guid}
@@ -3077,8 +3069,8 @@ defmodule RebusTest do
         {:ok, [{127, 0, 0, 1}, {127, 0, 0, 2}]}
       end
 
-      connector = fn address, opts ->
-        timeout = Keyword.fetch!(opts, :address_list_setup_timeout)
+      connector = fn address, {_conn_opts, internal} ->
+        timeout = Map.fetch!(internal, :setup_timeout)
         send(parent, {:attempted, address, timeout})
 
         Process.put(
@@ -3090,13 +3082,13 @@ defmodule RebusTest do
       end
 
       assert {:error, {:read_timeout, :econnrefused}} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [{:tcp, "example", 12_345, :inet, nil}],
                  [timeout: 50],
-                 resolver: resolver,
-                 connector: connector,
-                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
-                 monotonic_time: monotonic_time
+                 resolver: TestImpl.resolver(getaddrs: resolver),
+                 connector: TestImpl.connector(connect_candidate: connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end),
+                 clock: TestImpl.clock(monotonic_time: monotonic_time)
                )
 
       assert_receive {:attempted, %{addr: {127, 0, 0, 1}}, 25}
@@ -3111,21 +3103,21 @@ defmodule RebusTest do
         {:ok, []}
       end
 
-      connector = fn address, _opts ->
+      connector = fn address, _args ->
         send(parent, {:connected, address})
         {:ok, self()}
       end
 
       assert {:ok, _pid} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [
                    {:tcp, "example", 12_345, :inet, nil},
                    {:local, "/tmp/fallback", nil}
                  ],
                  [timeout: 100],
-                 resolver: resolver,
-                 connector: connector,
-                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end
+                 resolver: TestImpl.resolver(getaddrs: resolver),
+                 connector: TestImpl.connector(connect_candidate: connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end)
                )
 
       assert_receive {:resolved, :inet}
@@ -3144,14 +3136,14 @@ defmodule RebusTest do
       end
 
       assert {:error, {:tcp_resolution_failed, :nxdomain}} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [{:tcp, sentinel, 12_345, :unspec, nil}],
                  [timeout: 100],
-                 resolver: resolver,
-                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
+                 resolver: TestImpl.resolver(getaddrs: resolver),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end),
                  # This test controls the resolver result; make its reason
                  # assertion independent of scheduler time before resolution.
-                 monotonic_time: fn -> 0 end
+                 clock: TestImpl.clock(monotonic_time: fn -> 0 end)
                )
     end
 
@@ -3168,12 +3160,12 @@ defmodule RebusTest do
       end
 
       assert {:error, {:read_timeout, :tcp_resolution_failed}} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [{:tcp, "example", 12_345, :unspec, nil}],
                  [timeout: 5],
-                 resolver: resolver,
-                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
-                 monotonic_time: monotonic_time
+                 resolver: TestImpl.resolver(getaddrs: resolver),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end),
+                 clock: TestImpl.clock(monotonic_time: monotonic_time)
                )
 
       assert_receive {:resolved, :inet6, 2}
@@ -3190,18 +3182,18 @@ defmodule RebusTest do
         now
       end
 
-      connector = fn address, _opts ->
+      connector = fn address, _args ->
         send(parent, {:attempted, address})
         {:ok, self()}
       end
 
       assert {:error, :read_timeout} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [{:local, "/tmp/never-attempted", nil}],
                  [timeout: 5],
-                 connector: connector,
-                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
-                 monotonic_time: monotonic_time
+                 connector: TestImpl.connector(connect_candidate: connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end),
+                 clock: TestImpl.clock(monotonic_time: monotonic_time)
                )
 
       refute_receive {:attempted, _}
@@ -3213,24 +3205,19 @@ defmodule RebusTest do
 
       monotonic_time = fn -> Process.get(:bus_address_safe_deadline_clock) end
 
-      connector = fn _address, _opts ->
+      connector = fn _address, _args ->
         Process.put(:bus_address_safe_deadline_clock, 10)
         {:error, {:untrusted, sentinel}}
       end
 
       assert {:error, {:read_timeout, :connection_failed}} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [{:local, "/tmp/one", nil}, {:local, "/tmp/two", nil}],
                  [timeout: 5],
-                 connector: connector,
-                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
-                 monotonic_time: monotonic_time
+                 connector: TestImpl.connector(connect_candidate: connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end),
+                 clock: TestImpl.clock(monotonic_time: monotonic_time)
                )
-    end
-
-    test "rejects an invalid internal address-list implementation seam" do
-      assert {:error, :invalid_bus_address_implementation} =
-               Rebus.connect_address_candidates([], [timeout: 100], resolver: :not_a_function)
     end
 
     test "shares one setup budget across list attempts and aborts global failures" do
@@ -3239,58 +3226,58 @@ defmodule RebusTest do
 
       monotonic_time = fn -> Process.get(:bus_address_clock) end
 
-      connector = fn address, opts ->
-        send(parent, {:attempted, address, Keyword.fetch!(opts, :address_list_setup_timeout)})
+      connector = fn address, {_conn_opts, internal} ->
+        send(parent, {:attempted, address, Map.fetch!(internal, :setup_timeout)})
         Process.put(:bus_address_clock, Process.get(:bus_address_clock) + 40)
         {:error, :econnrefused}
       end
 
       assert {:error, {:read_timeout, :econnrefused}} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [
                    {:local, "/tmp/one", nil},
                    {:local, "/tmp/two", nil},
                    {:local, "/tmp/three", nil}
                  ],
                  [timeout: 50],
-                 connector: connector,
-                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
-                 monotonic_time: monotonic_time
+                 connector: TestImpl.connector(connect_candidate: connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end),
+                 clock: TestImpl.clock(monotonic_time: monotonic_time)
                )
 
       assert_receive {:attempted, %{path: "/tmp/one"}, 16}
       assert_receive {:attempted, %{path: "/tmp/two"}, 5}
       refute_receive {:attempted, %{path: "/tmp/three"}, _}
 
-      aborting_connector = fn address, _opts ->
+      aborting_connector = fn address, _args ->
         send(parent, {:aborted, address})
         {:error, :auth_id_unavailable}
       end
 
       assert {:error, :auth_id_unavailable} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [{:local, "/tmp/one", nil}, {:local, "/tmp/two", nil}],
                  [timeout: 50],
-                 connector: aborting_connector,
-                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
-                 monotonic_time: monotonic_time
+                 connector: TestImpl.connector(connect_candidate: aborting_connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end),
+                 clock: TestImpl.clock(monotonic_time: monotonic_time)
                )
 
       assert_receive {:aborted, %{path: "/tmp/one"}}
       refute_receive {:aborted, %{path: "/tmp/two"}}
 
-      unavailable_cookie_connector = fn address, _opts ->
+      unavailable_cookie_connector = fn address, _args ->
         send(parent, {:cookie_unavailable, address})
         {:error, :auth_cookie_unavailable}
       end
 
       assert {:error, :auth_cookie_unavailable} =
-               Rebus.connect_address_candidates(
+               connect_candidates(
                  [{:local, "/tmp/one", nil}, {:local, "/tmp/two", nil}],
                  [timeout: 50],
-                 connector: unavailable_cookie_connector,
-                 auth_id_runner: fn _timeout -> {:ok, "501\n"} end,
-                 monotonic_time: monotonic_time
+                 connector: TestImpl.connector(connect_candidate: unavailable_cookie_connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end),
+                 clock: TestImpl.clock(monotonic_time: monotonic_time)
                )
 
       assert_receive {:cookie_unavailable, %{path: "/tmp/one"}}
@@ -3630,16 +3617,14 @@ defmodule RebusTest do
       {:select_info, :send, handle} = continuation
       calls = :atomics.new(1, [])
 
-      :sys.replace_state(cli, fn state ->
-        %{
-          state
-          | send_fun: fn _sock, rest, flags_or_cont, timeout ->
-              call = :atomics.add_get(calls, 1, 1)
-              send(parent, {:outbound_send, call, rest, flags_or_cont, timeout})
-              if call == 1, do: {:select, continuation}, else: :ok
-            end
-        }
-      end)
+      :ok =
+        TestImpl.install(cli,
+          send: fn _sock, rest, flags_or_cont, timeout ->
+            call = :atomics.add_get(calls, 1, 1)
+            send(parent, {:outbound_send, call, rest, flags_or_cont, timeout})
+            if call == 1, do: {:select, continuation}, else: :ok
+          end
+        )
 
       signal = Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Selected")
       task = Task.async(fn -> Rebus.send(cli, signal, 500) end)
@@ -3654,16 +3639,14 @@ defmodule RebusTest do
       parent = self()
       continuation = {:select_info, :send, make_ref()}
 
-      :sys.replace_state(cli, fn state ->
-        %{
-          state
-          | send_fun: fn _, _, _, _ -> {:select, continuation} end,
-            cancel_fun: fn _sock, info ->
-              send(parent, {:cancelled_write, info})
-              :ok
-            end
-        }
-      end)
+      :ok =
+        TestImpl.install(cli,
+          send: fn _, _, _, _ -> {:select, continuation} end,
+          cancel: fn _sock, info ->
+            send(parent, {:cancelled_write, info})
+            :ok
+          end
+        )
 
       signal =
         Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Cancelled")
@@ -3677,23 +3660,21 @@ defmodule RebusTest do
       parent = self()
       calls = :atomics.new(1, [])
 
-      :sys.replace_state(cli, fn state ->
-        %{
-          state
-          | send_fun: fn _sock, rest, _flags, _timeout ->
-              case :atomics.add_get(calls, 1, 1) do
-                1 ->
-                  tail = binary_part(rest, 1, byte_size(rest) - 1)
-                  send(parent, {:first_tail, tail})
-                  {:ok, tail}
+      :ok =
+        TestImpl.install(cli,
+          send: fn _sock, rest, _flags, _timeout ->
+            case :atomics.add_get(calls, 1, 1) do
+              1 ->
+                tail = binary_part(rest, 1, byte_size(rest) - 1)
+                send(parent, {:first_tail, tail})
+                {:ok, tail}
 
-                2 ->
-                  send(parent, {:second_tail, rest})
-                  :ok
-              end
+              2 ->
+                send(parent, {:second_tail, rest})
+                :ok
             end
-        }
-      end)
+          end
+        )
 
       signal = Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Partial")
       assert :ok = Rebus.send(cli, signal, 500)
@@ -3707,23 +3688,21 @@ defmodule RebusTest do
       {:select_info, :send, handle} = continuation
       calls = :atomics.new(1, [])
 
-      :sys.replace_state(cli, fn state ->
-        %{
-          state
-          | send_fun: fn _sock, rest, flags, timeout ->
-              case :atomics.add_get(calls, 1, 1) do
-                1 ->
-                  tail = binary_part(rest, 1, byte_size(rest) - 1)
-                  send(parent, {:selected_tail, tail})
-                  {:select, {continuation, tail}}
+      :ok =
+        TestImpl.install(cli,
+          send: fn _sock, rest, flags, timeout ->
+            case :atomics.add_get(calls, 1, 1) do
+              1 ->
+                tail = binary_part(rest, 1, byte_size(rest) - 1)
+                send(parent, {:selected_tail, tail})
+                {:select, {continuation, tail}}
 
-                2 ->
-                  send(parent, {:resumed_tail, rest, flags, timeout})
-                  :ok
-              end
+              2 ->
+                send(parent, {:resumed_tail, rest, flags, timeout})
+                :ok
             end
-        }
-      end)
+          end
+        )
 
       signal =
         Message.new!(:signal, path: "/", interface: "org.example.Test", member: "SelectPartial")
@@ -3739,9 +3718,7 @@ defmodule RebusTest do
       completion = {:completion_info, :send, make_ref()}
       {:completion_info, :send, handle} = completion
 
-      :sys.replace_state(cli, fn state ->
-        %{state | send_fun: fn _, _, _, _ -> {:completion, completion} end}
-      end)
+      :ok = TestImpl.install(cli, send: fn _, _, _, _ -> {:completion, completion} end)
 
       signal =
         Message.new!(:signal, path: "/", interface: "org.example.Test", member: "Completion")
@@ -3758,20 +3735,18 @@ defmodule RebusTest do
       {:completion_info, :send, handle} = completion
       calls = :atomics.new(1, [])
 
-      :sys.replace_state(cli, fn state ->
-        %{
-          state
-          | send_fun: fn _, rest, _, _ ->
-              if :atomics.add_get(calls, 1, 1) == 1 do
-                send(parent, {:completion_rest, rest})
-                {:completion, completion}
-              else
-                send(parent, {:completion_tail, rest})
-                :ok
-              end
+      :ok =
+        TestImpl.install(cli,
+          send: fn _, rest, _, _ ->
+            if :atomics.add_get(calls, 1, 1) == 1 do
+              send(parent, {:completion_rest, rest})
+              {:completion, completion}
+            else
+              send(parent, {:completion_tail, rest})
+              :ok
             end
-        }
-      end)
+          end
+        )
 
       signal =
         Message.new!(:signal,
@@ -3792,19 +3767,18 @@ defmodule RebusTest do
       parent = self()
       continuation = {:select_info, :send, make_ref()}
 
-      :sys.replace_state(cli, fn state ->
-        %{
-          state
-          | write_timeout: 20,
-            send_fun: fn _, rest, _, _ ->
-              {:select, {continuation, binary_part(rest, 1, byte_size(rest) - 1)}}
-            end,
-            cancel_fun: fn _, info ->
-              send(parent, {:cancelled_write, info})
-              :ok
-            end
-        }
-      end)
+      _ = :sys.replace_state(cli, fn state -> %{state | write_timeout: 20} end)
+
+      :ok =
+        TestImpl.install(cli,
+          send: fn _, rest, _, _ ->
+            {:select, {continuation, binary_part(rest, 1, byte_size(rest) - 1)}}
+          end,
+          cancel: fn _, info ->
+            send(parent, {:cancelled_write, info})
+            :ok
+          end
+        )
 
       signal =
         Message.new!(:signal, path: "/", interface: "org.example.Test", member: "TimeoutPartial")
@@ -3823,16 +3797,14 @@ defmodule RebusTest do
       {:select_info, :send, handle} = continuation
       calls = :atomics.new(1, [])
 
-      :sys.replace_state(cli, fn state ->
-        %{
-          state
-          | send_fun: fn _, _rest, _flags, _timeout ->
-              call = :atomics.add_get(calls, 1, 1)
-              send(parent, {:queued_down_send, call})
-              if call == 1, do: {:select, continuation}, else: :ok
-            end
-        }
-      end)
+      :ok =
+        TestImpl.install(cli,
+          send: fn _, _rest, _flags, _timeout ->
+            call = :atomics.add_get(calls, 1, 1)
+            send(parent, {:queued_down_send, call})
+            if call == 1, do: {:select, continuation}, else: :ok
+          end
+        )
 
       signal =
         Message.new!(:signal, path: "/", interface: "org.example.Test", member: "QueuedDown")
@@ -3868,23 +3840,21 @@ defmodule RebusTest do
       {:select_info, :send, handle} = continuation
       calls = :atomics.new(1, [])
 
-      :sys.replace_state(cli, fn state ->
-        %{
-          state
-          | send_fun: fn _, rest, _flags, _timeout ->
-              case :atomics.add_get(calls, 1, 1) do
-                1 ->
-                  tail = binary_part(rest, 1, byte_size(rest) - 1)
-                  send(parent, {:partial_down_tail, tail})
-                  {:select, {continuation, tail}}
+      :ok =
+        TestImpl.install(cli,
+          send: fn _, rest, _flags, _timeout ->
+            case :atomics.add_get(calls, 1, 1) do
+              1 ->
+                tail = binary_part(rest, 1, byte_size(rest) - 1)
+                send(parent, {:partial_down_tail, tail})
+                {:select, {continuation, tail}}
 
-                _ ->
-                  send(parent, {:partial_down_resume, rest})
-                  :ok
-              end
+              _ ->
+                send(parent, {:partial_down_resume, rest})
+                :ok
             end
-        }
-      end)
+          end
+        )
 
       signal =
         Message.new!(:signal, path: "/", interface: "org.example.Test", member: "PartialDown")
@@ -4247,9 +4217,10 @@ defmodule RebusTest do
       # already the active write) and later calls go unanswered.
       continuation = {:select_info, :send, make_ref()}
 
-      :sys.replace_state(cli, fn state ->
-        %{state | send_fun: fn _sock, _rest, _flags, _timeout -> {:select, continuation} end}
-      end)
+      :ok =
+        TestImpl.install(cli,
+          send: fn _sock, _rest, _flags, _timeout -> {:select, continuation} end
+        )
 
       log =
         capture_log(fn ->
@@ -4458,10 +4429,12 @@ defmodule RebusTest do
     {_fixture_opts, connect_opts} = split_fixture_options(opts)
     {:ok, addr} = TestServer.get_listen_addr(svr)
     :ok = TestServer.set_auto_hello(svr, false)
-    args = Keyword.put(connect_opts, :addr, addr)
 
     {:ok, cli} =
-      DynamicSupervisor.start_child(Rebus.ConnectionSupervisor, {Rebus.Connection, args})
+      DynamicSupervisor.start_child(
+        Rebus.ConnectionSupervisor,
+        {Rebus.Connection, connection_args(addr, connect_opts)}
+      )
 
     hello = await_hello(svr)
     assert hello.serial == 1
@@ -4487,14 +4460,44 @@ defmodule RebusTest do
       TestServer.set_auto_hello(svr, true, Keyword.get(fixture_opts, :send_name_acquired?, true))
 
     {:ok, addr} = TestServer.get_listen_addr(svr)
-    args = Keyword.put(connect_opts, :addr, addr)
 
     {:ok, cli} =
-      DynamicSupervisor.start_child(Rebus.ConnectionSupervisor, {Rebus.Connection, args})
+      DynamicSupervisor.start_child(
+        Rebus.ConnectionSupervisor,
+        {Rebus.Connection, connection_args(addr, connect_opts)}
+      )
 
     assert await_hello(svr).serial == 1
     assert wait_until(fn -> :sys.get_state(cli).established? end)
     cli
+  end
+
+  # Connections take the caller's public options and the internal arguments
+  # Rebus itself computes as separate values; tests that start one directly
+  # name both here.
+  @internal_connection_options [
+    :connect_waiter,
+    :expected_guid,
+    :impl,
+    :precomputed_auth_id,
+    :setup_timeout
+  ]
+
+  defp connection_args(addr, opts) do
+    {internal, opts} = Keyword.split(opts, @internal_connection_options)
+
+    internal =
+      internal
+      |> Keyword.replace_lazy(:impl, &Rebus.Impl.build/1)
+      |> Keyword.put(:addr, addr)
+
+    {opts, Map.new(internal)}
+  end
+
+  # The address-list walk selects its resolver, connector, identity and clock
+  # through the private `:__impl__` option rather than a separate argument.
+  defp connect_candidates(candidates, opts, impl) do
+    Rebus.connect_address_candidates(candidates, Keyword.put(opts, :__impl__, Map.new(impl)))
   end
 
   defp split_fixture_options(opts) do

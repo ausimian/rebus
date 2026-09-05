@@ -1,7 +1,7 @@
 defmodule Rebus.UnixFDTest do
   use ExUnit.Case, async: false
 
-  alias Rebus.{Message, TestServer, UnixFD}
+  alias Rebus.{Message, TestImpl, TestServer, UnixFD}
 
   @connection_name :rebus_unix_fd_test_connection
 
@@ -92,27 +92,25 @@ defmodule Rebus.UnixFDTest do
     calls = :atomics.new(1, [])
     {:ok, fd} = :socket.getopt(:sys.get_state(connection).sock, {:otp, :fd})
 
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | sendmsg_fun: fn
-            _sock, %{iov: [rest], ctrl: ctrl}, [], :nowait ->
-              tail = binary_part(rest, 1, byte_size(rest) - 1)
-              send(parent, {:sendmsg_initial, rest, ctrl})
-              :atomics.add_get(calls, 1, 1)
-              {:select, {continuation, [tail]}}
-          end,
-          send_fun: fn _sock, rest, [], :nowait ->
-            send(parent, {:send_tail, rest})
+    :ok =
+      TestImpl.install(connection,
+        sendmsg: fn
+          _sock, %{iov: [rest], ctrl: ctrl}, [], :nowait ->
+            tail = binary_part(rest, 1, byte_size(rest) - 1)
+            send(parent, {:sendmsg_initial, rest, ctrl})
             :atomics.add_get(calls, 1, 1)
-            :ok
-          end,
-          cancel_fun: fn _sock, ^continuation ->
-            send(parent, :sendmsg_continuation_cancelled)
-            :ok
-          end
-      }
-    end)
+            {:select, {continuation, [tail]}}
+        end,
+        send: fn _sock, rest, [], :nowait ->
+          send(parent, {:send_tail, rest})
+          :atomics.add_get(calls, 1, 1)
+          :ok
+        end,
+        cancel: fn _sock, ^continuation ->
+          send(parent, :sendmsg_continuation_cancelled)
+          :ok
+        end
+      )
 
     message =
       Message.new!(:signal,
@@ -145,20 +143,18 @@ defmodule Rebus.UnixFDTest do
     {:select_info, :sendmsg, handle} = continuation
     {:ok, fd} = :socket.getopt(:sys.get_state(connection).sock, {:otp, :fd})
 
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | sendmsg_fun: fn
-            _sock, %{iov: [rest], ctrl: ctrl}, [], :nowait ->
-              send(parent, {:sendmsg_initial_no_progress, rest, ctrl})
-              {:select, continuation}
+    :ok =
+      TestImpl.install(connection,
+        sendmsg: fn
+          _sock, %{iov: [rest], ctrl: ctrl}, [], :nowait ->
+            send(parent, {:sendmsg_initial_no_progress, rest, ctrl})
+            {:select, continuation}
 
-            _sock, [rest], ^continuation, :nowait ->
-              send(parent, {:sendmsg_no_progress_continuation, rest})
-              :ok
-          end
-      }
-    end)
+          _sock, [rest], ^continuation, :nowait ->
+            send(parent, {:sendmsg_no_progress_continuation, rest})
+            :ok
+        end
+      )
 
     message =
       Message.new!(:signal,
@@ -183,19 +179,17 @@ defmodule Rebus.UnixFDTest do
     {:completion_info, :sendmsg, handle} = completion
     {:ok, fd} = :socket.getopt(:sys.get_state(connection).sock, {:otp, :fd})
 
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | sendmsg_fun: fn _sock, %{iov: [rest], ctrl: ctrl}, [], :nowait ->
-            send(parent, {:sendmsg_completion_initial, rest, ctrl})
-            {:completion, completion}
-          end,
-          send_fun: fn _sock, rest, [], :nowait ->
-            send(parent, {:sendmsg_completion_tail, rest})
-            :ok
-          end
-      }
-    end)
+    :ok =
+      TestImpl.install(connection,
+        sendmsg: fn _sock, %{iov: [rest], ctrl: ctrl}, [], :nowait ->
+          send(parent, {:sendmsg_completion_initial, rest, ctrl})
+          {:completion, completion}
+        end,
+        send: fn _sock, rest, [], :nowait ->
+          send(parent, {:sendmsg_completion_tail, rest})
+          :ok
+        end
+      )
 
     message =
       Message.new!(:signal,
@@ -226,25 +220,23 @@ defmodule Rebus.UnixFDTest do
     {:select_info, :send, handle} = send_continuation
     {:ok, fd} = :socket.getopt(:sys.get_state(connection).sock, {:otp, :fd})
 
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | sendmsg_fun: fn _sock, %{iov: [rest], ctrl: ctrl}, [], :nowait ->
-            tail = binary_part(rest, 1, byte_size(rest) - 1)
-            send(parent, {:sticky_sendmsg_initial, rest, ctrl})
-            {:ok, tail}
-          end,
-          send_fun: fn
-            _sock, rest, [], :nowait ->
-              send(parent, {:sticky_plain_tail, rest})
-              {:select, send_continuation}
+    :ok =
+      TestImpl.install(connection,
+        sendmsg: fn _sock, %{iov: [rest], ctrl: ctrl}, [], :nowait ->
+          tail = binary_part(rest, 1, byte_size(rest) - 1)
+          send(parent, {:sticky_sendmsg_initial, rest, ctrl})
+          {:ok, tail}
+        end,
+        send: fn
+          _sock, rest, [], :nowait ->
+            send(parent, {:sticky_plain_tail, rest})
+            {:select, send_continuation}
 
-            _sock, rest, ^send_continuation, :nowait ->
-              send(parent, {:sticky_plain_continuation, rest})
-              :ok
-          end
-      }
-    end)
+          _sock, rest, ^send_continuation, :nowait ->
+            send(parent, {:sticky_plain_continuation, rest})
+            :ok
+        end
+      )
 
     message =
       Message.new!(:signal,
@@ -349,19 +341,16 @@ defmodule Rebus.UnixFDTest do
     before_fds = fd_set!()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | fd_claim_handoff_fun: fn ->
-            send(parent, :fd_claim_handoff_waiting)
+    TestImpl.install(connection,
+      fd_claim_handoff: fn ->
+        send(parent, :fd_claim_handoff_waiting)
 
-            receive do
-              :continue_fd_claim_handoff -> :ok
-            end
-          end,
-          request_timeout_slack: 1_000
-      }
-    end)
+        receive do
+          :continue_fd_claim_handoff -> :ok
+        end
+      end,
+      request_timeout_slack: fn -> 1_000 end
+    )
 
     method =
       Message.new!(:method_call,
@@ -413,23 +402,20 @@ defmodule Rebus.UnixFDTest do
     before_fds = fd_set!()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | fd_claim_delivery_fun: fn ->
-            send(parent, :fd_delivery_waiting)
+    TestImpl.install(connection,
+      fd_claim_delivery: fn ->
+        send(parent, :fd_delivery_waiting)
 
-            receive do
-              :continue_fd_delivery -> :ok
-            end
-          end,
-          # The caller's alias must time out while the connection still holds
-          # the request, so the reply has to survive the socket round trip on
-          # a loaded runner. Keep the connection-side reaper well behind the
-          # caller deadline, as the timed-out alias test above does.
-          request_timeout_slack: 1_000
-      }
-    end)
+        receive do
+          :continue_fd_delivery -> :ok
+        end
+      end,
+      # The caller's alias must time out while the connection still holds the
+      # request, so the reply has to survive the socket round trip on a loaded
+      # runner. Keep the connection-side reaper well behind the caller
+      # deadline, as the timed-out alias test above does.
+      request_timeout_slack: fn -> 1_000 end
+    )
 
     method =
       Message.new!(:method_call,
@@ -480,18 +466,15 @@ defmodule Rebus.UnixFDTest do
     before_fds = fd_set!()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | fd_claim_ack_fun: fn ->
-            send(parent, :fd_ack_waiting)
+    TestImpl.install(connection,
+      fd_claim_ack: fn _claim ->
+        send(parent, :fd_ack_waiting)
 
-            receive do
-              :continue_fd_ack -> :ok
-            end
-          end
-      }
-    end)
+        receive do
+          :continue_fd_ack -> :ok
+        end
+      end
+    )
 
     method =
       Message.new!(:method_call,
@@ -539,18 +522,15 @@ defmodule Rebus.UnixFDTest do
     before_fds = fd_set!()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | fd_claim_delivery_fun: fn ->
-            send(parent, :claimed_fd_delivery_waiting)
+    TestImpl.install(connection,
+      fd_claim_delivery: fn ->
+        send(parent, :claimed_fd_delivery_waiting)
 
-            receive do
-              :continue_claimed_fd_delivery -> :ok
-            end
-          end
-      }
-    end)
+        receive do
+          :continue_claimed_fd_delivery -> :ok
+        end
+      end
+    )
 
     caller =
       spawn(fn ->
@@ -648,18 +628,15 @@ defmodule Rebus.UnixFDTest do
     parent = self()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | fd_claim_ack_fun: fn %{msg: %Message{unix_fds: [received]}} ->
-            send(parent, {:close_claim_ack_waiting, received})
+    TestImpl.install(connection,
+      fd_claim_ack: fn %{msg: %Message{unix_fds: [received]}} ->
+        send(parent, {:close_claim_ack_waiting, received})
 
-            receive do
-              :continue_close_claim_ack -> :ok
-            end
-          end
-      }
-    end)
+        receive do
+          :continue_close_claim_ack -> :ok
+        end
+      end
+    )
 
     method =
       Message.new!(:method_call,
@@ -1119,15 +1096,13 @@ defmodule Rebus.UnixFDTest do
     # CtrlSz=0 selects OTP's default buffer. The declined path therefore keeps
     # a bounded control buffer, closes illicit rights immediately, quarantines
     # only their frame, and still parses the coalesced successor.
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | recvmsg_fun: fn sock, length, control_size, flags, timeout ->
-            send(parent, {:declined_recvmsg, length, control_size})
-            :socket.recvmsg(sock, length, control_size, flags, timeout)
-          end
-      }
-    end)
+    :ok =
+      TestImpl.install(connection,
+        recvmsg: fn sock, length, control_size, flags, timeout ->
+          send(parent, {:declined_recvmsg, length, control_size})
+          :socket.recvmsg(sock, length, control_size, flags, timeout)
+        end
+      )
 
     fd_encoded = IO.iodata_to_binary(fd_encoded)
     <<prefix::binary-size(8), tail::binary>> = fd_encoded
@@ -1222,14 +1197,10 @@ defmodule Rebus.UnixFDTest do
   test "handles an unaccepted descriptor error with an explicit RestData", %{
     connection: connection
   } do
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | sendmsg_fun: fn _sock, %{iov: [rest]}, [], :nowait ->
-            {:error, {:ebadf, rest}}
-          end
-      }
-    end)
+    :ok =
+      TestImpl.install(connection,
+        sendmsg: fn _sock, %{iov: [rest]}, [], :nowait -> {:error, {:ebadf, rest}} end
+      )
 
     message =
       Message.new!(:signal,
@@ -1246,15 +1217,13 @@ defmodule Rebus.UnixFDTest do
   end
 
   test "stops after a partial FD frame later fails", %{connection: connection} do
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | sendmsg_fun: fn _sock, %{iov: [rest]}, [], :nowait ->
-            {:ok, binary_part(rest, 1, byte_size(rest) - 1)}
-          end,
-          send_fun: fn _sock, _rest, [], :nowait -> {:error, :closed} end
-      }
-    end)
+    :ok =
+      TestImpl.install(connection,
+        sendmsg: fn _sock, %{iov: [rest]}, [], :nowait ->
+          {:ok, binary_part(rest, 1, byte_size(rest) - 1)}
+        end,
+        send: fn _sock, _rest, [], :nowait -> {:error, :closed} end
+      )
 
     message =
       Message.new!(:signal,
@@ -1546,36 +1515,37 @@ defmodule Rebus.UnixFDTest do
     assert {:stop, {:shutdown, :read_timeout}, _state} =
              Rebus.Connection.handle_continue(
                :hello_reply,
-               %{state | recvmsg_fun: fn _, _, _, _, _ -> {:error, :timeout} end}
+               TestImpl.stub(state, recvmsg: fn _, _, _, _, _ -> {:error, :timeout} end)
              )
 
     assert {:stop, {:shutdown, :receive_failed}, _state} =
              Rebus.Connection.handle_continue(
                :hello_reply,
-               %{state | recvmsg_fun: fn _, _, _, _, _ -> :unexpected end}
+               TestImpl.stub(state, recvmsg: fn _, _, _, _, _ -> :unexpected end)
              )
 
     assert {:noreply, _state} =
              Rebus.Connection.handle_continue(
                :hello_reply,
-               %{
-                 state
-                 | recvmsg_fun: fn _, _, _, _, _ ->
-                     {:error, {:timeout, %{iov: [], ctrl: [], flags: []}}}
-                   end
-               }
+               TestImpl.stub(state,
+                 recvmsg: fn _, _, _, _, _ ->
+                   {:error, {:timeout, %{iov: [], ctrl: [], flags: []}}}
+                 end
+               )
              )
 
     assert {:stop, {:shutdown, :read_timeout}, _state} =
              Rebus.Connection.handle_continue(
                :hello_reply,
-               %{state | recvmsg_fun: fn _, _, _, _, _ -> {:error, {:timeout, :partial}} end}
+               TestImpl.stub(state,
+                 recvmsg: fn _, _, _, _, _ -> {:error, {:timeout, :partial}} end
+               )
              )
 
     assert {:stop, {:shutdown, :closed}, _state} =
              Rebus.Connection.handle_continue(
                :hello_reply,
-               %{state | recvmsg_fun: fn _, _, _, _, _ -> {:error, :closed} end}
+               TestImpl.stub(state, recvmsg: fn _, _, _, _, _ -> {:error, :closed} end)
              )
 
     assert {:stop, {:shutdown, :invalid_unix_fds}, _state} =
