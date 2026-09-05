@@ -219,6 +219,54 @@ defmodule Rebus.DecoderTest do
     end
   end
 
+  describe "strict wire validation" do
+    test "decodes the only two booleans the specification allows" do
+      assert [false] = Decoder.decode("b", <<0::little-32>>)
+      assert [true] = Decoder.decode("b", <<1::little-32>>)
+      assert [false] = Decoder.decode("b", <<0::big-32>>, :big)
+      assert [true] = Decoder.decode("b", <<1::big-32>>, :big)
+    end
+
+    test "rejects a boolean that is neither 0 nor 1" do
+      assert_raise ArgumentError, "D-Bus boolean must be 0 or 1", fn ->
+        Decoder.decode("b", <<2::little-32>>)
+      end
+
+      assert_raise ArgumentError, "D-Bus boolean must be 0 or 1", fn ->
+        Decoder.decode("b", <<0xFFFFFFFF::little-32>>)
+      end
+    end
+
+    test "rejects an out-of-range boolean inside an array" do
+      assert [[true, false]] =
+               Decoder.decode("ab", <<8::little-32, 1::little-32, 0::little-32>>)
+
+      assert_raise ArgumentError, "D-Bus boolean must be 0 or 1", fn ->
+        Decoder.decode("ab", <<8::little-32, 1::little-32, 2::little-32>>)
+      end
+    end
+
+    test "rejects non-zero struct alignment padding" do
+      # (yi): the byte at offset 0 is followed by three padding bytes before
+      # the 4-aligned int32.
+      assert [[7, 42]] = Decoder.decode("(yi)", <<7, 0, 0, 0, 42::little-32>>)
+
+      assert_raise ArgumentError, "D-Bus alignment padding must be zero", fn ->
+        Decoder.decode("(yi)", <<7, 0, 1, 0, 42::little-32>>)
+      end
+    end
+
+    test "rejects non-zero padding before an 8-aligned value" do
+      # yx: the byte at offset 0 is followed by seven padding bytes before the
+      # 8-aligned int64.
+      assert [7, 42] = Decoder.decode("yx", <<7, 0, 0, 0, 0, 0, 0, 0, 42::little-64>>)
+
+      assert_raise ArgumentError, "D-Bus alignment padding must be zero", fn ->
+        Decoder.decode("yx", <<7, 0, 0, 0, 0, 0, 0, 0xFF, 42::little-64>>)
+      end
+    end
+  end
+
   describe "endianness" do
     test "decodes with big endian" do
       data = <<0x12, 0x34, 0x56, 0x78>>

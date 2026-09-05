@@ -48,7 +48,8 @@ defmodule Rebus.Decoder do
 
   ## Raises
 
-  Raises `ArgumentError` for an invalid signature, and
+  Raises `ArgumentError` for an invalid signature, for a boolean whose wire
+  value is neither 0 nor 1, and for non-zero alignment padding, and
   `Rebus.ResourceLimitError` when the signature or data exceeds a local
   nesting, structural, or scalar-array limit.
 
@@ -171,8 +172,13 @@ defmodule Rebus.Decoder do
   end
 
   defp decode_single({:boolean, _}, state) do
-    {value, new_state} = decode_uint32(state)
-    {value != 0, new_state}
+    # The specification only permits 0 and 1 on the wire; anything else is a
+    # malformed message, as libdbus also treats it.
+    case decode_uint32(state) do
+      {0, new_state} -> {false, new_state}
+      {1, new_state} -> {true, new_state}
+      {_other, _new_state} -> raise ArgumentError, "D-Bus boolean must be 0 or 1"
+    end
   end
 
   defp decode_single({:int16, _}, state) do
@@ -492,7 +498,20 @@ defmodule Rebus.Decoder do
 
     # Skip padding bytes in the data
     padded_data = binary_part(state.data, padding_size, byte_size(state.data) - padding_size)
+    check_zero_padding!(state.data, padding_size)
     %{state | position: aligned_pos, data: padded_data}
+  end
+
+  # The specification requires alignment padding to be NUL bytes.
+  defp check_zero_padding!(_data, 0), do: :ok
+
+  defp check_zero_padding!(data, padding_size) do
+    padding_bits = padding_size * 8
+
+    case data do
+      <<0::size(^padding_bits), _rest::binary>> -> :ok
+      _ -> raise ArgumentError, "D-Bus alignment padding must be zero"
+    end
   end
 
   defp align_position(position, alignment) do

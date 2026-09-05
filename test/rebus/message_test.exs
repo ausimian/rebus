@@ -1107,6 +1107,53 @@ defmodule Rebus.MessageTest do
   end
 
   describe "decode/1 error handling" do
+    test "rejects a body boolean that is neither 0 nor 1" do
+      fields = [
+        [1, {"o", "/test"}],
+        [2, {"s", "test.interface"}],
+        [3, {"s", "Test"}],
+        [8, {"g", "b"}]
+      ]
+
+      assert {:ok, message} = Message.decode(wire_message(fields, <<1::little-32>>))
+      assert message.body == [true]
+
+      assert {:error, :invalid_message} =
+               Message.decode(wire_message(fields, <<2::little-32>>))
+    end
+
+    test "rejects non-zero alignment padding in the body" do
+      fields = [
+        [1, {"o", "/test"}],
+        [2, {"s", "test.interface"}],
+        [3, {"s", "Test"}],
+        [8, {"g", "yi"}]
+      ]
+
+      assert {:ok, message} =
+               Message.decode(wire_message(fields, <<7, 0, 0, 0, 42::little-32>>))
+
+      assert message.body == [7, 42]
+
+      assert {:error, :invalid_message} =
+               Message.decode(wire_message(fields, <<7, 0, 1, 0, 42::little-32>>))
+    end
+
+    test "rejects non-zero alignment padding in the header fields" do
+      fields = [[1, {"o", "/test"}], [2, {"s", "test.interface"}], [3, {"s", "Test"}]]
+      wire = wire_message(fields, [])
+
+      # The first `(yv)` struct ends at offset 30 ("/test\\0" finishes at 29),
+      # so the second struct is preceded by two padding bytes.
+      assert :binary.at(wire, 30) == 0
+      assert {:ok, _message} = Message.decode(wire)
+
+      <<prefix::binary-size(30), 0, suffix::binary>> = wire
+
+      assert {:error, :invalid_message} =
+               Message.decode(<<prefix::binary, 1, suffix::binary>>)
+    end
+
     test "rejects invalid endianness flag" do
       # Create a message with invalid endianness (not 'l' or 'B')
       invalid_data = <<99, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0>>
