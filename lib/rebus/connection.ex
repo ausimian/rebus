@@ -3,8 +3,10 @@ defmodule Rebus.Connection do
   use GenServer, restart: :temporary
   use TypedStruct
 
+  alias Rebus.Connection.FDClaims
   alias Rebus.Connection.Handshake
   alias Rebus.Connection.Inbound
+  alias Rebus.Connection.Rights
   alias Rebus.Connection.SocketError
   alias Rebus.Connection.Writer
   alias Rebus.MachineId
@@ -20,17 +22,6 @@ defmodule Rebus.Connection do
   @max_read_chunk 65_536
   @max_read_attempts 1
   @max_unix_fd_control_size 256
-  # A reply carrying descriptors is first acknowledged through a small
-  # connection-owned claim.  This deliberately avoids treating delivery to a
-  # GenServer.call alias as ownership transfer: aliases can be deactivated
-  # while their process remains alive after a caller-side timeout.
-  # FD delivery starts in a short extension of the request's original absolute
-  # deadline. It exists solely to close or hand off a descriptor safely after
-  # a reply reaches the boundary of that deadline; it is not a second public
-  # request timeout. A definitive resolver may wait longer if a live connection
-  # has an acknowledgement queued ahead of it; see resolve_fd_claim/3.
-  @fd_claim_handoff_grace 100
-  @fd_claim_cleanup_grace 250
 
   # Every D-Bus connection is expected to implement org.freedesktop.DBus.Peer;
   # dbus-daemon, busctl and d-feet all call it. Every other inbound method call
@@ -59,7 +50,7 @@ defmodule Rebus.Connection do
   defp call_for_reply(pid, msg, deadline, request_ref, timeout) do
     pid
     |> GenServer.call({:call, msg, deadline, request_ref}, timeout)
-    |> receive_fd_reply_claim(pid, deadline, request_ref)
+    |> FDClaims.Client.receive_claim(pid, deadline)
   catch
     :exit, {:timeout, _call} ->
       GenServer.cast(pid, {:cancel, request_ref})
@@ -171,12 +162,10 @@ defmodule Rebus.Connection do
     # The pending receive select handle, or nil when no receive is outstanding.
     field :rref, :socket.select_handle() | nil, default: nil
     field :inbound, Inbound.t(), default: Inbound.new()
-    field :inbound_unix_fds, [UnixFD.t()], default: []
-    # Ancillary data rejected before a complete D-Bus frame is known belongs
-    # to that frame, not to a later coalesced frame. The descriptors themselves
-    # are closed immediately; this bit makes the eventual frame a recoverable
-    # drop once its byte boundary is available.
-    field :inbound_fd_tainted?, boolean(), default: false
+    # SCM_RIGHTS descriptors received with the frame currently being assembled,
+    # and the taint bit recording ancillary data rejected before that frame's
+    # boundary was known.
+    field :inbound_fds, Rights.t(), default: Rights.new()
     field :name, binary() | nil, default: nil
     field :hello_serial, non_neg_integer() | nil, default: nil
     field :established?, boolean(), default: false
@@ -210,13 +199,9 @@ defmodule Rebus.Connection do
 
     field :request_index, %{reference() => non_neg_integer()}, default: %{}
     field :monitor_index, %{reference() => non_neg_integer()}, default: %{}
-    field :fd_claims, %{reference() => map()}, default: %{}
-    field :fd_claim_request_index, %{reference() => reference()}, default: %{}
-    field :fd_claim_monitor_index, %{reference() => reference()}, default: %{}
-
-    field :fd_claim_outcomes, %{reference() => {:acknowledged | :closed, reference()}},
-      default: %{}
-
+    # Replies whose descriptors have been handed to a caller but not yet
+    # acknowledged, and the terminal outcomes retained just after.
+    field :fd_claims, FDClaims.t(), default: FDClaims.new()
     field :signal_handler_monitor_index, %{reference() => reference()}, default: %{}
     field :signal_handler_ref_index, %{reference() => reference()}, default: %{}
     # Implementation modules behind the connection's side effects. Production
@@ -315,13 +300,13 @@ defmodule Rebus.Connection do
           sock: sock,
           impl: impl,
           partial_frame_timer: timer_ref,
-          inbound_unix_fds: inbound_unix_fds,
+          inbound_fds: inbound_fds,
           fd_claims: fd_claims
         }
       ) do
     cancel_partial_frame_timer(timer_ref)
-    _ = UnixFD.close_all(inbound_unix_fds)
-    close_fd_claims(fd_claims)
+    _ = UnixFD.close_all(Rights.fds(inbound_fds))
+    FDClaims.close_all(fd_claims)
     _ = impl.transport.close(sock)
     :ok
   end
@@ -409,21 +394,11 @@ defmodule Rebus.Connection do
   end
 
   def handle_info({:fd_claim_timeout, claim_ref}, %__MODULE__{} = state) do
-    case Map.fetch(state.fd_claims, claim_ref) do
-      {:ok, _claim} ->
-        Logger.warning("D-Bus FD reply claim dropped: :claim_timeout", reason: :claim_timeout)
-        {:noreply, drop_fd_claim(state, claim_ref, close?: true)}
-
-      :error ->
-        {:noreply, state}
-    end
+    {:noreply, %{state | fd_claims: FDClaims.expire(state.fd_claims, claim_ref)}}
   end
 
   def handle_info({:fd_claim_outcome_timeout, claim_ref}, %__MODULE__{} = state) do
-    case Map.pop(state.fd_claim_outcomes, claim_ref) do
-      {nil, _outcomes} -> {:noreply, state}
-      {_outcome, outcomes} -> {:noreply, %{state | fd_claim_outcomes: outcomes}}
-    end
+    {:noreply, %{state | fd_claims: FDClaims.expire_outcome(state.fd_claims, claim_ref)}}
   end
 
   def handle_info(
@@ -465,7 +440,7 @@ defmodule Rebus.Connection do
       {nil, _index} ->
         case Writer.pop_monitor(state.writer, ref) do
           :error ->
-            case Map.fetch(state.fd_claim_monitor_index, ref) do
+            case FDClaims.fetch_by_monitor(state.fd_claims, ref) do
               {:ok, claim_ref} ->
                 {:noreply, drop_fd_claim(state, claim_ref, close?: true, monitor_down?: true)}
 
@@ -790,96 +765,38 @@ defmodule Rebus.Connection do
     end
   end
 
-  # The public call's reply alias carries only the claim token. The
-  # descriptor-bearing message uses a caller-created one-shot alias, which is
-  # explicitly unaliased on every timeout path. That prevents a late internal
-  # delivery from reaching application `handle_info/2` after Connection.call/3
-  # has returned.
   def handle_call(
         {:claim_fd_reply, claim_ref, delivery_ref, delivery_alias},
         {pid, _tag},
         %__MODULE__{} = state
       ) do
-    case Map.fetch(state.fd_claims, claim_ref) do
-      {:ok, %{pid: ^pid, delivery_ref: nil, msg: msg} = claim}
-      when is_reference(delivery_ref) and is_reference(delivery_alias) ->
-        if fd_claim_live?(claim) and Process.alive?(pid) do
-          claim = rearm_fd_claim(claim_ref, claim)
-          state.impl.hooks.fd_claim_delivery()
+    {reply, claims} =
+      FDClaims.claim(
+        state.fd_claims,
+        claim_ref,
+        delivery_ref,
+        delivery_alias,
+        pid,
+        fd_claims_context(state)
+      )
 
-          if fd_claim_live?(claim) and Process.alive?(pid) do
-            send(delivery_alias, {:rebus_fd_reply, claim_ref, delivery_ref, msg})
-
-            {:reply, :ok,
-             %{
-               state
-               | fd_claims:
-                   Map.put(state.fd_claims, claim_ref, %{
-                     claim
-                     | delivery_ref: delivery_ref,
-                       delivery_alias: delivery_alias
-                   })
-             }}
-          else
-            {:reply, {:error, :fd_claim_expired},
-             drop_fd_claim(state, claim_ref, close?: true, outcome: :closed)}
-          end
-        else
-          {:reply, {:error, :fd_claim_expired},
-           drop_fd_claim(state, claim_ref, close?: true, outcome: :closed)}
-        end
-
-      _ ->
-        {:reply, {:error, :fd_claim_expired}, state}
-    end
+    {:reply, reply, %{state | fd_claims: claims}}
   end
 
   def handle_call({:ack_fd_reply, claim_ref, delivery_ref}, {pid, _tag}, %__MODULE__{} = state) do
-    case Map.fetch(state.fd_claims, claim_ref) do
-      {:ok, %{pid: ^pid, delivery_ref: ^delivery_ref} = claim} ->
-        state.impl.hooks.fd_claim_ack(claim)
+    {reply, claims} =
+      FDClaims.ack(state.fd_claims, claim_ref, delivery_ref, pid, fd_claims_context(state))
 
-        # A call alias timing out does not revoke a queued acknowledgement. It
-        # is the resolver's FIFO position after this message that makes its
-        # outcome definitive. Never acknowledge after the claim deadline,
-        # though: at that point the connection must retain and close the FD.
-        if fd_claim_live?(claim) and Process.alive?(pid) do
-          {:reply, :ok, drop_fd_claim(state, claim_ref, close?: false, outcome: :acknowledged)}
-        else
-          {:reply, {:error, :fd_claim_expired},
-           drop_fd_claim(state, claim_ref, close?: true, outcome: :closed)}
-        end
-
-      _ ->
-        {:reply, {:error, :fd_claim_expired}, state}
-    end
+    {:reply, reply, %{state | fd_claims: claims}}
   end
 
-  # This ordered descriptor-free barrier is used only if the bounded ack call
-  # times out. It serializes behind a queued acknowledgement: either that ack
-  # transferred ownership (and we report it), or this handler closes the claim.
-  # Connection.call/3 waits for this handler without another finite timeout so
-  # it never reports a closed claim while an earlier acknowledgement can still
-  # transfer ownership.
   def handle_call({:resolve_fd_claim, claim_ref, delivery_ref}, _from, %__MODULE__{} = state) do
-    case Map.fetch(state.fd_claims, claim_ref) do
-      {:ok, %{delivery_ref: ^delivery_ref}} ->
-        {:reply, :closed, drop_fd_claim(state, claim_ref, close?: true, outcome: :closed)}
-
-      _ ->
-        {outcome, state} = take_fd_claim_outcome(state, claim_ref)
-        {:reply, outcome || :fd_claim_expired, state}
-    end
+    {reply, claims} = FDClaims.resolve(state.fd_claims, claim_ref, delivery_ref)
+    {:reply, reply, %{state | fd_claims: claims}}
   end
 
   def handle_call({:discard_fd_claim, claim_ref}, {pid, _tag}, %__MODULE__{} = state) do
-    case Map.fetch(state.fd_claims, claim_ref) do
-      {:ok, %{pid: ^pid}} ->
-        {:reply, :ok, drop_fd_claim(state, claim_ref, close?: true, outcome: :closed)}
-
-      _ ->
-        {:reply, :ok, state}
-    end
+    {:reply, :ok, %{state | fd_claims: FDClaims.discard(state.fd_claims, claim_ref, pid)}}
   end
 
   def handle_call(:bus?, _from, %__MODULE__{} = state) do
@@ -951,7 +868,7 @@ defmodule Rebus.Connection do
   def handle_cast({:cancel, request_ref}, %__MODULE__{} = state) do
     case Map.pop(state.request_index, request_ref) do
       {nil, _index} ->
-        case Map.fetch(state.fd_claim_request_index, request_ref) do
+        case FDClaims.fetch_by_request(state.fd_claims, request_ref) do
           {:ok, claim_ref} ->
             {:noreply, drop_fd_claim(state, claim_ref, close?: true)}
 
@@ -1037,46 +954,24 @@ defmodule Rebus.Connection do
   end
 
   defp attach_inbound_fds(%Message{} = msg, %__MODULE__{} = state) do
-    fds = state.inbound_unix_fds
-    tainted? = state.inbound_fd_tainted?
-    state = %{state | inbound_unix_fds: [], inbound_fd_tainted?: false}
+    case Rights.attach(state.inbound_fds, msg, state.unix_fd_negotiated?) do
+      {:ok, msg, inbound_fds} ->
+        {:ok, msg, %{state | inbound_fds: inbound_fds}}
 
-    with :ok <- inbound_fd_frame_clean?(tainted?),
-         :ok <- inbound_fd_negotiated?(msg, state),
-         {:ok, msg} <- Message.attach_unix_fds(msg, fds) do
-      {:ok, msg, state}
-    else
-      {:error, reason} ->
+      {:error, reason, fds, inbound_fds} ->
         _ = UnixFD.close_all(fds)
-        {:error, reason, state}
+        {:error, reason, %{state | inbound_fds: inbound_fds}}
     end
   end
-
-  defp inbound_fd_frame_clean?(false), do: :ok
-  defp inbound_fd_frame_clean?(true), do: {:error, :invalid_unix_fds}
 
   # Count/index/negotiation checks run after a complete D-Bus frame and its
   # ancillary data have been collected. The stream boundary is therefore known:
   # close the descriptors, drop only this frame, and continue with a coalesced
   # successor rather than letting a peer kill unrelated calls or handlers.
   defp drop_recoverable_fd_frame(reason, rest, state, continuation, source) do
-    reason = fd_drop_reason(reason)
+    reason = Rights.drop_reason(reason)
     Logger.warning("D-Bus FD frame dropped: #{inspect(reason)}", reason: reason)
     parse_flat_messages(rest, finish_frame(state), continuation, source)
-  end
-
-  defp fd_drop_reason(reason)
-       when reason in [:invalid_unix_fds, :unix_fd_not_negotiated, :unix_fd_limit],
-       do: reason
-
-  defp fd_drop_reason(_reason), do: :invalid_unix_fds
-
-  defp inbound_fd_negotiated?(%Message{header_fields: header_fields, unix_fds: fds}, state) do
-    if state.unix_fd_negotiated? or (Map.get(header_fields, :unix_fds, 0) == 0 and fds == []) do
-      :ok
-    else
-      {:error, :unix_fd_not_negotiated}
-    end
   end
 
   defp dispatch_inbound_message(
@@ -1394,157 +1289,6 @@ defmodule Rebus.Connection do
       {:error, :disconnected}
   end
 
-  defp receive_fd_reply_claim({:fd_claim, claim_ref}, conn, deadline, _request_ref)
-       when is_reference(claim_ref) do
-    delivery_ref = make_ref()
-    # An alias is the delivery address, not a process mailbox convention. On
-    # timeout `unalias/1` atomically rejects in-flight sends; the small drain
-    # below merely consumes a message already enqueued before that operation.
-    delivery_alias = :erlang.alias([:reply])
-
-    await_fd_reply(conn, claim_ref, delivery_ref, delivery_alias, deadline)
-  end
-
-  defp receive_fd_reply_claim(%Message{} = msg, _conn, _deadline, _request_ref),
-    do: reply_result(msg)
-
-  defp receive_fd_reply_claim(result, _conn, _deadline, _request_ref), do: result
-
-  # A D-Bus error reply is a definitive peer answer, not a transport failure,
-  # but callers should not have to test the type to branch on it. The complete
-  # message is retained in either shape so its error name, body and any owned
-  # descriptors stay available to the caller.
-  defp reply_result(%Message{type: :error} = msg), do: {:error, msg}
-  defp reply_result(%Message{} = msg), do: {:ok, msg}
-
-  defp await_fd_reply(conn, claim_ref, delivery_ref, delivery_alias, deadline) do
-    with {:ok, timeout} <- fd_claim_remaining_timeout(deadline),
-         :ok <- claim_fd_reply(conn, claim_ref, delivery_ref, delivery_alias, timeout) do
-      receive do
-        {:rebus_fd_reply, ^claim_ref, ^delivery_ref, %Message{} = msg} ->
-          # Ownership moves only after the server acknowledges the claim.
-          # The first acknowledgement is bounded by the original request
-          # deadline plus the handoff grace. If its reply races that bound,
-          # the FIFO resolver waits for the definitive transfer-or-close
-          # outcome rather than returning an ambiguous raw descriptor.
-          case acknowledge_fd_reply(conn, claim_ref, delivery_ref, deadline) do
-            :ok -> reply_result(msg)
-            {:error, _reason} = error -> error
-          end
-      after
-        timeout ->
-          discard_fd_claim(conn, claim_ref, deadline)
-          {:error, :timeout}
-      end
-    else
-      {:error, :timeout} ->
-        discard_fd_claim(conn, claim_ref, deadline)
-        {:error, :timeout}
-
-      {:error, _reason} = error ->
-        discard_fd_claim(conn, claim_ref, deadline)
-        error
-    end
-  after
-    :erlang.unalias(delivery_alias)
-    drain_fd_reply_delivery(claim_ref, delivery_ref)
-  end
-
-  defp claim_fd_reply(conn, claim_ref, delivery_ref, delivery_alias, timeout) do
-    case GenServer.call(
-           conn,
-           {:claim_fd_reply, claim_ref, delivery_ref, delivery_alias},
-           timeout
-         ) do
-      :ok -> :ok
-      {:error, _reason} = error -> error
-      _unexpected -> {:error, :fd_claim_expired}
-    end
-  catch
-    :exit, {:timeout, _call} -> {:error, :timeout}
-    :exit, _reason -> {:error, :disconnected}
-  end
-
-  defp acknowledge_fd_reply(conn, claim_ref, delivery_ref, deadline) do
-    case fd_claim_remaining_timeout(deadline) do
-      {:ok, timeout} ->
-        call_ack_fd_reply(conn, claim_ref, delivery_ref, timeout)
-
-      :error ->
-        resolve_fd_claim(conn, claim_ref, delivery_ref)
-    end
-  end
-
-  defp call_ack_fd_reply(conn, claim_ref, delivery_ref, timeout) do
-    case GenServer.call(conn, {:ack_fd_reply, claim_ref, delivery_ref}, timeout) do
-      :ok -> :ok
-      {:error, _reason} = error -> error
-      _unexpected -> {:error, :fd_claim_expired}
-    end
-  catch
-    :exit, {:timeout, _call} -> resolve_fd_claim(conn, claim_ref, delivery_ref)
-    :exit, _reason -> {:error, :disconnected}
-  end
-
-  defp resolve_fd_claim(conn, claim_ref, delivery_ref) do
-    # The bounded acknowledgement call may time out after its message is
-    # already queued. This call is deliberately FIFO and unbounded: every
-    # production Connection callback after setup uses :nowait socket I/O and
-    # bounded local work, so a live process will dispatch it. A test seam can
-    # stall a callback to cover that ordering; the public docs make the rare
-    # extended wait explicit. If the connection dies, its monitor makes the
-    # only indeterminate case explicit as :disconnected.
-    monitor_ref = Process.monitor(conn)
-
-    await_fd_claim_resolution(conn, claim_ref, delivery_ref, monitor_ref)
-  end
-
-  defp await_fd_claim_resolution(conn, claim_ref, delivery_ref, monitor_ref) do
-    case GenServer.call(conn, {:resolve_fd_claim, claim_ref, delivery_ref}, :infinity) do
-      :acknowledged -> :ok
-      _ -> {:error, :fd_claim_expired}
-    end
-  catch
-    :exit, _reason -> {:error, :disconnected}
-  after
-    Process.demonitor(monitor_ref, [:flush])
-  end
-
-  defp discard_fd_claim(conn, claim_ref, deadline) do
-    case fd_claim_cleanup_remaining_timeout(deadline) do
-      {:ok, timeout} ->
-        call_discard_fd_claim(conn, claim_ref, timeout)
-
-      :error ->
-        :ok
-    end
-  end
-
-  defp call_discard_fd_claim(conn, claim_ref, timeout) do
-    _ = GenServer.call(conn, {:discard_fd_claim, claim_ref}, timeout)
-    :ok
-  catch
-    :exit, _reason -> :ok
-  end
-
-  defp drain_fd_reply_delivery(claim_ref, delivery_ref) do
-    receive do
-      {:rebus_fd_reply, ^claim_ref, ^delivery_ref, %Message{}} -> :ok
-    after
-      0 -> :ok
-    end
-  end
-
-  defp fd_claim_remaining_timeout(deadline) do
-    remaining = deadline + @fd_claim_handoff_grace - System.monotonic_time(:millisecond)
-    if remaining > 0, do: {:ok, remaining}, else: :error
-  end
-
-  defp fd_claim_cleanup_remaining_timeout(deadline) do
-    remaining = deadline + @fd_claim_cleanup_grace - System.monotonic_time(:millisecond)
-    if remaining > 0, do: {:ok, remaining}, else: :error
-  end
-
   defp monitor_connect_waiter({pid, _ref}) when is_pid(pid), do: Process.monitor(pid)
   defp monitor_connect_waiter(nil), do: nil
 
@@ -1681,9 +1425,9 @@ defmodule Rebus.Connection do
     {:stop, {:shutdown, reason}, state |> discard_inbound_unix_fds() |> fail_pending()}
   end
 
-  defp discard_inbound_unix_fds(%__MODULE__{inbound_unix_fds: fds} = state) do
-    _ = UnixFD.close_all(fds)
-    %{state | inbound_unix_fds: [], inbound_fd_tainted?: false}
+  defp discard_inbound_unix_fds(%__MODULE__{inbound_fds: inbound_fds} = state) do
+    _ = UnixFD.close_all(Rights.fds(inbound_fds))
+    %{state | inbound_fds: Rights.new()}
   end
 
   # Each zero-length receive returns data already available through the fixed
@@ -1697,168 +1441,41 @@ defmodule Rebus.Connection do
     append_inbound(data, state, continuation)
   end
 
-  defp append_recvmsg(
-         %{iov: iov, ctrl: ctrl, flags: flags},
-         %__MODULE__{} = state,
-         continuation
-       )
-       when is_list(ctrl) and is_list(flags) do
-    fds = recvmsg_fds(ctrl, flags)
-
-    case recvmsg_data(iov) do
-      {:ok, data} ->
-        append_recvmsg_fds(fds, data, state, continuation)
-
-      {:error, reason} ->
-        # Validate control data before iodata so descriptors cannot leak when
-        # the recvmsg shape is invalid. No frame bytes are usable in this case.
-        _ = close_recvmsg_fds(fds)
-        stop_for_protocol_error(reason, state)
-    end
+  # Everything the rights decoder borrows from the connection for one
+  # `recvmsg` result.
+  defp rights_context(%__MODULE__{} = state) do
+    %{
+      negotiated?: state.unix_fd_negotiated?,
+      frame_pending?: Inbound.pending?(state.inbound),
+      max_bytes: @max_read_chunk
+    }
   end
 
-  defp append_recvmsg(%{ctrl: ctrl, flags: flags}, %__MODULE__{} = state, _continuation)
-       when is_list(ctrl) and is_list(flags) do
-    _ = close_recvmsg_fds(recvmsg_fds(ctrl, flags))
-    stop_for_protocol_error(:invalid_unix_fds, state)
+  defp append_recvmsg(message, %__MODULE__{} = state, continuation) do
+    message
+    |> Rights.decode(state.inbound_fds, rights_context(state))
+    |> apply_rights_decision(state, continuation)
   end
 
-  defp append_recvmsg(%{ctrl: ctrl}, %__MODULE__{} = state, _continuation) when is_list(ctrl) do
-    _ = close_recvmsg_fds(recvmsg_fds(ctrl, []))
-    stop_for_protocol_error(:invalid_unix_fds, state)
+  # The single close-or-deliver ownership path for every received descriptor:
+  # `:frame` retains them for the frame under assembly, and the other two
+  # decisions close exactly the descriptors they name.
+  defp apply_rights_decision({:frame, data, fds}, %__MODULE__{} = state, continuation) do
+    append_inbound(
+      data,
+      %{state | inbound_fds: Rights.retain(state.inbound_fds, fds)},
+      continuation
+    )
   end
 
-  defp append_recvmsg(_message, %__MODULE__{} = state, _continuation),
-    do: stop_for_protocol_error(:invalid_unix_fds, state)
-
-  defp append_recvmsg_fds({:ok, []}, data, state, continuation),
-    do: append_inbound(data, state, continuation)
-
-  defp append_recvmsg_fds({:ok, fds}, data, state, continuation) do
-    cond do
-      not state.unix_fd_negotiated? ->
-        _ = UnixFD.close_all(fds)
-        quarantine_ancillary_frame(data, state, continuation)
-
-      data == <<>> ->
-        _ = UnixFD.close_all(fds)
-        # A rights-only recvmsg result has no byte offset to associate with a
-        # D-Bus frame, so it cannot be recovered without risking later frame
-        # ownership.
-        stop_for_protocol_error(:invalid_unix_fds, state)
-
-      Inbound.pending?(state.inbound) or state.inbound_unix_fds != [] ->
-        _ = UnixFD.close_all(fds)
-        quarantine_ancillary_frame(data, state, continuation)
-
-      true ->
-        append_inbound(data, %{state | inbound_unix_fds: fds}, continuation)
-    end
-  end
-
-  defp append_recvmsg_fds({:error, :unix_fd_truncated, fds}, _data, state, _continuation) do
+  defp apply_rights_decision({:quarantine, data, fds}, %__MODULE__{} = state, continuation) do
     _ = UnixFD.close_all(fds)
-    # MSG_CTRUNC means the kernel may have installed descriptors omitted from
-    # the returned control data. Their identities are unknowable, so this
-    # cannot be quarantined frame-locally and must fail closed.
-    stop_for_protocol_error(:unix_fd_truncated, state)
+    append_inbound(data, %{state | inbound_fds: Rights.taint(state.inbound_fds)}, continuation)
   end
 
-  defp append_recvmsg_fds({:error, _reason, fds}, data, state, continuation) do
+  defp apply_rights_decision({:stop, reason, fds}, %__MODULE__{} = state, _continuation) do
     _ = UnixFD.close_all(fds)
-    # We decoded every complete descriptor before finding the malformed or
-    # oversized tail. Close them now and drop only the byte-aligned frame.
-    quarantine_ancillary_frame(data, state, continuation)
-  end
-
-  defp close_recvmsg_fds({:ok, fds}), do: UnixFD.close_all(fds)
-  defp close_recvmsg_fds({:error, _reason, fds}), do: UnixFD.close_all(fds)
-
-  defp recvmsg_data(iov) do
-    data = IO.iodata_to_binary(iov)
-
-    if byte_size(data) <= @max_read_chunk,
-      do: {:ok, data},
-      else: {:error, :message_too_large}
-  rescue
-    ArgumentError -> {:error, :invalid_unix_fds}
-  end
-
-  defp recvmsg_fds(ctrl, flags) do
-    case {extract_rights_fds(ctrl), :ctrunc in flags} do
-      {{:ok, fds}, true} ->
-        {:error, :unix_fd_truncated, fds}
-
-      {{:error, _reason, fds}, true} ->
-        # Preserve every complete descriptor decoded before the malformed or
-        # oversized tail so the single fail-closed path can close it. CTRUNC
-        # takes precedence because the kernel may have omitted more descriptors
-        # whose identities are unknowable.
-        {:error, :unix_fd_truncated, fds}
-
-      {result, _ctrunc?} ->
-        result
-    end
-  end
-
-  defp quarantine_ancillary_frame(<<>>, %__MODULE__{} = state, _continuation) do
-    stop_for_protocol_error(:invalid_unix_fds, state)
-  end
-
-  defp quarantine_ancillary_frame(data, %__MODULE__{} = state, continuation) do
-    append_inbound(data, %{state | inbound_fd_tainted?: true}, continuation)
-  end
-
-  defp extract_rights_fds(ctrl) do
-    {fds, reason} =
-      Enum.reduce(ctrl, {[], nil}, fn
-        %{level: :socket, type: :rights, data: data}, {fds, reason} when is_binary(data) ->
-          case decode_rights_data(data) do
-            {:ok, received} ->
-              append_received_fds(fds, received, reason)
-
-            # A malformed control payload can still contain complete
-            # descriptors before its invalid tail. Continue scanning later
-            # cmsgs too, retaining every descriptor for the single close path.
-            {:error, received} ->
-              append_received_fds(fds, received, reason || :invalid_unix_fds)
-          end
-
-        # An SCM_RIGHTS item with a non-binary payload must fail closed, but
-        # later rights cmsgs can still carry descriptors which must be closed.
-        %{level: :socket, type: :rights}, {fds, reason} ->
-          {fds, reason || :invalid_unix_fds}
-
-        _cmsg, acc ->
-          acc
-      end)
-
-    case reason do
-      nil -> {:ok, fds}
-      reason -> {:error, reason, fds}
-    end
-  end
-
-  defp append_received_fds(fds, received, reason) do
-    fds = fds ++ received
-
-    reason =
-      reason ||
-        if length(fds) > Message.max_unix_fds(), do: :unix_fd_limit
-
-    {fds, reason}
-  end
-
-  defp decode_rights_data(data) do
-    complete_size = div(byte_size(data), 4) * 4
-    <<complete::binary-size(^complete_size), _tail::binary>> = data
-    fds = for <<fd::native-signed-32 <- complete>>, do: fd
-
-    cond do
-      Enum.any?(fds, &(&1 < 0)) -> {:error, fds}
-      complete_size == byte_size(data) -> {:ok, fds}
-      true -> {:error, fds}
-    end
+    stop_for_protocol_error(reason, state)
   end
 
   defp append_inbound(data, %__MODULE__{} = state, continuation) do
@@ -2084,48 +1701,21 @@ defmodule Rebus.Connection do
 
               {:ok, remove_indexes(%{state | pending: pending}, request_ref, monitor_ref)}
             else
-              # A live PID alone cannot prove a GenServer.call alias still
-              # accepts messages. Hold FD ownership in a claimed state until
-              # Connection.call/3 has consumed the regular-process delivery.
-              claim_ref = make_ref()
-
-              claim_deadline = fd_claim_deadline(deadline)
-
-              timer_ref =
-                Process.send_after(
-                  self(),
-                  {:fd_claim_timeout, claim_ref},
-                  fd_claim_timer_timeout(claim_deadline)
+              claims =
+                FDClaims.open(
+                  state.fd_claims,
+                  %{
+                    msg: msg,
+                    from: from,
+                    request_ref: request_ref,
+                    monitor_ref: monitor_ref,
+                    deadline: deadline
+                  },
+                  fd_claims_context(state)
                 )
 
-              {pid, _tag} = from
-
-              claim = %{
-                pid: pid,
-                msg: msg,
-                request_ref: request_ref,
-                monitor_ref: monitor_ref,
-                timer_ref: timer_ref,
-                delivery_ref: nil,
-                delivery_alias: nil,
-                deadline: claim_deadline
-              }
-
-              state.impl.hooks.fd_claim_handoff()
-              GenServer.reply(from, {:fd_claim, claim_ref})
-
-              {:ok,
-               %{
-                 state
-                 | pending: pending,
-                   request_index: Map.delete(state.request_index, request_ref),
-                   monitor_index: Map.delete(state.monitor_index, monitor_ref),
-                   fd_claims: Map.put(state.fd_claims, claim_ref, claim),
-                   fd_claim_request_index:
-                     Map.put(state.fd_claim_request_index, request_ref, claim_ref),
-                   fd_claim_monitor_index:
-                     Map.put(state.fd_claim_monitor_index, monitor_ref, claim_ref)
-               }}
+              state = %{state | pending: pending, fd_claims: claims}
+              {:ok, remove_indexes(state, request_ref, monitor_ref)}
             end
         end
 
@@ -2137,91 +1727,11 @@ defmodule Rebus.Connection do
   defp live_from?({pid, _tag}) when is_pid(pid), do: Process.alive?(pid)
   defp live_from?(_from), do: false
 
-  defp drop_fd_claim(%__MODULE__{} = state, claim_ref, opts) do
-    case Map.pop(state.fd_claims, claim_ref) do
-      {nil, _claims} ->
-        state
+  # Everything a claim operation borrows from the connection for one call.
+  defp fd_claims_context(%__MODULE__{impl: %{hooks: hooks}}), do: %{hooks: hooks}
 
-      {%{msg: msg, request_ref: request_ref, monitor_ref: monitor_ref, timer_ref: timer_ref},
-       claims} ->
-        _ = Process.cancel_timer(timer_ref)
-
-        close? = Keyword.get(opts, :close?, false)
-        if close?, do: close_message_fds(msg)
-
-        unless Keyword.get(opts, :monitor_down?, false) do
-          Process.demonitor(monitor_ref, [:flush])
-        end
-
-        state = %{
-          state
-          | fd_claims: claims,
-            fd_claim_request_index: Map.delete(state.fd_claim_request_index, request_ref),
-            fd_claim_monitor_index: Map.delete(state.fd_claim_monitor_index, monitor_ref)
-        }
-
-        case Keyword.get(opts, :outcome, if(close?, do: :closed, else: nil)) do
-          outcome when outcome in [:acknowledged, :closed] ->
-            put_fd_claim_outcome(state, claim_ref, outcome)
-
-          _ ->
-            state
-        end
-    end
-  end
-
-  defp close_fd_claims(claims) do
-    Enum.each(claims, fn {_claim_ref, %{msg: msg, timer_ref: timer_ref}} ->
-      _ = Process.cancel_timer(timer_ref)
-      close_message_fds(msg)
-    end)
-  end
-
-  defp rearm_fd_claim(claim_ref, %{timer_ref: timer_ref, deadline: deadline} = claim) do
-    _ = Process.cancel_timer(timer_ref)
-
-    %{
-      claim
-      | timer_ref:
-          Process.send_after(
-            self(),
-            {:fd_claim_timeout, claim_ref},
-            fd_claim_timer_timeout(deadline)
-          )
-    }
-  end
-
-  defp fd_claim_deadline(request_deadline), do: request_deadline + @fd_claim_cleanup_grace
-
-  defp fd_claim_live?(%{deadline: deadline}) when is_integer(deadline) do
-    deadline > System.monotonic_time(:millisecond)
-  end
-
-  defp fd_claim_timer_timeout(deadline) do
-    max(0, deadline - System.monotonic_time(:millisecond))
-  end
-
-  defp put_fd_claim_outcome(%__MODULE__{} = state, claim_ref, outcome) do
-    {old, outcomes} = Map.pop(state.fd_claim_outcomes, claim_ref)
-
-    if old, do: Process.cancel_timer(elem(old, 1))
-
-    timer_ref =
-      Process.send_after(self(), {:fd_claim_outcome_timeout, claim_ref}, @fd_claim_cleanup_grace)
-
-    %{state | fd_claim_outcomes: Map.put(outcomes, claim_ref, {outcome, timer_ref})}
-  end
-
-  defp take_fd_claim_outcome(%__MODULE__{} = state, claim_ref) do
-    case Map.pop(state.fd_claim_outcomes, claim_ref) do
-      {nil, _outcomes} ->
-        {nil, state}
-
-      {{outcome, timer_ref}, outcomes} ->
-        _ = Process.cancel_timer(timer_ref)
-        {outcome, %{state | fd_claim_outcomes: outcomes}}
-    end
-  end
+  defp drop_fd_claim(%__MODULE__{} = state, claim_ref, opts),
+    do: %{state | fd_claims: FDClaims.drop(state.fd_claims, claim_ref, opts)}
 
   defp drop_resource_limited_reply(
          %{type: :method_return, reply_serial: reply_serial},
@@ -2359,25 +1869,12 @@ defmodule Rebus.Connection do
       GenServer.reply(from, {:error, :disconnected})
     end)
 
-    close_fd_claims(state.fd_claims)
-
-    Enum.each(state.fd_claims, fn {_claim_ref, %{monitor_ref: monitor_ref}} ->
-      Process.demonitor(monitor_ref, [:flush])
-    end)
-
-    Enum.each(state.fd_claim_outcomes, fn {_claim_ref, {_outcome, timer_ref}} ->
-      _ = Process.cancel_timer(timer_ref)
-    end)
-
     %{
       state
       | pending: %{},
         request_index: %{},
         monitor_index: %{},
-        fd_claims: %{},
-        fd_claim_request_index: %{},
-        fd_claim_monitor_index: %{},
-        fd_claim_outcomes: %{},
+        fd_claims: FDClaims.fail_all(state.fd_claims),
         writer: writer
     }
   end

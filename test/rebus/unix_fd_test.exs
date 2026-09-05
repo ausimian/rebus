@@ -1,6 +1,7 @@
 defmodule Rebus.UnixFDTest do
   use ExUnit.Case, async: false
 
+  alias Rebus.Connection.FDClaims
   alias Rebus.Connection.Inbound
   alias Rebus.{Message, TestImpl, TestServer, UnixFD}
 
@@ -525,7 +526,7 @@ defmodule Rebus.UnixFDTest do
 
     send(connection, :continue_claimed_fd_delivery)
     refute_receive {:claimed_caller_result, _result}, 50
-    assert eventually(fn -> :sys.get_state(connection).fd_claims == %{} end)
+    assert eventually(fn -> :sys.get_state(connection).fd_claims.claims == %{} end)
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
     assert Process.alive?(connection)
   end
@@ -562,8 +563,8 @@ defmodule Rebus.UnixFDTest do
         1_000
       )
 
-    assert eventually(fn -> :sys.get_state(connection).inbound_unix_fds != [] end)
-    [received] = :sys.get_state(connection).inbound_unix_fds
+    assert eventually(fn -> :sys.get_state(connection).inbound_fds.fds != [] end)
+    [received] = :sys.get_state(connection).inbound_fds.fds
 
     ref = Process.monitor(connection)
     assert :ok = Rebus.close(connection)
@@ -657,7 +658,7 @@ defmodule Rebus.UnixFDTest do
     assert {:noreply, expired_state} =
              Rebus.Connection.handle_info({:fd_claim_timeout, expired_ref}, expired)
 
-    assert expired_state.fd_claims == %{}
+    assert expired_state.fd_claims.claims == %{}
 
     assert {:noreply, ^expired_state} =
              Rebus.Connection.handle_info({:fd_claim_timeout, make_ref()}, expired_state)
@@ -672,7 +673,7 @@ defmodule Rebus.UnixFDTest do
                down_state
              )
 
-    assert down_state.fd_claims == %{}
+    assert down_state.fd_claims.claims == %{}
 
     cancel_ref = make_ref()
     cancel_monitor = Process.monitor(self())
@@ -682,7 +683,7 @@ defmodule Rebus.UnixFDTest do
     end)
 
     GenServer.cast(connection, {:cancel, cancel_ref})
-    assert eventually(fn -> :sys.get_state(connection).fd_claims == %{} end)
+    assert eventually(fn -> :sys.get_state(connection).fd_claims.claims == %{} end)
   end
 
   test "rejects stale claim and acknowledgement tokens without changing connection state", %{
@@ -775,11 +776,14 @@ defmodule Rebus.UnixFDTest do
     outcome_timer = Process.send_after(self(), {:fd_claim_outcome_timeout, outcome_ref}, 60_000)
 
     :sys.replace_state(connection, fn state ->
-      %{state | fd_claim_outcomes: %{outcome_ref => {:closed, outcome_timer}}}
+      %{
+        state
+        | fd_claims: %{state.fd_claims | outcomes: %{outcome_ref => {:closed, outcome_timer}}}
+      }
     end)
 
     send(connection, {:fd_claim_outcome_timeout, outcome_ref})
-    assert eventually(fn -> :sys.get_state(connection).fd_claim_outcomes == %{} end)
+    assert eventually(fn -> :sys.get_state(connection).fd_claims.outcomes == %{} end)
 
     state = :sys.get_state(connection)
 
@@ -829,7 +833,7 @@ defmodule Rebus.UnixFDTest do
         deadline: System.monotonic_time(:millisecond) - 1
       )
 
-    expired_delivery_ref = expired_state.fd_claims[expired_ref].delivery_ref
+    expired_delivery_ref = expired_state.fd_claims.claims[expired_ref].delivery_ref
     :sys.replace_state(connection, fn _state -> expired_state end)
 
     assert {:error, :fd_claim_expired} =
@@ -1082,7 +1086,7 @@ defmodule Rebus.UnixFDTest do
     # only a taint bit remains while the eight-byte prefix is buffered.
     assert eventually(fn ->
              state = :sys.get_state(connection)
-             state.inbound_fd_tainted? and state.inbound.size == byte_size(prefix)
+             state.inbound_fds.tainted? and state.inbound.size == byte_size(prefix)
            end)
 
     :ok =
@@ -1651,9 +1655,11 @@ defmodule Rebus.UnixFDTest do
 
     %{
       state
-      | fd_claims: %{claim_ref => claim},
-        fd_claim_request_index: %{request_ref => claim_ref},
-        fd_claim_monitor_index: %{monitor_ref => claim_ref}
+      | fd_claims: %FDClaims{
+          claims: %{claim_ref => claim},
+          request_index: %{request_ref => claim_ref},
+          monitor_index: %{monitor_ref => claim_ref}
+        }
     }
   end
 
