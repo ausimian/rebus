@@ -5,10 +5,7 @@ defmodule Rebus.MatchRule do
   Construct rules with `new/1`, then pass them to `Rebus.add_match/3`.
   Rebus deliberately accepts structured criteria instead of raw rule strings,
   so every outbound rule is bounded, correctly quoted, and safe to use for
-  client-side filtering when several subscriptions share a connection. Unique
-  sender names are locally checked; well-known sender names remain bus-owned
-  for broadcast signals. A directed signal matches a well-known sender rule
-  only when its sender header names that sender exactly.
+  client-side filtering when several subscriptions share a connection.
 
   The generated rule always contains `type='signal'`. Supported criteria are
   `:sender`, `:interface`, `:member`, `:path`, `:path_namespace`,
@@ -16,9 +13,9 @@ defmodule Rebus.MatchRule do
   `:path_namespace` are mutually exclusive. `:args` and `:arg_paths` are maps
   or keyword lists keyed by indexes 0 through 63.
 
-  `eavesdrop` is intentionally not accepted. It changes bus policy and routing
-  semantics that cannot be safely inferred from an inbound signal; callers who
-  need monitoring should use a dedicated monitoring connection instead.
+  `eavesdrop` is not accepted, and sender matching is split between the bus
+  and Rebus; see
+  [Signal subscriptions and match rules](match_rules.html).
   """
 
   alias Rebus.Message
@@ -91,16 +88,11 @@ defmodule Rebus.MatchRule do
   Returns whether an inbound signal matches the criteria that Rebus can safely
   evaluate after the bus has routed it.
 
-  Rebus compares unique-name `:sender` values, `:interface`, `:member`, `:path`, `:destination`,
-  `:path_namespace`, `:args`, `:arg_paths`, and `:arg0namespace`. It
-  compares unique-name `:sender` values. A well-known sender remains bus-owned
-  for broadcast signals because the bus may forward it under the current unique
-  owner. A directed signal bypasses bus match routing, so Rebus accepts it for
-  a well-known sender only when its sender header equals that well-known name;
-  this preserves bus-driver signals while rejecting a peer's unique sender.
-  Subscription setup rejects an overlapping rule that would make that
-  well-known sender ambiguous locally. This does not emulate bus access policy
-  or eavesdropping.
+  Rebus compares unique-name `:sender` values, `:interface`, `:member`,
+  `:path`, `:path_namespace`, `:destination`, `:args`, `:arg_paths`, and
+  `:arg0namespace`. A well-known `:sender` is left to the bus for broadcast
+  signals, and accepted for a directed signal only when the sender header is
+  that exact name. This does not emulate bus access policy or eavesdropping.
   """
   @spec matches?(t(), Message.t()) :: boolean()
   def matches?(%__MODULE__{criteria: criteria}, %Message{type: :signal} = message) do

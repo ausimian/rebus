@@ -90,7 +90,15 @@ defmodule Rebus.MixProject do
       main: "readme",
       source_ref: @version,
       source_url: @source_url,
-      extras: ["README.md", "CHANGELOG.md", "LICENSE.md"],
+      extras: [
+        "README.md",
+        "guides/unix_fds.md",
+        "guides/authentication.md",
+        "guides/match_rules.md",
+        "CHANGELOG.md",
+        "LICENSE.md"
+      ],
+      groups_for_extras: [Guides: ~r"guides/"],
       groups_for_modules: [
         Core: [
           Rebus,
