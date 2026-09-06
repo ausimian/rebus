@@ -1081,11 +1081,14 @@ defmodule Rebus.MatchRuleTest do
     end
 
     test "keeps state loss explicit for a directly started connection" do
-      {:ok, server} = TestServer.start_link(tap: self())
-
-      on_exit(fn ->
-        if Process.alive?(server), do: GenServer.stop(server)
-      end)
+      # ExUnit owns the server's lifecycle: stopping it from `on_exit` races
+      # the shutdown a linked server starts when the test process exits. The
+      # id must be unique because the describe setup supervises a server too.
+      {:ok, server} =
+        start_supervised(%{
+          id: {:direct_test_server, make_ref()},
+          start: {TestServer, :start_link, [[tap: self()]]}
+        })
 
       {direct_connection, worker} = start_direct_connection(server)
 
