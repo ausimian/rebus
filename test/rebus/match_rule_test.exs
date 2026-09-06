@@ -539,6 +539,80 @@ defmodule Rebus.MatchRuleTest do
       send(owner, :stop)
     end
 
+    test "replaces an owner a failed untrack left behind", %{
+      server: server,
+      connection: connection
+    } do
+      rule = test_rule()
+      owner = subscribe_owner(self(), connection, rule)
+      add = assert_add_match(server, rule)
+      :ok = TestServer.push(server, method_return(add.serial))
+      ref = assert_subscription(owner)
+
+      :ok = answer_tracking(server, "org.example.Service", ":1.1")
+      assert wait_until(fn -> name_owner(connection, "org.example.Service") == ":1.1" end)
+
+      # An untrack whose last step alone failed leaves the entry behind, so a
+      # later re-track meets an owner rather than a missing name.
+      :ok = Rebus.Connection.track_name_owner(connection, "org.example.Service", 1_000)
+      :ok = Rebus.Connection.seed_name_owner(connection, "org.example.Service", ":1.2", 1_000)
+
+      :ok = TestServer.push(server, directed_signal(":1.2"))
+      assert_receive {:matched, ^owner, ^ref, %Message{body: ["changed"]}}, 1_000
+
+      :ok = TestServer.push(server, directed_signal(":1.1"))
+      refute_receive {:matched, ^owner, ^ref, _message}, 100
+
+      send(owner, :stop)
+    end
+
+    test "resets a re-tracked name to :unknown", %{server: server, connection: connection} do
+      rule = test_rule()
+      owner = subscribe_owner(self(), connection, rule)
+      add = assert_add_match(server, rule)
+      :ok = TestServer.push(server, method_return(add.serial))
+      _ref = assert_subscription(owner)
+
+      :ok = answer_tracking(server, "org.example.Service", ":1.1")
+      assert wait_until(fn -> name_owner(connection, "org.example.Service") == ":1.1" end)
+
+      :ok = Rebus.Connection.track_name_owner(connection, "org.example.Service", 1_000)
+      assert name_owner(connection, "org.example.Service") == :unknown
+
+      send(owner, :stop)
+    end
+
+    test "keeps the owner a signal reported after a re-track", %{
+      server: server,
+      connection: connection
+    } do
+      rule = test_rule()
+      owner = subscribe_owner(self(), connection, rule)
+      add = assert_add_match(server, rule)
+      :ok = TestServer.push(server, method_return(add.serial))
+      ref = assert_subscription(owner)
+
+      :ok = answer_tracking(server, "org.example.Service", ":1.1")
+      assert wait_until(fn -> name_owner(connection, "org.example.Service") == ":1.1" end)
+
+      # The reset the re-track forces does not hand the seed priority over a
+      # change that arrives before it.
+      :ok = Rebus.Connection.track_name_owner(connection, "org.example.Service", 1_000)
+      :ok = TestServer.push(server, name_owner_changed("org.example.Service", ":1.1", ":1.3"))
+      assert wait_until(fn -> name_owner(connection, "org.example.Service") == ":1.3" end)
+
+      :ok = Rebus.Connection.seed_name_owner(connection, "org.example.Service", ":1.2", 1_000)
+      assert name_owner(connection, "org.example.Service") == ":1.3"
+
+      :ok = TestServer.push(server, directed_signal(":1.2"))
+      refute_receive {:matched, ^owner, ^ref, _message}, 100
+
+      :ok = TestServer.push(server, directed_signal(":1.3"))
+      assert_receive {:matched, ^owner, ^ref, %Message{body: ["changed"]}}, 1_000
+
+      send(owner, :stop)
+    end
+
     test "tracks one well-known sender once for two rules", %{
       server: server,
       connection: connection
