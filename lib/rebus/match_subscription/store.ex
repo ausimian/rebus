@@ -200,9 +200,15 @@ defmodule Rebus.MatchSubscription.Store do
 
     Enum.each(dirty, fn key ->
       case Map.fetch(values, key) do
-        {:ok, value} -> true = :ets.insert(@state_table, {{kind, conn, key}, value})
+        {:ok, value} -> true = :ets.insert(@state_table, {{kind, conn, key}, row(value)})
         :error -> true = :ets.delete(@state_table, {kind, conn, key})
       end
     end)
   end
+
+  # A row is a plain map of the record's fields. A worker that holds a record
+  # as a struct writes it without its struct tag, so the rows a version leaves
+  # behind stay readable by the record definitions of another.
+  defp row(%_struct{} = value), do: Map.from_struct(value)
+  defp row(value) when is_map(value), do: value
 end
