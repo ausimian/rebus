@@ -10,18 +10,28 @@ defmodule Rebus.MatchSubscription.Store do
   # untouched, while a crash here restarts all of them, which is right: the
   # rows really are gone.
   #
-  # `Rebus.MatchSubscription` reads and writes the table directly; this
-  # process keeps it alive and reaps the rows of connections that die while
-  # no worker is around to notice. `persist_state/5` casts `{:watch, conn}`
-  # the first time it writes a connection's meta row, and the monitor set up
-  # here covers the window after a worker-supervisor restart when nothing else
-  # is watching that connection.
+  # This module is both halves of persistence: the change set recording what a
+  # worker has touched since its last write, and the reads and writes that
+  # apply it. Callers use the table directly through the functions below
+  # rather than through this process; it keeps the table alive and reaps the
+  # rows of connections that die while no worker is around to notice.
+  # `persist_state/5` casts `{:watch, conn}` the first time it writes a
+  # connection's meta row, and the monitor set up here covers the window after
+  # a worker-supervisor restart when nothing else is watching that connection.
 
   use GenServer
 
-  alias Rebus.MatchSubscription
-
   @state_table Rebus.MatchSubscription.State
+
+  # A worker's rules and subscriptions are persisted incrementally, so it
+  # records which keys it has touched since its last write. A key belongs to
+  # exactly one of its kind's two sets.
+  @type changes :: %{
+          dirty_rules: MapSet.t(binary()),
+          removed_rules: MapSet.t(binary()),
+          dirty_subscriptions: MapSet.t(reference()),
+          removed_subscriptions: MapSet.t(reference())
+        }
 
   def table, do: @state_table
 
@@ -70,10 +80,129 @@ defmodule Rebus.MatchSubscription.Store do
         # The connection's own worker deletes these rows too when it sees the
         # same `:DOWN`. Deleting twice is harmless: `:ets.delete/2` and
         # `:ets.match_delete/2` are idempotent.
-        :ok = MatchSubscription.delete_state(conn)
+        :ok = delete_state(conn)
         {:noreply, conns}
     end
   end
 
   def handle_info(_message, conns), do: {:noreply, conns}
+
+  @doc false
+  def load_state(conn) when is_pid(conn) do
+    case :ets.lookup(@state_table, {:meta, conn}) do
+      [{{:meta, ^conn}, %{uncertain?: uncertain?}}] ->
+        {:ok,
+         %{
+           uncertain?: uncertain?,
+           rules: persisted_rows(conn, :rule),
+           subscriptions: persisted_rows(conn, :subscription)
+         }}
+
+      [] ->
+        :error
+    end
+  end
+
+  @doc false
+  def persisted?(conn) when is_pid(conn), do: :ets.member(@state_table, {:meta, conn})
+
+  @doc false
+  def persist_state(conn, uncertain?, changes, rules, subscriptions)
+      when is_pid(conn) and is_boolean(uncertain?) and is_map(changes) and is_map(rules) and
+             is_map(subscriptions) do
+    persist_rows(conn, :rule, changes.dirty_rules, changes.removed_rules, rules)
+
+    persist_rows(
+      conn,
+      :subscription,
+      changes.dirty_subscriptions,
+      changes.removed_subscriptions,
+      subscriptions
+    )
+
+    meta = {{:meta, conn}, %{uncertain?: uncertain?}}
+
+    # The first write for a connection asks the table owner to monitor it, so
+    # its rows are reaped even if no worker is alive to see the connection go.
+    # The cast keeps the owner off this write path. Nothing may write the meta
+    # row after the cast: the connection may already be dead, in which case the
+    # owner reaps the row it can see and a later write would strand a new one.
+    if :ets.insert_new(@state_table, meta) do
+      GenServer.cast(__MODULE__, {:watch, conn})
+    else
+      true = :ets.insert(@state_table, meta)
+    end
+
+    :ok
+  end
+
+  @doc false
+  def delete_state(conn) when is_pid(conn) do
+    true = :ets.delete(@state_table, {:meta, conn})
+    true = :ets.match_delete(@state_table, {{:rule, conn, :_}, :_})
+    true = :ets.match_delete(@state_table, {{:subscription, conn, :_}, :_})
+    :ok
+  end
+
+  # No `@spec`: `MapSet.t/0` is opaque, so declaring one here would make this
+  # constructor's success typing an opaqueness violation.
+  @doc false
+  def no_changes do
+    %{
+      dirty_rules: MapSet.new(),
+      removed_rules: MapSet.new(),
+      dirty_subscriptions: MapSet.new(),
+      removed_subscriptions: MapSet.new()
+    }
+  end
+
+  @doc false
+  @spec rule_changed(changes(), binary()) :: changes()
+  def rule_changed(changes, key), do: track_change(changes, :rules, key, :dirty)
+
+  @doc false
+  @spec rule_removed(changes(), binary()) :: changes()
+  def rule_removed(changes, key), do: track_change(changes, :rules, key, :removed)
+
+  @doc false
+  @spec subscription_changed(changes(), reference()) :: changes()
+  def subscription_changed(changes, ref), do: track_change(changes, :subscriptions, ref, :dirty)
+
+  @doc false
+  @spec subscription_removed(changes(), reference()) :: changes()
+  def subscription_removed(changes, ref), do: track_change(changes, :subscriptions, ref, :removed)
+
+  # A key belongs to exactly one of its kind's two change sets, so recording a
+  # change moves it into one and out of the other.
+  defp track_change(changes, kind, key, change) do
+    {dirty, removed} =
+      case kind do
+        :rules -> {:dirty_rules, :removed_rules}
+        :subscriptions -> {:dirty_subscriptions, :removed_subscriptions}
+      end
+
+    {into, out_of} = if change == :dirty, do: {dirty, removed}, else: {removed, dirty}
+
+    changes
+    |> Map.update!(into, &MapSet.put(&1, key))
+    |> Map.update!(out_of, &MapSet.delete(&1, key))
+  end
+
+  defp persisted_rows(conn, kind) do
+    :ets.match_object(@state_table, {{kind, conn, :_}, :_})
+    |> Map.new(fn {{^kind, ^conn, key}, value} -> {key, value} end)
+  end
+
+  defp persist_rows(conn, kind, dirty, removed, values) do
+    Enum.each(removed, fn key ->
+      true = :ets.delete(@state_table, {kind, conn, key})
+    end)
+
+    Enum.each(dirty, fn key ->
+      case Map.fetch(values, key) do
+        {:ok, value} -> true = :ets.insert(@state_table, {{kind, conn, key}, value})
+        :error -> true = :ets.delete(@state_table, {kind, conn, key})
+      end
+    end)
+  end
 end

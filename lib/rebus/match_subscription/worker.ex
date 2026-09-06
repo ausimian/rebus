@@ -7,8 +7,8 @@ defmodule Rebus.MatchSubscription.Worker do
   alias Rebus.Connection
   alias Rebus.MatchRule
   alias Rebus.MatchRule.Overlap
-  alias Rebus.MatchSubscription
   alias Rebus.MatchSubscription.Operation
+  alias Rebus.MatchSubscription.Store
   alias Rebus.SafeCall
 
   @cleanup_timeout 1_000
@@ -63,10 +63,10 @@ defmodule Rebus.MatchSubscription.Worker do
       reset_task_monitor: nil,
       state_lost?: false,
       bus?: nil,
-      persistence: empty_persistence_changes()
+      persistence: Store.no_changes()
     }
 
-    case MatchSubscription.load_state(conn) do
+    case Store.load_state(conn) do
       {:ok, %{uncertain?: true}} ->
         send(self(), :reset_state_lost)
         {:ok, %{state | state_lost?: true}}
@@ -268,7 +268,7 @@ defmodule Rebus.MatchSubscription.Worker do
       monitor_ref == state.connection_monitor ->
         # A disconnected bus drops all server-side match state. Do not try to
         # send RemoveMatch through a dead transport.
-        :ok = MatchSubscription.delete_state(state.conn)
+        :ok = Store.delete_state(state.conn)
         {:stop, :normal, state}
 
       true ->
@@ -1199,9 +1199,9 @@ defmodule Rebus.MatchSubscription.Worker do
       state.state_lost? or map_size(state.operations) > 0 or map_size(state.requests) > 0
 
     if not uncertain? and map_size(state.rules) == 0 and map_size(state.subscriptions) == 0 do
-      :ok = MatchSubscription.delete_state(state.conn)
+      :ok = Store.delete_state(state.conn)
     else
-      MatchSubscription.persist_state(
+      Store.persist_state(
         state.conn,
         uncertain?,
         state.persistence,
@@ -1210,7 +1210,7 @@ defmodule Rebus.MatchSubscription.Worker do
       )
     end
 
-    %{state | persistence: empty_persistence_changes()}
+    %{state | persistence: Store.no_changes()}
   end
 
   defp restore_state(state, %{rules: rules, subscriptions: subscriptions})
@@ -1257,49 +1257,21 @@ defmodule Rebus.MatchSubscription.Worker do
 
   defp restore_state(state, _persisted), do: state
 
-  defp empty_persistence_changes do
-    %{
-      dirty_rules: MapSet.new(),
-      removed_rules: MapSet.new(),
-      dirty_subscriptions: MapSet.new(),
-      removed_subscriptions: MapSet.new()
-    }
-  end
-
   defp put_rule(state, key, rule) do
     state = %{state | rules: Map.put(state.rules, key, rule)}
-    track_change(state, :rules, key, :dirty)
+    %{state | persistence: Store.rule_changed(state.persistence, key)}
   end
 
   defp delete_rule(state, key) do
     state = %{state | rules: Map.delete(state.rules, key)}
-    track_change(state, :rules, key, :removed)
+    %{state | persistence: Store.rule_removed(state.persistence, key)}
   end
 
   defp mark_subscription_dirty(state, ref),
-    do: track_change(state, :subscriptions, ref, :dirty)
+    do: %{state | persistence: Store.subscription_changed(state.persistence, ref)}
 
   defp mark_subscription_removed(state, ref),
-    do: track_change(state, :subscriptions, ref, :removed)
-
-  # A key belongs to exactly one of its kind's two change sets, so recording a
-  # change moves it into one and out of the other.
-  defp track_change(state, kind, key, change) do
-    {dirty, removed} =
-      case kind do
-        :rules -> {:dirty_rules, :removed_rules}
-        :subscriptions -> {:dirty_subscriptions, :removed_subscriptions}
-      end
-
-    {into, out_of} = if change == :dirty, do: {dirty, removed}, else: {removed, dirty}
-
-    changes =
-      state.persistence
-      |> Map.update!(into, &MapSet.put(&1, key))
-      |> Map.update!(out_of, &MapSet.delete(&1, key))
-
-    %{state | persistence: changes}
-  end
+    do: %{state | persistence: Store.subscription_removed(state.persistence, ref)}
 
   defp update_rule(state, key, fun) do
     case Map.get(state.rules, key) do
