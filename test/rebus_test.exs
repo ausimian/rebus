@@ -1517,6 +1517,53 @@ defmodule RebusTest do
       assert {:error, :owner_down} = Rebus.connect(addr, cached_identity(owner: dead_process()))
     end
 
+    test "refuse a dead owner even when the waiter monitors too late", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+
+      # `Rebus.Connector.Supervised` can only monitor the connection once
+      # `DynamicSupervisor.start_child/2` has returned it a PID, so a
+      # connection that stops during setup may already be gone by then and the
+      # monitor fires `:noproc`. Nothing in production can be scheduled
+      # between those two steps, so this connector stands in for the
+      # supervised one with the losing order forced: it starts the same child
+      # and monitors only once the connection is known to have exited. The
+      # answer can then come from nowhere but the notification setup sent.
+      connector = fn address, {opts, internal} ->
+        connect_ref = make_ref()
+
+        internal =
+          internal
+          |> Map.put(:addr, address)
+          |> Map.put(:connect_waiter, {self(), connect_ref})
+
+        {:ok, pid} =
+          DynamicSupervisor.start_child(
+            Rebus.ConnectionSupervisor,
+            {Rebus.Connection, {opts, internal}}
+          )
+
+        await_exit_elsewhere(pid)
+        monitor_ref = Process.monitor(pid)
+
+        receive do
+          {^connect_ref, {:error, reason}} -> {:error, reason}
+          {:DOWN, ^monitor_ref, :process, ^pid, {:shutdown, reason}} -> {:error, reason}
+          {:DOWN, ^monitor_ref, :process, ^pid, reason} -> {:error, reason}
+        after
+          1_000 -> {:error, :no_answer}
+        end
+      end
+
+      assert {:error, :owner_down} =
+               Rebus.connect(
+                 addr,
+                 cached_identity(
+                   owner: dead_process(),
+                   __impl__: %{connector: TestImpl.connector(connect_candidate: connector)}
+                 )
+               )
+    end
+
     test "reject an owner that is not a process", %{svr: svr} do
       {:ok, addr} = TestServer.get_listen_addr(svr)
       parent = self()
@@ -4982,6 +5029,22 @@ defmodule RebusTest do
     ref = Process.monitor(pid)
     assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1_000
     pid
+  end
+
+  # Waits for `pid` to exit through another process's monitor, so a caller that
+  # must not hold a monitor of its own can still wait without polling.
+  defp await_exit_elsewhere(pid) do
+    caller = self()
+
+    spawn(fn ->
+      ref = Process.monitor(pid)
+
+      receive do
+        {:DOWN, ^ref, :process, ^pid, _reason} -> send(caller, {:exited, pid})
+      end
+    end)
+
+    assert_receive {:exited, ^pid}, 1_000
   end
 
   defp test_signal(body) do

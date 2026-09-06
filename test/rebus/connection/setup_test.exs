@@ -92,18 +92,43 @@ defmodule Rebus.Connection.SetupTest do
       assert ScriptedTransport.sent(sock) == <<>>
     end
 
+    test "reports a dead owner to a waiting caller" do
+      owner = dead_process()
+      waiter_ref = make_ref()
+
+      {sock, state} =
+        connection(["OK #{@guid}\r\n"],
+          connect_waiter: {self(), waiter_ref},
+          connect_waiter_monitor: Process.monitor(self()),
+          owner: owner,
+          owner_monitor: Process.monitor(owner)
+        )
+
+      # The waiter monitors the connection only once its supervisor has
+      # returned the PID, so a connection that stops here may already be gone
+      # and the monitor carries `:noproc`. The notification is what makes
+      # `connect/2` answer `:owner_down` regardless of that ordering.
+      assert {:shutdown, :owner_down, %Connection{}} = Setup.setup(state, @addr)
+      assert_received {^waiter_ref, {:error, :owner_down}}
+      assert ScriptedTransport.sent(sock) == <<>>
+    end
+
     test "reports a dead caller rather than a dead owner" do
       gone = dead_process()
+      waiter_ref = make_ref()
 
       {_sock, state} =
         connection(["OK #{@guid}\r\n"],
-          connect_waiter: {gone, make_ref()},
+          connect_waiter: {gone, waiter_ref},
           connect_waiter_monitor: Process.monitor(gone),
           owner: gone,
           owner_monitor: Process.monitor(gone)
         )
 
       assert {:shutdown, :caller_gone, %Connection{}} = Setup.setup(state, @addr)
+      # Nothing is told: the waiter this connection would answer is the dead
+      # process, not this test.
+      refute_received {^waiter_ref, _result}
     end
 
     test "refuses to establish a connection whose owner died during setup" do

@@ -36,9 +36,23 @@ defmodule Rebus.Connection.Setup do
     # reports `:caller_gone` whether or not it also named an owner.
     cond do
       connect_waiter_gone?(state) -> {:shutdown, :caller_gone, state}
-      owner_gone?(state) -> {:shutdown, :owner_down, state}
+      owner_gone?(state) -> owner_down(state)
       true -> state |> initialize(addr) |> setup_result(state)
     end
+  end
+
+  # The waiter is live here, because `connect_waiter_gone?/1` was asked first,
+  # so it is told why the connection is stopping instead of being left to read
+  # the reason off its monitor. `Rebus.Connector.Supervised` can only monitor
+  # the connection once `DynamicSupervisor.start_child/2` has returned, by
+  # which time a connection that stops in setup may already be gone and the
+  # monitor fires `:noproc`. The notification is in the waiter's mailbox
+  # first, so `connect/2` reports `:owner_down` whatever the scheduler did.
+  # The reason is not routed through `setup_result/2`: a waiter that dies
+  # between the two checks must not turn this stop into `:caller_gone`.
+  defp owner_down(%Connection{} = state) do
+    notify_connect_waiter(state.connect_waiter, {:error, :owner_down})
+    {:shutdown, :owner_down, state}
   end
 
   defp setup_result({:ok, initialized, {:continue, continuation}}, %Connection{}) do
