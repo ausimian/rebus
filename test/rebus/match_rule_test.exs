@@ -1123,6 +1123,44 @@ defmodule Rebus.MatchRuleTest do
       :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
+    test "clears a restored cleaning rule before serving a new add for it", %{
+      server: server,
+      connection: connection
+    } do
+      # No well-known sender, so nothing here waits on owner tracking. The row
+      # is written directly because a worker only ever persists a cleaning rule
+      # alongside the operation cleaning it, and that snapshot is uncertain: the
+      # stable snapshot this restores from is what a worker leaves behind once
+      # the operation-in-flight window closes.
+      rule = MatchRule.new!(interface: "org.example.Interface", member: "Restarted")
+      key = MatchRule.to_string(rule)
+
+      :ok =
+        Store.persist_state(
+          connection,
+          false,
+          persistence_changes(key),
+          %{key => cleaning_row(rule)},
+          %{}
+        )
+
+      adding = Task.async(fn -> Rebus.add_match(connection, rule, 2_000) end)
+
+      # Starting the worker restores the rule and re-runs the cleanup it owed.
+      # Without that the add would queue behind a cleanup that never runs.
+      remove = assert_remove_match(server, rule, 1_500)
+      :ok = TestServer.push(server, method_return(remove.serial))
+
+      add = assert_add_match(server, rule)
+      :ok = TestServer.push(server, method_return(add.serial))
+
+      assert {:ok, ref} = Task.await(adding, 2_000)
+      assert :ok = Rebus.remove_match(connection, ref, 1_000)
+
+      final_remove = assert_remove_match(server, rule, 1_500)
+      :ok = TestServer.push(server, method_return(final_remove.serial))
+    end
+
     test "retries ambiguous owner cleanup until RemoveMatch is known", %{
       server: server,
       connection: connection
@@ -2058,6 +2096,75 @@ defmodule Rebus.MatchRuleTest do
       assert_receive :reset_state_lost
     end
 
+    test "restarts the best-effort cleanup a restored rule still owes the bus" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+
+      :ok =
+        Store.persist_state(
+          conn,
+          false,
+          persistence_changes(key),
+          %{key => cleaning_row(rule)},
+          %{}
+        )
+
+      assert {:ok, restored} = Worker.init(conn)
+
+      # The rule takes an initial-cleanup slot rather than a place in the
+      # bounded recovery set: it has not failed a cleanup yet, it has only lost
+      # the worker that was running one.
+      assert MapSet.member?(restored.initial_cleanup_keys, key)
+      refute MapSet.member?(restored.recovering_rules, key)
+      assert :queue.is_empty(restored.initial_cleanup_queue)
+
+      assert [{token, %{key: ^key, type: :initial_cleanup}}] = Map.to_list(restored.operations)
+      assert restored.rules[key].operation == token
+
+      :ok = Store.delete_state(conn)
+    end
+
+    test "admits restored cleaning rules under the live initial-cleanup cap" do
+      conn = start_placeholder_conn()
+
+      # One more rule than `@max_initial_cleanups`, which is private to the
+      # worker: a restart can present as many cleaning rules at once as a burst
+      # of owner exits can, so it must not start more bus work than that burst
+      # would have been allowed to.
+      rules =
+        Map.new(1..17, fn index ->
+          rule = test_rule("Changed#{index}")
+          {MatchRule.to_string(rule), cleaning_row(rule)}
+        end)
+
+      keys = Map.keys(rules)
+      changes = Enum.reduce(keys, empty_persistence(), &Store.rule_changed(&2, &1))
+
+      :ok = Store.persist_state(conn, false, changes, rules, %{})
+
+      assert {:ok, restored} = Worker.init(conn)
+
+      assert MapSet.size(restored.initial_cleanup_keys) == 16
+      assert map_size(restored.operations) == 16
+      assert MapSet.size(restored.recovering_rules) == 0
+      assert [queued] = :queue.to_list(restored.initial_cleanup_queue)
+      refute MapSet.member?(restored.initial_cleanup_keys, queued)
+
+      [{token, %{key: cleared_key}} | _rest] = Map.to_list(restored.operations)
+
+      assert {:noreply, drained} =
+               Worker.handle_info({:operation_result, token, :cleared}, restored)
+
+      # The freed slot goes to the key that had to wait, exactly as it does for
+      # a cleanup queued by the live path.
+      refute MapSet.member?(drained.initial_cleanup_keys, cleared_key)
+      assert MapSet.member?(drained.initial_cleanup_keys, queued)
+      assert :queue.is_empty(drained.initial_cleanup_queue)
+
+      :ok = Store.delete_state(conn)
+    end
+
     test "covers initial cleanup and recovery operation-loss outcomes" do
       conn = start_placeholder_conn()
       rule = test_rule()
@@ -2802,6 +2909,13 @@ defmodule Rebus.MatchRuleTest do
       recovery_attempt: 0,
       retry_timer: nil
     }
+  end
+
+  # The persisted shape of a rule whose final owner has gone and whose one
+  # best-effort RemoveMatch is still owed to the bus, as `start_initial_cleanup`
+  # leaves it.
+  defp cleaning_row(rule) do
+    %{rule_state(rule) | status: :cleaning, recovery_kind: :rule, remote_may_exist?: true}
   end
 
   defp empty_persistence do
