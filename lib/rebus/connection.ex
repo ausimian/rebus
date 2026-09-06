@@ -159,7 +159,7 @@ defmodule Rebus.Connection do
   # round trips that answer these belong to the match-subscription worker; the
   # connection only holds the table dispatch reads.
   #
-  # Marks a name tracked, without disturbing an owner a signal already set.
+  # Marks a name tracked, resetting whatever the table held for it.
   @doc false
   @spec track_name_owner(pid(), binary(), non_neg_integer()) ::
           :ok | {:error, :timeout | :disconnected | :not_connected}
@@ -738,8 +738,20 @@ defmodule Rebus.Connection do
     add_signal_handler(state, pid, handler_ref, rule)
   end
 
+  # The reset is unconditional, so an entry a previous tracking cycle left
+  # behind - an untrack whose final step failed after the bus rule was already
+  # removed - cannot survive a later re-track and block every seed after it,
+  # since the seed below writes only over `:unknown`. Forcing the value is safe
+  # because tracking marks the name before it installs the tracking rule with
+  # AddMatch, so no NameOwnerChanged for a freshly tracked name can have been
+  # applied yet, and GetNameOwner reseeds immediately after; a signal that does
+  # arrive between the reset and the seed still wins, exactly as it did before.
+  # A worker restart, which re-tracks names the table still holds a current
+  # owner for, rejects conservatively until that reseed - and, if the sequence
+  # fails before it, until tracking runs again (#168) - which is preferred over
+  # keeping a value that may be stale.
   def handle_call({:track_name_owner, name}, _from, %__MODULE__{} = state) do
-    {:reply, :ok, %{state | name_owners: Map.put_new(state.name_owners, name, :unknown)}}
+    {:reply, :ok, %{state | name_owners: Map.put(state.name_owners, name, :unknown)}}
   end
 
   def handle_call({:seed_name_owner, name, owner}, _from, %__MODULE__{} = state) do
