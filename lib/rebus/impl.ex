@@ -7,7 +7,7 @@ defmodule Rebus.Impl do
 
   @default %{
     transport: Rebus.Transport.Socket,
-    identity: Rebus.Identity.Posix,
+    identity: Rebus.Identity.Cached,
     resolver: Rebus.Resolver.Inet,
     clock: Rebus.Clock.System,
     connector: Rebus.Connector.Supervised,
