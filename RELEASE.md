@@ -15,8 +15,12 @@ It is a breaking release: result shapes changed and validation is stricter.
 - Address-list parsing for `:system` and `:session`: `unix:path`,
   `unix:abstract` and `tcp` entries in order, with `guid=` verification.
 - The `:timeout`, `:name`, `:read_timeout`, `:write_timeout`,
-  `:allow_anonymous` and `:bus` connection options.
+  `:allow_anonymous`, `:bus` and `:owner` connection options.
 - `bus: false` connects to a peer-to-peer endpoint rather than a message bus.
+- `owner: pid` ties a connection's lifetime to a process: Rebus stops the
+  connection when that process exits, so the bus reclaims the names, services
+  and other state the connection held. Without it a connection still lives
+  until `Rebus.close/1`.
 - Inbound method calls are answered: `org.freedesktop.DBus.Peer` is
   implemented, and everything else gets an `UnknownMethod` error reply.
 - `Rebus.Message.max_message_size/0`, `max_array_size/0` and
@@ -46,7 +50,8 @@ It is a breaking release: result shapes changed and validation is stricter.
   failure no longer stops established connections.
 - Connection log entries carry their reason as `reason:` Logger metadata.
 - `Rebus.connect/2` is the only supported way to create a connection, and the
-  supervisor owns it until `Rebus.close/1`.
+  supervisor owns it until `Rebus.close/1` or, with `owner: pid`, until that
+  process exits.
 
 ### Removed
 

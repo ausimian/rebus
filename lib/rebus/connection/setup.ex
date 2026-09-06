@@ -31,10 +31,13 @@ defmodule Rebus.Connection.Setup do
   @doc false
   @spec setup(Connection.t(), map()) :: Dispatch.result()
   def setup(%Connection{} = state, addr) do
-    if connect_waiter_gone?(state) do
-      {:shutdown, :caller_gone, state}
-    else
-      state |> initialize(addr) |> setup_result(state)
+    # Nothing is authenticated or connected on behalf of a process that has
+    # already gone. The waiter is checked first, so an abandoned connect still
+    # reports `:caller_gone` whether or not it also named an owner.
+    cond do
+      connect_waiter_gone?(state) -> {:shutdown, :caller_gone, state}
+      owner_gone?(state) -> {:shutdown, :owner_down, state}
+      true -> state |> initialize(addr) |> setup_result(state)
     end
   end
 
@@ -96,7 +99,7 @@ defmodule Rebus.Connection.Setup do
   def established(%Connection{} = state) do
     case establish_connection(%{state | established?: true}) do
       {:ok, established} -> Dispatch.process_inbound(established, :recv)
-      {:error, :caller_gone} -> {:shutdown, :caller_gone, state}
+      {:error, reason} -> {:shutdown, reason, state}
     end
   end
 
@@ -290,26 +293,45 @@ defmodule Rebus.Connection.Setup do
   defp notify_connect_waiter(nil, _result), do: :ok
 
   @doc false
-  @spec establish_connection(Connection.t()) :: {:ok, Connection.t()} | {:error, :caller_gone}
+  @spec establish_connection(Connection.t()) ::
+          {:ok, Connection.t()} | {:error, :caller_gone | :owner_down}
   def establish_connection(
         %Connection{connect_waiter: {pid, connect_ref}, connect_waiter_monitor: monitor_ref} =
           state
       ) do
-    receive do
-      {:DOWN, ^monitor_ref, :process, ^pid, _reason} ->
-        {:error, :caller_gone}
-    after
-      0 ->
-        # This acknowledgement is the ownership-transfer boundary. Check the
-        # queued monitor event first, then send the acknowledgement before
-        # releasing the monitor: a caller that dies after this send owns the
-        # normal established-connection lifecycle, while a prior death wins.
-        send(pid, {connect_ref, :accepted})
-        {:ok, release_connect_waiter(state)}
+    # The acknowledgement below is the ownership-transfer boundary. The queued
+    # monitor events are read first, and the acknowledgement is sent before
+    # the waiter's monitor is released: a caller that dies after this send
+    # owns the normal established-connection lifecycle, while a prior death
+    # wins. An owner that died while setup was blocked on the socket is a
+    # prior death too, so its caller is told the connection failed rather than
+    # handed a PID that stops on the next pass through the loop.
+    cond do
+      connect_waiter_down?(pid, monitor_ref) -> {:error, :caller_gone}
+      owner_gone?(state) -> {:error, :owner_down}
+      true -> accept_connect_waiter(state, pid, connect_ref)
     end
   end
 
-  def establish_connection(%Connection{} = state), do: {:ok, state}
+  # A connection started without a connect waiter has no one to report to, but
+  # a dead owner still ends it here rather than on the next pass through the
+  # receive loop.
+  def establish_connection(%Connection{} = state) do
+    if owner_gone?(state), do: {:error, :owner_down}, else: {:ok, state}
+  end
+
+  defp connect_waiter_down?(pid, monitor_ref) do
+    receive do
+      {:DOWN, ^monitor_ref, :process, ^pid, _reason} -> true
+    after
+      0 -> false
+    end
+  end
+
+  defp accept_connect_waiter(%Connection{} = state, pid, connect_ref) do
+    send(pid, {connect_ref, :accepted})
+    {:ok, release_connect_waiter(state)}
+  end
 
   @doc false
   @spec monitor_connect_waiter({pid(), reference()} | nil) :: reference() | nil
@@ -331,6 +353,23 @@ defmodule Rebus.Connection.Setup do
       {:DOWN, ^monitor_ref, :process, ^pid, _reason} -> true
     after
       0 -> not Process.alive?(pid)
+    end
+  end
+
+  # The owner's monitor is never released, so an exit that happened while
+  # setup was blocked on the socket is still queued here. Reading it costs a
+  # mailbox scan and saves establishing a connection that is already doomed.
+  # As with `connect_waiter_gone?/1`, an owner always carries its monitor:
+  # `Connection.monitor_owner/1` installs one whenever the owner is a PID, so
+  # there is no clause for an owner without a reference.
+  defp owner_gone?(%Connection{owner: nil}), do: false
+
+  defp owner_gone?(%Connection{owner: owner, owner_monitor: monitor_ref})
+       when is_reference(monitor_ref) do
+    receive do
+      {:DOWN, ^monitor_ref, :process, ^owner, _reason} -> true
+    after
+      0 -> not Process.alive?(owner)
     end
   end
 

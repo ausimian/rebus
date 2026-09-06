@@ -413,8 +413,8 @@ defmodule Rebus.Connection.Dispatch do
       {:ok, established} ->
         parse_flat_messages(rest, established, %{cursor | continuation: :recv})
 
-      {:error, :caller_gone} ->
-        {:shutdown, :caller_gone, state}
+      {:error, reason} ->
+        {:shutdown, reason, state}
     end
   end
 

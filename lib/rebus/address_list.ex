@@ -385,7 +385,11 @@ defmodule Rebus.AddressList do
   defp retryable_bus_address_error?(:invalid_write_timeout), do: false
   defp retryable_bus_address_error?(:invalid_allow_anonymous), do: false
   defp retryable_bus_address_error?(:invalid_bus_option), do: false
+  defp retryable_bus_address_error?(:invalid_owner), do: false
   defp retryable_bus_address_error?(:invalid_name), do: false
+  # A dead owner is a property of the caller's request, not of the entry that
+  # reported it, so the entries after it would fail the same way.
+  defp retryable_bus_address_error?(:owner_down), do: false
   defp retryable_bus_address_error?(:auth_id_unavailable), do: false
   defp retryable_bus_address_error?(:auth_cookie_unavailable), do: false
   defp retryable_bus_address_error?(:guid_mismatch), do: false
