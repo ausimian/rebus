@@ -22,6 +22,13 @@ advertised and prefers `DBUS_COOKIE_SHA1`. `ANONYMOUS` is considered last, and
 only with `allow_anonymous: true`. When no advertised mechanism is usable,
 `connect/2` returns `{:error, {:auth_rejected, mechanisms}}`.
 
+A `REJECTED` line is read leniently, because implementations space its
+mechanism list out differently. Rebus bounds how many space-separated segments
+it will consider, then keeps the ones that are well-formed mechanism names and
+ignores the rest, so a trailing or doubled space costs nothing. A line whose
+segments are all unusable is an `:auth_failed`, while a bare `REJECTED`
+advertises nothing and leaves no alternative to attempt.
+
 ## Cookie authentication
 
 `DBUS_COOKIE_SHA1` proves you can read a private cookie file that the peer
@@ -133,3 +140,24 @@ See `Rebus.connect/2` for the complete address, option and timeout contract.
 | `{:auth_rejected, mechanisms}` | The peer rejected the attempted mechanism and advertised no usable alternative. |
 | `:guid_mismatch` | The address named a `guid` that the server's identity did not match. No further address is tried. |
 | `:read_timeout` | Socket setup or authentication did not finish within its budget. |
+
+## Candidate retry policy
+
+When `connect/2` works through an address list, whether an authentication
+failure ends the attempt or moves on to the next candidate follows from what
+the failure describes.
+
+`:auth_failed` and `:read_timeout` describe one peer's behaviour: another
+candidate is a different peer, which may well answer correctly and in time, so
+the next candidate is tried. The list's own budget still bounds that: once it
+is exhausted the attempt ends, whatever remains untried, as `:read_timeout`
+if no candidate had yet failed and `{:read_timeout, reason}` once one had.
+`{:auth_rejected, mechanisms}` is retried on the same grounds: which
+mechanisms a peer offers is that peer's choice, and the next candidate may
+offer a usable one.
+
+`:auth_id_unavailable` and `:auth_cookie_unavailable` describe the local
+environment - no obtainable identity, or no safely readable cookie. Every
+candidate would fail on them identically, so they are final and no later entry
+is tried. `:guid_mismatch` is final for the same kind of reason: the address
+itself named the identity that did not match.

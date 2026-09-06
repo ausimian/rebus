@@ -26,7 +26,7 @@ defmodule Rebus.AuthTest do
 
       for malformed <- [
             "REJECTED ",
-            "REJECTED DBUS_COOKIE_SHA1 ",
+            "REJECTED lower case",
             "REJECTED DBUS_COOKIE_SHA1\tANONYMOUS",
             "REJECTED " <> Enum.join(List.duplicate("ANONYMOUS", 65), " "),
             "REJECTED " <> String.duplicate("A", 65)
@@ -35,6 +35,18 @@ defmodule Rebus.AuthTest do
       end
 
       assert {:error, :auth_failed} = Auth.parse_rejected("DATA not-a-rejection")
+    end
+
+    test "tolerates the spacing implementations actually send" do
+      assert {:ok, ["EXTERNAL", "DBUS_COOKIE_SHA1", "ANONYMOUS"]} =
+               Auth.parse_rejected("REJECTED EXTERNAL DBUS_COOKIE_SHA1 ANONYMOUS")
+
+      assert {:ok, ["DBUS_COOKIE_SHA1"]} = Auth.parse_rejected("REJECTED DBUS_COOKIE_SHA1 ")
+
+      assert {:ok, ["EXTERNAL", "ANONYMOUS"]} =
+               Auth.parse_rejected("REJECTED EXTERNAL  ANONYMOUS")
+
+      assert {:ok, ["ANONYMOUS"]} = Auth.parse_rejected("REJECTED ext*ernal ANONYMOUS")
     end
   end
 
@@ -555,11 +567,24 @@ defmodule Rebus.AuthTest do
         :ok = File.write(path, String.duplicate("A", 1_025))
         unavailable.("1", "challenge", "cookie_missing")
 
+        # The reference implementation bounds a cookie context at 255 bytes, so
+        # one of exactly that length must still be usable.
+        long_context = String.duplicate("a", 255)
+        :ok = File.write(Path.join(keyring, long_context), "1 0 #{cookie}\n")
+        :ok = File.chmod(Path.join(keyring, long_context), 0o600)
+
+        assert {:ok, _response} =
+                 Auth.cookie_response(
+                   "user",
+                   uid,
+                   Base.encode16("#{long_context} 1 challenge", case: :lower)
+                 )
+
         assert {:error, :auth_failed} =
                  Auth.cookie_response(
                    "user",
                    uid,
-                   Base.encode16("#{String.duplicate("a", 129)} 1 challenge", case: :lower)
+                   Base.encode16("#{String.duplicate("a", 256)} 1 challenge", case: :lower)
                  )
 
         assert {:error, :auth_failed} =
@@ -1147,7 +1172,7 @@ defmodule Rebus.AuthTest do
     {server, addr} =
       start_auth_server(fn peer ->
         assert "\0AUTH EXTERNAL " <> _external_id = receive_line(peer)
-        :ok = :socket.send(peer, "REJECTED DBUS_COOKIE_SHA1 #{sentinel}\r\n")
+        :ok = :socket.send(peer, "REJECTED #{sentinel}\r\n")
         assert {:error, :closed} = :socket.recv(peer, 0, [], 1_000)
         :ok
       end)
