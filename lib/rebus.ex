@@ -232,6 +232,11 @@ defmodule Rebus do
     and the bus releases the state that connection held. Inflight callers
     receive `{:error, :disconnected}`. Only a PID on the local node is
     accepted; a remote PID is `:invalid_owner`.
+  - `connect/2` is the only supported way to create a connection: the supervisor
+    owns it until `close/1` or, with `:owner`, until that process exits. A
+    connection process started by any other means is unsupported - `close/1`
+    cannot stop it, and its match-subscription state cannot be recovered (see
+    `add_match/3`).
   - A write timeout that accepted no bytes fails only that caller. After a
     partial frame the connection terminates and inflight callers receive
     `{:error, :disconnected}`.
@@ -424,11 +429,16 @@ defmodule Rebus do
   - `{:error, %Rebus.Message{type: :error}}` - the peer returned a D-Bus error reply.
   - `{:error, :timeout}` - no reply arrived in time, and the request may already
     have reached the peer. A request sent to a named PID whose `connect/2` has
-    not yet returned was never written and is safe to retry.
+    not yet returned was never written and is safe to retry. A reply that
+    exhausted a local decoding cap inside its own header fields also lands here:
+    Rebus recovered no trusted `reply_serial`, so the frame is dropped and the
+    connection stays up, but the call cannot be matched to it.
   - `{:error, {:reply_dropped, :method_return}}` or
     `{:error, {:reply_dropped, {:error, error_name}}}` - the peer definitely
-    replied, but the reply was too large to decode and was discarded. Neither is
-    delivery-ambiguous, so decide whether to retry from what the operation does.
+    replied, but the reply exhausted a local decoding cap and was discarded.
+    Neither is delivery-ambiguous, so decide whether to retry from what the
+    operation does. A cap exhausted inside the reply's own header fields cannot
+    produce these shapes; it returns `{:error, :timeout}` instead.
   - `{:error, :fd_claim_expired}` - Rebus closed the reply's descriptors instead of handing them over.
   - `{:error, :disconnected}` - the connection stopped before the reply, or
     before its descriptors transferred. A call carrying descriptors can return
@@ -506,7 +516,9 @@ defmodule Rebus do
 
   Rebus closes the connection when too many ambiguous cleanups accumulate. A reference
   that failed with `{:error, :match_subscription_state_lost}` stays unresolved until the
-  connection is closed.
+  connection is closed. Rebus responds by closing a connection created by
+  `connect/2`; on a connection started any other way no close happens, so the
+  lost state is terminal for as long as that process lives.
 
   ## Return values
 

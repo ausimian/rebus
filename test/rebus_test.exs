@@ -226,6 +226,55 @@ defmodule RebusTest do
       assert Process.alive?(cli)
     end
 
+    test "returns :timeout for a header-limited reply", %{svr: svr} do
+      cli = connect_until_ready(svr)
+      {:ok, ref} = Rebus.add_signal_handler(cli)
+
+      method =
+        Message.new!(:method_call,
+          path: "/test",
+          interface: "test.interface",
+          member: "HeaderLimitedReply"
+        )
+
+      call_task = Task.async(fn -> Rebus.call(cli, method, 300) end)
+
+      assert_receive {^svr, %Message{header_fields: %{member: "HeaderLimitedReply"}} = request},
+                     1_000
+
+      limited_reply = raw_header_resource_limited_reply(request.serial)
+
+      # No envelope, so no trusted reply_serial: the pending call cannot be
+      # matched to the dropped frame and takes the conservative timeout result.
+      assert {:error, :resource_limit, nil, <<>>} = Message.parse_inbound(limited_reply)
+
+      valid =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "AfterHeaderLimitedReply"
+        )
+
+      {:ok, valid_data} = Message.encode(valid)
+
+      log =
+        capture_log(fn ->
+          :ok = TestServer.push_raw(svr, limited_reply <> IO.iodata_to_binary(valid_data))
+
+          # The signal sits behind the limited frame in the same buffer, so its
+          # arrival proves that frame was fully parsed and dropped before the
+          # call is checked - a slow dispatcher cannot pass this by timing out
+          # before the frame was even seen.
+          assert_receive {^ref, %Message{header_fields: %{member: "AfterHeaderLimitedReply"}}},
+                         2_000
+
+          assert {:error, :timeout} = Task.await(call_task, 5_000)
+        end)
+
+      assert log =~ "D-Bus frame dropped: :resource_limit"
+      assert Process.alive?(cli)
+    end
+
     test "treats truncated over-declared arrays as protocol errors", %{svr: svr} do
       cli = connect_until_ready(svr)
       ref = Process.monitor(cli)
@@ -4897,6 +4946,12 @@ defmodule RebusTest do
         List.duplicate([10, {"ay", []}], 25_001)
 
     raw_wire_message(4, fields, <<>>)
+  end
+
+  defp raw_header_resource_limited_reply(reply_serial) do
+    fields = [[5, {"u", reply_serial}]] ++ List.duplicate([10, {"ay", []}], 25_001)
+
+    raw_wire_message(2, fields, <<>>)
   end
 
   defp raw_truncated_scalar_signal do

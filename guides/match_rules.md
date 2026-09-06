@@ -90,6 +90,9 @@ Two outcomes end differently. Rebus closes the connection when too many rules
 are left uncertain, which makes the bus discard all of them. And
 `{:error, :match_subscription_state_lost}` means an operation in flight lost
 its state, and that reference stays unresolved until the connection closes.
+Both closes are `Rebus.close/1`, which only works on a connection created by
+`Rebus.connect/2`; a connection started any other way never gets closed, so the
+lost state lasts as long as that connection process does.
 
 Closing a connection stops its local handlers, and the bus discards every
 match rule it held.
@@ -104,7 +107,7 @@ match rule it held.
 | `:sender_routing_ambiguous` | The rule overlaps an existing one with a different sender. |
 | `:timeout` | The operation did not finish in time. The bus may still hold the rule. |
 | `:match_rule_cleanup_pending` | An earlier ambiguous operation on the same rule is still being cleaned up. |
-| `:match_subscription_state_lost` | An in-flight operation lost its state and cannot be resolved on this connection. |
+| `:match_subscription_state_lost` | An in-flight operation lost its state and cannot be resolved on this connection. Rebus ends it by closing a connection created by `Rebus.connect/2`; the state dies with the connection. |
 | `{:bus_error, error_name}` | The bus returned a D-Bus error reply. |
 | `:invalid_bus_reply` | The bus reply did not have the expected shape. |
 | `:not_connected` | Connection setup has not completed. |
