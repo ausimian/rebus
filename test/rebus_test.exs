@@ -949,6 +949,12 @@ defmodule RebusTest do
           assert reason in [:noproc, {:shutdown, :caller_gone}]
           refute_receive :unexpected_auth_id_lookup, 100
 
+          # The retry closes as soon as its Hello is answered. A `NameAcquired`
+          # pushed behind that answer would still be unread in the socket, and
+          # closing then draws a reset that crashes the peer and logs the very
+          # `GenServer terminating` line this test refutes.
+          :ok = TestServer.set_auto_hello(svr, true, false)
+
           assert {:ok, retry_cli} = Rebus.connect(addr, name: name)
           await_hello(svr)
           assert :ok = Rebus.close(retry_cli)
