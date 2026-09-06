@@ -177,6 +177,7 @@ defmodule Rebus do
           | :match_rule_cleanup_pending
           | :match_subscription_state_lost
           | :sender_routing_ambiguous
+          | :not_started
           | :not_a_bus
           | {:reply_dropped, :method_return | {:error, binary()}}
           | {:bus_error, binary()}
@@ -525,9 +526,9 @@ defmodule Rebus do
   Success is `{:ok, reference}`. Every failure is `{:error, reason}`: `:timeout`, `:not_a_bus`,
   `:sender_routing_ambiguous`, `:match_rule_cleanup_pending`, `:match_subscription_state_lost`,
   `{:bus_error, error_name}`, `:invalid_bus_reply`, `:not_connected`, `:disconnected`,
-  `:encode_failed`, `:serial_exhausted`, `:fd_claim_expired`, `{:reply_dropped, outcome}` and
-  `:remote_connection_unsupported`. The [match rules guide](match_rules.html) lists what each
-  one means.
+  `:encode_failed`, `:serial_exhausted`, `:fd_claim_expired`, `:not_started`,
+  `{:reply_dropped, outcome}` and `:remote_connection_unsupported`. The
+  [match rules guide](match_rules.html) lists what each one means.
 
   ## Example
 
