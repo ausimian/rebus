@@ -819,7 +819,6 @@ defmodule Rebus.Message do
        when is_integer(value) and value >= -2_147_483_648 and value <= 2_147_483_647,
        do: "i"
 
-  defp infer_type(value) when is_integer(value) and value >= 0 and value <= 255, do: "y"
   defp infer_type(value) when is_integer(value), do: "x"
   defp infer_type(value) when is_binary(value), do: "s"
   defp infer_type(value) when is_boolean(value), do: "b"
