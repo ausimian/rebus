@@ -37,7 +37,7 @@ defmodule Rebus.SeamsTest do
     test "defaults to the production modules" do
       assert %{
                transport: Rebus.Transport.Socket,
-               identity: Rebus.Identity.Posix,
+               identity: Rebus.Identity.Cached,
                resolver: Rebus.Resolver.Inet,
                clock: Rebus.Clock.System,
                connector: Rebus.Connector.Supervised
@@ -45,7 +45,7 @@ defmodule Rebus.SeamsTest do
     end
 
     test "takes only known keys from an override" do
-      assert %{transport: Rebus.TestImpl, identity: Rebus.Identity.Posix} =
+      assert %{transport: Rebus.TestImpl, identity: Rebus.Identity.Cached} =
                Impl.build(transport: Rebus.TestImpl, unknown: :ignored)
 
       assert Impl.build(:not_an_override) == Impl.default()

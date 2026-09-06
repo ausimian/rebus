@@ -16,6 +16,9 @@ mechanism. Rebus selects one, and fails closed when no safe one remains.
 
 `EXTERNAL` passes the calling user's local Unix credentials. It is what the
 system and session buses normally accept, and Rebus always attempts it first.
+The local uid, and the username `DBUS_COOKIE_SHA1` needs, are read from `id(1)`
+once per VM and reused by later connections; a lookup that fails is not
+remembered, so the next connection tries again.
 
 If the peer rejects `EXTERNAL`, Rebus reads the mechanisms the peer
 advertised and prefers `DBUS_COOKIE_SHA1`. `ANONYMOUS` is considered last, and

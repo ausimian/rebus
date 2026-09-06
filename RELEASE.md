@@ -52,6 +52,8 @@ It is a breaking release: result shapes changed and validation is stricter.
   does.
 - **Breaking:** doubles use `:infinity`, `:negative_infinity` and `:nan`.
 - **Breaking:** Rebus requires Elixir 1.18 or later.
+- Connections reuse the local uid and username after the first successful
+  lookup instead of running `id` for every connection.
 - Signals are delivered by the connection that received them, so an internal
   failure no longer stops established connections.
 - Connection and authentication log entries carry their reason as `reason:`
