@@ -1002,12 +1002,31 @@ defmodule Rebus.MatchSubscription.Worker do
     end
   end
 
+  # The backoff saturates at one second, so retrying is otherwise unbounded: a
+  # bus that stays ambiguous for this one rule would be retried forever,
+  # visible only at debug level. A rule whose bus state cannot be proven is
+  # never silently forgotten or permanently quarantined, so when the module
+  # runs out of ways to resolve it the connection is reset, exactly as the
+  # capacity branch of `enter_recovery/3` does for too many such rules at once.
+  # `request_connection_reset/2` is a no-op while a reset is already in flight,
+  # so only the exhaustion that starts one is worth a warning.
+  defp escalate_exhausted_recovery(state, key) do
+    if not state.resetting?, do: log_reset(:recovery_exhausted)
+    request_connection_reset(state, key)
+  end
+
   defp schedule_recovery_retry(state, key) do
     case Map.get(state.rules, key) do
       %Rule{status: :recovering, retry_timer: nil} = rule ->
         attempt = rule.recovery_attempt + 1
-        timer = Process.send_after(self(), {:retry_recovery, key}, retry_delay(attempt))
-        put_rule(state, key, %{rule | recovery_attempt: attempt, retry_timer: timer})
+
+        if attempt > max_recovery_attempts() do
+          escalate_exhausted_recovery(state, key)
+        else
+          maybe_log_recovery_saturated(attempt)
+          timer = Process.send_after(self(), {:retry_recovery, key}, retry_delay(attempt))
+          put_rule(state, key, %{rule | recovery_attempt: attempt, retry_timer: timer})
+        end
 
       _ ->
         state
@@ -1579,6 +1598,21 @@ defmodule Rebus.MatchSubscription.Worker do
     Application.get_env(:rebus, :match_recovery_max_rules, 64)
   end
 
+  # Consecutive recovery attempts allowed for a single rule before the
+  # connection is reset. With `@recovery_delays` the default is roughly 26
+  # seconds of retrying per recovery episode: long enough that a transient bus
+  # hiccup never trips it, short enough that an operator learns of a stuck rule
+  # within a minute. Attempts rather than wall-clock keeps it deterministic,
+  # and `recovery_attempt` is already persisted, so the budget spans worker
+  # restarts: a restored rule gets one immediate attempt and then only what is
+  # left of its budget, so one restored with the budget already spent escalates
+  # on its next failure. That is intended, since a restart is not evidence that
+  # the bus resolved anything. A successful recovery, and each new episode entered
+  # through `enter_recovery/3`, resets the count to zero.
+  defp max_recovery_attempts do
+    Application.get_env(:rebus, :match_recovery_max_attempts, 30)
+  end
+
   defp retry_delay(attempt) do
     Enum.at(@recovery_delays, min(attempt - 1, length(@recovery_delays) - 1))
   end
@@ -1589,6 +1623,22 @@ defmodule Rebus.MatchSubscription.Worker do
 
   defp log_recovery(event) do
     Logger.debug("D-Bus match cleanup transition=#{event}")
+  end
+
+  # Individual retries stay at debug, but a rule that has exhausted the backoff
+  # is stuck on the bus and an operator should see it well before the budget
+  # runs out and the connection is reset. The equality fires exactly once per
+  # recovery episode, since a new episode restarts the count at zero. The rule
+  # itself is not named: it can carry caller-supplied arguments.
+  defp maybe_log_recovery_saturated(attempt) do
+    if attempt == length(@recovery_delays) do
+      Logger.warning(
+        "D-Bus match recovery still retrying attempt=#{attempt} " <>
+          "delay_ms=#{retry_delay(attempt)}"
+      )
+    end
+
+    :ok
   end
 
   # A well-known bus name is not a secret, and naming it and the failed step is

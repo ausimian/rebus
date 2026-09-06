@@ -97,7 +97,8 @@ that cleanup under its own timeout, and returns
 `{:error, :match_rule_cleanup_pending}` if the cleanup outlasts it.
 
 Two outcomes end differently. Rebus closes the connection when too many rules
-are left uncertain, which makes the bus discard all of them. And
+are left uncertain, or when a single rule stays uncertain for more than its
+retry budget, which makes the bus discard all of them. And
 `{:error, :match_subscription_state_lost}` means an operation in flight lost
 its state, and that reference stays unresolved until the connection closes.
 Both closes are `Rebus.close/1`, which only works on a connection created by
@@ -106,6 +107,18 @@ lost state lasts as long as that connection process does.
 
 Closing a connection stops its local handlers, and the bus discards every
 match rule it held.
+
+Two application environment settings bound that cleanup.
+`:match_recovery_max_rules` (default `64`) is how many rules may be uncertain
+at once before the connection is closed. `:match_recovery_max_attempts`
+(default `30`) is how many times one rule's cleanup is retried before the same
+close happens; with the backoff Rebus uses that is about 26 seconds of
+backoff, and under a minute in total once each attempt's own timeout is
+counted. With the default budget, a rule that has run out of backoff also logs
+a warning once, well before the budget is spent. The count of attempts
+survives a restart of the
+subscription worker, since a restart is not evidence that the bus resolved
+anything.
 
 ## Errors
 

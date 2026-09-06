@@ -2096,6 +2096,166 @@ defmodule Rebus.MatchRuleTest do
                Worker.handle_info({:operation_result, make_ref(), :late}, orphaned)
     end
 
+    test "resets the connection when a rule's recovery budget is spent" do
+      put_recovery_env(:match_recovery_max_attempts, 2)
+
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      state = recovering_state(conn, key, rule)
+
+      first = fail_recovery(state, key)
+      assert %{status: :recovering, recovery_attempt: 1} = first.rules[key]
+      assert is_reference(first.rules[key].retry_timer)
+      refute first.resetting?
+
+      second = fail_recovery(first, key)
+      assert %{status: :recovering, recovery_attempt: 2} = second.rules[key]
+      assert is_reference(second.rules[key].retry_timer)
+      refute second.resetting?
+
+      log =
+        capture_log(fn ->
+          exhausted = fail_recovery(second, key)
+
+          # The budget is spent, so nothing is armed for another attempt. The
+          # rule is not forgotten either: the reset owns it from here, exactly
+          # as it owns the rules held back by the capacity branch.
+          assert %{status: :recovering, operation: nil, retry_timer: nil} = exhausted.rules[key]
+          assert exhausted.resetting?
+          assert exhausted.state_lost?
+          assert is_reference(exhausted.reset_token)
+        end)
+
+      assert log =~ "D-Bus match reset transition=recovery_exhausted"
+    end
+
+    test "retries a recovery to the default budget before resetting" do
+      previous = Application.get_env(:rebus, :match_recovery_max_attempts)
+      Application.delete_env(:rebus, :match_recovery_max_attempts)
+
+      on_exit(fn ->
+        unless is_nil(previous),
+          do: Application.put_env(:rebus, :match_recovery_max_attempts, previous)
+      end)
+
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+
+      capture_log(fn ->
+        spent =
+          Enum.reduce(1..30, recovering_state(conn, key, rule), fn attempt, acc ->
+            acc = fail_recovery(acc, key)
+
+            assert %{status: :recovering, recovery_attempt: ^attempt} = acc.rules[key]
+            assert is_reference(acc.rules[key].retry_timer)
+            refute acc.resetting?
+
+            acc
+          end)
+
+        exhausted = fail_recovery(spent, key)
+
+        assert %{recovery_attempt: 30, retry_timer: nil} = exhausted.rules[key]
+        assert exhausted.resetting?
+      end)
+    end
+
+    test "warns once when a rule's recovery backoff saturates" do
+      put_recovery_env(:match_recovery_max_attempts, 100)
+
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+
+      fifth =
+        Enum.reduce(1..5, recovering_state(conn, key, rule), fn _attempt, acc ->
+          fail_recovery(acc, key)
+        end)
+
+      assert %{recovery_attempt: 5} = fifth.rules[key]
+
+      {sixth, log} = with_log(fn -> fail_recovery(fifth, key) end)
+
+      assert %{recovery_attempt: 6} = sixth.rules[key]
+
+      lines = for line <- String.split(log, "\n"), line =~ "still retrying", do: line
+      assert [line] = lines
+      assert line =~ "attempt=6"
+      assert line =~ "delay_ms=1000"
+
+      quiet =
+        capture_log(fn ->
+          seventh = fail_recovery(sixth, key)
+          assert %{recovery_attempt: 7} = seventh.rules[key]
+          refute seventh.resetting?
+        end)
+
+      refute quiet =~ "still retrying"
+    end
+
+    test "carries a rule's recovery budget across a worker restart" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      row = %{rule_state(rule) | status: :recovering, recovery_kind: :rule, recovery_attempt: 29}
+
+      :ok = Store.persist_state(conn, false, persistence_changes(key), %{key => row}, %{})
+
+      assert {:ok, restored} = Worker.init(conn)
+
+      # A restart is not evidence that the bus resolved anything, so the count
+      # the rule had accrued is restored with it.
+      assert %{status: :recovering, recovery_attempt: 29} = restored.rules[key]
+      assert MapSet.member?(restored.recovering_rules, key)
+      assert_receive {:resume_recovery, ^key}
+
+      log =
+        capture_log(fn ->
+          # One attempt is left of the default budget of 30, not a fresh 30.
+          last = fail_recovery(restored, key)
+          assert %{recovery_attempt: 30} = last.rules[key]
+          assert is_reference(last.rules[key].retry_timer)
+          refute last.resetting?
+
+          exhausted = fail_recovery(last, key)
+
+          assert %{recovery_attempt: 30, retry_timer: nil} = exhausted.rules[key]
+          assert exhausted.resetting?
+        end)
+
+      assert log =~ "D-Bus match reset transition=recovery_exhausted"
+
+      :ok = Store.delete_state(conn)
+    end
+
+    test "spends recovery budget on an attempt whose task never starts" do
+      put_recovery_env(:match_recovery_max_attempts, 1)
+
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      state = recovering_state(conn, key, rule)
+
+      log =
+        capture_log(fn ->
+          first = fail_recovery(state, key, :not_started)
+
+          assert %{status: :recovering, recovery_attempt: 1} = first.rules[key]
+          assert is_reference(first.rules[key].retry_timer)
+          refute first.resetting?
+
+          exhausted = fail_recovery(first, key, :not_started)
+
+          assert %{recovery_attempt: 1, retry_timer: nil} = exhausted.rules[key]
+          assert exhausted.resetting?
+          assert exhausted.state_lost?
+        end)
+
+      assert log =~ "D-Bus match reset transition=recovery_exhausted"
+    end
+
     test "covers final removal and successful recovery transitions" do
       conn = start_placeholder_conn()
       state = fresh_worker_state(conn)
@@ -3202,6 +3362,53 @@ defmodule Rebus.MatchRuleTest do
     }
 
     {state, token}
+  end
+
+  # A rule already in the bounded recovery set, at attempt zero, as
+  # `enter_recovery/3` leaves it once its first unproven cleanup graduates.
+  defp recovering_state(conn, key, rule) do
+    :ok = Store.delete_state(conn)
+
+    state = put_rule_state(fresh_worker_state(conn), key, rule, [])
+    rule_state = %{state.rules[key] | status: :recovering, recovery_kind: :rule}
+
+    %{state | rules: %{key => rule_state}, recovering_rules: MapSet.new([key])}
+  end
+
+  # One failed recovery attempt for a rule that is already `:recovering`. The
+  # attempt count it has accrued is preserved, and the timer the previous
+  # attempt armed is cleared first, as the `{:retry_recovery, key}` path does
+  # before it starts the next attempt.
+  defp fail_recovery(state, key, result \\ {:definitive_bus_error, {:error, {:bus_error, "no"}}}) do
+    token = make_ref()
+    rule_state = %{state.rules[key] | operation: token, retry_timer: nil}
+
+    state = %{
+      state
+      | rules: Map.put(state.rules, key, rule_state),
+        operations:
+          Map.put(state.operations, token, %{
+            key: key,
+            type: :recovery,
+            request_id: nil,
+            monitor: nil
+          })
+    }
+
+    assert {:noreply, state} = Worker.handle_info({:operation_result, token, result}, state)
+
+    state
+  end
+
+  defp put_recovery_env(key, value) do
+    previous = Application.get_env(:rebus, key)
+    Application.put_env(:rebus, key, value)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:rebus, key),
+        else: Application.put_env(:rebus, key, previous)
+    end)
   end
 
   # A rule holding one of the bounded initial-cleanup slots, with its
