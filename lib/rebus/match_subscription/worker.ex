@@ -178,7 +178,7 @@ defmodule Rebus.MatchSubscription.Worker do
       {:ok, persisted} ->
         state = restore_state(state, persisted)
         Enum.each(state.recovering_rules, &send(self(), {:resume_recovery, &1}))
-        {:ok, reconcile_tracking(state)}
+        {:ok, state |> admit_restored_cleanups() |> reconcile_tracking()}
 
       :error ->
         {:ok, state}
@@ -862,16 +862,23 @@ defmodule Rebus.MatchSubscription.Worker do
             retry_timer: nil
         }
 
-        state = put_rule(state, key, rule)
-
-        if MapSet.size(state.initial_cleanup_keys) < @max_initial_cleanups do
-          start_recovery_attempt(state, key)
-        else
-          %{state | initial_cleanup_queue: :queue.in(key, state.initial_cleanup_queue)}
-        end
+        state
+        |> put_rule(key, rule)
+        |> admit_initial_cleanup(key)
 
       _ ->
         state
+    end
+  end
+
+  # The one place the initial-cleanup concurrency cap is applied: a rule marked
+  # `:cleaning` either takes a free slot now or waits in the queue that
+  # `start_next_initial_cleanup/1` drains as slots come back.
+  defp admit_initial_cleanup(state, key) do
+    if MapSet.size(state.initial_cleanup_keys) < @max_initial_cleanups do
+      start_recovery_attempt(state, key)
+    else
+      %{state | initial_cleanup_queue: :queue.in(key, state.initial_cleanup_queue)}
     end
   end
 
@@ -1435,6 +1442,13 @@ defmodule Rebus.MatchSubscription.Worker do
     # directly. The operation in flight, the callers queued behind it and the
     # retry timer belonged to the worker that died, and none of them is a fact
     # about the bus, so a restored rule starts without them.
+    #
+    # Only the recovering rules are collected here. A rule restored as
+    # `:cleaning` still owes the bus its best-effort RemoveMatch, and
+    # `admit_restored_cleanups/1` re-admits it through the same cap the live
+    # path uses: the cap bounds concurrent bus work, and a restart can present
+    # as many cleaning rules at once as a burst of owner exits can, so it must
+    # apply to them identically.
     rules =
       Map.new(rules, fn {key, row} ->
         {key, %{struct!(Rule, row) | operation: nil, queue: [], retry_timer: nil}}
@@ -1464,6 +1478,22 @@ defmodule Rebus.MatchSubscription.Worker do
   end
 
   defp restore_state(state, _persisted), do: state
+
+  # Nothing else schedules a restored cleaning rule: it is not in
+  # `recovering_rules`, and the admission that would have started or queued it
+  # ran in the worker that died. Re-admit each one synchronously, since
+  # `start_recovery_attempt/2` only spawns a supervised task and takes a
+  # monitor, so this does not block `init/1`, and the rules restore with
+  # `operation: nil` and `retry_timer: nil` already, which is exactly what it
+  # requires.
+  defp admit_restored_cleanups(state) do
+    state.rules
+    |> Enum.flat_map(fn
+      {key, %Rule{status: :cleaning}} -> [key]
+      {_key, _rule} -> []
+    end)
+    |> Enum.reduce(state, &admit_initial_cleanup(&2, &1))
+  end
 
   defp put_rule(state, key, rule) do
     state = %{state | rules: Map.put(state.rules, key, rule)}
