@@ -19,6 +19,20 @@
 # removes or renames it fails the suite loudly on the first matrix cell rather
 # than degrading `close/1` to `{:error, :unsupported}` at runtime.
 #
+# Why the contract is "consumed regardless of the result": `:file.close/1`
+# reaches `prim_file:close/1` (`erts/preloaded/src/prim_file.erl:154` at
+# OTP-28.3), whose `close_nif` moves the reference to its CLOSED state and
+# demonitors the owner before calling the OS.  The unix backend clears the
+# descriptor from the resource and releases it *before* `close(2)`, so an
+# error is reported after the reference has already let go
+# (`erts/emulator/nifs/unix/unix_prim_file.c:246`,
+# `erts/emulator/nifs/common/prim_file_nif.c:618`, OTP-28.3).  A second
+# `:file.close/1` on the same reference returns `{:error, :einval}`.  Nothing
+# closes the number a second time: `prim_file`'s janitor (`delayed_close_nif/1`
+# from `helper_loop/0`, prim_file.erl:112) is reached only from the
+# owner-death monitor, which an explicit close has removed.  So on
+# `{:error, _}` this adapter must not retry, and neither can the caller.
+#
 # Migration: if OTP gains a public way to close a raw descriptor, change
 # `close/1` below to use it and delete the compatibility test.  Otherwise the
 # fallback is a minimal NIF built with `elixir_make`; that adds a C toolchain
