@@ -10,6 +10,7 @@ defmodule RebusTest do
   alias Rebus.Message
   alias Rebus.TestImpl
   alias Rebus.TestServer
+  alias Rebus.Transport.Socket
 
   # GitHub run 33276531794 on Elixir 1.19.1/OTP 27.1 observed a referenced
   # byte size of 256 for copied GUID and mechanism binaries. This remains far
@@ -1394,6 +1395,148 @@ defmodule RebusTest do
       assert :ok = TestServer.push_raw(svr, rest)
       assert wait_until(fn -> :sys.get_state(cli).inbound.size == 0 end)
       assert :sys.get_state(cli).partial_frame_timer == nil
+    end
+  end
+
+  describe "Owned connections" do
+    setup [:server_setup]
+
+    test "stop when their owner exits normally", %{svr: svr} do
+      owner = start_owner()
+      # No `NameAcquired` is pushed, so the connection reads everything the
+      # peer sent it and this test leaves nothing racing the owner's exit.
+      cli = connect_until_ready(svr, owner: owner, send_name_acquired?: false)
+      ref = Process.monitor(cli)
+
+      send(owner, :stop)
+
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :owner_down}}, 1_000
+      # The peer's session ends with the connection: its next read fails and
+      # the server process exits. Whether the kernel delivered a FIN or a
+      # reset is not Rebus's to promise, so the exit reason is not asserted.
+      assert wait_until(fn -> not Process.alive?(svr) end)
+      assert {:error, :not_found} = Rebus.close(cli)
+    end
+
+    test "stop and close their socket when their owner crashes", %{svr: svr} do
+      parent = self()
+      owner = start_owner()
+      cli = connect_until_ready(svr, owner: owner)
+      sock = :sys.get_state(cli).sock
+
+      :ok =
+        TestImpl.install(cli,
+          close: fn closed ->
+            send(parent, {:socket_closed, closed})
+            Socket.close(closed)
+          end
+        )
+
+      ref = Process.monitor(cli)
+      Process.exit(owner, :kill)
+
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :owner_down}}, 1_000
+      assert_receive {:socket_closed, ^sock}, 1_000
+      assert {:error, :not_found} = Rebus.close(cli)
+    end
+
+    test "fail an inflight call when their owner exits", %{svr: svr} do
+      owner = start_owner()
+      cli = connect_until_ready(svr, owner: owner)
+
+      method =
+        Message.new!(:method_call,
+          path: "/test",
+          interface: "test.interface",
+          member: "OwnerExits"
+        )
+
+      call_task = Task.async(fn -> Rebus.call(cli, method, 5_000) end)
+      assert_receive {^svr, %Message{header_fields: %{member: "OwnerExits"}}}, 1_000
+
+      Process.exit(owner, :kill)
+
+      assert {:error, :disconnected} = Task.await(call_task, 2_000)
+    end
+
+    test "outlive the process that connected them", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      owner = start_owner()
+      connector = Task.async(fn -> Rebus.connect(addr, cached_identity(owner: owner)) end)
+
+      assert {:ok, cli} = Task.await(connector, 2_000)
+      await_hello(svr)
+      # The task has returned its result, so it is on its way out; a monitor
+      # installed here could report either its exit or `:noproc`, so the test
+      # waits for the process to be gone rather than for a reason.
+      assert wait_until(fn -> not Process.alive?(connector.pid) end)
+
+      ref = Process.monitor(cli)
+      refute_receive {:DOWN, ^ref, :process, ^cli, _reason}, 200
+      assert :ok = Rebus.close(cli)
+    end
+
+    test "are still closed on request while their owner is alive", %{svr: svr} do
+      owner = start_owner()
+      # Closed straight after Hello, so no `NameAcquired` is left unread to
+      # turn the close into a reset at the peer.
+      cli = connect_until_ready(svr, owner: owner, send_name_acquired?: false)
+      ref = Process.monitor(cli)
+
+      assert :ok = Rebus.close(cli)
+      assert_receive {:DOWN, ^ref, :process, ^cli, :shutdown}, 1_000
+      assert Process.alive?(owner)
+    end
+
+    test "fail the connect when their owner exits during setup", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      :ok = TestServer.set_auto_hello(svr, false)
+      owner = start_owner()
+      owner_ref = Process.monitor(owner)
+      connect_task = Task.async(fn -> Rebus.connect(addr, cached_identity(owner: owner)) end)
+
+      hello = await_hello(svr)
+      Process.exit(owner, :kill)
+      assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, 1_000
+      # The doomed connection never reads this reply, so the peer may see a
+      # reset and log its exit. That is the scenario under test, not a flaw.
+      handle_hello(hello, svr)
+
+      assert {:error, :owner_down} = Task.await(connect_task, 2_000)
+    end
+
+    test "refuse an owner that has already exited", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+
+      assert {:error, :owner_down} = Rebus.connect(addr, cached_identity(owner: dead_process()))
+    end
+
+    test "reject an owner that is not a process", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      parent = self()
+      name = :rebus_issue_143_invalid_owner
+
+      :ok =
+        TestImpl.put(name,
+          open: fn domain, type, protocol ->
+            send(parent, :socket_opened)
+            Socket.open(domain, type, protocol)
+          end
+        )
+
+      impl = %{transport: TestImpl, identity: TestImpl.CachedIdentity}
+
+      assert {:error, :invalid_owner} =
+               Rebus.connect(addr, name: name, owner: :not_a_process, __impl__: impl)
+
+      refute_receive :socket_opened, 100
+
+      # The same connection with a valid owner does reach the socket, so the
+      # refusal above came before any I/O rather than before the stub.
+      assert {:ok, cli} = Rebus.connect(addr, name: name, owner: self(), __impl__: impl)
+      assert_receive :socket_opened, 1_000
+      await_hello(svr)
+      assert :ok = Rebus.close(cli)
     end
   end
 
@@ -3226,6 +3369,43 @@ defmodule RebusTest do
 
       assert_receive {:cookie_unavailable, %{path: "/tmp/one"}}
       refute_receive {:cookie_unavailable, %{path: "/tmp/two"}}
+
+      # An owner the caller named badly, or one that is already dead, is a
+      # property of the request rather than of the entry that reported it, so
+      # the remaining entries are not tried either.
+      invalid_owner_connector = fn address, _args ->
+        send(parent, {:invalid_owner, address})
+        {:error, :invalid_owner}
+      end
+
+      assert {:error, :invalid_owner} =
+               connect_candidates(
+                 [{:local, "/tmp/one", nil}, {:local, "/tmp/two", nil}],
+                 [timeout: 50],
+                 connector: TestImpl.connector(connect_candidate: invalid_owner_connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end),
+                 clock: TestImpl.clock(monotonic_time: monotonic_time)
+               )
+
+      assert_receive {:invalid_owner, %{path: "/tmp/one"}}
+      refute_receive {:invalid_owner, %{path: "/tmp/two"}}
+
+      owner_down_connector = fn address, _args ->
+        send(parent, {:owner_down, address})
+        {:error, :owner_down}
+      end
+
+      assert {:error, :owner_down} =
+               connect_candidates(
+                 [{:local, "/tmp/one", nil}, {:local, "/tmp/two", nil}],
+                 [timeout: 50],
+                 connector: TestImpl.connector(connect_candidate: owner_down_connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end),
+                 clock: TestImpl.clock(monotonic_time: monotonic_time)
+               )
+
+      assert_receive {:owner_down, %{path: "/tmp/one"}}
+      refute_receive {:owner_down, %{path: "/tmp/two"}}
     end
   end
 
@@ -4775,6 +4955,27 @@ defmodule RebusTest do
       Process.sleep(10)
       wait_until(predicate, attempts - 1)
     end
+  end
+
+  # An owner the test drives itself: it exits normally on `:stop`, abnormally
+  # on an exit signal, and never outlives the test that started it.
+  defp start_owner do
+    owner =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    on_exit(fn -> Process.exit(owner, :kill) end)
+    owner
+  end
+
+  defp dead_process do
+    pid = spawn(fn -> :ok end)
+    ref = Process.monitor(pid)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1_000
+    pid
   end
 
   defp test_signal(body) do

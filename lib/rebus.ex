@@ -188,7 +188,8 @@ defmodule Rebus do
 
   The call blocks until the connection is usable: authenticated and, on a
   message bus, holding its unique name. The returned PID is supervised and
-  outlives the process that connected it, so release it with `close/1`.
+  outlives the process that connected it, so release it with `close/1`, or
+  bind it to a process with `:owner`.
 
   ## Addresses
 
@@ -217,12 +218,20 @@ defmodule Rebus do
   | `:name` | `nil` | Atom to register the connection process under, for local discovery only. |
   | `:allow_anonymous` | `false` | Allow the `ANONYMOUS` mechanism, which authenticates nothing and also requires `bus: false`. |
   | `:bus` | `true` | Pass `false` for a peer-to-peer endpoint, which sends no `Hello` and has no unique name. |
+  | `:owner` | `nil` | A local PID whose exit stops the connection. `nil` leaves the connection alive until `close/1`. |
 
   ## Notes
 
   - A PID found by name before its `connect/2` returns is still being
     established. Operations sent to it may time out, and are safe to retry
     once `connect/2` succeeds.
+  - An `:owner` is monitored, not linked, and need not be the process calling
+    `connect/2`. The connection stops with `{:shutdown, :owner_down}` when the
+    owner exits for any reason, including `:normal`. The stop is an ordinary
+    one, so the connection's socket and any retained descriptors are closed
+    and the bus releases the state that connection held. Inflight callers
+    receive `{:error, :disconnected}`. Only a PID on the local node is
+    accepted; a remote PID is `:invalid_owner`.
   - A write timeout that accepted no bytes fails only that caller. After a
     partial frame the connection terminates and inflight callers receive
     `{:error, :disconnected}`.
@@ -237,7 +246,8 @@ defmodule Rebus do
 
   - Invalid option: `:invalid_timeout`, `:invalid_read_timeout`,
     `:invalid_write_timeout`, `:invalid_allow_anonymous`,
-    `:invalid_bus_option`, `:invalid_name`.
+    `:invalid_bus_option`, `:invalid_owner`, `:invalid_name`.
+  - Owner that exited before the connection was established: `:owner_down`.
   - Unusable address: `{:invalid_bus_address, reason}`,
     `:unsupported_bus_transport`, `{:tcp_resolution_failed, reason}`,
     `:no_system_bus_address`, `:no_session_bus_address`.
@@ -263,6 +273,9 @@ defmodule Rebus do
       # Release a named connection when its lifecycle is complete
       {:ok, conn} = Rebus.connect(address, name: :local_bus)
       :ok = Rebus.close(conn)
+
+      # Let the connection end with the process whose bus-side state it holds
+      {:ok, conn} = Rebus.connect(address, owner: self())
   """
   @spec connect(address(), keyword()) :: {:ok, pid()} | {:error, term()}
   def connect(address, opts \\ [])
@@ -350,9 +363,15 @@ defmodule Rebus do
   @doc """
   Stops a local connection process created by `connect/2`.
 
-  Connections are supervised and remain alive after the connecting process exits.
-  Use this function to release a named or otherwise no-longer-needed connection.
-  It accepts only local connection PIDs; remote PIDs are not supported.
+  Connections are supervised and, unless `connect/2` was given an `:owner`,
+  remain alive after the connecting process exits. Use this function to release
+  a named or otherwise no-longer-needed connection. It accepts only local
+  connection PIDs; remote PIDs are not supported.
+
+  An owned connection is stopped the same way. Once an owner's exit has stopped
+  its connection there is nothing left to close, and this function answers
+  `{:error, :not_found}` as it does for any other PID that is no longer a
+  connection.
 
   ## Return values
 

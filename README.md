@@ -89,7 +89,13 @@ address list may hold.
 
 Pass `bus: false` to talk to an endpoint that is not a message bus. Rebus then
 sends no `Hello`, the connection has no unique name, and `Rebus.add_match/3`
-returns `{:error, :not_a_bus}`. See `Rebus.connect/2` for the full address,
+returns `{:error, :not_a_bus}`.
+
+A connection outlives the process that created it and lives until
+`Rebus.close/1`. Pass `owner: pid` when the state it holds on the bus — a
+published service, a requested name, an inhibitor — belongs to one process
+instead: Rebus monitors that process and stops the connection when it exits,
+so the bus reclaims that state. See `Rebus.connect/2` for the full address,
 option, error and timeout contract.
 
 ## Signals

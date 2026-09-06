@@ -82,6 +82,60 @@ defmodule Rebus.Connection.SetupTest do
       assert ScriptedTransport.sent(sock) == <<>>
     end
 
+    test "stops without touching the socket when the owner is already gone" do
+      owner = dead_process()
+
+      {sock, state} =
+        connection(["OK #{@guid}\r\n"], owner: owner, owner_monitor: Process.monitor(owner))
+
+      assert {:shutdown, :owner_down, %Connection{}} = Setup.setup(state, @addr)
+      assert ScriptedTransport.sent(sock) == <<>>
+    end
+
+    test "reports a dead caller rather than a dead owner" do
+      gone = dead_process()
+
+      {_sock, state} =
+        connection(["OK #{@guid}\r\n"],
+          connect_waiter: {gone, make_ref()},
+          connect_waiter_monitor: Process.monitor(gone),
+          owner: gone,
+          owner_monitor: Process.monitor(gone)
+        )
+
+      assert {:shutdown, :caller_gone, %Connection{}} = Setup.setup(state, @addr)
+    end
+
+    test "refuses to establish a connection whose owner died during setup" do
+      owner = dead_process()
+      waiter_ref = make_ref()
+
+      {_sock, state} =
+        connection([],
+          bus?: false,
+          connect_waiter: {self(), waiter_ref},
+          connect_waiter_monitor: Process.monitor(self()),
+          owner: owner,
+          owner_monitor: Process.monitor(owner)
+        )
+
+      # The waiter is never acknowledged, so its connect/2 answers with the
+      # connection's own shutdown reason instead of a PID that stops at once.
+      assert {:shutdown, :owner_down, %Connection{}} = Setup.established(state)
+      refute_received {^waiter_ref, :accepted}
+    end
+
+    test "refuses to establish an unwaited connection whose owner died" do
+      owner = dead_process()
+
+      {_sock, state} =
+        connection([], bus?: false, owner: owner, owner_monitor: Process.monitor(owner))
+
+      # Nothing is waiting on this connection, so the dead owner ends it here
+      # rather than on the next pass through the receive loop.
+      assert {:shutdown, :owner_down, %Connection{}} = Setup.established(state)
+    end
+
     test "waits for the caller's acknowledgement before continuing" do
       waiter_ref = make_ref()
 

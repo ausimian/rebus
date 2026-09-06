@@ -35,7 +35,8 @@ defmodule Rebus.Connection do
     :precomputed_auth_id,
     :allow_anonymous?,
     :bus?,
-    :connect_waiter
+    :connect_waiter,
+    :owner
   ]
 
   # The peer-supplied reasons a connection reports verbatim. Each list is
@@ -208,6 +209,11 @@ defmodule Rebus.Connection do
     field :connect_waiter, {pid(), reference()} | nil, default: nil
     field :connect_waiter_monitor, reference() | nil, default: nil
     field :connect_accepted?, boolean(), default: false
+    # The process this connection's lifetime is bound to, and the monitor that
+    # reports its exit. Unlike the connect waiter, whose monitor is released
+    # once setup is accepted, this one lives as long as the connection does.
+    field :owner, pid() | nil, default: nil
+    field :owner_monitor, reference() | nil, default: nil
     field :partial_frame_timer, {reference(), reference()} | nil, default: nil
     field :unix_fd_transport?, boolean(), default: false
     field :unix_fd_negotiated?, boolean(), default: false
@@ -264,6 +270,7 @@ defmodule Rebus.Connection do
       bus?: Keyword.get(opts, :bus, true),
       name: Keyword.get(opts, :name),
       connect_waiter: Map.get(internal, :connect_waiter),
+      owner: Keyword.get(opts, :owner),
       impl: Map.get_lazy(internal, :impl, &Rebus.Impl.default/0)
     }
   end
@@ -279,7 +286,8 @@ defmodule Rebus.Connection do
          :ok <- validate_expected_guid(settings.expected_guid),
          :ok <- validate_precomputed_auth_id(settings.precomputed_auth_id),
          :ok <- validate_flag(:invalid_allow_anonymous, settings.allow_anonymous?),
-         :ok <- validate_flag(:invalid_bus_option, settings.bus?) do
+         :ok <- validate_flag(:invalid_bus_option, settings.bus?),
+         :ok <- validate_owner(settings.owner) do
       validate_registered_name(settings.name)
     end
   end
@@ -298,6 +306,15 @@ defmodule Rebus.Connection do
 
   defp validate_flag(_reason, value) when is_boolean(value), do: :ok
   defp validate_flag(reason, _value), do: {:stop, reason}
+
+  # An owner is monitored, and a monitor on a remote process reports node
+  # failures as well as process exits. Binding a connection's life to that is
+  # a different contract from the local one this option promises, so a remote
+  # PID is refused rather than silently accepted. The remote clause is
+  # unexercised by the suite, which runs on a single, undistributed node.
+  defp validate_owner(nil), do: :ok
+  defp validate_owner(owner) when is_pid(owner) and node(owner) == node(), do: :ok
+  defp validate_owner(_owner), do: {:stop, :invalid_owner}
 
   defp validate_registered_name(name) when is_nil(name) or is_atom(name), do: :ok
   defp validate_registered_name(_name), do: {:stop, :invalid_name}
@@ -323,6 +340,7 @@ defmodule Rebus.Connection do
             %__MODULE__{
               sock: sock,
               connect_waiter_monitor: Setup.monitor_connect_waiter(settings.connect_waiter),
+              owner_monitor: monitor_owner(settings.owner),
               unix_fd_transport?: Setup.unix_fd_transport_supported?(family)
             },
             Map.take(settings, @setting_fields)
@@ -334,6 +352,13 @@ defmodule Rebus.Connection do
         {:stop, normalize_socket_error(reason)}
     end
   end
+
+  # A monitor rather than a link: a connection that dies must not take its
+  # owner with it, and in-flight callers already learn of that death through
+  # `{:error, :disconnected}`. An owner that is already dead answers with an
+  # immediate `:DOWN`, which setup reads before it touches the socket.
+  defp monitor_owner(nil), do: nil
+  defp monitor_owner(owner) when is_pid(owner), do: Process.monitor(owner)
 
   @impl true
   def terminate(
@@ -370,6 +395,19 @@ defmodule Rebus.Connection do
         %__MODULE__{connect_waiter_monitor: ref} = state
       ) do
     {:stop, {:shutdown, :caller_gone}, state}
+  end
+
+  # An owned connection follows its owner out. The stop is ordinary, so
+  # terminate/2 runs and closes the socket and every retained descriptor.
+  # Whether the peer then reads a FIN or a reset is the kernel's decision, and
+  # depends on bytes this side may not have read yet. This clause precedes the
+  # general monitor handling below: the owner's reference indexes no request
+  # of its own.
+  def handle_info(
+        {:DOWN, ref, :process, _pid, _reason},
+        %__MODULE__{owner_monitor: ref} = state
+      ) do
+    {:stop, {:shutdown, :owner_down}, state}
   end
 
   # Replies this connection originates are queued from the inbound path, which
