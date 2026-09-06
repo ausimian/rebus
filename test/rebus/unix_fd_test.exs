@@ -4,6 +4,7 @@ defmodule Rebus.UnixFDTest do
   alias Rebus.Connection.FDClaims
   alias Rebus.Connection.Inbound
   alias Rebus.{Message, TestImpl, TestServer, UnixFD}
+  alias Rebus.UnixFD.Raw
 
   @connection_name :rebus_unix_fd_test_connection
 
@@ -70,6 +71,74 @@ defmodule Rebus.UnixFDTest do
     assert {:error, :invalid_descriptor} = UnixFD.close(:not_a_descriptor)
     assert {:error, :ebadf} = UnixFD.close(1_000_000)
     assert :ok = UnixFD.close_all([1_000_000, -1])
+    assert {:error, :ebadf} = Raw.close(1_000_000)
+  end
+
+  test "the private OTP close primitive is still exported" do
+    Code.ensure_loaded(:prim_file)
+
+    assert function_exported?(:prim_file, :file_desc_to_ref, 2),
+           "Rebus.UnixFD.Raw closes owned descriptors with the private OTP function " <>
+             ":prim_file.file_desc_to_ref/2, and this OTP release no longer exports it. " <>
+             "The migration plan in lib/rebus/unix_fd/raw.ex now applies."
+  end
+
+  test "closes a received socket descriptor without disturbing the original", %{
+    server: server,
+    connection: connection
+  } do
+    {:ok, sock} = :socket.open(:local, :stream)
+    on_exit(fn -> _ = :socket.close(sock) end)
+    {:ok, fd} = :socket.getopt(sock, {:otp, :fd})
+
+    method =
+      Message.new!(:method_call,
+        path: "/test",
+        interface: "test.interface",
+        member: "ReceiveSocketFD"
+      )
+
+    task = Task.async(fn -> Rebus.call(connection, method, 1_000) end)
+
+    assert_receive {^server,
+                    %Message{serial: serial, header_fields: %{member: "ReceiveSocketFD"}}},
+                   1_000
+
+    reply =
+      Message.new!(:method_return,
+        reply_serial: serial,
+        signature: "hh",
+        body: [0, 1],
+        fds: [fd, fd]
+      )
+
+    :ok = TestServer.push_with_fds(server, reply, [fd, fd])
+
+    assert {:ok, %Message{type: :method_return, unix_fds: [first, second]}} =
+             Task.await(task, 1_000)
+
+    # SCM_RIGHTS hands the receiver an independent duplicate per right, so
+    # closing them leaves this process's own socket open.
+    assert first != fd
+    assert second != fd
+    assert first != second
+    assert :ok = UnixFD.close(first)
+    assert :ok = Raw.close(second)
+
+    # Read-only: /dev/fd is /proc/self/fd on Linux and the fdesc filesystem on
+    # macOS, and exists?/1 is a stat, not an open, so this cannot adopt or
+    # disturb a reused number.  Pins that Raw.close/1 closed the number it was
+    # given rather than a duplicate.  It sits directly after the closes, before
+    # any other syscall in this test frees a number, because it holds only
+    # while nothing in the VM has reused either number; the module is
+    # async: false for that reason.
+    refute File.exists?("/dev/fd/#{first}")
+    refute File.exists?("/dev/fd/#{second}")
+
+    assert {:ok, %{family: :local}} = :socket.sockname(sock)
+    # Part of the survival check, not cleanup: a socket whose descriptor was
+    # closed out from under it fails this close with :ebadf.
+    assert :ok = :socket.close(sock)
   end
 
   test "sends one descriptor for reused h indexes", %{server: server, connection: connection} do

@@ -49,6 +49,9 @@ Close each descriptor exactly once with `Rebus.UnixFD.close/1`, or adopt it
 with an OS or OTP API of your own. Never close one twice. Operating systems
 reuse descriptor numbers, so a second close can close an unrelated resource.
 
+`Rebus.UnixFD.close/1` returns `:ok` on success and `{:error, reason}` when the
+operating system refuses the close, so check the result where that matters.
+
 ```elixir
 {:ok, %Rebus.Message{unix_fds: fds} = reply} = Rebus.call(conn, message)
 
