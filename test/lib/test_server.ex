@@ -126,14 +126,18 @@ defmodule Rebus.TestServer do
   def handle_continue(:accept, %__MODULE__{cli_sock: nil} = state) do
     case :socket.accept(state.svr_sock, :nowait) do
       {:ok, cli} ->
-        {:ok, "\0AUTH " <> _} = :socket.recv(cli)
-
-        if state.notify_auth, do: send(state.tap, {self(), :auth_received})
-
-        authenticate(cli, state)
+        await_auth(cli, state)
 
       {:select, {:select_info, :accept, handle}} ->
         {:noreply, %{state | handle: handle}}
+
+      # No client was ever established here, so there is nothing to report to
+      # the tap; a peer that connected and reset before the accept completed
+      # just means waiting for the next one. `:closed` is deliberately not in
+      # this list: at accept it says the listening socket itself is gone, and
+      # retrying that would spin without ever reaching the mailbox.
+      {:error, reason} when reason in [:econnaborted, :econnreset] ->
+        {:noreply, state, {:continue, :accept}}
 
       {:error, reason} ->
         {:stop, reason, state}
@@ -164,14 +168,25 @@ defmodule Rebus.TestServer do
       {:select, {:select_info, :recvmsg, handle}} ->
         {:noreply, %{state | handle: handle}}
 
-      # A peer that closes while frames it never read are still queued draws a
-      # reset instead of a clean FIN. Either way the client is simply gone, so
-      # stop normally rather than logging a crash report for it.
-      {:error, reason} when reason in [:closed, :econnreset] ->
-        {:stop, :normal, state}
+      # Past BEGIN, so there is nothing left to do but end the session; see
+      # `peer_gone?/1` for what a gone peer means here.
+      {:error, reason} ->
+        session_error(reason, state)
+    end
+  end
+
+  defp await_auth(cli, %__MODULE__{} = state) do
+    case :socket.recv(cli) do
+      {:ok, "\0AUTH " <> _} ->
+        if state.notify_auth, do: send(state.tap, {self(), :auth_received})
+
+        authenticate(cli, state)
+
+      {:ok, other} ->
+        {:stop, {:unexpected_auth, other}, state}
 
       {:error, reason} ->
-        {:stop, reason, state}
+        handshake_error(cli, reason, state)
     end
   end
 
@@ -182,17 +197,26 @@ defmodule Rebus.TestServer do
 
   defp authenticate(cli, %__MODULE__{partial_auth: partial_auth} = state)
        when is_binary(partial_auth) do
-    :ok = :socket.send(cli, partial_auth)
-    send(state.tap, {self(), :auth_received})
-    {:noreply, %{state | cli_sock: cli}}
+    case :socket.send(cli, partial_auth) do
+      :ok ->
+        send(state.tap, {self(), :auth_received})
+        {:noreply, %{state | cli_sock: cli}}
+
+      {:error, reason} ->
+        handshake_error(cli, reason, state)
+    end
   end
 
   defp authenticate(cli, %__MODULE__{} = state) do
-    send_auth_response(cli, state)
+    case send_auth_response(cli, state) do
+      :ok ->
+        case state.auth_response do
+          <<"OK ", _::binary>> -> await_begin(cli, state)
+          _ -> observe_client_close(cli, state)
+        end
 
-    case state.auth_response do
-      <<"OK ", _::binary>> -> await_begin(cli, state)
-      _ -> observe_client_close(cli, state)
+      {:error, reason} ->
+        handshake_error(cli, reason, state)
     end
   end
 
@@ -201,9 +225,12 @@ defmodule Rebus.TestServer do
       {:ok, "BEGIN \r\n"} ->
         begin_session(cli, state)
 
-      {:error, :closed} ->
-        send(state.tap, {self(), :client_closed})
-        {:noreply, %{state | cli_sock: nil}, {:continue, :accept}}
+      {:error, reason} ->
+        # A gone peer is not a failure of the handshake, it is the end of it.
+        # Anything else is still worth observing on the way out.
+        if peer_gone?(reason),
+          do: handshake_error(cli, reason, state),
+          else: observe_client_close(cli, state)
 
       _ ->
         observe_client_close(cli, state)
@@ -211,7 +238,7 @@ defmodule Rebus.TestServer do
   end
 
   defp begin_session(cli, %__MODULE__{close_after_begin: true} = state) do
-    :ok = :socket.close(cli)
+    _ = :socket.close(cli)
     {:noreply, %{state | cli_sock: nil}, {:continue, :accept}}
   end
 
@@ -240,19 +267,29 @@ defmodule Rebus.TestServer do
   end
 
   def handle_call({:push_call, %Message{} = msg}, _from, %__MODULE__{} = state) do
-    {:reply, {:ok, state.serial}, send_message(msg, state)}
+    # The reply carries the serial the frame was stamped with, not the next one.
+    reply = {:ok, state.serial}
+
+    case send_message(msg, state) do
+      {:ok, state} -> {:reply, reply, state}
+      {:error, reason} -> session_error_reply(reason, reply, state)
+    end
   end
 
   def handle_call({:push_call_with_fds, %Message{} = msg, fds}, _from, %__MODULE__{} = state) do
-    {:reply, {:ok, state.serial}, send_message_with_fds(msg, fds, state)}
+    reply = {:ok, state.serial}
+
+    case send_message_with_fds(msg, fds, state) do
+      {:ok, state} -> {:reply, reply, state}
+      {:error, reason} -> session_error_reply(reason, reply, state)
+    end
   end
 
   def handle_call({:push_raw_fragments, data}, _from, %__MODULE__{} = state) do
-    for <<byte <- data>> do
-      :ok = :socket.send(state.cli_sock, <<byte>>)
+    case send_fragments(state.cli_sock, for(<<byte <- data>>, do: <<byte>>), 0) do
+      :ok -> {:reply, :ok, state}
+      {:error, reason} -> session_error_reply(reason, :ok, state)
     end
-
-    {:reply, :ok, state}
   end
 
   def handle_call(
@@ -260,31 +297,32 @@ defmodule Rebus.TestServer do
         _from,
         %__MODULE__{} = state
       ) do
-    fragments
-    |> Enum.with_index()
-    |> Enum.each(fn {fragment, index} ->
-      :ok = :socket.send(state.cli_sock, fragment)
-
-      if index < length(fragments) - 1 and delay > 0 do
-        Process.sleep(delay)
-      end
-    end)
-
-    {:reply, :ok, state}
+    case send_fragments(state.cli_sock, fragments, delay) do
+      :ok -> {:reply, :ok, state}
+      {:error, reason} -> session_error_reply(reason, :ok, state)
+    end
   end
 
   @impl true
   def handle_cast({:push, %Message{} = msg}, %__MODULE__{} = state) do
-    {:noreply, send_message(msg, state)}
+    case send_message(msg, state) do
+      {:ok, state} -> {:noreply, state}
+      {:error, reason} -> session_error(reason, state)
+    end
   end
 
   def handle_cast({:push_raw, data}, %__MODULE__{} = state) do
-    :ok = :socket.send(state.cli_sock, data)
-    {:noreply, state}
+    case :socket.send(state.cli_sock, data) do
+      :ok -> {:noreply, state}
+      {:error, reason} -> session_error(reason, state)
+    end
   end
 
   def handle_cast({:push_with_fds, %Message{} = msg, fds}, %__MODULE__{} = state) do
-    {:noreply, send_message_with_fds(msg, fds, state)}
+    case send_message_with_fds(msg, fds, state) do
+      {:ok, state} -> {:noreply, state}
+      {:error, reason} -> session_error(reason, state)
+    end
   end
 
   @impl true
@@ -302,15 +340,18 @@ defmodule Rebus.TestServer do
 
   defp send_message(%Message{} = msg, %__MODULE__{} = state) do
     {:ok, bin} = Message.encode(%{msg | serial: state.serial})
-    :ok = :socket.send(state.cli_sock, bin)
-    %{state | serial: state.serial + 1}
+
+    case :socket.send(state.cli_sock, bin) do
+      :ok -> {:ok, %{state | serial: state.serial + 1}}
+      {:error, _reason} = error -> error
+    end
   end
 
   defp send_message_with_fds(%Message{} = msg, fds, %__MODULE__{} = state) do
     {:ok, bin} = Message.encode(%{msg | serial: state.serial})
     rights = for fd <- fds, into: <<>>, do: <<fd::native-signed-32>>
 
-    :ok =
+    result =
       :socket.sendmsg(
         state.cli_sock,
         %{
@@ -321,7 +362,10 @@ defmodule Rebus.TestServer do
         1_000
       )
 
-    %{state | serial: state.serial + 1}
+    case result do
+      :ok -> {:ok, %{state | serial: state.serial + 1}}
+      {:error, _reason} = error -> error
+    end
   end
 
   defp loopback_address(:inet), do: :loopback
@@ -330,8 +374,11 @@ defmodule Rebus.TestServer do
   defp observe_client_close(cli, %__MODULE__{} = state) do
     outcome =
       case :socket.recv(cli, 0, [], 1_000) do
-        {:error, :closed} -> :client_closed
-        result -> {:client_close_outcome, result}
+        {:error, reason} = result ->
+          if peer_gone?(reason), do: :client_closed, else: {:client_close_outcome, result}
+
+        result ->
+          {:client_close_outcome, result}
       end
 
     _ = :socket.close(cli)
@@ -342,22 +389,39 @@ defmodule Rebus.TestServer do
   defp send_auth_response(cli, %__MODULE__{} = state) do
     fragments = state.auth_response_fragments || [state.auth_response]
 
+    send_fragments(cli, fragments, state.auth_fragment_delay)
+  end
+
+  # Writes each fragment in turn, stopping at the first failure so that a
+  # vanished peer surfaces as `{:error, reason}` for the caller to act on.
+  defp send_fragments(sock, fragments, delay) do
+    last = length(fragments) - 1
+
     fragments
     |> Enum.with_index()
-    |> Enum.each(fn {fragment, index} ->
-      :ok = :socket.send(cli, fragment)
-
-      if index < length(fragments) - 1 and state.auth_fragment_delay > 0 do
-        Process.sleep(state.auth_fragment_delay)
-      end
+    |> Enum.reduce_while(:ok, fn {fragment, index}, :ok ->
+      send_fragment(sock, fragment, if(index < last, do: delay, else: 0))
     end)
+  end
+
+  defp send_fragment(sock, fragment, delay) do
+    case :socket.send(sock, fragment) do
+      :ok ->
+        if delay > 0, do: Process.sleep(delay)
+        {:cont, :ok}
+
+      {:error, _reason} = error ->
+        {:halt, error}
+    end
   end
 
   defp receive_begin(cli, %__MODULE__{family: :local, unix_fd_response: response}) do
     case :socket.recv(cli, 0) do
       {:ok, "NEGOTIATE_UNIX_FD\r\n"} ->
-        :ok = :socket.send(cli, response)
-        :socket.recv(cli, 8)
+        case :socket.send(cli, response) do
+          :ok -> :socket.recv(cli, 8)
+          {:error, _reason} = error -> error
+        end
 
       result ->
         result
@@ -371,8 +435,7 @@ defmodule Rebus.TestServer do
       {:ok, %Message{} = msg, rest} ->
         case Message.attach_unix_fds(msg, state.received_fds) do
           {:ok, msg} ->
-            send(state.tap, {self(), msg})
-            parse(rest, maybe_reply_hello(msg, %{state | received_fds: []}))
+            deliver_frame(msg, rest, %{state | received_fds: []})
 
           {:error, _reason} ->
             Enum.each(state.received_fds, &Rebus.UnixFD.close/1)
@@ -385,6 +448,21 @@ defmodule Rebus.TestServer do
 
       {:error, _reason} ->
         {:stop, :parse_error, state}
+    end
+  end
+
+  # The reply goes out before the tap is notified: `await_hello/1` returning
+  # has to imply the reply is already on the wire, or a test that closes on it
+  # races the send. The tap is told either way, even when that send failed: a
+  # test blocked in `await_hello/1` must not hang because the peer vanished, so
+  # it gets the frame and the server then stops normally underneath it.
+  defp deliver_frame(%Message{} = msg, rest, %__MODULE__{} = state) do
+    result = maybe_reply_hello(msg, state)
+    send(state.tap, {self(), msg})
+
+    case result do
+      {:ok, state} -> parse(rest, state)
+      {:error, reason} -> session_error(reason, state)
     end
   end
 
@@ -401,30 +479,90 @@ defmodule Rebus.TestServer do
       )
 
     {:ok, encoded} = Message.encode(reply)
-    :ok = :socket.send(cli, encoded)
 
-    if state.auto_hello_name_acquired? do
-      signal =
-        Message.new!(:signal,
-          sender: "org.freedesktop.DBus",
-          path: "/org/freedesktop/DBus",
-          interface: "org.freedesktop.DBus",
-          member: "NameAcquired",
-          destination: ":1.100",
-          serial: state.serial + 1,
-          signature: "s",
-          body: [":1.100"]
-        )
-
-      {:ok, encoded} = Message.encode(signal)
-      :ok = :socket.send(cli, encoded)
-      %{state | serial: state.serial + 2}
-    else
-      %{state | serial: state.serial + 1}
+    case :socket.send(cli, encoded) do
+      :ok -> maybe_send_name_acquired(cli, state)
+      {:error, _reason} = error -> error
     end
   end
 
-  defp maybe_reply_hello(_msg, state), do: state
+  defp maybe_reply_hello(_msg, state), do: {:ok, state}
+
+  defp maybe_send_name_acquired(cli, %__MODULE__{auto_hello_name_acquired?: true} = state) do
+    signal =
+      Message.new!(:signal,
+        sender: "org.freedesktop.DBus",
+        path: "/org/freedesktop/DBus",
+        interface: "org.freedesktop.DBus",
+        member: "NameAcquired",
+        destination: ":1.100",
+        serial: state.serial + 1,
+        signature: "s",
+        body: [":1.100"]
+      )
+
+    {:ok, encoded} = Message.encode(signal)
+
+    case :socket.send(cli, encoded) do
+      :ok -> {:ok, %{state | serial: state.serial + 2}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp maybe_send_name_acquired(_cli, %__MODULE__{} = state) do
+    {:ok, %{state | serial: state.serial + 1}}
+  end
+
+  # The single meaning of a vanished peer in this module, once a client exists.
+  # `:closed` (a clean FIN), `:econnreset` (a peer that closed while frames it
+  # never read were still queued) and `:epipe` (a write to a connection the
+  # peer has already torn down) all say the same thing: the client is simply
+  # gone. Nothing here can tell them apart - which of the three arrives is an
+  # artefact of timing - so every socket call on a client treats them alike.
+  # Before BEGIN that means reporting `:client_closed` to the tap and going
+  # back to accepting; after BEGIN it means stopping normally rather than
+  # logging a crash report for it. The accept call has its own, narrower rule
+  # above: no client exists yet, and `:closed` there means the listener.
+  #
+  # On a stream socket the reason can also arrive wrapped as `{reason, rest}`,
+  # carrying the tail that was left unsent or unread when a partially completed
+  # operation was interrupted: a binary for `send` and `recv`, an iovec for
+  # `sendmsg`. That is the common shape for a peer that vanishes mid-write, and
+  # the wrapper says nothing about the peer beyond what the reason inside it
+  # already says, so it is unwrapped and judged the same.
+  defp peer_gone?({reason, rest}) when is_binary(rest) or is_list(rest),
+    do: peer_gone?(reason)
+
+  defp peer_gone?(reason), do: reason in [:closed, :econnreset, :epipe]
+
+  # A socket error during the handshake: a gone peer never became a session, so
+  # tell the tap and wait for the next one. Any other error is real and stops
+  # the server with its own reason.
+  defp handshake_error(cli, reason, %__MODULE__{} = state) do
+    _ = :socket.close(cli)
+
+    if peer_gone?(reason) do
+      send(state.tap, {self(), :client_closed})
+      {:noreply, %{state | cli_sock: nil, handle: nil, prev: <<>>}, {:continue, :accept}}
+    else
+      {:stop, reason, state}
+    end
+  end
+
+  # A socket error once the session is running: the connection is all this
+  # server is doing, so a gone peer ends it normally.
+  defp session_error(reason, %__MODULE__{} = state) do
+    if peer_gone?(reason), do: {:stop, :normal, state}, else: {:stop, reason, state}
+  end
+
+  # As `session_error/2`, for a `handle_call` that must still answer its caller:
+  # it replies on the way out so the caller gets its answer rather than exiting
+  # with the server.
+  defp session_error_reply(reason, reply, %__MODULE__{} = state) do
+    if peer_gone?(reason),
+      do: {:stop, :normal, reply, state},
+      else: {:stop, reason, reply, state}
+  end
 
   defp iodata_to_binary(iodata) do
     {:ok, IO.iodata_to_binary(iodata)}
