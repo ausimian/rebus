@@ -57,7 +57,19 @@ defmodule Rebus.MatchSubscription do
       subscriptions
     )
 
-    true = :ets.insert(@state_table, {{:meta, conn}, %{uncertain?: uncertain?}})
+    meta = {{:meta, conn}, %{uncertain?: uncertain?}}
+
+    # The first write for a connection asks the table owner to monitor it, so
+    # its rows are reaped even if no worker is alive to see the connection go.
+    # The cast keeps the owner off this write path. Nothing may write the meta
+    # row after the cast: the connection may already be dead, in which case the
+    # owner reaps the row it can see and a later write would strand a new one.
+    if :ets.insert_new(@state_table, meta) do
+      GenServer.cast(Store, {:watch, conn})
+    else
+      true = :ets.insert(@state_table, meta)
+    end
+
     :ok
   end
 
