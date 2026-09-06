@@ -8,12 +8,10 @@ defmodule Rebus.MatchSubscription.Worker do
   alias Rebus.MatchRule
   alias Rebus.MatchRule.Overlap
   alias Rebus.MatchSubscription
-  alias Rebus.Message
+  alias Rebus.MatchSubscription.Operation
   alias Rebus.SafeCall
-  alias Rebus.UnixFD
 
   @cleanup_timeout 1_000
-  @match_rule_not_found "org.freedesktop.DBus.Error.MatchRuleNotFound"
   @max_queued_requests 64
   @max_initial_cleanups 16
   @recovery_delays [50, 100, 200, 400, 800, 1_000]
@@ -35,7 +33,7 @@ defmodule Rebus.MatchSubscription.Worker do
 
   @spec call(pid(), term(), integer(), non_neg_integer()) :: term()
   def call(worker, request, deadline, overhead) do
-    case remaining_timeout(deadline) do
+    case Operation.remaining_timeout(deadline) do
       {:ok, timeout} when timeout > 0 ->
         SafeCall.call(worker, request, timeout + overhead)
 
@@ -154,7 +152,7 @@ defmodule Rebus.MatchSubscription.Worker do
   defp ensure_bus(%{bus?: false} = state, _deadline), do: {:error, :not_a_bus, state}
 
   defp ensure_bus(state, deadline) do
-    case remaining_timeout(deadline) do
+    case Operation.remaining_timeout(deadline) do
       {:ok, timeout} ->
         case Connection.bus?(state.conn, timeout) do
           true -> {:ok, %{state | bus?: true}}
@@ -355,8 +353,8 @@ defmodule Rebus.MatchSubscription.Worker do
 
     fun =
       case type do
-        :add_new -> fn -> add_new_operation(conn, owner, rule, deadline) end
-        :add_existing -> fn -> add_existing_operation(conn, owner, rule, deadline) end
+        :add_new -> fn -> Operation.add_new(conn, owner, rule, deadline) end
+        :add_existing -> fn -> Operation.add_existing(conn, owner, rule, deadline) end
       end
 
     start_operation(state, key, type, request_id, fun)
@@ -372,7 +370,7 @@ defmodule Rebus.MatchSubscription.Worker do
     deadline = request.deadline
 
     start_operation(state, key, :remove, request_id, fn ->
-      remove_operation(
+      Operation.remove(
         conn,
         canonical_rule,
         ref,
@@ -407,7 +405,7 @@ defmodule Rebus.MatchSubscription.Worker do
           end
 
         start_operation(state, key, operation_type, nil, fn ->
-          recover_operation(conn, recovery, deadline)
+          Operation.recover(conn, recovery, deadline)
         end)
 
       _ ->
@@ -532,7 +530,7 @@ defmodule Rebus.MatchSubscription.Worker do
 
   defp complete_add_new(state, key, request_id, {:add_failed, error, handler_ref}) do
     state = reply_request_if_live(state, request_id, error)
-    remote_may_exist? = not definitive_bus_error?(error)
+    remote_may_exist? = not Operation.definitive_bus_error?(error)
 
     state =
       state
@@ -949,166 +947,6 @@ defmodule Rebus.MatchSubscription.Worker do
     %{state | reset_task_monitor: nil, reset_token: nil}
   end
 
-  defp add_new_operation(conn, owner, rule, deadline) do
-    with {:ok, timeout} <- remaining_timeout(deadline),
-         {:ok, handler_ref} <- install_local_handler(conn, owner, rule, timeout) do
-      case invoke_bus_method(conn, "AddMatch", rule, deadline) do
-        :ok -> {:added, handler_ref}
-        {:error, _reason} = error -> {:add_failed, error, handler_ref}
-      end
-    else
-      {:error, _reason} = error -> {:add_failed, error, nil}
-    end
-  end
-
-  defp add_existing_operation(conn, owner, rule, deadline) do
-    with {:ok, timeout} <- remaining_timeout(deadline),
-         {:ok, handler_ref} <- install_local_handler(conn, owner, rule, timeout) do
-      {:added_existing, handler_ref}
-    else
-      {:error, _reason} = error -> {:add_existing_failed, error}
-    end
-  end
-
-  defp remove_operation(conn, rule, ref, handler, final?, deadline) do
-    case ensure_handler_removed(conn, ref, handler, deadline) do
-      :ok ->
-        remove_bus_rule(conn, rule, ref, final?, deadline)
-
-      {:error, _reason} = error ->
-        {:remove_failed, error, :active}
-    end
-  end
-
-  defp remove_bus_rule(_conn, _rule, ref, false, _deadline), do: {:removed, ref, :nonfinal}
-
-  defp remove_bus_rule(conn, rule, ref, true, deadline) do
-    case remove_match(conn, rule, deadline) do
-      :ok -> {:removed, ref, :final}
-      {:definitive, error} -> {:remove_definitive_error, ref, error}
-      {:ambiguous, error} -> {:remove_ambiguous, ref, error}
-    end
-  end
-
-  # Shared RemoveMatch classification: a rule the bus does not know is already
-  # gone, a bus error is definitive, and anything else leaves the server-side
-  # rule unresolved.
-  defp remove_match(conn, rule, deadline) do
-    case invoke_bus_method(conn, "RemoveMatch", rule, deadline) do
-      :ok ->
-        :ok
-
-      error ->
-        cond do
-          match_rule_not_found?(error) -> :ok
-          definitive_bus_error?(error) -> {:definitive, error}
-          true -> {:ambiguous, error}
-        end
-    end
-  end
-
-  defp recover_operation(conn, rule, deadline) do
-    case remove_pending_handlers(conn, rule.pending_handlers, deadline) do
-      :ok ->
-        recover_rule_state(conn, rule, deadline)
-
-      {:error, _reason} ->
-        {:retry, :handlers}
-    end
-  end
-
-  defp recover_rule_state(_conn, %{recovery_kind: :handlers}, _deadline), do: :handlers_cleared
-
-  defp recover_rule_state(conn, %{recovery_kind: :rule} = rule, deadline) do
-    case remove_remote_rule(conn, rule, deadline) do
-      :ok -> :cleared
-      {:definitive, error} -> {:definitive_bus_error, error}
-      :ambiguous -> {:retry, :remote}
-    end
-  end
-
-  defp remove_pending_handlers(conn, handler_refs, deadline) do
-    Enum.reduce_while(handler_refs, :ok, fn handler_ref, :ok ->
-      case delete_local_handler(conn, handler_ref, deadline) do
-        :ok -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-  end
-
-  defp remove_remote_rule(_conn, %{remote_may_exist?: false}, _deadline), do: :ok
-
-  defp remove_remote_rule(conn, %{rule: rule}, deadline) do
-    case remove_match(conn, rule, deadline) do
-      {:ambiguous, _error} -> :ambiguous
-      result -> result
-    end
-  end
-
-  defp ensure_handler_removed(_conn, _ref, :removed, _deadline), do: :ok
-
-  defp ensure_handler_removed(conn, ref, :active, deadline),
-    do: delete_local_handler(conn, ref, deadline)
-
-  defp install_local_handler(conn, owner, rule, timeout) do
-    handler_ref = make_ref()
-
-    case Connection.add_signal_handler(conn, owner, handler_ref, rule, timeout) do
-      {:ok, ^handler_ref} = ok -> ok
-      {:error, _reason} = error -> error
-    end
-  end
-
-  defp delete_local_handler(conn, handler_ref, deadline) do
-    with {:ok, timeout} <- remaining_timeout(deadline) do
-      Connection.delete_signal_handler(conn, handler_ref, timeout)
-    end
-  end
-
-  defp invoke_bus_method(conn, member, rule, deadline) do
-    with {:ok, timeout} <- remaining_timeout(deadline) do
-      # A D-Bus error reply now arrives as {:error, %Message{}}. Both reply
-      # shapes must reach bus_reply_result/1 so any received descriptors are
-      # closed before the reason is classified.
-      case Rebus.call(conn, bus_message(member, rule), timeout) do
-        {:ok, %Message{} = reply} -> bus_reply_result(reply)
-        {:error, %Message{} = reply} -> bus_reply_result(reply)
-        {:error, _reason} = error -> error
-      end
-    end
-  end
-
-  defp bus_message(member, rule) do
-    Message.new!(:method_call,
-      path: "/org/freedesktop/DBus",
-      interface: "org.freedesktop.DBus",
-      destination: "org.freedesktop.DBus",
-      member: member,
-      signature: "s",
-      body: [MatchRule.to_string(rule)]
-    )
-  end
-
-  # These internal method calls never expose a D-Bus reply to application
-  # code. Retain neither its body nor any received descriptors; in particular,
-  # a malicious AddMatch/RemoveMatch reply must not leak Unix FD ownership into
-  # the worker process.
-  defp bus_reply_result(%Message{} = reply) do
-    _ = UnixFD.close_all(reply.unix_fds)
-
-    case reply do
-      %Message{type: :method_return} ->
-        :ok
-
-      %Message{type: :error, header_fields: %{error_name: error_name}}
-      when is_binary(error_name) ->
-        {:error, {:bus_error, :binary.copy(error_name)}}
-
-      _ ->
-        {:error, :invalid_bus_reply}
-    end
-  end
-
   defp put_request(state, from, owner, kind, key, ref, deadline) do
     request_id = make_ref()
     monitor_ref = Process.monitor(owner)
@@ -1478,31 +1316,8 @@ defmodule Rebus.MatchSubscription.Worker do
     Enum.at(@recovery_delays, min(attempt - 1, length(@recovery_delays) - 1))
   end
 
-  defp definitive_bus_error?({:error, {:bus_error, error_name}}) when is_binary(error_name),
-    do: true
-
-  defp definitive_bus_error?({:error, {:reply_dropped, {:error, error_name}}})
-       when is_binary(error_name),
-       do: true
-
-  defp definitive_bus_error?(_error), do: false
-
-  defp match_rule_not_found?({:error, {:bus_error, @match_rule_not_found}}), do: true
-
-  defp match_rule_not_found?({:error, {:reply_dropped, {:error, @match_rule_not_found}}}),
-    do: true
-
-  defp match_rule_not_found?(_error), do: false
-
   defp before_deadline?(deadline) when is_integer(deadline) do
     deadline > System.monotonic_time(:millisecond)
-  end
-
-  defp remaining_timeout(deadline) when is_integer(deadline) do
-    case deadline - System.monotonic_time(:millisecond) do
-      remaining when remaining > 0 -> {:ok, remaining}
-      _expired -> {:error, :timeout}
-    end
   end
 
   defp log_recovery(event) do
