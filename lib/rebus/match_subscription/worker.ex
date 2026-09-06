@@ -1,6 +1,7 @@
 defmodule Rebus.MatchSubscription.Worker do
   @moduledoc false
   use GenServer
+  use TypedStruct
 
   require Logger
 
@@ -78,28 +79,87 @@ defmodule Rebus.MatchSubscription.Worker do
     end
   end
 
+  @typedoc """
+  A public call waiting for its reply: the caller to answer, what it asked for,
+  and the deadline it must be answered by. A request owns the timer bounding
+  that deadline and the monitor on its caller, so answering one releases both.
+  `ref` is the subscription a `:remove` names, and `nil` for an `:add`.
+  """
+  @type request :: %{
+          from: GenServer.from(),
+          owner: pid(),
+          kind: :add | :remove,
+          key: String.t(),
+          ref: reference() | nil,
+          deadline: integer(),
+          timer: reference(),
+          monitor: reference()
+        }
+
+  typedstruct enforce: true do
+    field :conn, pid()
+    field :connection_monitor, reference()
+    # The local signal handlers installed on this connection, by handler
+    # reference, together with the rule each belongs to. A handler already
+    # reported gone to the bus is kept as `:removed` until its rule is settled.
+    field :subscriptions,
+          %{reference() => %{owner: pid(), key: String.t(), handler: :active | :removed}},
+          default: %{}
+
+    field :rules, %{String.t() => Rule.t()}, default: %{}
+    # Each subscription owner is monitored once: `owner_monitors` finds the
+    # subscription a DOWN belongs to, `ref_monitors` the monitor to release
+    # when that subscription goes.
+    field :owner_monitors, %{reference() => reference()}, default: %{}
+    field :ref_monitors, %{reference() => reference()}, default: %{}
+    # The calls still waiting for a reply, and the index from the monitor on a
+    # caller back to the call it is waiting on.
+    field :requests, %{reference() => request()}, default: %{}
+    field :request_monitors, %{reference() => reference()}, default: %{}
+    # The tasks in flight, by the token their result arrives with, and the
+    # index from the monitor on a task back to that token.
+    field :operations,
+          %{
+            reference() => %{
+              key: String.t(),
+              type: :add_new | :add_existing | :remove | :recovery | :initial_cleanup,
+              request_id: reference() | nil,
+              monitor: reference() | nil
+            }
+          },
+          default: %{}
+
+    field :operation_monitors, %{reference() => reference()}, default: %{}
+    # The keys of the rules in the bounded recovery set. Spelled `%MapSet{}`
+    # rather than `MapSet.t(binary())` because an empty set does not inhabit
+    # that opaque type and every spec naming `t/0` would then be reported as
+    # violating it.
+    field :recovering_rules, %MapSet{}, default: MapSet.new()
+    # The keys holding one of the bounded initial-cleanup slots, and the keys
+    # waiting for one. `:queue.new/0` is called in `init/1` rather than left to
+    # a field default so the queue keeps its opaque type instead of the literal
+    # a compile-time default bakes in.
+    field :initial_cleanup_keys, %MapSet{}, default: MapSet.new()
+    field :initial_cleanup_queue, :queue.queue()
+    # Whether a connection reset is in flight, and the token and monitor of the
+    # task running it. `state_lost?` latches state that cannot be reconstructed
+    # and turns public operations away.
+    field :resetting?, boolean(), default: false
+    field :state_lost?, boolean(), default: false
+    field :reset_token, reference() | nil, default: nil
+    field :reset_task_monitor, reference() | nil, default: nil
+    # Whether this connection is a bus, `nil` until it has been asked once.
+    field :bus?, boolean() | nil, default: nil
+    # The rules and subscriptions touched since the last write to the table.
+    field :persistence, Store.changes(), default: Store.no_changes()
+  end
+
   @impl true
   def init(conn) do
-    state = %{
+    state = %__MODULE__{
       conn: conn,
       connection_monitor: Process.monitor(conn),
-      subscriptions: %{},
-      rules: %{},
-      owner_monitors: %{},
-      ref_monitors: %{},
-      requests: %{},
-      request_monitors: %{},
-      operations: %{},
-      operation_monitors: %{},
-      recovering_rules: MapSet.new(),
-      initial_cleanup_keys: MapSet.new(),
-      initial_cleanup_queue: :queue.new(),
-      resetting?: false,
-      reset_token: nil,
-      reset_task_monitor: nil,
-      state_lost?: false,
-      bus?: nil,
-      persistence: Store.no_changes()
+      initial_cleanup_queue: :queue.new()
     }
 
     case Store.load_state(conn) do
@@ -118,7 +178,7 @@ defmodule Rebus.MatchSubscription.Worker do
   end
 
   @impl true
-  def handle_call({:add, _owner, _rule, _deadline}, _from, %{state_lost?: true} = state) do
+  def handle_call({:add, _owner, _rule, _deadline}, _from, %__MODULE__{state_lost?: true} = state) do
     {:reply, {:error, :match_subscription_state_lost}, state}
   end
 
@@ -140,7 +200,7 @@ defmodule Rebus.MatchSubscription.Worker do
     end
   end
 
-  def handle_call({:remove, _ref, _deadline}, _from, %{state_lost?: true} = state) do
+  def handle_call({:remove, _ref, _deadline}, _from, %__MODULE__{state_lost?: true} = state) do
     {:reply, {:error, :match_subscription_state_lost}, state}
   end
 
@@ -184,8 +244,8 @@ defmodule Rebus.MatchSubscription.Worker do
   # AddMatch is a bus-driver method, so it cannot be served by a peer-to-peer
   # connection. The answer is fixed for the connection's life: ask once, then
   # cache it so an established bus connection pays no extra round trip.
-  defp ensure_bus(%{bus?: true} = state, _deadline), do: {:ok, state}
-  defp ensure_bus(%{bus?: false} = state, _deadline), do: {:error, :not_a_bus, state}
+  defp ensure_bus(%__MODULE__{bus?: true} = state, _deadline), do: {:ok, state}
+  defp ensure_bus(%__MODULE__{bus?: false} = state, _deadline), do: {:error, :not_a_bus, state}
 
   defp ensure_bus(state, deadline) do
     case Operation.remaining_timeout(deadline) do
@@ -213,7 +273,7 @@ defmodule Rebus.MatchSubscription.Worker do
     {:noreply, start_recovery_attempt(state, key)}
   end
 
-  def handle_info({:connection_reset_result, token, :ok}, %{reset_token: token} = state) do
+  def handle_info({:connection_reset_result, token, :ok}, %__MODULE__{reset_token: token} = state) do
     state = clear_reset_task(state)
     log_reset(:close_requested)
     # Supervisor termination is asynchronous relative to this monitor. Keep
@@ -225,7 +285,7 @@ defmodule Rebus.MatchSubscription.Worker do
 
   def handle_info(
         {:connection_reset_result, token, {:error, _reason}},
-        %{reset_token: token} = state
+        %__MODULE__{reset_token: token} = state
       ) do
     state = clear_reset_task(state)
     log_reset(:close_not_started)
@@ -277,11 +337,8 @@ defmodule Rebus.MatchSubscription.Worker do
         # registration disappeared; expose explicit state loss instead.
         log_reset(:task_lost)
 
-        state =
-          state
-          |> clear_reset_task()
-          |> Map.put(:resetting?, false)
-          |> Map.put(:state_lost?, true)
+        state = clear_reset_task(state)
+        state = %{state | resetting?: false, state_lost?: true}
 
         {:noreply, persist_state(state)}
 
