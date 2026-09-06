@@ -2,6 +2,7 @@ defmodule RebusTest do
   use ExUnit.Case
   doctest Rebus
   import ExUnit.CaptureLog
+  import Rebus.TestRestartBudget, only: [kill_supervised: 2]
 
   alias Rebus.Connection
   alias Rebus.Connection.Handshake
@@ -4060,7 +4061,7 @@ defmodule RebusTest do
       workers = Process.whereis(Rebus.MatchSubscription)
 
       capture_log(fn ->
-        Process.exit(task_supervisor, :kill)
+        kill_supervised(task_supervisor, Rebus.MatchSubscription.Supervisor)
 
         # `rest_for_one` restarts the task supervisor and everything started
         # after it, so the worker supervisor comes back under a new pid too.
