@@ -1155,10 +1155,16 @@ defmodule Rebus.MatchRuleTest do
       :ok = TestServer.push(server, method_return(add.serial))
 
       assert {:ok, ref} = Task.await(adding, 2_000)
-      assert :ok = Rebus.remove_match(connection, ref, 1_000)
 
+      # The adding task owns the subscription and exits as soon as it has the
+      # reference, so the worker races its own owner-DOWN cleanup against this
+      # removal. Whichever wins, exactly one RemoveMatch reaches the bus and the
+      # final removal only replies once that reply arrives, so answer it before
+      # awaiting rather than calling synchronously.
+      removal = Task.async(fn -> Rebus.remove_match(connection, ref, 1_000) end)
       final_remove = assert_remove_match(server, rule, 1_500)
       :ok = TestServer.push(server, method_return(final_remove.serial))
+      assert :ok = Task.await(removal, 2_000)
     end
 
     test "retries ambiguous owner cleanup until RemoveMatch is known", %{
