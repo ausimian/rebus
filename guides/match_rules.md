@@ -78,10 +78,16 @@ is rejected. Both facts come from the bus driver, whose sender header a peer
 cannot forge.
 
 Tracking is best effort. If it fails, Rebus logs a warning naming the well-known
-name, directed delivery for that name stays off, and broadcast delivery is
-unaffected. There is also a short window, between the subscription being
-installed and the first owner answer arriving, in which a directed signal from
-the owner is not yet delivered.
+name and retries the whole sequence after a growing delay, for about half a
+minute. Directed delivery for the name stays off while it retries, and
+broadcast delivery is unaffected. If the last retry fails too, Rebus logs an
+error saying so and leaves the name's owner unknown: directed signals from
+that service stay rejected for the life of the connection. Giving up tracking a name
+no subscription needs any more is not retried; the stale rule it may leave on
+the bus costs nothing but a duplicate signal Rebus already handles. There is
+also a short window, between the subscription being installed and the first
+owner answer arriving, in which a directed signal from the owner is not yet
+delivered.
 
 D-Bus does not say which rule admitted a signal. Rebus therefore rejects a
 rule that overlaps an existing one with a different sender, returning

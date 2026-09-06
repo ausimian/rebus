@@ -656,6 +656,9 @@ defmodule Rebus.MatchRuleTest do
       server: server,
       connection: connection
     } do
+      # One retry, so the sequence reaches its terminal state within the test
+      # rather than retrying underneath the assertions that follow it.
+      put_app_env(:match_tracking_max_attempts, 1)
       rule = test_rule()
 
       log =
@@ -665,13 +668,8 @@ defmodule Rebus.MatchRuleTest do
           :ok = TestServer.push(server, method_return(add.serial))
           ref = assert_subscription(owner)
 
-          tracking_add = assert_add_match(server, tracking_rule())
-
-          :ok =
-            TestServer.push(
-              server,
-              bus_error(tracking_add.serial, "org.freedesktop.DBus.Error.AccessDenied")
-            )
+          reject_tracking(server)
+          reject_tracking(server)
 
           assert wait_until(fn -> tracking_idle?(connection) end)
 
@@ -685,6 +683,112 @@ defmodule Rebus.MatchRuleTest do
           refute_receive {:matched, ^owner, ^ref, _message}, 100
 
           send(owner, :stop)
+        end)
+
+      assert log =~ "D-Bus name owner tracking failed name=org.example.Service step=add_match"
+    end
+
+    test "retries a failed owner tracking sequence", %{server: server, connection: connection} do
+      rule = test_rule()
+
+      log =
+        capture_log(fn ->
+          owner = subscribe_owner(self(), connection, rule)
+          add = assert_add_match(server, rule)
+          :ok = TestServer.push(server, method_return(add.serial))
+          ref = assert_subscription(owner)
+
+          reject_tracking(server)
+
+          # The retry runs the whole sequence again, and a transient failure
+          # therefore costs the name nothing but the delay.
+          :ok = answer_tracking(server, "org.example.Service", ":1.42")
+          assert wait_until(fn -> name_owner(connection, "org.example.Service") == ":1.42" end)
+
+          :ok = TestServer.push(server, directed_signal(":1.42"))
+          assert_receive {:matched, ^owner, ^ref, %Message{body: ["changed"]}}, 1_000
+
+          send(owner, :stop)
+        end)
+
+      assert log =~ "D-Bus name owner tracking failed name=org.example.Service step=add_match"
+      refute log =~ "D-Bus name owner tracking exhausted"
+    end
+
+    test "gives up owner tracking after the retry budget", %{
+      server: server,
+      connection: connection
+    } do
+      put_app_env(:match_tracking_max_attempts, 2)
+      rule = test_rule()
+
+      log =
+        capture_log(fn ->
+          owner = subscribe_owner(self(), connection, rule)
+          add = assert_add_match(server, rule)
+          :ok = TestServer.push(server, method_return(add.serial))
+          ref = assert_subscription(owner)
+
+          # The first attempt and both retries the budget allows.
+          Enum.each(1..3, fn _attempt -> reject_tracking(server) end)
+
+          assert wait_until(fn -> tracking_idle?(connection) end)
+
+          # The budget is spent, so nothing asks the bus again, and the name is
+          # left exactly as an unretried failure used to leave it.
+          refute_receive {^server, %Message{header_fields: %{member: "AddMatch"}}}, 500
+          assert name_owner(connection, "org.example.Service") == :unknown
+
+          :ok = TestServer.push(server, directed_signal(":1.42"))
+          refute_receive {:matched, ^owner, ^ref, _message}, 100
+
+          :ok = TestServer.push(server, test_signal("changed"))
+          assert_receive {:matched, ^owner, ^ref, %Message{body: ["changed"]}}, 1_000
+
+          send(owner, :stop)
+        end)
+
+      message = "D-Bus name owner tracking exhausted name=org.example.Service attempts=2"
+
+      # Once, not once per attempt: the error says the retrying has stopped.
+      assert [_before, _after] = String.split(log, message)
+    end
+
+    test "cancels a pending tracking retry when the name stops being needed", %{
+      server: server,
+      connection: connection
+    } do
+      rule = test_rule()
+
+      log =
+        capture_log(fn ->
+          owner = subscribe_owner(self(), connection, rule)
+          add = assert_add_match(server, rule)
+          :ok = TestServer.push(server, method_return(add.serial))
+          _ref = assert_subscription(owner)
+
+          tracking_add = assert_add_match(server, tracking_rule())
+
+          # The last rule goes while the tracking sequence is still in flight,
+          # so the failure below schedules a retry the reconcile that follows
+          # it has to take back.
+          send(owner, :stop)
+          remove = assert_remove_match(server, rule)
+          :ok = TestServer.push(server, method_return(remove.serial))
+          assert wait_until(fn -> rule_status(connection, rule) == nil end)
+
+          :ok =
+            TestServer.push(
+              server,
+              bus_error(tracking_add.serial, "org.freedesktop.DBus.Error.AccessDenied")
+            )
+
+          untrack = assert_remove_match(server, tracking_rule())
+          :ok = TestServer.push(server, method_return(untrack.serial))
+          assert wait_until(fn -> not tracked?(connection, "org.example.Service") end)
+
+          # Well past the delay the cancelled retry would have fired after.
+          refute_receive {^server, %Message{header_fields: %{member: "AddMatch"}}}, 500
         end)
 
       assert log =~ "D-Bus name owner tracking failed name=org.example.Service step=add_match"
@@ -1753,6 +1857,9 @@ defmodule Rebus.MatchRuleTest do
       assert {:noreply, ^state} = Worker.handle_info({:retry_recovery, "missing"}, state)
 
       assert {:noreply, ^state} =
+               Worker.handle_info({:retry_tracking, "org.example.Service"}, state)
+
+      assert {:noreply, ^state} =
                Worker.handle_info({:operation_result, make_ref(), :ignored}, state)
 
       assert {:noreply, ^state} = Worker.handle_info({:request_timeout, make_ref()}, state)
@@ -2177,7 +2284,7 @@ defmodule Rebus.MatchRuleTest do
     end
 
     test "resets the connection when a rule's recovery budget is spent" do
-      put_recovery_env(:match_recovery_max_attempts, 2)
+      put_app_env(:match_recovery_max_attempts, 2)
 
       conn = start_placeholder_conn()
       rule = test_rule()
@@ -2243,7 +2350,7 @@ defmodule Rebus.MatchRuleTest do
     end
 
     test "warns once when a rule's recovery backoff saturates" do
-      put_recovery_env(:match_recovery_max_attempts, 100)
+      put_app_env(:match_recovery_max_attempts, 100)
 
       conn = start_placeholder_conn()
       rule = test_rule()
@@ -2311,7 +2418,7 @@ defmodule Rebus.MatchRuleTest do
     end
 
     test "spends recovery budget on an attempt whose task never starts" do
-      put_recovery_env(:match_recovery_max_attempts, 1)
+      put_app_env(:match_recovery_max_attempts, 1)
 
       conn = start_placeholder_conn()
       rule = test_rule()
@@ -3311,6 +3418,15 @@ defmodule Rebus.MatchRuleTest do
     |> map_size() == 0
   end
 
+  # Refuses one whole owner-tracking sequence at its first step, the way a bus
+  # that will not let this connection add the tracking rule does.
+  defp reject_tracking(server, name \\ "org.example.Service") do
+    add = assert_add_match(server, tracking_rule(name))
+
+    :ok =
+      TestServer.push(server, bus_error(add.serial, "org.freedesktop.DBus.Error.AccessDenied"))
+  end
+
   # Plays the bus for the owner-tracking sequence a well-known sender
   # subscription runs after its own AddMatch: the tracking rule, then the
   # GetNameOwner whose reply seeds the owner.
@@ -3591,7 +3707,7 @@ defmodule Rebus.MatchRuleTest do
     state
   end
 
-  defp put_recovery_env(key, value) do
+  defp put_app_env(key, value) do
     previous = Application.get_env(:rebus, key)
     Application.put_env(:rebus, key, value)
 
