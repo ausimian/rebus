@@ -2,6 +2,8 @@ defmodule Rebus.Connection.HandshakeTest do
   # The cookie cases replace $HOME for the duration of the test.
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias Rebus.Connection.Handshake
   alias Rebus.ScriptedTransport
   alias Rebus.TestImpl
@@ -246,9 +248,16 @@ defmodule Rebus.Connection.HandshakeTest do
           "DATA #{challenge()}\r\n"
         ])
 
-      assert {:error, :auth_cookie_unavailable} =
-               run(sock, identity: identity(), allow_anonymous?: true)
+      # No keyring fixture here, so the ambient `$HOME` decides which category
+      # `Rebus.Auth` reports; capturing keeps the suite's output clean either
+      # way.
+      log =
+        capture_log(fn ->
+          assert {:error, :auth_cookie_unavailable} =
+                   run(sock, identity: identity(), allow_anonymous?: true)
+        end)
 
+      assert log =~ "D-Bus cookie authentication unavailable reason="
       refute ScriptedTransport.sent(sock) =~ "AUTH ANONYMOUS"
       refute ScriptedTransport.sent(sock) =~ "DATA "
     end

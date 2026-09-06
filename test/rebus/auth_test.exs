@@ -200,20 +200,26 @@ defmodule Rebus.AuthTest do
           System.put_env("HOME", Enum.at(links, 7))
           assert {:ok, _eight_links} = cookie_response(context, home)
 
-          System.put_env("HOME", Enum.at(links, 8))
-          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+          reasons =
+            logged_reasons(fn ->
+              System.put_env("HOME", Enum.at(links, 8))
+              assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
 
-          # `lstat` follows a trailing separator or `.` component, so without
-          # normalisation these spellings would skip resolution and accept the
-          # nine-link chain. Pinning the bound under them pins the normalisation.
-          System.put_env("HOME", Enum.at(links, 8) <> "/")
-          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+              # `lstat` follows a trailing separator or `.` component, so
+              # without normalisation these spellings would skip resolution and
+              # accept the nine-link chain. Pinning the bound under them pins
+              # the normalisation.
+              System.put_env("HOME", Enum.at(links, 8) <> "/")
+              assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
 
-          System.put_env("HOME", Enum.at(links, 8) <> "/.")
-          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+              System.put_env("HOME", Enum.at(links, 8) <> "/.")
+              assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
 
-          System.put_env("HOME", Enum.at(links, 8) <> "/./")
-          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+              System.put_env("HOME", Enum.at(links, 8) <> "/./")
+              assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+            end)
+
+          assert reasons == List.duplicate("home_unsafe", 4)
         end)
       end)
     end
@@ -236,14 +242,19 @@ defmodule Rebus.AuthTest do
         with_home(home, [], fn ->
           assert {:ok, _control} = cookie_response(context, home)
 
-          System.put_env("HOME", sub <> "/..")
-          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+          reasons =
+            logged_reasons(fn ->
+              System.put_env("HOME", sub <> "/..")
+              assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
 
-          System.put_env("HOME", sub <> "/../")
-          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+              System.put_env("HOME", sub <> "/../")
+              assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
 
-          System.put_env("HOME", Path.join(sub, "up"))
-          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+              System.put_env("HOME", Path.join(sub, "up"))
+              assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+            end)
+
+          assert reasons == List.duplicate("home_unsafe", 3)
         end)
       end)
     end
@@ -370,10 +381,15 @@ defmodule Rebus.AuthTest do
           :ok = File.ln_s(regular, file_link)
           :ok = File.ln_s(Path.join(home, "missing"), dangling_link)
 
-          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+          reasons =
+            logged_reasons(fn ->
+              assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
 
-          System.put_env("HOME", dangling_link)
-          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+              System.put_env("HOME", dangling_link)
+              assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+            end)
+
+          assert reasons == List.duplicate("home_unsafe", 2)
         end)
       end)
     end
@@ -390,12 +406,17 @@ defmodule Rebus.AuthTest do
           :ok = File.ln_s(home, symlinked_home)
           :ok = File.chmod(home, 0o775)
 
-          assert {:error, :auth_cookie_unavailable} =
-                   Auth.cookie_response(
-                     "user",
-                     uid,
-                     Base.encode16("#{context} 1 server-challenge", case: :lower)
-                   )
+          reasons =
+            logged_reasons(fn ->
+              assert {:error, :auth_cookie_unavailable} =
+                       Auth.cookie_response(
+                         "user",
+                         uid,
+                         Base.encode16("#{context} 1 server-challenge", case: :lower)
+                       )
+            end)
+
+          assert reasons == ["home_unsafe"]
 
           :ok = File.chmod(home, Bitwise.band(mode, 0o7777))
         end)
@@ -420,12 +441,14 @@ defmodule Rebus.AuthTest do
         keyring = Path.join(home, ".dbus-keyrings")
         :ok = File.chmod(keyring, 0o755)
 
-        assert {:error, :auth_cookie_unavailable} =
-                 Auth.cookie_response(
-                   "user",
-                   File.stat!(keyring).uid,
-                   Base.encode16("#{context} 1 challenge", case: :lower)
-                 )
+        assert logged_reasons(fn ->
+                 assert {:error, :auth_cookie_unavailable} =
+                          Auth.cookie_response(
+                            "user",
+                            File.stat!(keyring).uid,
+                            Base.encode16("#{context} 1 challenge", case: :lower)
+                          )
+               end) == ["keyring_unsafe"]
       end)
 
       with_private_keyring(context, cookie, fn home ->
@@ -435,12 +458,14 @@ defmodule Rebus.AuthTest do
         :ok = File.rm(path)
         :ok = File.ln_s(target, path)
 
-        assert {:error, :auth_cookie_unavailable} =
-                 Auth.cookie_response(
-                   "user",
-                   File.stat!(home).uid,
-                   Base.encode16("#{context} 1 challenge", case: :lower)
-                 )
+        assert logged_reasons(fn ->
+                 assert {:error, :auth_cookie_unavailable} =
+                          Auth.cookie_response(
+                            "user",
+                            File.stat!(home).uid,
+                            Base.encode16("#{context} 1 challenge", case: :lower)
+                          )
+               end) == ["cookie_unsafe"]
       end)
     end
 
@@ -448,7 +473,12 @@ defmodule Rebus.AuthTest do
       context = "rebus_test_context"
       cookie = "0123456789abcdef"
 
-      assert {:error, :auth_cookie_unavailable} = Auth.cookie_response(:user, 0, "00")
+      # The argument guard is the only path that reaches the boundary without a
+      # category of its own, so it reports the safety net rather than nothing.
+      assert logged_reasons(fn ->
+               assert {:error, :auth_cookie_unavailable} = Auth.cookie_response(:user, 0, "00")
+             end) == ["internal"]
+
       assert {:error, :auth_failed} = Auth.cookie_response("", 0, "")
       assert {:error, :auth_failed} = Auth.cookie_response("user", 0, "")
 
@@ -463,6 +493,12 @@ defmodule Rebus.AuthTest do
             uid,
             Base.encode16("#{context} #{cookie_id} #{challenge}", case: :lower)
           )
+        end
+
+        unavailable = fn cookie_id, challenge, expected_reason ->
+          assert logged_reasons(fn ->
+                   assert {:error, :auth_cookie_unavailable} = response.(cookie_id, challenge)
+                 end) == [expected_reason]
         end
 
         assert {:ok, _response} =
@@ -496,28 +532,28 @@ defmodule Rebus.AuthTest do
           Enum.map_join(1..257, "\n", fn id -> "#{id} 0 #{cookie}" end) <> "\n"
 
         :ok = File.write(path, too_many_records)
-        assert {:error, :auth_cookie_unavailable} = response.("1", "challenge")
+        unavailable.("1", "challenge", "keyring_malformed")
 
         :ok = File.write(path, "2 0 #{cookie}\n")
-        assert {:error, :auth_cookie_unavailable} = response.("1", "challenge")
+        unavailable.("1", "challenge", "cookie_missing")
 
         :ok = File.write(path, "1 0 #{cookie}\n1 1 #{cookie}\n")
-        assert {:error, :auth_cookie_unavailable} = response.("1", "challenge")
+        unavailable.("1", "challenge", "cookie_duplicate")
 
         :ok = File.write(path, "not-a-cookie-record\n")
-        assert {:error, :auth_cookie_unavailable} = response.("1", "challenge")
+        unavailable.("1", "challenge", "cookie_missing")
 
         :ok = File.write(path, "1 0 zz\n")
-        assert {:error, :auth_cookie_unavailable} = response.("1", "challenge")
+        unavailable.("1", "challenge", "keyring_malformed")
 
         :ok = File.write(path, "1 0 ABCD\n")
         assert {:ok, _response} = response.("1", "challenge")
 
         :ok = File.write(path, "1 0 f\n")
-        assert {:error, :auth_cookie_unavailable} = response.("1", "challenge")
+        unavailable.("1", "challenge", "keyring_malformed")
 
         :ok = File.write(path, String.duplicate("A", 1_025))
-        assert {:error, :auth_cookie_unavailable} = response.("1", "challenge")
+        unavailable.("1", "challenge", "cookie_missing")
 
         assert {:error, :auth_failed} =
                  Auth.cookie_response(
@@ -693,6 +729,212 @@ defmodule Rebus.AuthTest do
     end
   end
 
+  describe "cookie diagnostics" do
+    test "reports a home that is not an absolute path" do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        # `System.user_home/0` cannot be made to return nil from the suite, so
+        # the other half of the category - a home that is not absolute - stands
+        # for it.
+        with_home("relative/home", [], fn ->
+          assert_unavailable("home_missing", fn -> cookie_response(context, home) end)
+        end)
+      end)
+    end
+
+    test "reports a home whose path ends in .." do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        sub = Path.join(home, "sub")
+        :ok = File.mkdir_p(sub)
+
+        with_home(sub <> "/..", [], fn ->
+          assert_unavailable("home_unsafe", fn -> cookie_response(context, home) end)
+        end)
+      end)
+    end
+
+    test "reports a keyring directory that is not private" do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        :ok = File.chmod(Path.join(home, ".dbus-keyrings"), 0o755)
+
+        assert_unavailable("keyring_unsafe", fn -> cookie_response(context, home) end)
+      end)
+    end
+
+    test "reports a cookie file that is not private" do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        :ok = File.chmod(Path.join([home, ".dbus-keyrings", context]), 0o644)
+
+        assert_unavailable("cookie_unsafe", fn -> cookie_response(context, home) end)
+      end)
+    end
+
+    # The size checks compare two `lstat`s with the bytes actually read, so a
+    # deterministic mismatch needs a writer racing the read. The classification
+    # is exercised directly instead, and the boundary log is proved by the
+    # categories above that do reach it through the file system.
+    test "reports a cookie file that changed under the read" do
+      assert Auth.cookie_unchanged(5, 5, "abcde") == :ok
+      assert Auth.cookie_unchanged(5, 4, "abcde") == {:error, {:unavailable, :cookie_changed}}
+      assert Auth.cookie_unchanged(5, 5, "abcd") == {:error, {:unavailable, :cookie_changed}}
+    end
+
+    test "reports a cookie file that cannot be read" do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        path = Path.join([home, ".dbus-keyrings", context])
+        :ok = File.chmod(path, 0o000)
+
+        # root ignores the permission bits, so the open succeeds there and the
+        # category cannot be provoked at all.
+        if File.stat!(path).uid == 0 do
+          assert {:ok, _response} = cookie_response(context, home)
+        else
+          assert_unavailable("cookie_unreadable", fn -> cookie_response(context, home) end)
+        end
+      end)
+    end
+
+    test "reports a keyring holding more records than the bound allows" do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        records = Enum.map_join(1..257, "\n", fn id -> "#{id} 0 #{cookie}" end) <> "\n"
+        :ok = File.write(Path.join([home, ".dbus-keyrings", context]), records)
+
+        assert_unavailable("keyring_malformed", fn -> cookie_response(context, home) end)
+      end)
+    end
+
+    test "reports a cookie ID no record carries" do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        :ok = File.write(Path.join([home, ".dbus-keyrings", context]), "4242 0 #{cookie}\n")
+
+        assert_unavailable("cookie_missing", fn -> cookie_response(context, home) end)
+      end)
+    end
+
+    test "reports a cookie ID more than one record carries" do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        :ok =
+          File.write(
+            Path.join([home, ".dbus-keyrings", context]),
+            "1 0 #{cookie}\n1 1 #{cookie}\n"
+          )
+
+        assert_unavailable("cookie_duplicate", fn -> cookie_response(context, home) end)
+      end)
+    end
+
+    # No supported platform can be made to report a stat without POSIX owner
+    # and mode metadata, so the fail-closed classification is exercised
+    # directly rather than through the file system.
+    test "reports a platform without POSIX owner and mode metadata" do
+      assert Auth.posix_metadata(0, 0o700) == :ok
+      assert Auth.posix_metadata(:undefined, 0o700) == {:error, {:unavailable, :unsupported}}
+      assert Auth.posix_metadata(0, :undefined) == {:error, {:unavailable, :unsupported}}
+    end
+
+    test "never lets a sentinel value reach an error or a log" do
+      home = Path.join(Rebus.TestTmp.path("auth"), "SENTINELHOME-keyring")
+      keyring = Path.join(home, ".dbus-keyrings")
+      context = "sentinelctx"
+      cookie_id = "424242"
+      cookie = Base.encode16("SENTINEL", case: :lower)
+      challenge = "sentinelchallenge"
+      username = "sentineluser"
+      path = Path.join(keyring, context)
+      previous_home = System.get_env("HOME")
+
+      sentinels = ["SENTINEL", "sentinel", cookie_id, cookie, home, context, challenge, username]
+
+      try do
+        :ok = File.mkdir_p(keyring)
+        :ok = File.chmod(keyring, 0o700)
+        :ok = File.write(path, "#{cookie_id} 0 #{cookie}\n")
+        :ok = File.chmod(path, 0o600)
+        System.put_env("HOME", home)
+        uid = File.stat!(home).uid
+
+        respond = fn id ->
+          Auth.cookie_response(
+            username,
+            uid,
+            Base.encode16("#{context} #{id} #{challenge}", case: :lower)
+          )
+        end
+
+        drive = fn fun ->
+          {result, log} = with_log(fun)
+
+          Enum.each(sentinels, fn sentinel ->
+            refute log =~ sentinel
+            refute inspect(result) =~ sentinel
+          end)
+
+          {result, log}
+        end
+
+        # A success logs nothing at all, so the whole fixture is covered by the
+        # refutations above only once a failure has something to disclose.
+        assert {{:ok, _response}, ""} = drive.(fn -> respond.(cookie_id) end)
+
+        assert {{:error, :auth_cookie_unavailable}, missing} =
+                 drive.(fn -> respond.("999999") end)
+
+        assert missing =~ "unavailable reason=cookie_missing"
+
+        records = Enum.map_join(1..257, "\n", fn id -> "#{id} 0 #{cookie}" end) <> "\n"
+        :ok = File.write(path, records)
+
+        assert {{:error, :auth_cookie_unavailable}, malformed} =
+                 drive.(fn -> respond.(cookie_id) end)
+
+        assert malformed =~ "unavailable reason=keyring_malformed"
+
+        :ok = File.chmod(path, 0o644)
+
+        assert {{:error, :auth_cookie_unavailable}, unsafe_cookie} =
+                 drive.(fn -> respond.(cookie_id) end)
+
+        assert unsafe_cookie =~ "unavailable reason=cookie_unsafe"
+
+        :ok = File.chmod(keyring, 0o755)
+
+        assert {{:error, :auth_cookie_unavailable}, unsafe_keyring} =
+                 drive.(fn -> respond.(cookie_id) end)
+
+        assert unsafe_keyring =~ "unavailable reason=keyring_unsafe"
+      after
+        if is_nil(previous_home),
+          do: System.delete_env("HOME"),
+          else: System.put_env("HOME", previous_home)
+
+        _ = File.rm_rf(home)
+      end
+    end
+  end
+
   describe "ANONYMOUS" do
     test "does not send CANCEL when cookie credentials are unavailable without opt-in" do
       context = "rebus_test_context"
@@ -713,7 +955,10 @@ defmodule Rebus.AuthTest do
             :ok
           end)
 
-        assert {:error, :auth_cookie_unavailable} = Rebus.connect(addr)
+        assert logged_reasons(fn ->
+                 assert {:error, :auth_cookie_unavailable} = Rebus.connect(addr)
+               end) == ["keyring_unsafe"]
+
         assert :ok = Task.await(server, 2_000)
       end)
     end
@@ -737,7 +982,11 @@ defmodule Rebus.AuthTest do
             :ok
           end)
 
-        assert {:error, :auth_cookie_unavailable} = Rebus.connect(addr, allow_anonymous: true)
+        assert logged_reasons(fn ->
+                 assert {:error, :auth_cookie_unavailable} =
+                          Rebus.connect(addr, allow_anonymous: true)
+               end) == ["keyring_unsafe"]
+
         assert :ok = Task.await(server, 2_000)
       end)
     end
@@ -761,7 +1010,13 @@ defmodule Rebus.AuthTest do
               :ok
             end)
 
-          assert {:error, :auth_cookie_unavailable} = Rebus.connect(addr, allow_anonymous: true)
+          assert [reason] =
+                   logged_reasons(fn ->
+                     assert {:error, :auth_cookie_unavailable} =
+                              Rebus.connect(addr, allow_anonymous: true)
+                   end)
+
+          assert reason in ["cookie_unsafe", "cookie_missing"]
           assert :ok = Task.await(server, 2_000)
         end)
       end
@@ -909,6 +1164,23 @@ defmodule Rebus.AuthTest do
   test "rejects a non-boolean anonymous opt-in" do
     assert {:error, :invalid_allow_anonymous} =
              Rebus.connect(%{family: :inet, addr: {127, 0, 0, 1}, port: 1}, allow_anonymous: :yes)
+  end
+
+  # The boundary emits exactly one warning per failed cookie attempt, so the
+  # occurrence count is asserted rather than mere presence.
+  defp assert_unavailable(reason, fun) do
+    log = capture_log(fn -> assert {:error, :auth_cookie_unavailable} = fun.() end)
+
+    assert log =~ "D-Bus cookie authentication unavailable reason=#{reason}"
+    assert length(Regex.scan(~r/unavailable reason=/, log)) == 1
+  end
+
+  defp logged_reasons(fun) do
+    log = capture_log(fun)
+
+    ~r/unavailable reason=(\w+)/
+    |> Regex.scan(log)
+    |> Enum.map(fn [_match, reason] -> reason end)
   end
 
   # Points `HOME` at `path`, restores the previous value, and removes every

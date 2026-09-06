@@ -50,6 +50,39 @@ Most `:auth_cookie_unavailable` failures are a permission problem, and
 reached through more than eight symlinks, or whose path ends in `..`, or that
 is reached through a symlink whose target does, fails with the same reason.
 
+### Diagnosing a cookie failure
+
+The returned reason is deliberately coarse, so Rebus logs one warning for each
+failed cookie attempt to say which condition was not met:
+
+```
+D-Bus cookie authentication unavailable reason=keyring_unsafe
+```
+
+The category is also attached as `reason:` Logger metadata, so a structured
+backend can filter on it. The line never carries a path, a file name, a cookie
+ID, a cookie value, a challenge, a digest, a GUID, an identity, or any raw
+protocol data: only the category below is ever interpolated. Nothing is logged
+for `:auth_failed`, whose inputs are chosen by the peer.
+
+The peer chooses the cookie context and ID, so a hostile or misconfigured bus
+can select among the `cookie_*` categories and produce one warning per
+connection attempt; the content stays bounded either way.
+
+| Reason | What to check |
+| --- | --- |
+| `home_missing` | `HOME` is unset and the system reports no home, or `HOME` is not an absolute path. |
+| `home_unsafe` | The home is not a directory, or `chmod go-w ~` is needed; also a chain of more than eight symlinks, a dangling or non-directory link, a path ending in `..`, or an owner other than you. |
+| `keyring_unsafe` | `~/.dbus-keyrings` is missing, is a symlink, or needs `chmod 0700 ~/.dbus-keyrings` and the right owner. |
+| `cookie_unsafe` | The cookie file the peer named is missing, is a symlink, is over 64 KiB, or needs `chmod 0600` and the right owner. |
+| `cookie_changed` | The file was rewritten while Rebus read it. Retry; if it repeats, another process is churning the keyring. |
+| `cookie_unreadable` | The file could not be opened or read. Check the mode of the file and the search permission of every directory above it. |
+| `keyring_malformed` | The file holds more than 256 records, or the record for the requested ID is malformed. Let the peer regenerate it. |
+| `cookie_missing` | No record in the file the peer named carries the ID it asked for. The peer's keyring and yours have diverged; remove the file and let it be regenerated. |
+| `cookie_duplicate` | Two records in the file the peer named carry that ID. Rebus refuses to guess; remove the file and let it be regenerated. |
+| `unsupported` | The platform reports no POSIX owner and mode metadata, so Rebus cannot prove the file is private. |
+| `internal` | Never expected. Please report it. |
+
 Once a cookie exchange has started, every failure is terminal. Rebus does not
 cancel it and retry as `ANONYMOUS`, so a misconfigured keyring cannot silently
 downgrade your connection.

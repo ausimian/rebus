@@ -13,7 +13,8 @@ It is a breaking release: result shapes changed and validation is stricter.
   owner, tracked through `NameOwnerChanged`.
 - Unix file descriptor passing on Linux and macOS local sockets: `fds:` to
   send, `unix_fds` to receive, `Rebus.UnixFD.close/1` to release each one.
-- Authentication negotiation: `DBUS_COOKIE_SHA1`, and opt-in `ANONYMOUS`.
+- Authentication negotiation: `DBUS_COOKIE_SHA1`, and opt-in `ANONYMOUS`. A
+  failed cookie attempt logs one payload-free warning naming the cause.
 - Address-list parsing for `:system` and `:session`: `unix:path`,
   `unix:abstract` and `tcp` entries in order, with `guid=` verification.
 - The `:timeout`, `:name`, `:read_timeout`, `:write_timeout`,
@@ -53,7 +54,8 @@ It is a breaking release: result shapes changed and validation is stricter.
 - **Breaking:** Rebus requires Elixir 1.18 or later.
 - Signals are delivered by the connection that received them, so an internal
   failure no longer stops established connections.
-- Connection log entries carry their reason as `reason:` Logger metadata.
+- Connection and authentication log entries carry their reason as `reason:`
+  Logger metadata.
 - `Rebus.connect/2` is the only supported way to create a connection, and the
   supervisor owns it until `Rebus.close/1` or, with `owner: pid`, until that
   process exits.
