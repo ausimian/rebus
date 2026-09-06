@@ -2862,15 +2862,23 @@ defmodule Rebus.MatchRuleTest do
       assert {:error, :disconnected} =
                Worker.call(self(), :ignored, System.monotonic_time(:millisecond) + 1_000, 0)
 
+      # The call must expire against a process that never answers and never
+      # exits: an exit while the call is still in flight would be reported as
+      # `{:error, :disconnected}` instead of the timeout under test.
       silent =
-        spawn(fn ->
+        spawn_link(fn ->
           receive do
-            _message -> Process.sleep(50)
+            {:"$gen_call", _from, _request} ->
+              receive do
+                :stop -> :ok
+              end
           end
         end)
 
       assert {:error, :timeout} =
                Worker.call(silent, :ignored, System.monotonic_time(:millisecond) + 10, 0)
+
+      send(silent, :stop)
 
       {state, _request_id, tag} = live_request(fresh_worker_state(conn), key, :add)
 
