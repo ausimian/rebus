@@ -3,6 +3,8 @@ defmodule Rebus.Auth do
 
   import Bitwise, only: [band: 2]
 
+  require Logger
+
   @max_mechanisms 64
   @max_mechanism_size 64
   @max_cookie_context_size 128
@@ -14,6 +16,47 @@ defmodule Rebus.Auth do
   @max_home_links 8
 
   @type auth_error :: :auth_cookie_unavailable | :auth_failed
+
+  # Every environmental failure that the public contract collapses into
+  # `:auth_cookie_unavailable` is classified into exactly one of these
+  # categories, so an operator can act on the cause without any of the values
+  # behind it being disclosed:
+  #
+  #   * `:home_missing` - no `HOME` and no `System.user_home/0`, or a
+  #     non-absolute home.
+  #   * `:home_unsafe` - the home is not a directory, is reached through too
+  #     long, dangling or non-directory a symlink chain, has a hop ending in
+  #     `..`, has the wrong owner, or is group or other writable.
+  #   * `:keyring_unsafe` - `.dbus-keyrings` is missing, is not a directory, is
+  #     a symlink, has the wrong owner, or is not private.
+  #   * `:cookie_unsafe` - the cookie file is missing, is not a regular file,
+  #     is a symlink, has the wrong owner, is not private, or is already larger
+  #     than the bounded read allows.
+  #   * `:cookie_changed` - the file changed size between the two `lstat`s, or
+  #     between them and the bytes read.
+  #   * `:cookie_unreadable` - opening or reading the cookie file failed.
+  #   * `:keyring_malformed` - the keyring holds more than the bounded number
+  #     of lines, or the requested cookie's own record is malformed.
+  #   * `:cookie_missing` - no record carries the requested cookie ID.
+  #   * `:cookie_duplicate` - more than one record carries it.
+  #   * `:unsupported` - the platform reports no POSIX owner and mode metadata.
+  #   * `:internal` - the safety net: a failure that reached the boundary
+  #     untagged. It is never expected, and exists so that a future untagged
+  #     path is visible rather than silent.
+  @type cookie_unavailable_reason ::
+          :home_missing
+          | :home_unsafe
+          | :keyring_unsafe
+          | :cookie_unsafe
+          | :cookie_changed
+          | :cookie_unreadable
+          | :keyring_malformed
+          | :cookie_missing
+          | :cookie_duplicate
+          | :unsupported
+          | :internal
+
+  @typep unavailable :: {:error, {:unavailable, cookie_unavailable_reason()}}
 
   @doc false
   @spec parse_rejected(binary()) :: {:ok, [binary()]} | {:error, :auth_failed}
@@ -50,12 +93,27 @@ defmodule Rebus.Auth do
       response = Base.encode16(client_challenge <> " " <> digest, case: :lower)
       {:ok, response}
     else
-      {:error, reason} -> {:error, reason}
+      {:error, {:unavailable, reason}} -> cookie_unavailable(reason)
+      {:error, :auth_failed} -> {:error, :auth_failed}
+      {:error, :auth_cookie_unavailable} -> cookie_unavailable(:internal)
       _ -> {:error, :auth_failed}
     end
   end
 
-  def cookie_response(_username, _uid, _encoded_challenge), do: {:error, :auth_cookie_unavailable}
+  def cookie_response(_username, _uid, _encoded_challenge), do: cookie_unavailable(:internal)
+
+  # The single diagnostic boundary. Only the category atom is interpolated, and
+  # only it reaches the Logger metadata, so no path, cookie ID, cookie value,
+  # challenge, identity or raw protocol byte can be disclosed by construction.
+  # `:auth_failed` is not logged: its inputs are peer-controlled.
+  @spec cookie_unavailable(cookie_unavailable_reason()) :: {:error, :auth_cookie_unavailable}
+  defp cookie_unavailable(reason) do
+    Logger.warning("D-Bus cookie authentication unavailable reason=#{reason}", reason: reason)
+    {:error, :auth_cookie_unavailable}
+  end
+
+  @spec unavailable(cookie_unavailable_reason()) :: unavailable()
+  defp unavailable(reason), do: {:error, {:unavailable, reason}}
 
   defp parse_cookie_challenge(encoded)
        when byte_size(encoded) > 0 and byte_size(encoded) <= @max_cookie_challenge_size * 2 and
@@ -73,29 +131,42 @@ defmodule Rebus.Auth do
 
   defp parse_cookie_challenge(_encoded), do: {:error, :auth_failed}
 
+  # Every step below classifies its own failure, so this chain needs no `else`:
+  # a tagged `{:unavailable, category}` propagates unchanged to the boundary.
   defp read_cookie(context, cookie_id, uid) do
     with {:ok, keyring_dir} <- secure_keyring_dir(uid),
          path <- Path.join(keyring_dir, context),
-         {:ok, before} <- secure_lstat(path, :regular, uid),
+         {:ok, before} <- secure_lstat(path, :regular, uid, :cookie_unsafe),
          {:ok, contents} <- read_bounded_file(path),
-         {:ok, after_stat} <- secure_lstat(path, :regular, uid),
-         true <- before.size == after_stat.size and after_stat.size == byte_size(contents),
-         {:ok, cookie} <- find_cookie(contents, cookie_id) do
-      {:ok, cookie}
-    else
-      _ -> {:error, :auth_cookie_unavailable}
+         {:ok, after_stat} <- secure_lstat(path, :regular, uid, :cookie_unsafe),
+         :ok <- cookie_unchanged(before.size, after_stat.size, contents) do
+      find_cookie(contents, cookie_id)
     end
   end
 
+  # Public so that the size-race classification, which cannot be provoked
+  # deterministically through the file system, can be exercised directly.
+  @doc false
+  @spec cookie_unchanged(term(), term(), binary()) :: :ok | unavailable()
+  def cookie_unchanged(size, size, contents) when byte_size(contents) == size, do: :ok
+  def cookie_unchanged(_before, _after, _contents), do: unavailable(:cookie_changed)
+
   defp secure_keyring_dir(uid) do
-    with home when is_binary(home) and home != <<>> <- user_home(),
-         :absolute <- Path.type(home),
+    with {:ok, home} <- absolute_home(),
          {:ok, resolved_home} <- resolve_home(home, uid),
          path <- Path.join(resolved_home, ".dbus-keyrings"),
-         {:ok, _stat} <- secure_lstat(path, :directory, uid) do
+         {:ok, _stat} <- secure_lstat(path, :directory, uid, :keyring_unsafe) do
       {:ok, path}
-    else
-      _ -> {:error, :auth_cookie_unavailable}
+    end
+  end
+
+  defp absolute_home do
+    case user_home() do
+      home when is_binary(home) and home != <<>> ->
+        if Path.type(home) == :absolute, do: {:ok, home}, else: unavailable(:home_missing)
+
+      _other ->
+        unavailable(:home_missing)
     end
   end
 
@@ -116,13 +187,23 @@ defmodule Rebus.Auth do
   # home path are resolved by the operating system, as they are for any path.
   defp resolve_home(home, uid) do
     with {:ok, resolved, stat} <- resolve_home_dir(home),
-         true <- is_integer(stat.uid) and stat.uid == uid,
-         true <- is_integer(stat.mode) and band(stat.mode, 0o022) == 0 do
+         :ok <- posix_metadata(stat.uid, stat.mode),
+         true <- stat.uid == uid,
+         true <- band(stat.mode, 0o022) == 0 do
       {:ok, resolved}
     else
-      _ -> {:error, :auth_cookie_unavailable}
+      false -> unavailable(:home_unsafe)
+      {:error, _reason} = error -> error
     end
   end
+
+  # Public so that the fail-closed handling of a platform without POSIX owner
+  # and mode metadata, which no supported platform can be made to report, can
+  # be exercised directly.
+  @doc false
+  @spec posix_metadata(term(), term()) :: :ok | unavailable()
+  def posix_metadata(uid, mode) when is_integer(uid) and is_integer(mode), do: :ok
+  def posix_metadata(_uid, _mode), do: unavailable(:unsupported)
 
   defp resolve_home_dir(home) do
     with {:ok, home} <- normalise_home(home), do: resolve_home_dir(home, @max_home_links)
@@ -140,17 +221,20 @@ defmodule Rebus.Auth do
         follow_home_link(home, hops)
 
       _ ->
-        {:error, :auth_cookie_unavailable}
+        unavailable(:home_unsafe)
     end
   end
 
   defp follow_home_link(home, hops) do
-    with {:ok, target} <- File.read_link(home),
-         {:ok, resolved} <- expand_home_target(target, home),
-         {:ok, resolved} <- normalise_home(resolved) do
-      resolve_home_dir(resolved, hops - 1)
-    else
-      _ -> {:error, :auth_cookie_unavailable}
+    case File.read_link(home) do
+      {:ok, target} ->
+        with {:ok, expanded} <- expand_home_target(target, home),
+             {:ok, resolved} <- normalise_home(expanded) do
+          resolve_home_dir(resolved, hops - 1)
+        end
+
+      _error ->
+        unavailable(:home_unsafe)
     end
   end
 
@@ -179,7 +263,7 @@ defmodule Rebus.Auth do
 
       normalised ->
         if Path.basename(normalised) == "..",
-          do: {:error, :auth_cookie_unavailable},
+          do: unavailable(:home_unsafe),
           else: {:ok, normalised}
     end
   end
@@ -202,15 +286,25 @@ defmodule Rebus.Auth do
   # `lstat` deliberately rejects symlinks. OTP does not expose O_NOFOLLOW for
   # portable raw file opens, so we validate both sides of the bounded read too.
   # Platforms without POSIX owner/mode metadata fail closed rather than guessing.
-  defp secure_lstat(path, type, uid) do
-    with {:ok, stat} <- File.lstat(path),
+  # `reason` names the entry being checked, so an unsafe keyring directory and
+  # an unsafe cookie file stay distinguishable without either path being named.
+  defp secure_lstat(path, type, uid, reason) do
+    case File.lstat(path) do
+      {:ok, stat} -> verify_stat(stat, type, uid, reason)
+      _error -> unavailable(reason)
+    end
+  end
+
+  defp verify_stat(stat, type, uid, reason) do
+    with :ok <- posix_metadata(stat.uid, stat.mode),
          true <- stat.type == type,
-         true <- is_integer(stat.uid) and stat.uid == uid,
-         true <- is_integer(stat.mode) and band(stat.mode, 0o077) == 0,
+         true <- stat.uid == uid,
+         true <- band(stat.mode, 0o077) == 0,
          true <- safe_stat_size?(stat, type) do
       {:ok, stat}
     else
-      _ -> {:error, :auth_cookie_unavailable}
+      false -> unavailable(reason)
+      {:error, _reason} = error -> error
     end
   end
 
@@ -220,20 +314,29 @@ defmodule Rebus.Auth do
   defp safe_stat_size?(_stat, :directory), do: true
 
   defp read_bounded_file(path) do
-    with {:ok, file} <- :file.open(String.to_charlist(path), [:read, :binary, :raw]) do
-      result =
-        case :file.read(file, @max_cookie_file_size + 1) do
-          {:ok, contents} when byte_size(contents) <= @max_cookie_file_size -> {:ok, contents}
-          _ -> {:error, :auth_cookie_unavailable}
-        end
+    case :file.open(String.to_charlist(path), [:read, :binary, :raw]) do
+      {:ok, file} ->
+        result = read_bounded_contents(file)
+        :ok = :file.close(file)
+        result
 
-      :ok = :file.close(file)
-      result
+      _error ->
+        unavailable(:cookie_unreadable)
     end
   rescue
-    _exception -> {:error, :auth_cookie_unavailable}
+    _exception -> unavailable(:cookie_unreadable)
   catch
-    _kind, _reason -> {:error, :auth_cookie_unavailable}
+    _kind, _reason -> unavailable(:cookie_unreadable)
+  end
+
+  # More bytes than `lstat` reported means the file grew under the read rather
+  # than that the read failed, so it is a change rather than a read error.
+  defp read_bounded_contents(file) do
+    case :file.read(file, @max_cookie_file_size + 1) do
+      {:ok, contents} when byte_size(contents) <= @max_cookie_file_size -> {:ok, contents}
+      {:ok, _oversized} -> unavailable(:cookie_changed)
+      _error -> unavailable(:cookie_unreadable)
+    end
   end
 
   defp find_cookie(contents, wanted_id) do
@@ -244,7 +347,7 @@ defmodule Rebus.Auth do
       |> Enum.reduce_while({:ok, nil}, &scan_cookie_line(&1, &2, wanted_id))
       |> found_cookie()
     else
-      {:error, :auth_cookie_unavailable}
+      unavailable(:keyring_malformed)
     end
   end
 
@@ -254,7 +357,7 @@ defmodule Rebus.Auth do
         {:cont, {:ok, cookie}}
 
       {:ok, {^wanted_id, _timestamp, _cookie}} ->
-        {:halt, {:error, :auth_cookie_unavailable}}
+        {:halt, unavailable(:cookie_duplicate)}
 
       {:ok, _other} ->
         {:cont, {:ok, found}}
@@ -272,14 +375,16 @@ defmodule Rebus.Auth do
   # fail-closed handling for a malformed target record.
   defp skip_unparsable_cookie_line(line, wanted_id, found) do
     if malformed_target_cookie_line?(line, wanted_id) do
-      {:halt, {:error, :auth_cookie_unavailable}}
+      {:halt, unavailable(:keyring_malformed)}
     else
       {:cont, {:ok, found}}
     end
   end
 
   defp found_cookie({:ok, cookie}) when is_binary(cookie), do: {:ok, cookie}
-  defp found_cookie(_result), do: {:error, :auth_cookie_unavailable}
+  defp found_cookie({:ok, nil}), do: unavailable(:cookie_missing)
+  defp found_cookie({:error, _reason} = error), do: error
+  defp found_cookie(_other), do: unavailable(:internal)
 
   defp keyring_lines(contents) do
     lines = :binary.split(contents, "\n", [:global])
