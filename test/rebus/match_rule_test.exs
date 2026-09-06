@@ -2265,11 +2265,13 @@ defmodule Rebus.MatchRuleTest do
   end
 
   defp put_rule_state(state, key, rule, queue) do
-    rule_state = %{rule_state(rule) | queue: queue}
+    rule_state = %{struct!(Worker.Rule, rule_state(rule)) | queue: queue}
 
     %{state | rules: %{key => rule_state}}
   end
 
+  # The persisted shape of a rule: a plain map of the record's fields, which is
+  # both what a row holds and what the record restores from.
   defp rule_state(rule) do
     %{
       rule: rule,

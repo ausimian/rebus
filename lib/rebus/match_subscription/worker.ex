@@ -16,6 +16,42 @@ defmodule Rebus.MatchSubscription.Worker do
   @max_initial_cleanups 16
   @recovery_delays [50, 100, 200, 400, 800, 1_000]
 
+  defmodule Rule do
+    @moduledoc false
+
+    use TypedStruct
+
+    # One match rule this worker is responsible for: the canonical rule, who
+    # holds it, and where it has got to in the rule state machine. Everything
+    # below `status` bounds the work still owed for it, either the operation in
+    # flight and the requests waiting behind it, or the retries of a cleanup
+    # whose effect on the bus is not yet known.
+
+    typedstruct enforce: true do
+      field :rule, MatchRule.t()
+      # The live subscription references, and the handler references whose
+      # removal is still owed. Spelled `%MapSet{}` rather than
+      # `MapSet.t(reference())` because an empty set does not inhabit that
+      # opaque type and every spec naming `t/0` would then be reported as
+      # violating it.
+      field :refs, %MapSet{}, default: MapSet.new()
+      field :pending_handlers, %MapSet{}, default: MapSet.new()
+      # Whether the bus may still hold this rule, and so whether cleanup owes
+      # it a RemoveMatch.
+      field :remote_may_exist?, boolean(), default: false
+      field :status, :installing | :active | :cleaning | :recovering
+      # The token of the operation in flight for this rule, and the requests
+      # waiting behind it. Neither survives a restart.
+      field :operation, reference() | nil, default: nil
+      field :queue, [reference()], default: []
+      # What the current cleanup is clearing, how many attempts it has taken,
+      # and the timer holding the next one.
+      field :recovery_kind, :rule | :handlers | nil, default: nil
+      field :recovery_attempt, non_neg_integer(), default: 0
+      field :retry_timer, reference() | nil, default: nil
+    end
+  end
+
   def child_spec(conn) do
     %{
       id: {__MODULE__, conn},
@@ -214,7 +250,7 @@ defmodule Rebus.MatchSubscription.Worker do
 
   def handle_info({:retry_recovery, key}, state) do
     case Map.get(state.rules, key) do
-      %{status: :recovering} = rule ->
+      %Rule{status: :recovering} = rule ->
         state = put_rule(state, key, %{rule | retry_timer: nil})
         {:noreply, start_recovery_attempt(state, key)}
 
@@ -302,13 +338,13 @@ defmodule Rebus.MatchSubscription.Worker do
       nil ->
         state
 
-      %{status: :recovering} ->
+      %Rule{status: :recovering} ->
         state
 
-      %{status: :cleaning} ->
+      %Rule{status: :cleaning} ->
         state
 
-      %{operation: operation} when not is_nil(operation) ->
+      %Rule{operation: operation} when not is_nil(operation) ->
         state
 
       rule ->
@@ -383,7 +419,7 @@ defmodule Rebus.MatchSubscription.Worker do
 
   defp start_recovery_attempt(state, key) do
     case Map.get(state.rules, key) do
-      %{status: status, operation: nil, retry_timer: nil} = rule
+      %Rule{status: status, operation: nil, retry_timer: nil} = rule
       when status in [:cleaning, :recovering] ->
         conn = state.conn
         deadline = System.monotonic_time(:millisecond) + @cleanup_timeout
@@ -712,20 +748,20 @@ defmodule Rebus.MatchSubscription.Worker do
       nil ->
         state
 
-      %{status: :recovering} ->
+      %Rule{status: :recovering} ->
         state
 
-      %{operation: operation} when not is_nil(operation) ->
+      %Rule{operation: operation} when not is_nil(operation) ->
         state
 
-      %{status: :active} = rule ->
+      %Rule{status: :active} = rule ->
         if MapSet.size(rule.refs) == 0 and not has_live_add?(rule.queue, state.requests) do
           start_initial_cleanup(state, key)
         else
           state
         end
 
-      %{status: :installing, queue: []} ->
+      %Rule{status: :installing, queue: []} ->
         delete_rule(state, key)
 
       _rule ->
@@ -739,7 +775,7 @@ defmodule Rebus.MatchSubscription.Worker do
   # concurrent bus work separately and queue the rest without dropping state.
   defp start_initial_cleanup(state, key) do
     case Map.get(state.rules, key) do
-      %{status: :active, operation: nil} = rule ->
+      %Rule{status: :active, operation: nil} = rule ->
         rule = %{
           rule
           | status: :cleaning,
@@ -781,7 +817,7 @@ defmodule Rebus.MatchSubscription.Worker do
 
   defp resume_initial_cleanup(state, key) do
     case Map.get(state.rules, key) do
-      %{status: :cleaning, operation: nil} ->
+      %Rule{status: :cleaning, operation: nil} ->
         state
         |> start_recovery_attempt(key)
         |> start_next_initial_cleanup()
@@ -796,10 +832,10 @@ defmodule Rebus.MatchSubscription.Worker do
       nil ->
         state
 
-      %{status: :recovering} ->
+      %Rule{status: :recovering} ->
         state
 
-      %{operation: operation} when not is_nil(operation) ->
+      %Rule{operation: operation} when not is_nil(operation) ->
         state
 
       rule ->
@@ -826,7 +862,7 @@ defmodule Rebus.MatchSubscription.Worker do
 
   defp schedule_recovery_retry(state, key) do
     case Map.get(state.rules, key) do
-      %{status: :recovering, retry_timer: nil} = rule ->
+      %Rule{status: :recovering, retry_timer: nil} = rule ->
         attempt = rule.recovery_attempt + 1
         timer = Process.send_after(self(), {:retry_recovery, key}, retry_delay(attempt))
         put_rule(state, key, %{rule | recovery_attempt: attempt, retry_timer: timer})
@@ -1064,20 +1100,7 @@ defmodule Rebus.MatchSubscription.Worker do
       else: put_rule(state, key, new_rule(rule, :installing))
   end
 
-  defp new_rule(rule, status) do
-    %{
-      rule: rule,
-      refs: MapSet.new(),
-      pending_handlers: MapSet.new(),
-      remote_may_exist?: false,
-      status: status,
-      operation: nil,
-      queue: [],
-      recovery_kind: nil,
-      recovery_attempt: 0,
-      retry_timer: nil
-    }
-  end
+  defp new_rule(rule, status), do: %Rule{rule: rule, status: status}
 
   defp enqueue_request(state, key, request_id) do
     update_rule(state, key, fn rule -> %{rule | queue: rule.queue ++ [request_id]} end)
@@ -1091,7 +1114,7 @@ defmodule Rebus.MatchSubscription.Worker do
   end
 
   defp sender_routing_ambiguous?(state, key, candidate) do
-    Enum.any?(state.rules, fn {existing_key, %{rule: existing}} ->
+    Enum.any?(state.rules, fn {existing_key, %Rule{rule: existing}} ->
       existing_key != key and Overlap.sender_routing_ambiguous?(candidate, existing)
     end)
   end
@@ -1215,21 +1238,13 @@ defmodule Rebus.MatchSubscription.Worker do
 
   defp restore_state(state, %{rules: rules, subscriptions: subscriptions})
        when is_map(rules) and is_map(subscriptions) do
+    # A row is a plain map of the rule's fields, so it restores into the record
+    # directly. The operation in flight, the callers queued behind it and the
+    # retry timer belonged to the worker that died, and none of them is a fact
+    # about the bus, so a restored rule starts without them.
     rules =
-      Map.new(rules, fn {key, rule} ->
-        {key,
-         %{
-           rule: rule.rule,
-           refs: rule.refs,
-           pending_handlers: rule.pending_handlers,
-           remote_may_exist?: rule.remote_may_exist?,
-           status: rule.status,
-           operation: nil,
-           queue: [],
-           recovery_kind: rule.recovery_kind,
-           recovery_attempt: rule.recovery_attempt,
-           retry_timer: nil
-         }}
+      Map.new(rules, fn {key, row} ->
+        {key, %{struct!(Rule, row) | operation: nil, queue: [], retry_timer: nil}}
       end)
 
     {owner_monitors, ref_monitors} =
@@ -1241,7 +1256,7 @@ defmodule Rebus.MatchSubscription.Worker do
     recovering_rules =
       rules
       |> Enum.reduce(MapSet.new(), fn
-        {key, %{status: :recovering}}, keys -> MapSet.put(keys, key)
+        {key, %Rule{status: :recovering}}, keys -> MapSet.put(keys, key)
         {_key, _rule}, keys -> keys
       end)
 
