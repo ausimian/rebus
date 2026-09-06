@@ -76,6 +76,13 @@ defmodule Rebus do
 
       config :rebus, :match_recovery_max_rules, 64
 
+  `:match_recovery_max_attempts` caps how many times the cleanup of one such
+  rule is retried before the connection is closed. The default is 30, about 26
+  seconds of backoff. See
+  [Signal subscriptions and match rules](match_rules.html).
+
+      config :rebus, :match_recovery_max_attempts, 30
+
   ## Architecture
 
   When you connect to a D-Bus bus using `connect/2`, Rebus creates a supervised
@@ -515,7 +522,8 @@ defmodule Rebus do
   overlaps an existing one with a different sender. `{:error, :not_a_bus}`
   means the connection was opened with `bus: false`, and nothing was sent.
 
-  Rebus closes the connection when too many ambiguous cleanups accumulate. A reference
+  Rebus closes the connection when too many ambiguous cleanups accumulate, or when
+  one of them is still unresolved after its retry budget. A reference
   that failed with `{:error, :match_subscription_state_lost}` stays unresolved until the
   connection is closed. Rebus responds by closing a connection created by
   `connect/2`; on a connection started any other way no close happens, so the
