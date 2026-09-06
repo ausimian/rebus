@@ -164,7 +164,10 @@ defmodule Rebus.TestServer do
       {:select, {:select_info, :recvmsg, handle}} ->
         {:noreply, %{state | handle: handle}}
 
-      {:error, :closed} ->
+      # A peer that closes while frames it never read are still queued draws a
+      # reset instead of a clean FIN. Either way the client is simply gone, so
+      # stop normally rather than logging a crash report for it.
+      {:error, reason} when reason in [:closed, :econnreset] ->
         {:stop, :normal, state}
 
       {:error, reason} ->
