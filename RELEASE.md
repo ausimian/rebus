@@ -8,7 +8,9 @@ It is a breaking release: result shapes changed and validation is stricter.
 - `Rebus.send/2` and `Rebus.send/3` send a message without waiting for a reply.
 - `Rebus.close/1` stops a connection you no longer need.
 - `Rebus.MatchRule` with `Rebus.add_match/3` and `Rebus.remove_match/3`
-  subscribes the caller to the signals the bus routes on request.
+  subscribes the caller to the signals the bus routes on request; directed
+  signals from a well-known `sender` are matched against the name's current
+  owner, tracked through `NameOwnerChanged`.
 - Unix file descriptor passing on Linux and macOS local sockets: `fds:` to
   send, `unix_fds` to receive, `Rebus.UnixFD.close/1` to release each one.
 - Authentication negotiation: `DBUS_COOKIE_SHA1`, and opt-in `ANONYMOUS`.

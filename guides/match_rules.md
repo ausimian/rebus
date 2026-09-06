@@ -70,8 +70,18 @@ routed.
 
 A well-known `:sender` is left to the bus for broadcast signals, because the
 bus forwards them under the sender's current unique name. A directed signal
-bypasses bus routing, so Rebus accepts one for a well-known `:sender` only
-when the signal's sender header is that exact name.
+bypasses bus routing, so Rebus decides that one itself. It tracks who owns the
+name, with `GetNameOwner` and the bus driver's `NameOwnerChanged` signal, and
+delivers a directed signal whose sender is that owner, or the well-known name
+itself, which only the bus driver can send. A directed signal from anyone else
+is rejected. Both facts come from the bus driver, whose sender header a peer
+cannot forge.
+
+Tracking is best effort. If it fails, Rebus logs a warning naming the well-known
+name, directed delivery for that name stays off, and broadcast delivery is
+unaffected. There is also a short window, between the subscription being
+installed and the first owner answer arriving, in which a directed signal from
+the owner is not yet delivered.
 
 D-Bus does not say which rule admitted a signal. Rebus therefore rejects a
 rule that overlaps an existing one with a different sender, returning

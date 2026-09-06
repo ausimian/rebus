@@ -13,6 +13,14 @@ defmodule Rebus.MatchSubscription.Operation do
   alias Rebus.UnixFD
 
   @match_rule_not_found "org.freedesktop.DBus.Error.MatchRuleNotFound"
+  @name_has_no_owner "org.freedesktop.DBus.Error.NameHasNoOwner"
+  # The tracking sequences below are not one caller operation with one budget:
+  # each bus round trip gets its own deadline, so a slow AddMatch cannot spend
+  # what GetNameOwner needs and turn a healthy service into an untracked one.
+  # The steps that only call the connection are bounded `GenServer.call`s, not
+  # bus round trips, so they take a fixed timeout of the same size.
+  @tracking_step_timeout 1_000
+  @tracking_call_timeout 1_000
 
   @type error :: {:error, term()}
 
@@ -80,6 +88,59 @@ defmodule Rebus.MatchSubscription.Operation do
       {:error, _reason} ->
         {:retry, :handlers}
     end
+  end
+
+  # Starts tracking the current owner of a well-known sender name, so directed
+  # signals forwarded under the owner's unique name can be matched against it.
+  # The steps are ordered: the name is marked tracked first, then the bus rule
+  # that reports every later change is installed, and only then is the current
+  # owner asked for. An owner change cannot slip between the query and the rule
+  # that way, and a reply that lost the race to a signal is discarded by
+  # `Rebus.Connection.seed_name_owner/4`.
+  @doc false
+  @spec track_owner(pid(), binary()) :: :ok | {:error, {atom(), term()}}
+  def track_owner(conn, name) do
+    track = Connection.track_name_owner(conn, name, @tracking_call_timeout)
+
+    with :ok <- tagged(:track, track),
+         :ok <-
+           tagged(
+             :add_match,
+             invoke_bus_method(conn, "AddMatch", tracking_rule(name), step_deadline())
+           ),
+         {:ok, owner} <- tagged(:get_name_owner, get_name_owner(conn, name, step_deadline())) do
+      tagged(:seed, Connection.seed_name_owner(conn, name, owner, @tracking_call_timeout))
+    end
+  end
+
+  # Stops tracking a name no subscription needs any more. The local entry goes
+  # whatever the bus made of the RemoveMatch: a tracking rule the bus may still
+  # hold only delivers NameOwnerChanged signals that no longer change anything.
+  @doc false
+  @spec untrack_owner(pid(), binary()) :: :ok | {:error, {atom(), term()}}
+  def untrack_owner(conn, name) do
+    removed = tagged(:remove_match, remove_tracking_rule(conn, name, step_deadline()))
+
+    untracked =
+      tagged(:untrack, Connection.untrack_name_owner(conn, name, @tracking_call_timeout))
+
+    case removed do
+      :ok -> untracked
+      error -> error
+    end
+  end
+
+  # The canonical rule that asks the bus driver to report ownership changes for
+  # one well-known name.
+  @doc false
+  @spec tracking_rule(binary()) :: MatchRule.t()
+  def tracking_rule(name) do
+    MatchRule.new!(
+      sender: "org.freedesktop.DBus",
+      interface: "org.freedesktop.DBus",
+      member: "NameOwnerChanged",
+      args: %{0 => name}
+    )
   end
 
   # A bus error names a fault the bus is certain about, so it settles whether
@@ -196,14 +257,62 @@ defmodule Rebus.MatchSubscription.Operation do
     end
   end
 
-  defp bus_message(member, rule) do
+  defp tagged(_step, :ok), do: :ok
+  defp tagged(_step, {:ok, _value} = ok), do: ok
+  defp tagged(step, {:error, reason}), do: {:error, {step, reason}}
+
+  # A fresh deadline for one bus round trip of a tracking sequence.
+  defp step_deadline, do: System.monotonic_time(:millisecond) + @tracking_step_timeout
+
+  defp remove_tracking_rule(conn, name, deadline) do
+    case remove_match(conn, tracking_rule(name), deadline) do
+      :ok -> :ok
+      {_classification, error} -> error
+    end
+  end
+
+  defp get_name_owner(conn, name, deadline) do
+    with {:ok, timeout} <- remaining_timeout(deadline) do
+      case Rebus.call(conn, bus_message("GetNameOwner", name), timeout) do
+        {:ok, %Message{} = reply} -> name_owner_result(reply)
+        {:error, %Message{} = reply} -> name_owner_result(reply)
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
+  # A name nobody owns is a definite answer, not a failure. Every other error
+  # leaves the name unseeded, so directed signals for it stay rejected.
+  defp name_owner_result(%Message{} = reply) do
+    _ = UnixFD.close_all(reply.unix_fds)
+
+    case reply do
+      %Message{type: :method_return, body: [owner]} when is_binary(owner) ->
+        {:ok, :binary.copy(owner)}
+
+      %Message{type: :error, header_fields: %{error_name: @name_has_no_owner}} ->
+        {:ok, nil}
+
+      %Message{type: :error, header_fields: %{error_name: error_name}}
+      when is_binary(error_name) ->
+        {:error, {:bus_error, :binary.copy(error_name)}}
+
+      _ ->
+        {:error, :invalid_bus_reply}
+    end
+  end
+
+  defp bus_message(member, %MatchRule{} = rule),
+    do: bus_message(member, MatchRule.to_string(rule))
+
+  defp bus_message(member, argument) when is_binary(argument) do
     Message.new!(:method_call,
       path: "/org/freedesktop/DBus",
       interface: "org.freedesktop.DBus",
       destination: "org.freedesktop.DBus",
       member: member,
       signature: "s",
-      body: [MatchRule.to_string(rule)]
+      body: [argument]
     )
   end
 

@@ -155,6 +155,38 @@ defmodule Rebus.Connection do
     )
   end
 
+  # Owner tracking for the well-known names subscriptions depend on. The bus
+  # round trips that answer these belong to the match-subscription worker; the
+  # connection only holds the table dispatch reads.
+  #
+  # Marks a name tracked, without disturbing an owner a signal already set.
+  @doc false
+  @spec track_name_owner(pid(), binary(), non_neg_integer()) ::
+          :ok | {:error, :timeout | :disconnected | :not_connected}
+  def track_name_owner(conn, name, timeout)
+      when is_pid(conn) and is_binary(name) and is_integer(timeout) and timeout >= 0 do
+    safe_setup_call(conn, {:track_name_owner, name}, nil, timeout)
+  end
+
+  # Records the owner a GetNameOwner reply reported, but only while the name is
+  # still unseeded: a NameOwnerChanged that arrived first is the newer fact.
+  @doc false
+  @spec seed_name_owner(pid(), binary(), binary() | nil, non_neg_integer()) ::
+          :ok | {:error, :timeout | :disconnected | :not_connected}
+  def seed_name_owner(conn, name, owner, timeout)
+      when is_pid(conn) and is_binary(name) and (is_binary(owner) or is_nil(owner)) and
+             is_integer(timeout) and timeout >= 0 do
+    safe_setup_call(conn, {:seed_name_owner, name, owner}, nil, timeout)
+  end
+
+  @doc false
+  @spec untrack_name_owner(pid(), binary(), non_neg_integer()) ::
+          :ok | {:error, :timeout | :disconnected | :not_connected}
+  def untrack_name_owner(conn, name, timeout)
+      when is_pid(conn) and is_binary(name) and is_integer(timeout) and timeout >= 0 do
+    safe_setup_call(conn, {:untrack_name_owner, name}, nil, timeout)
+  end
+
   @spec delete_signal_handler(pid(), reference()) ::
           :ok | {:error, :timeout | :disconnected | :not_connected}
   def delete_signal_handler(conn, ref) when is_pid(conn) and is_reference(ref) do
@@ -238,6 +270,12 @@ defmodule Rebus.Connection do
           default: %{}
 
     field :handler_monitor_index, %{reference() => reference()}, default: %{}
+    # The current owner of every well-known name a subscription depends on, as
+    # the bus reports it. `:unknown` is tracked but not yet seeded, `nil` is a
+    # name nobody owns, and a binary is the owner's unique name. Matching a
+    # directed signal needs this answer synchronously, so it lives here rather
+    # than in the process that performs the bus round trips.
+    field :name_owners, %{binary() => :unknown | nil | binary()}, default: %{}
     # Implementation modules behind the connection's side effects. Production
     # always uses the defaults; tests substitute a module rather than reaching
     # into per-operation state.
@@ -698,6 +736,24 @@ defmodule Rebus.Connection do
         %__MODULE__{} = state
       ) do
     add_signal_handler(state, pid, handler_ref, rule)
+  end
+
+  def handle_call({:track_name_owner, name}, _from, %__MODULE__{} = state) do
+    {:reply, :ok, %{state | name_owners: Map.put_new(state.name_owners, name, :unknown)}}
+  end
+
+  def handle_call({:seed_name_owner, name, owner}, _from, %__MODULE__{} = state) do
+    case Map.fetch(state.name_owners, name) do
+      {:ok, :unknown} ->
+        {:reply, :ok, %{state | name_owners: Map.put(state.name_owners, name, owner)}}
+
+      _seeded_or_untracked ->
+        {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:untrack_name_owner, name}, _from, %__MODULE__{} = state) do
+    {:reply, :ok, %{state | name_owners: Map.delete(state.name_owners, name)}}
   end
 
   def handle_call({:delete_signal_handler, _ref}, _from, %__MODULE__{established?: false} = state) do

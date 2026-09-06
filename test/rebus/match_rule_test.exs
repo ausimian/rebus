@@ -29,6 +29,7 @@ defmodule Rebus.MatchRuleTest do
 
   alias Rebus.MatchRule
   alias Rebus.MatchRuleTest.PlaceholderConnection
+  alias Rebus.MatchSubscription.Operation
   alias Rebus.MatchSubscription.Store
   alias Rebus.MatchSubscription.Worker
   alias Rebus.Message
@@ -165,6 +166,60 @@ defmodule Rebus.MatchRuleTest do
              })
     end
 
+    test "matches a directed well-known sender against the tracked owner" do
+      rule = MatchRule.new!(sender: "org.example.Service", member: "Changed")
+      owners = %{"org.example.Service" => ":1.42"}
+
+      directed = fn sender ->
+        Message.new!(:signal,
+          sender: sender,
+          destination: ":1.100",
+          path: "/org/example",
+          interface: "org.example.Interface",
+          member: "Changed"
+        )
+      end
+
+      # The bus driver's own name still matches literally, and so does the
+      # unique name it currently reports as the owner. Nothing else does.
+      assert MatchRule.matches?(rule, directed.("org.example.Service"), owners)
+      assert MatchRule.matches?(rule, directed.(":1.42"), owners)
+      refute MatchRule.matches?(rule, directed.(":1.99"), owners)
+
+      # Tracked but unseeded, unowned, untracked, and no sender header at all.
+      refute MatchRule.matches?(rule, directed.(":1.42"), %{"org.example.Service" => :unknown})
+      refute MatchRule.matches?(rule, directed.(":1.42"), %{"org.example.Service" => nil})
+      refute MatchRule.matches?(rule, directed.(":1.42"), %{})
+
+      anonymous = directed.(":1.42")
+
+      refute MatchRule.matches?(
+               rule,
+               %{anonymous | header_fields: Map.delete(anonymous.header_fields, :sender)},
+               owners
+             )
+
+      # A broadcast signal is still left to the bus, and a unique-name sender
+      # criterion is still compared directly.
+      broadcast =
+        Message.new!(:signal,
+          sender: ":1.99",
+          path: "/org/example",
+          interface: "org.example.Interface",
+          member: "Changed"
+        )
+
+      assert MatchRule.matches?(rule, broadcast, %{})
+
+      unique = MatchRule.new!(sender: ":1.42", member: "Changed")
+      assert MatchRule.matches?(unique, directed.(":1.42"), owners)
+      refute MatchRule.matches?(unique, directed.(":1.99"), owners)
+
+      # `matches?/2` knows no owners, so it is `matches?/3` with an empty table.
+      assert MatchRule.matches?(rule, directed.("org.example.Service"))
+      refute MatchRule.matches?(rule, directed.(":1.42"))
+    end
+
     test "matches a directed signal for a unique sender" do
       rule = MatchRule.new!(sender: ":1.42", member: "Changed")
 
@@ -205,6 +260,7 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(add.serial))
       ref_a = assert_subscription(owner_a)
+      :ok = answer_tracking(server)
 
       owner_b = subscribe_owner(self(), connection, rule)
       ref_b = assert_subscription(owner_b)
@@ -238,6 +294,9 @@ defmodule Rebus.MatchRuleTest do
 
       send(owner_a, :stop)
       send(owner_b, :stop)
+
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
     test "queues a same-rule add while the first AddMatch is still in flight", %{
@@ -257,6 +316,7 @@ defmodule Rebus.MatchRuleTest do
       first_ref = assert_subscription(first)
       second_ref = assert_subscription(second)
       refute first_ref == second_ref
+      :ok = answer_tracking(server)
 
       # The queued caller was served from the rule the first one installed.
       refute_receive {^server, %Message{header_fields: %{member: "AddMatch"}}}, 100
@@ -281,6 +341,7 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(add.serial))
       ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
 
       :ok =
         TestServer.push(server, test_signal("changed", sender: ":1.99", destination: ":1.100"))
@@ -298,6 +359,261 @@ defmodule Rebus.MatchRuleTest do
       send(owner, :stop)
       remove = assert_remove_match(server, rule)
       :ok = TestServer.push(server, method_return(remove.serial))
+    end
+
+    test "delivers a directed signal from the well-known sender's tracked owner", %{
+      server: server,
+      connection: connection
+    } do
+      rule = test_rule()
+      owner = subscribe_owner(self(), connection, rule)
+      add = assert_add_match(server, rule)
+      :ok = TestServer.push(server, method_return(add.serial))
+      ref = assert_subscription(owner)
+
+      :ok = answer_tracking(server, "org.example.Service", ":1.42")
+      assert wait_until(fn -> name_owner(connection, "org.example.Service") == ":1.42" end)
+
+      :ok = TestServer.push(server, directed_signal(":1.42"))
+      assert_receive {:matched, ^owner, ^ref, %Message{body: ["changed"]}}, 1_000
+
+      :ok = TestServer.push(server, directed_signal(":1.99"))
+      refute_receive {:matched, ^owner, ^ref, _message}, 100
+
+      # The literal well-known name still matches: that is the bus driver.
+      :ok = TestServer.push(server, directed_signal("org.example.Service"))
+      assert_receive {:matched, ^owner, ^ref, %Message{body: ["changed"]}}, 1_000
+
+      send(owner, :stop)
+      remove = assert_remove_match(server, rule)
+      :ok = TestServer.push(server, method_return(remove.serial))
+    end
+
+    test "installs the owner tracking rule before asking who owns the name", %{
+      server: server,
+      connection: connection
+    } do
+      rule = test_rule()
+      owner = subscribe_owner(self(), connection, rule)
+      add = assert_add_match(server, rule)
+      :ok = TestServer.push(server, method_return(add.serial))
+      _ref = assert_subscription(owner)
+
+      # The rule that reports every later change must be in place before the
+      # current owner is asked for, so no change can slip between the two.
+      tracking_add = assert_add_match(server, tracking_rule())
+      assert tracking_add.body == [MatchRule.to_string(tracking_rule())]
+      refute_receive {^server, %Message{header_fields: %{member: "GetNameOwner"}}}, 100
+
+      :ok = TestServer.push(server, method_return(tracking_add.serial))
+      get = assert_get_name_owner(server, "org.example.Service")
+      :ok = TestServer.push(server, name_owner_reply(get.serial, ":1.42"))
+      assert wait_until(fn -> name_owner(connection, "org.example.Service") == ":1.42" end)
+
+      send(owner, :stop)
+    end
+
+    test "follows the tracked name to its new owner and to none", %{
+      server: server,
+      connection: connection
+    } do
+      rule = test_rule()
+      owner = subscribe_owner(self(), connection, rule)
+      add = assert_add_match(server, rule)
+      :ok = TestServer.push(server, method_return(add.serial))
+      ref = assert_subscription(owner)
+
+      :ok = answer_tracking(server, "org.example.Service", ":1.42")
+      assert wait_until(fn -> name_owner(connection, "org.example.Service") == ":1.42" end)
+
+      :ok =
+        TestServer.push(server, name_owner_changed("org.example.Service", ":1.42", ":1.77"))
+
+      assert wait_until(fn -> name_owner(connection, "org.example.Service") == ":1.77" end)
+
+      :ok = TestServer.push(server, directed_signal(":1.77"))
+      assert_receive {:matched, ^owner, ^ref, %Message{body: ["changed"]}}, 1_000
+
+      :ok = TestServer.push(server, directed_signal(":1.42"))
+      refute_receive {:matched, ^owner, ^ref, _message}, 100
+
+      :ok = TestServer.push(server, name_owner_changed("org.example.Service", ":1.77", ""))
+      assert wait_until(fn -> name_owner(connection, "org.example.Service") == nil end)
+
+      :ok = TestServer.push(server, directed_signal(":1.77"))
+      :ok = TestServer.push(server, directed_signal(":1.42"))
+      refute_receive {:matched, ^owner, ^ref, _message}, 100
+
+      send(owner, :stop)
+    end
+
+    test "ignores a NameOwnerChanged a peer sent directly", %{
+      server: server,
+      connection: connection
+    } do
+      rule = test_rule()
+      owner = subscribe_owner(self(), connection, rule)
+      add = assert_add_match(server, rule)
+      :ok = TestServer.push(server, method_return(add.serial))
+      ref = assert_subscription(owner)
+
+      :ok = answer_tracking(server, "org.example.Service", ":1.42")
+      assert wait_until(fn -> name_owner(connection, "org.example.Service") == ":1.42" end)
+
+      # Same interface, member and body, but sent by a peer rather than the
+      # bus driver, whose sender header a peer cannot forge.
+      :ok =
+        TestServer.push(
+          server,
+          name_owner_changed("org.example.Service", ":1.42", ":1.99",
+            sender: ":1.99",
+            destination: ":1.100"
+          )
+        )
+
+      :ok = TestServer.push(server, directed_signal(":1.42"))
+      assert_receive {:matched, ^owner, ^ref, %Message{body: ["changed"]}}, 1_000
+      assert name_owner(connection, "org.example.Service") == ":1.42"
+
+      :ok = TestServer.push(server, directed_signal(":1.99"))
+      refute_receive {:matched, ^owner, ^ref, _message}, 100
+
+      send(owner, :stop)
+    end
+
+    test "rejects directed signals while the tracked name has no owner", %{
+      server: server,
+      connection: connection
+    } do
+      rule = test_rule()
+      owner = subscribe_owner(self(), connection, rule)
+      add = assert_add_match(server, rule)
+      :ok = TestServer.push(server, method_return(add.serial))
+      ref = assert_subscription(owner)
+
+      :ok = answer_tracking(server, "org.example.Service", nil)
+      assert wait_until(fn -> tracking_idle?(connection) end)
+      assert tracked?(connection, "org.example.Service")
+      assert name_owner(connection, "org.example.Service") == nil
+
+      :ok = TestServer.push(server, directed_signal(":1.42"))
+      :ok = TestServer.push(server, directed_signal(":1.99"))
+      refute_receive {:matched, ^owner, ^ref, _message}, 100
+
+      :ok = TestServer.push(server, name_owner_changed("org.example.Service", "", ":1.42"))
+      assert wait_until(fn -> name_owner(connection, "org.example.Service") == ":1.42" end)
+
+      :ok = TestServer.push(server, directed_signal(":1.42"))
+      assert_receive {:matched, ^owner, ^ref, %Message{body: ["changed"]}}, 1_000
+
+      send(owner, :stop)
+    end
+
+    test "keeps the owner a signal reported over a later GetNameOwner reply", %{
+      server: server,
+      connection: connection
+    } do
+      rule = test_rule()
+      owner = subscribe_owner(self(), connection, rule)
+      add = assert_add_match(server, rule)
+      :ok = TestServer.push(server, method_return(add.serial))
+      ref = assert_subscription(owner)
+
+      tracking_add = assert_add_match(server, tracking_rule())
+      :ok = TestServer.push(server, method_return(tracking_add.serial))
+      get = assert_get_name_owner(server, "org.example.Service")
+
+      # The change arrives first, so the reply describing the older state must
+      # not overwrite it.
+      :ok = TestServer.push(server, name_owner_changed("org.example.Service", "", ":1.77"))
+      assert wait_until(fn -> name_owner(connection, "org.example.Service") == ":1.77" end)
+
+      :ok = TestServer.push(server, name_owner_reply(get.serial, ":1.42"))
+      :ok = TestServer.push(server, directed_signal(":1.42"))
+      refute_receive {:matched, ^owner, ^ref, _message}, 100
+      assert name_owner(connection, "org.example.Service") == ":1.77"
+
+      :ok = TestServer.push(server, directed_signal(":1.77"))
+      assert_receive {:matched, ^owner, ^ref, %Message{body: ["changed"]}}, 1_000
+
+      send(owner, :stop)
+    end
+
+    test "tracks one well-known sender once for two rules", %{
+      server: server,
+      connection: connection
+    } do
+      first_rule = test_rule("Changed")
+      second_rule = test_rule("Altered")
+
+      first = subscribe_owner(self(), connection, first_rule)
+      first_add = assert_add_match(server, first_rule)
+      :ok = TestServer.push(server, method_return(first_add.serial))
+      _first_ref = assert_subscription(first)
+      :ok = answer_tracking(server, "org.example.Service", ":1.42")
+
+      second = subscribe_owner(self(), connection, second_rule)
+      second_add = assert_add_match(server, second_rule)
+      :ok = TestServer.push(server, method_return(second_add.serial))
+      _second_ref = assert_subscription(second)
+
+      # The second rule needs the same name, which is already tracked.
+      refute_receive {^server, %Message{header_fields: %{member: "GetNameOwner"}}}, 100
+
+      send(first, :stop)
+      first_remove = assert_remove_match(server, first_rule)
+      :ok = TestServer.push(server, method_return(first_remove.serial))
+      assert wait_until(fn -> rule_status(connection, first_rule) == nil end)
+
+      # The second rule still needs the name, so the tracking rule stays.
+      refute_receive {^server, %Message{header_fields: %{member: "RemoveMatch"}}}, 100
+      assert name_owner(connection, "org.example.Service") == ":1.42"
+
+      send(second, :stop)
+      second_remove = assert_remove_match(server, second_rule)
+      :ok = TestServer.push(server, method_return(second_remove.serial))
+
+      untrack = assert_remove_match(server, tracking_rule())
+      :ok = TestServer.push(server, method_return(untrack.serial))
+      assert wait_until(fn -> not tracked?(connection, "org.example.Service") end)
+    end
+
+    test "keeps a subscription when owner tracking fails", %{
+      server: server,
+      connection: connection
+    } do
+      rule = test_rule()
+
+      log =
+        capture_log(fn ->
+          owner = subscribe_owner(self(), connection, rule)
+          add = assert_add_match(server, rule)
+          :ok = TestServer.push(server, method_return(add.serial))
+          ref = assert_subscription(owner)
+
+          tracking_add = assert_add_match(server, tracking_rule())
+
+          :ok =
+            TestServer.push(
+              server,
+              bus_error(tracking_add.serial, "org.freedesktop.DBus.Error.AccessDenied")
+            )
+
+          assert wait_until(fn -> tracking_idle?(connection) end)
+
+          # The caller kept its reference and its broadcast delivery; only
+          # directed delivery for the name is off, with the name left unseeded.
+          assert name_owner(connection, "org.example.Service") == :unknown
+          :ok = TestServer.push(server, test_signal("changed"))
+          assert_receive {:matched, ^owner, ^ref, %Message{body: ["changed"]}}, 1_000
+
+          :ok = TestServer.push(server, directed_signal(":1.42"))
+          refute_receive {:matched, ^owner, ^ref, _message}, 100
+
+          send(owner, :stop)
+        end)
+
+      assert log =~ "D-Bus name owner tracking failed name=org.example.Service step=add_match"
     end
 
     test "delivers a directed bus-driver signal with an exact sender", %{
@@ -346,6 +662,7 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, sender_rule)
       :ok = TestServer.push(server, method_return(add.serial))
       _ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
 
       broad_rule =
         MatchRule.new!(
@@ -373,9 +690,15 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(add.serial))
       ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
 
       assert {:error, :timeout} = Rebus.remove_match(connection, ref, 10)
       assert_remove_match(server, rule)
+
+      # The rule left `:active` above, so the name is no longer needed and the
+      # tracking rule is withdrawn concurrently with the rule's own removal.
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
 
       :ok = TestServer.push(server, test_signal("changed"))
       refute_receive {:matched, ^owner, ^ref, %Message{}}, 200
@@ -418,6 +741,7 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(add.serial))
       ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
 
       removal = Task.async(fn -> Rebus.remove_match(connection, ref, 1_000) end)
       remove = assert_remove_match(server, rule)
@@ -434,6 +758,9 @@ defmodule Rebus.MatchRuleTest do
       assert :ok = Task.await(removal, 1_000)
       assert wait_until(fn -> rule_status(connection, rule) == nil end)
       send(owner, :stop)
+
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
     test "treats a dropped named AddMatch error as definitive", %{
@@ -462,10 +789,14 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(add.serial))
       _ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
 
       send(owner, :stop)
       remove = assert_remove_match(server, rule)
       :ok = TestServer.push(server, method_return(remove.serial))
+
+      untrack = assert_remove_match(server, tracking_rule())
+      :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
     test "retries owner cleanup after a definitive D-Bus error", %{
@@ -478,10 +809,16 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(add.serial))
       _ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
       worker = subscription_worker(connection)
 
       send(owner, :stop)
       remove = assert_remove_match(server, rule)
+
+      # The rule left `:active` above, so the name is no longer needed and the
+      # tracking rule is withdrawn concurrently with the rule's own removal.
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
 
       :ok =
         TestServer.push(
@@ -509,6 +846,7 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(add.serial))
       ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
       worker = subscription_worker(connection)
 
       removal = Task.async(fn -> Rebus.remove_match(connection, ref, 300) end)
@@ -523,6 +861,9 @@ defmodule Rebus.MatchRuleTest do
       assert wait_until(fn -> rule_status(connection, rule) == nil end)
       assert subscription_worker(connection) == worker
       assert Process.alive?(worker)
+
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
     test "keeps the worker alive when owner down races a definitive final removal", %{
@@ -535,6 +876,7 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(add.serial))
       ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
       worker = subscription_worker(connection)
 
       removal = Task.async(fn -> Rebus.remove_match(connection, ref, 1_000) end)
@@ -557,6 +899,9 @@ defmodule Rebus.MatchRuleTest do
       assert wait_until(fn -> rule_status(connection, rule) == nil end)
       assert subscription_worker(connection) == worker
       assert Process.alive?(worker)
+
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
     test "cleans up a timed-out AddMatch before a later re-add", %{
@@ -577,12 +922,16 @@ defmodule Rebus.MatchRuleTest do
       second_add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(second_add.serial))
       replacement_ref = assert_subscription(replacement)
+      :ok = answer_tracking(server)
 
       removal = Task.async(fn -> Rebus.remove_match(connection, replacement_ref, 1_000) end)
       final_remove = assert_remove_match(server, rule)
       :ok = TestServer.push(server, method_return(final_remove.serial))
       assert :ok = Task.await(removal, 1_000)
       send(replacement, :stop)
+
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
     test "does not let a slow connection block a healthy connection", %{
@@ -611,6 +960,7 @@ defmodule Rebus.MatchRuleTest do
       healthy_add = assert_add_match(healthy_server, rule)
       :ok = TestServer.push(healthy_server, method_return(healthy_add.serial))
       assert {:ok, _ref} = Task.await(healthy, 500)
+      :ok = answer_tracking(healthy_server)
       assert {:error, :timeout} = Task.await(slow, 1_000)
 
       slow_cleanup = assert_remove_match(slow_server, rule)
@@ -627,6 +977,7 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(add.serial))
       ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
 
       :ok = :sys.suspend(connection)
       removal = Task.async(fn -> Rebus.remove_match(connection, ref, 10) end)
@@ -645,6 +996,9 @@ defmodule Rebus.MatchRuleTest do
       :ok = TestServer.push(server, method_return(remove.serial))
       assert :ok = Task.await(retry, 1_000)
       send(owner, :stop)
+
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
     test "cleans up many dead owners with one final RemoveMatch", %{
@@ -656,6 +1010,7 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(add.serial))
       _first_ref = assert_subscription(first)
+      :ok = answer_tracking(server)
 
       owners = [
         first | Enum.map(1..11, fn _index -> subscribe_owner(self(), connection, rule) end)
@@ -668,6 +1023,10 @@ defmodule Rebus.MatchRuleTest do
       remove = assert_remove_match(server, rule)
       :ok = TestServer.push(server, method_return(remove.serial))
       assert wait_until(fn -> rule_status(connection, rule) == nil end)
+
+      # The last rule for the tracked sender took the tracking rule with it.
+      untrack = assert_remove_match(server, tracking_rule())
+      :ok = TestServer.push(server, method_return(untrack.serial))
       refute_receive {^server, %Message{header_fields: %{member: "RemoveMatch"}}}, 100
     end
 
@@ -694,6 +1053,8 @@ defmodule Rebus.MatchRuleTest do
           {owner, rule}
         end)
 
+      :ok = answer_tracking(server)
+
       Enum.each(subscriptions, fn {owner, _rule} -> send(owner, :stop) end)
 
       Enum.each(1..65, fn _index ->
@@ -708,6 +1069,9 @@ defmodule Rebus.MatchRuleTest do
                  rule_status(connection, rule) == nil
                end)
              end)
+
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
     test "persists only stable rule and reference rows across a worker restart", %{
@@ -723,6 +1087,8 @@ defmodule Rebus.MatchRuleTest do
           ref = assert_subscription(owner)
           {owner, rule, ref}
         end)
+
+      :ok = answer_tracking(server)
 
       assert {:ok, %{uncertain?: false, rules: rules, subscriptions: refs}} =
                Store.load_state(connection)
@@ -740,6 +1106,9 @@ defmodule Rebus.MatchRuleTest do
                end
              end)
 
+      # The restarted worker restores the rules and tracks the name again.
+      :ok = answer_tracking(server)
+
       Enum.each(subscriptions, fn {owner, _rule, ref} ->
         send(owner, :stop)
         assert is_reference(ref)
@@ -749,6 +1118,9 @@ defmodule Rebus.MatchRuleTest do
         remove = assert_any_remove_match(server, 1_500)
         :ok = TestServer.push(server, method_return(remove.serial))
       end)
+
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
     test "retries ambiguous owner cleanup until RemoveMatch is known", %{
@@ -761,9 +1133,15 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(add.serial))
       _ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
 
       send(owner, :stop)
       _first_remove = assert_remove_match(server, rule)
+
+      # The rule left `:active` above, so the name is no longer needed and the
+      # tracking rule is withdrawn concurrently with the rule's own removal.
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
 
       # The unanswered RemoveMatch cannot prove what the bus did, so the rule
       # graduates from its one best-effort cleanup into bounded recovery.
@@ -789,6 +1167,7 @@ defmodule Rebus.MatchRuleTest do
       healthy_add = assert_add_match(server, healthy_rule)
       :ok = TestServer.push(server, method_return(healthy_add.serial))
       healthy_ref = assert_subscription(healthy)
+      :ok = answer_tracking(server)
       assert {:error, :timeout} = Task.await(slow, 1_000)
 
       slow_cleanup = assert_remove_match(server, slow_rule)
@@ -799,6 +1178,9 @@ defmodule Rebus.MatchRuleTest do
       :ok = TestServer.push(server, method_return(healthy_remove.serial))
       assert :ok = Task.await(removal, 1_000)
       send(healthy, :stop)
+
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
     test "handles owner death while another rule operation is slow", %{
@@ -816,6 +1198,7 @@ defmodule Rebus.MatchRuleTest do
       healthy_add = assert_add_match(server, healthy_rule)
       :ok = TestServer.push(server, method_return(healthy_add.serial))
       healthy_ref = assert_subscription(healthy)
+      :ok = answer_tracking(server)
 
       slow_cleanup = assert_remove_match(server, slow_rule, 1_500)
       :ok = TestServer.push(server, method_return(slow_cleanup.serial))
@@ -825,6 +1208,9 @@ defmodule Rebus.MatchRuleTest do
       :ok = TestServer.push(server, method_return(healthy_remove.serial))
       assert :ok = Task.await(removal, 1_000)
       send(healthy, :stop)
+
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
     test "does not commit an AddMatch result after the caller deadline", %{
@@ -869,11 +1255,15 @@ defmodule Rebus.MatchRuleTest do
       replacement_add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(replacement_add.serial))
       assert {:ok, replacement_ref} = Task.await(replacement, 1_000)
+      :ok = answer_tracking(server)
 
       removal = Task.async(fn -> Rebus.remove_match(connection, replacement_ref, 1_000) end)
       final_remove = assert_remove_match(server, rule)
       :ok = TestServer.push(server, method_return(final_remove.serial))
       assert :ok = Task.await(removal, 1_000)
+
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
     test "restarts a crashed idle worker and accepts a new subscription", %{
@@ -885,12 +1275,16 @@ defmodule Rebus.MatchRuleTest do
       initial_add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(initial_add.serial))
       initial_ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
 
       initial_remove = Task.async(fn -> Rebus.remove_match(connection, initial_ref, 1_000) end)
       remove = assert_remove_match(server, rule)
       :ok = TestServer.push(server, method_return(remove.serial))
       assert :ok = Task.await(initial_remove, 1_000)
       send(owner, :stop)
+
+      untrack = assert_remove_match(server, tracking_rule())
+      :ok = TestServer.push(server, method_return(untrack.serial))
       assert wait_until(fn -> not Store.persisted?(connection) end)
 
       worker = subscription_worker(connection)
@@ -907,11 +1301,15 @@ defmodule Rebus.MatchRuleTest do
       replacement_add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(replacement_add.serial))
       assert {:ok, replacement_ref} = Task.await(replacement, 1_000)
+      :ok = answer_tracking(server)
 
       final_remove = Task.async(fn -> Rebus.remove_match(connection, replacement_ref, 1_000) end)
       remove = assert_remove_match(server, rule)
       :ok = TestServer.push(server, method_return(remove.serial))
       assert :ok = Task.await(final_remove, 1_000)
+
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
     test "restores a live subscription after worker restart instead of accepting a lost ref", %{
@@ -923,6 +1321,7 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(add.serial))
       ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
 
       worker = subscription_worker(connection)
       kill_worker(worker)
@@ -934,12 +1333,18 @@ defmodule Rebus.MatchRuleTest do
                end
              end)
 
+      # The restarted worker restores the rule and tracks the name again.
+      :ok = answer_tracking(server)
+
       removal = Task.async(fn -> Rebus.remove_match(connection, ref, 1_000) end)
       remove = assert_remove_match(server, rule)
       :ok = TestServer.push(server, method_return(remove.serial))
       assert :ok = Task.await(removal, 1_000)
       assert wait_until(fn -> rule_status(connection, rule) == nil end)
       send(owner, :stop)
+
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
     test "keeps persisted rows when the match-subscription supervisor restarts", %{
@@ -951,6 +1356,7 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(add.serial))
       ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
 
       table = :ets.whereis(state_table())
       table_owner = :ets.info(table, :owner)
@@ -972,13 +1378,18 @@ defmodule Rebus.MatchRuleTest do
       assert Store.load_state(connection) == {:ok, persisted}
 
       # A worker started afterwards restores them, so the reference is still
-      # honoured and the bus rule is removed rather than left behind.
+      # honoured and the bus rule is removed rather than left behind. That
+      # worker also tracks the name again.
       removal = Task.async(fn -> Rebus.remove_match(connection, ref, 1_000) end)
       remove = assert_remove_match(server, rule)
       :ok = TestServer.push(server, method_return(remove.serial))
+      :ok = answer_tracking(server)
       assert :ok = Task.await(removal, 1_000)
       assert wait_until(fn -> not Store.persisted?(connection) end)
       send(owner, :stop)
+
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
     test "keeps an active subscription usable across a task-supervisor restart", %{
@@ -998,6 +1409,7 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(add.serial))
       ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
 
       :ok = TestServer.push(server, test_signal("before the restart"))
       assert_receive {:matched, ^owner, ^ref, %Message{body: ["before the restart"]}}, 1_000
@@ -1021,12 +1433,18 @@ defmodule Rebus.MatchRuleTest do
       :ok = TestServer.push(server, test_signal("after the restart"))
       assert_receive {:matched, ^owner, ^ref, %Message{body: ["after the restart"]}}, 1_000
 
+      # The removal starts the worker the supervisor restart left unstarted:
+      # it restores the rule and tracks the name again before removing it.
       removal = Task.async(fn -> Rebus.remove_match(connection, ref, 1_000) end)
       remove = assert_remove_match(server, rule)
       :ok = TestServer.push(server, method_return(remove.serial))
+      :ok = answer_tracking(server)
       assert :ok = Task.await(removal, 1_000)
       assert wait_until(fn -> not Store.persisted?(connection) end)
       send(owner, :stop)
+
+      untrack = assert_remove_match(server, tracking_rule(), 1_500)
+      :ok = TestServer.push(server, method_return(untrack.serial))
     end
 
     test "reaps persisted rows for a connection that dies with no worker", %{
@@ -1038,6 +1456,7 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(add.serial))
       _ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
 
       assert Store.persisted?(connection)
       assert persisted_rows(connection, :rule) != []
@@ -2052,6 +2471,7 @@ defmodule Rebus.MatchRuleTest do
       add = assert_add_match(server, rule)
       :ok = TestServer.push(server, method_return(add.serial))
       _ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
 
       assert :ok = Rebus.close(connection)
       refute_receive {^server, %Message{header_fields: %{member: "RemoveMatch"}}}, 150
@@ -2111,7 +2531,21 @@ defmodule Rebus.MatchRuleTest do
     ref
   end
 
+  # The rule string is part of the received pattern rather than a following
+  # assertion, so an unrelated AddMatch/RemoveMatch in flight - the owner
+  # tracking rule a well-known sender installs - is skipped rather than
+  # mistaken for this rule's.
+  #
+  # Do not tighten this back to matching the next AddMatch and asserting the
+  # rule string afterwards: a second rule added for a well-known sender while
+  # the first rule's tracking task is still running puts the caller's AddMatch
+  # and the tracking AddMatch in flight from different processes, and their
+  # arrival order at the tap is nondeterministic, so the strict form flakes.
+  # The pinned pattern plus an explicit `answer_tracking/1` drain is the
+  # deterministic combination.
   defp assert_add_match(server, rule) do
+    rule_string = MatchRule.to_string(rule)
+
     assert_receive {^server,
                     %Message{
                       type: :method_call,
@@ -2121,31 +2555,111 @@ defmodule Rebus.MatchRuleTest do
                         member: "AddMatch",
                         path: "/org/freedesktop/DBus"
                       },
-                      body: [rule_string]
+                      body: [^rule_string]
                     } = message},
                    1_000
 
-    assert rule_string == MatchRule.to_string(rule)
     message
   end
 
   defp assert_remove_match(server, rule, timeout \\ 1_000) do
+    rule_string = MatchRule.to_string(rule)
+
+    assert_receive {^server,
+                    %Message{
+                      type: :method_call,
+                      header_fields: %{member: "RemoveMatch"},
+                      body: [^rule_string]
+                    } = message},
+                   timeout
+
+    message
+  end
+
+  defp tracking_rule(name \\ "org.example.Service"), do: Operation.tracking_rule(name)
+
+  defp directed_signal(sender),
+    do: test_signal("changed", sender: sender, destination: ":1.100")
+
+  defp bus_error(serial, error_name),
+    do: Message.new!(:error, reply_serial: serial, error_name: error_name)
+
+  defp name_owner(connection, name), do: Map.get(:sys.get_state(connection).name_owners, name)
+
+  defp tracked?(connection, name), do: Map.has_key?(:sys.get_state(connection).name_owners, name)
+
+  defp tracking_idle?(connection) do
+    connection
+    |> subscription_worker()
+    |> :sys.get_state()
+    |> Map.fetch!(:tracking_ops)
+    |> map_size() == 0
+  end
+
+  # Plays the bus for the owner-tracking sequence a well-known sender
+  # subscription runs after its own AddMatch: the tracking rule, then the
+  # GetNameOwner whose reply seeds the owner.
+  defp answer_tracking(server, name \\ "org.example.Service", owner \\ nil) do
+    add = assert_add_match(server, tracking_rule(name))
+    :ok = TestServer.push(server, method_return(add.serial))
+    get = assert_get_name_owner(server, name)
+    :ok = TestServer.push(server, name_owner_reply(get.serial, owner))
+    :ok
+  end
+
+  defp assert_get_name_owner(server, name) do
+    assert_receive {^server,
+                    %Message{
+                      type: :method_call,
+                      header_fields: %{
+                        destination: "org.freedesktop.DBus",
+                        interface: "org.freedesktop.DBus",
+                        member: "GetNameOwner",
+                        path: "/org/freedesktop/DBus"
+                      },
+                      body: [^name]
+                    } = message},
+                   1_000
+
+    message
+  end
+
+  defp name_owner_reply(serial, nil) do
+    Message.new!(:error,
+      reply_serial: serial,
+      error_name: "org.freedesktop.DBus.Error.NameHasNoOwner"
+    )
+  end
+
+  defp name_owner_reply(serial, owner) do
+    Message.new!(:method_return, reply_serial: serial, signature: "s", body: [owner])
+  end
+
+  defp name_owner_changed(name, old_owner, new_owner, opts \\ []) do
+    signal_opts = [
+      sender: "org.freedesktop.DBus",
+      path: "/org/freedesktop/DBus",
+      interface: "org.freedesktop.DBus",
+      member: "NameOwnerChanged",
+      signature: "sss",
+      body: [name, old_owner, new_owner]
+    ]
+
+    Message.new!(:signal, Keyword.merge(signal_opts, opts))
+  end
+
+  # A RemoveMatch for any subscription rule. The owner-tracking rule's own
+  # removal is not one of the removals these tests count, so it is skipped.
+  defp assert_any_remove_match(server, timeout) do
+    tracking = MatchRule.to_string(tracking_rule())
+
     assert_receive {^server,
                     %Message{
                       type: :method_call,
                       header_fields: %{member: "RemoveMatch"},
                       body: [rule_string]
-                    } = message},
-                   timeout
-
-    assert rule_string == MatchRule.to_string(rule)
-    message
-  end
-
-  defp assert_any_remove_match(server, timeout) do
-    assert_receive {^server,
-                    %Message{type: :method_call, header_fields: %{member: "RemoveMatch"}} =
-                      message},
+                    } = message}
+                   when rule_string != tracking,
                    timeout
 
     message
