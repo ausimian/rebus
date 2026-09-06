@@ -290,6 +290,21 @@ defmodule RebusTest do
       refute log =~ "D-Bus frame dropped: :resource_limit"
     end
 
+    test "stops with :message_too_large for an over-limit body array", %{svr: svr} do
+      cli = connect_until_ready(svr)
+      ref = Process.monitor(cli)
+
+      log =
+        capture_log(fn ->
+          :ok = TestServer.push_raw(svr, raw_oversized_array_signal())
+
+          assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :message_too_large}}, 1_000
+        end)
+
+      assert log =~ "D-Bus connection protocol stopped: :message_too_large"
+      refute log =~ "D-Bus frame dropped: :resource_limit"
+    end
+
     test "rejects an invalid write timeout", %{svr: svr} do
       {:ok, addr} = TestServer.get_listen_addr(svr)
       assert {:error, :invalid_write_timeout} = Rebus.connect(addr, write_timeout: -1)
@@ -4964,6 +4979,19 @@ defmodule RebusTest do
         [8, {"g", "ay"}]
       ],
       <<1_000_001::little-32, 1>>
+    )
+  end
+
+  defp raw_oversized_array_signal do
+    raw_wire_message(
+      4,
+      [
+        [1, {"o", "/test"}],
+        [2, {"s", "test.interface"}],
+        [3, {"s", "Oversized"}],
+        [8, {"g", "ay"}]
+      ],
+      <<Rebus.Message.max_array_size() + 1::little-32>>
     )
   end
 

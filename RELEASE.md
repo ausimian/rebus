@@ -28,9 +28,9 @@ It is a breaking release: result shapes changed and validation is stricter.
   implemented, and everything else gets an `UnknownMethod` error reply.
 - `Rebus.Message.max_message_size/0`, `max_array_size/0` and
   `max_scalar_elements/0` report the size limits Rebus enforces.
-- `Rebus.ProtocolLimitError`, raised by `Rebus.Encoder` when an array exceeds
-  the D-Bus 64 MiB array limit; `Rebus.Message` reports it as
-  `:message_too_large`.
+- `Rebus.ProtocolLimitError`, raised by `Rebus.Encoder` and `Rebus.Decoder`
+  when an array exceeds the D-Bus 64 MiB array limit; `Rebus.Message` reports
+  it as `:message_too_large`.
 - Guides for descriptor passing, authentication and match rules.
 
 ### Changed

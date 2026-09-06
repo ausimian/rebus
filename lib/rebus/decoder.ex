@@ -8,6 +8,7 @@ defmodule Rebus.Decoder do
   as `:nan`, canonically losing their wire sign and payload.
   """
 
+  alias Rebus.ProtocolLimitError
   alias Rebus.ResourceLimitError
   alias Rebus.Signature
   alias Rebus.WireValue
@@ -49,9 +50,10 @@ defmodule Rebus.Decoder do
   ## Raises
 
   Raises `ArgumentError` for an invalid signature, for a boolean whose wire
-  value is neither 0 nor 1, and for non-zero alignment padding, and
+  value is neither 0 nor 1, and for non-zero alignment padding,
   `Rebus.ResourceLimitError` when the signature or data exceeds a local
-  nesting, structural, or scalar-array limit.
+  nesting, structural, or scalar-array limit, and `Rebus.ProtocolLimitError`
+  when a declared array length exceeds `Rebus.Message.max_array_size/0`.
 
   ## Examples
 
@@ -93,7 +95,8 @@ defmodule Rebus.Decoder do
 
   D-Bus infinities are represented by atoms and NaNs by canonical `:nan`.
   Raises `Rebus.ResourceLimitError` when a local structural or scalar-array
-  limit is exceeded.
+  limit is exceeded, and `Rebus.ProtocolLimitError` when a declared array
+  length exceeds `Rebus.Message.max_array_size/0`.
   """
   @spec decode_with_position(binary(), binary(), endianness()) :: {[any()], non_neg_integer()}
   def decode_with_position(signature, data, endianness \\ :little) do
@@ -197,8 +200,12 @@ defmodule Rebus.Decoder do
     # Read array length
     {array_length, length_state} = decode_uint32(state)
 
+    # The declared length is checked before the data is bounded, so an array
+    # declared over the limit is reported as a protocol size limit however few
+    # body bytes are actually present: no conforming peer can send that array
+    # at all, which makes the frame too large rather than merely malformed.
     if array_length > Rebus.Message.max_array_size() do
-      raise ArgumentError, "D-Bus array size limit exceeded"
+      raise ProtocolLimitError, limit: :array, message: "D-Bus array size limit exceeded"
     end
 
     # An array consumes its alignment padding plus the declared element bytes.

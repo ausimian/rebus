@@ -568,6 +568,11 @@ defmodule Rebus.Message do
     ResourceLimitError ->
       {:error, :resource_limit}
 
+    # A declared array length over the protocol limit is a wire-valid frame no
+    # conforming peer could have sent, not a malformed one.
+    ProtocolLimitError ->
+      {:error, :message_too_large}
+
     # These are the parser failures expected from hostile wire input. Keep this
     # pure protocol module silent; the connection layer reports the safe result.
     _error in @decode_exceptions ->
@@ -663,7 +668,8 @@ defmodule Rebus.Message do
     Invalid endianness, message type, and protocol version are rejected as soon
     as the 12-byte fixed header is available. `:message_too_large` is returned
     as soon as the header-fields length is available and the declared complete
-    message would exceed `max_message_size/0`.
+    message would exceed `max_message_size/0`, and for a body array whose
+    declared length exceeds `max_array_size/0`.
   - `nil` - If the binary does not contain sufficient data for a complete message
 
   ## Examples
@@ -1165,6 +1171,7 @@ defmodule Rebus.Message do
       _ -> {:error, :invalid_message}
     end
   rescue
+    ProtocolLimitError -> {:error, :message_too_large}
     ResourceLimitError -> {:error, :resource_limit}
     _error in @decode_exceptions -> {:error, :invalid_message}
   end
