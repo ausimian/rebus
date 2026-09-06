@@ -2353,6 +2353,124 @@ defmodule Rebus.MessageTest do
     end
   end
 
+  describe "encoded body cache" do
+    test "new/2 caches the little-endian body it encoded" do
+      message = cached_signal()
+
+      assert {body, signature, encoded} = message.encoded_body
+      assert body === message.body
+      assert signature == message.header_fields.signature
+      assert is_binary(encoded)
+      assert byte_size(encoded) == message.body_length
+    end
+
+    test "new/2 caches an empty body as an empty binary" do
+      message =
+        Message.new!(:signal, path: "/test", interface: "test.interface", member: "Empty")
+
+      assert {[], "", ""} = message.encoded_body
+      assert message.body_length == 0
+    end
+
+    test "cache hit and cache miss encode identical bytes" do
+      message = cached_signal()
+      uncached = %{message | encoded_body: nil}
+
+      for endianness <- [:little, :big] do
+        assert {:ok, cached_iodata} = Message.encode(message, endianness)
+        assert {:ok, plain_iodata} = Message.encode(uncached, endianness)
+        assert IO.iodata_to_binary(cached_iodata) == IO.iodata_to_binary(plain_iodata)
+      end
+    end
+
+    test "encode/2 reuses the cached body for little-endian encoding" do
+      message = cached_signal()
+      poisoned = %{message | encoded_body: {message.body, "sai(is)v", <<"x">>}}
+
+      assert {:ok, iodata} = Message.encode(poisoned, :little)
+      binary = IO.iodata_to_binary(iodata)
+
+      assert {:ok, decoded_length} = body_length_of(binary)
+      assert decoded_length == 1
+      assert binary_part(binary, byte_size(binary), -1) == "x"
+    end
+
+    test "encode/2 ignores the cache for big-endian encoding" do
+      message = cached_signal()
+      poisoned = %{message | encoded_body: {message.body, "sai(is)v", <<"x">>}}
+
+      assert {:ok, iodata} = Message.encode(poisoned, :big)
+      assert {:ok, decoded} = iodata |> IO.iodata_to_binary() |> Message.decode()
+      assert decoded.body == message.body
+    end
+
+    test "encode/2 ignores the cache after the body changes" do
+      message = cached_signal()
+      replaced = %{message | body: ["other", [9], [1, "x"], {"i", 3}]}
+
+      assert {:ok, iodata} = Message.encode(replaced, :little)
+      assert {:ok, decoded} = iodata |> IO.iodata_to_binary() |> Message.decode()
+      assert decoded.body == replaced.body
+    end
+
+    test "encode/2 ignores the cache after the signature changes" do
+      message =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "Cached",
+          body: [42],
+          signature: "i"
+        )
+
+      restated = %{
+        message
+        | header_fields: %{message.header_fields | signature: "u"},
+          encoded_body: {message.body, "i", <<"zzzz">>}
+      }
+
+      assert {:ok, iodata} = Message.encode(restated, :little)
+      assert {:ok, decoded} = iodata |> IO.iodata_to_binary() |> Message.decode()
+      assert decoded.body == [42]
+      assert decoded.header_fields.signature == "u"
+    end
+
+    test "encode/2 ignores the cache for an == but not === body" do
+      message =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: "Cached",
+          body: [42],
+          signature: "i"
+        )
+
+      assert Message.encode(%{message | body: [42.0]}, :little) == {:error, :invalid_body}
+    end
+
+    test "decode/1 leaves the cache empty" do
+      message = cached_signal()
+      assert {:ok, iodata} = Message.encode(message)
+      assert {:ok, decoded} = iodata |> IO.iodata_to_binary() |> Message.decode()
+
+      assert decoded.encoded_body == nil
+      assert {:ok, _reencoded} = Message.encode(decoded)
+    end
+  end
+
+  defp cached_signal do
+    Message.new!(:signal,
+      path: "/test",
+      interface: "test.interface",
+      member: "Cached",
+      body: ["hello", [1, 2, 3], [7, "inner"], {"s", "variant"}],
+      signature: "sai(is)v"
+    )
+  end
+
+  defp body_length_of(<<_::binary-size(4), body_length::little-32, _::binary>>),
+    do: {:ok, body_length}
+
   defp signal_with(extra) do
     Message.new(
       :signal,
