@@ -86,6 +86,7 @@ defmodule Rebus.Message do
   alias Rebus.Decoder
   alias Rebus.Encoder
   alias Rebus.Message.UnixFDs
+  alias Rebus.ProtocolLimitError
   alias Rebus.ResourceLimitError
   alias Rebus.Signature
   alias Rebus.WireValue
@@ -308,7 +309,8 @@ defmodule Rebus.Message do
     type was not given
   - `:invalid_unix_fds` - the descriptors do not match the body
   - `:unix_fd_limit` - the message exceeds the Unix file descriptor limit
-  - `:message_too_large` - the encoded message exceeds the D-Bus size limit
+  - `:message_too_large` - the encoded message, or an array within it, exceeds
+    the D-Bus size limit
   - `:resource_limit` - a local structural, nesting, or scalar materialization
     cap is exceeded
   """
@@ -416,8 +418,8 @@ defmodule Rebus.Message do
   for invalid header values, or `{:error, :invalid_message}` for an invalid
   fixed header or missing required fields. Returns `{:error, :message_too_large}`
   when the encoded frame exceeds the D-Bus message or header-fields limits, or
-  `{:error, :resource_limit}` when a local structural, nesting, or scalar cap
-  is exhausted.
+  an encoded array exceeds `max_array_size/0`, or `{:error, :resource_limit}`
+  when a local structural, nesting, or scalar cap is exhausted.
   """
   @spec encode(t(), :little | :big) :: {:ok, iodata()} | {:error, encoding_error()}
   def encode(message, endianness \\ :little) when endianness in [:little, :big] do
@@ -932,6 +934,7 @@ defmodule Rebus.Message do
   defp encode_body(body, signature, endianness) do
     {:ok, Encoder.encode(signature, body, endianness)}
   rescue
+    ProtocolLimitError -> {:error, :message_too_large}
     ResourceLimitError -> {:error, :resource_limit}
     _error in @encode_exceptions -> {:error, :invalid_body}
   end
@@ -943,6 +946,7 @@ defmodule Rebus.Message do
     case encode_body(body, signature, :little) do
       {:ok, _body_data} -> :ok
       {:error, :invalid_body} = error -> error
+      {:error, :message_too_large} = error -> error
       {:error, :resource_limit} = error -> error
     end
   end
@@ -968,6 +972,7 @@ defmodule Rebus.Message do
 
     {:ok, Encoder.encode_at_position("a(yv)", [fields_data], endianness, 12)}
   rescue
+    ProtocolLimitError -> {:error, :message_too_large}
     ResourceLimitError -> {:error, :resource_limit}
     _error in @encode_exceptions -> {:error, :invalid_header_fields}
   end

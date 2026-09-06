@@ -7,6 +7,7 @@ defmodule Rebus.Encoder do
   `:nan` encodes as a canonical quiet NaN.
   """
 
+  alias Rebus.ProtocolLimitError
   alias Rebus.ResourceLimitError
   alias Rebus.Signature
   alias Rebus.WireValue
@@ -48,7 +49,8 @@ defmodule Rebus.Encoder do
   converted to binary using `IO.iodata_to_binary/1`.
 
   Raises `Rebus.ResourceLimitError` when an encode operation exceeds the local
-  fixed-width scalar-array limit.
+  fixed-width scalar-array limit, and `Rebus.ProtocolLimitError` when an
+  encoded array exceeds `Rebus.Message.max_array_size/0`.
 
   ## Examples
 
@@ -226,7 +228,7 @@ defmodule Rebus.Encoder do
     data_length = final_element_state.position - aligned_element_state.position
 
     if data_length > Rebus.Message.max_array_size() do
-      raise ArgumentError, "D-Bus array size limit exceeded"
+      raise ProtocolLimitError, limit: :array, message: "D-Bus array size limit exceeded"
     end
 
     length_data = integer_data(4, state.endianness, data_length)

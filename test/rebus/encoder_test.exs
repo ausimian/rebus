@@ -1,7 +1,7 @@
 defmodule Rebus.EncoderTest do
   use ExUnit.Case, async: true
 
-  alias Rebus.{Encoder, ResourceLimitError}
+  alias Rebus.{Encoder, ProtocolLimitError, ResourceLimitError}
 
   doctest Rebus.Encoder
 
@@ -747,6 +747,25 @@ defmodule Rebus.EncoderTest do
         assert byte_size(binary) == expected_size
         assert binary == expected
       end
+    end
+
+    test "encodes an array of exactly the D-Bus array size limit" do
+      # A 1019-byte string encodes as 4 length bytes, 1019 data bytes and a NUL
+      # terminator: exactly 1024 bytes, with no padding between elements.
+      elements = div(Rebus.Message.max_array_size(), 1024)
+      values = List.duplicate(String.duplicate("x", 1019), elements)
+
+      encoded = Encoder.encode("as", [values]) |> IO.iodata_to_binary()
+
+      assert byte_size(encoded) == 4 + Rebus.Message.max_array_size()
+    end
+
+    test "rejects one element over the D-Bus array size limit" do
+      elements = div(Rebus.Message.max_array_size(), 1024) + 1
+      values = List.duplicate(String.duplicate("x", 1019), elements)
+
+      assert %ProtocolLimitError{limit: :array} =
+               catch_error(Encoder.encode("as", [values]))
     end
   end
 
