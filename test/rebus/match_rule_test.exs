@@ -1,9 +1,33 @@
+defmodule Rebus.MatchRuleTest.PlaceholderConnection do
+  @moduledoc false
+  # Stands in for a connection in the unit-level worker tests, which drive the
+  # worker's callbacks directly rather than through a bus. A transition under
+  # test may start a recovery or reset task that calls into the connection, and
+  # a process that answers such a call by crashing would take its own persisted
+  # rows down with it and race every post-state assertion. Answering keeps the
+  # placeholder alive and the assertions deterministic. It is deliberately
+  # started unlinked for the same reason; the test's `on_exit` kills it.
+  use GenServer
+
+  def start, do: GenServer.start(__MODULE__, :ok)
+
+  @impl true
+  def init(:ok), do: {:ok, :placeholder}
+
+  @impl true
+  def handle_call(_request, _from, state), do: {:reply, {:error, :not_connected}, state}
+
+  @impl true
+  def handle_cast(_request, state), do: {:noreply, state}
+end
+
 defmodule Rebus.MatchRuleTest do
   use ExUnit.Case
 
   import ExUnit.CaptureLog
 
   alias Rebus.MatchRule
+  alias Rebus.MatchRuleTest.PlaceholderConnection
   alias Rebus.MatchSubscription.Store
   alias Rebus.MatchSubscription.Worker
   alias Rebus.Message
@@ -190,6 +214,8 @@ defmodule Rebus.MatchRuleTest do
       owner_b = subscribe_owner(self(), connection, rule)
       ref_b = assert_subscription(owner_b)
       refute_receive {^server, %Message{header_fields: %{member: "AddMatch"}}}, 100
+      assert rule_status(connection, rule) == :active
+      assert rule_ref_count(connection, rule) == 2
 
       :ok = TestServer.push(server, test_signal("other"))
       refute_receive {:matched, ^owner_a, ^ref_a, _message}, 100
@@ -211,8 +237,43 @@ defmodule Rebus.MatchRuleTest do
       refute_receive {:matched, ^owner_a, ^ref_a, _message}, 100
       refute_receive {:matched, ^owner_b, ^ref_b, _message}, 100
 
+      # The final reference took the rule with it, leaving nothing to restore.
+      assert wait_until(fn -> rule_status(connection, rule) == nil end)
+      assert wait_until(fn -> not Rebus.MatchSubscription.persisted?(connection) end)
+
       send(owner_a, :stop)
       send(owner_b, :stop)
+    end
+
+    test "queues a same-rule add while the first AddMatch is still in flight", %{
+      server: server,
+      connection: connection
+    } do
+      rule = test_rule()
+      first = subscribe_owner(self(), connection, rule)
+      add = assert_add_match(server, rule)
+
+      second = subscribe_owner(self(), connection, rule)
+      assert wait_until(fn -> rule_queue_length(connection, rule) == 1 end)
+      assert rule_status(connection, rule) == :installing
+      refute_receive {^server, %Message{header_fields: %{member: "AddMatch"}}}, 100
+
+      :ok = TestServer.push(server, method_return(add.serial))
+      first_ref = assert_subscription(first)
+      second_ref = assert_subscription(second)
+      refute first_ref == second_ref
+
+      # The queued caller was served from the rule the first one installed.
+      refute_receive {^server, %Message{header_fields: %{member: "AddMatch"}}}, 100
+      assert rule_status(connection, rule) == :active
+      assert rule_ref_count(connection, rule) == 2
+      assert rule_queue_length(connection, rule) == 0
+
+      send(first, :stop)
+      send(second, :stop)
+      remove = assert_remove_match(server, rule)
+      :ok = TestServer.push(server, method_return(remove.serial))
+      assert wait_until(fn -> rule_status(connection, rule) == nil end)
     end
 
     test "filters directed signals by an exact well-known sender subscription", %{
@@ -708,7 +769,12 @@ defmodule Rebus.MatchRuleTest do
 
       send(owner, :stop)
       _first_remove = assert_remove_match(server, rule)
+
+      # The unanswered RemoveMatch cannot prove what the bus did, so the rule
+      # graduates from its one best-effort cleanup into bounded recovery.
+      assert wait_until(fn -> rule_status(connection, rule) == :cleaning end)
       retry = assert_remove_match(server, rule, 1_500)
+      assert wait_until(fn -> rule_status(connection, rule) == :recovering end)
       :ok = TestServer.push(server, method_return(retry.serial))
       assert wait_until(fn -> rule_status(connection, rule) == nil end)
       assert Process.alive?(connection)
@@ -1048,7 +1114,7 @@ defmodule Rebus.MatchRuleTest do
     end
 
     test "rehydrates persisted removal state and prunes missing rows" do
-      {:ok, conn} = Agent.start_link(fn -> :connection_placeholder end)
+      conn = start_placeholder_conn()
       stale_key = "stale-rule"
 
       on_exit(fn ->
@@ -1056,9 +1122,6 @@ defmodule Rebus.MatchRuleTest do
           [{worker, _value}] when is_pid(worker) -> stop_worker(worker)
           [] -> :ok
         end
-
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
       end)
 
       :ok =
@@ -1075,16 +1138,11 @@ defmodule Rebus.MatchRuleTest do
     end
 
     test "covers reset guard transitions without a live bus" do
-      {:ok, conn} = Agent.start_link(fn -> :connection_placeholder end)
+      conn = start_placeholder_conn()
       state = fresh_worker_state(conn)
       rule = test_rule()
       deadline = System.monotonic_time(:millisecond) + 1_000
       from = {self(), make_ref()}
-
-      on_exit(fn ->
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
-      end)
 
       lost = %{state | state_lost?: true}
 
@@ -1114,13 +1172,8 @@ defmodule Rebus.MatchRuleTest do
     end
 
     test "covers stale, failed, and completed reset notifications" do
-      {:ok, conn} = Agent.start_link(fn -> :connection_placeholder end)
+      conn = start_placeholder_conn()
       state = fresh_worker_state(conn)
-
-      on_exit(fn ->
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
-      end)
 
       assert {:noreply, ^state} =
                Worker.handle_info({:connection_reset_result, make_ref(), :ok}, state)
@@ -1132,9 +1185,12 @@ defmodule Rebus.MatchRuleTest do
       assert {:noreply, completed} =
                Worker.handle_info({:connection_reset_result, token, :ok}, resetting)
 
+      # The reset was requested but the connection has not gone down yet, so
+      # the latch stays up while the monitored task is released.
       assert completed.state_lost?
       assert completed.resetting?
       assert is_nil(completed.reset_token)
+      assert is_nil(completed.reset_task_monitor)
 
       monitor = Process.monitor(conn)
       token = make_ref()
@@ -1146,19 +1202,17 @@ defmodule Rebus.MatchRuleTest do
                  resetting
                )
 
+      # Nothing was closed, so the latch is dropped and the loss made explicit
+      # rather than left to a reset that will never arrive.
       assert failed.state_lost?
       refute failed.resetting?
       assert is_nil(failed.reset_token)
+      assert is_nil(failed.reset_task_monitor)
     end
 
     test "covers stale worker events and reset task loss" do
-      {:ok, conn} = Agent.start_link(fn -> :connection_placeholder end)
+      conn = start_placeholder_conn()
       state = fresh_worker_state(conn)
-
-      on_exit(fn ->
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
-      end)
 
       assert {:noreply, ^state} = Worker.handle_info({:resume_recovery, "missing"}, state)
       assert {:noreply, ^state} = Worker.handle_info({:retry_recovery, "missing"}, state)
@@ -1180,54 +1234,90 @@ defmodule Rebus.MatchRuleTest do
       assert lost.state_lost?
       refute lost.resetting?
       assert is_nil(lost.reset_task_monitor)
+      assert is_nil(lost.reset_token)
     end
 
     test "covers failed add, reuse, and removal operation completions" do
-      {:ok, conn} = Agent.start_link(fn -> :connection_placeholder end)
-      state = fresh_worker_state(conn)
+      conn = start_placeholder_conn()
       rule = test_rule()
       key = MatchRule.to_string(rule)
+      bus_error = {:error, {:bus_error, "denied"}}
 
-      on_exit(fn ->
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
-      end)
+      {state, token} = operation_state(fresh_worker_state(conn), key, rule, :add_new)
+      {state, request_id, tag} = live_request(state, key, :add)
+      state = attach_request(state, token, request_id)
 
-      {state, token} = operation_state(state, key, rule, :add_new)
-
-      assert {:noreply, _state} =
+      assert {:noreply, add_failed} =
                Worker.handle_info(
-                 {:operation_result, token, {:add_failed, {:error, {:bus_error, "denied"}}, nil}},
+                 {:operation_result, token, {:add_failed, bus_error, nil}},
                  state
                )
 
-      {state, token} = operation_state(fresh_worker_state(conn), key, rule, :add_existing)
+      # A definitive AddMatch error that installed no local handler leaves
+      # nothing behind to recover: the caller is answered and the rule that was
+      # only ever installing is dropped along with its persisted row.
+      assert_receive {^tag, ^bus_error}
+      assert add_failed.requests == %{}
+      assert add_failed.request_monitors == %{}
+      assert add_failed.operations == %{}
+      refute Map.has_key?(add_failed.rules, key)
+      assert add_failed.recovering_rules == MapSet.new()
+      refute Rebus.MatchSubscription.persisted?(conn)
 
-      assert {:noreply, _state} =
+      {state, token} = operation_state(fresh_worker_state(conn), key, rule, :add_existing)
+      {state, request_id, tag} = live_request(state, key, :add)
+      state = attach_request(state, token, request_id)
+
+      assert {:noreply, reuse_failed} =
                Worker.handle_info(
                  {:operation_result, token, {:add_existing_failed, {:error, :disconnected}}},
                  state
                )
 
-      {state, token} = operation_state(fresh_worker_state(conn), key, rule, :remove)
+      # Reusing an existing rule owns no bus state, so a failure answers the
+      # caller and dispatches the rule onwards rather than entering recovery.
+      assert_receive {^tag, {:error, :disconnected}}
+      assert reuse_failed.requests == %{}
+      assert reuse_failed.operations == %{}
+      refute Map.has_key?(reuse_failed.rules, key)
+      assert reuse_failed.recovering_rules == MapSet.new()
+      refute Rebus.MatchSubscription.persisted?(conn)
 
-      assert {:noreply, _state} =
+      ref = make_ref()
+
+      {state, token} =
+        operation_state(fresh_worker_state(conn), key, rule, :remove, status: :active)
+
+      state = put_subscription_state(state, key, ref)
+      {state, request_id, tag} = live_request(state, key, :remove, ref: ref)
+      state = attach_request(state, token, request_id)
+
+      assert {:noreply, remove_failed} =
                Worker.handle_info(
-                 {:operation_result, token, {:remove_failed, {:error, :timeout}, :active}},
+                 {:operation_result, token, {:remove_failed, {:error, :not_connected}, :active}},
                  state
                )
+
+      # The local handler is still installed, so the operation's own error is
+      # reported verbatim and the still-referenced rule survives, idle, for the
+      # caller to retry against.
+      assert_receive {^tag, {:error, :not_connected}}
+      assert remove_failed.requests == %{}
+      assert remove_failed.operations == %{}
+      assert %{status: :active, operation: nil, queue: []} = remove_failed.rules[key]
+      assert MapSet.equal?(remove_failed.rules[key].refs, MapSet.new([ref]))
+      assert remove_failed.recovering_rules == MapSet.new()
+      assert remove_failed.subscriptions[ref].handler == :active
+
+      assert {:ok, %{uncertain?: false, rules: %{^key => %{status: :active}}}} =
+               Rebus.MatchSubscription.load_state(conn)
     end
 
     test "covers recovery result classifications and stale operation cleanup" do
-      {:ok, conn} = Agent.start_link(fn -> :connection_placeholder end)
+      conn = start_placeholder_conn()
       state = fresh_worker_state(conn)
       rule = test_rule()
       key = MatchRule.to_string(rule)
-
-      on_exit(fn ->
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
-      end)
 
       {state, token} = operation_state(state, key, rule, :recovery, status: :recovering)
 
@@ -1240,18 +1330,53 @@ defmodule Rebus.MatchRuleTest do
 
       assert %{status: :recovering, retry_timer: retry_timer} = retrying.rules[key]
       assert is_reference(retry_timer)
+      assert %{recovery_attempt: 1, operation: nil} = retrying.rules[key]
+      assert retrying.operations == %{}
+
+      # A rule waiting on its next attempt is stable enough to persist: only an
+      # in-flight request or operation makes the snapshot uncertain.
+      assert {:ok, %{uncertain?: false, rules: %{^key => %{status: :recovering}}}} =
+               Rebus.MatchSubscription.load_state(conn)
+
+      :ok = Rebus.MatchSubscription.delete_state(conn)
 
       {state, token} =
         operation_state(fresh_worker_state(conn), key, rule, :recovery, status: :recovering)
 
-      assert {:noreply, _state} =
+      handler_ref = make_ref()
+      state = put_in(state.rules[key].pending_handlers, MapSet.new([handler_ref]))
+
+      assert {:noreply, handler_retry} =
                Worker.handle_info({:operation_result, token, {:retry, :handlers}}, state)
 
+      # Handlers that could not be removed are still owed a removal, so they
+      # survive into the next attempt.
+      assert %{status: :recovering, recovery_attempt: 1, pending_handlers: pending} =
+               handler_retry.rules[key]
+
+      assert MapSet.equal?(pending, MapSet.new([handler_ref]))
+      assert is_reference(handler_retry.rules[key].retry_timer)
+
+      assert {:ok, %{uncertain?: false, rules: %{^key => %{recovery_attempt: 1}}}} =
+               Rebus.MatchSubscription.load_state(conn)
+
+      :ok = Rebus.MatchSubscription.delete_state(conn)
+
       {state, token} =
         operation_state(fresh_worker_state(conn), key, rule, :recovery, status: :recovering)
 
-      assert {:noreply, _state} =
+      state = put_in(state.rules[key].pending_handlers, MapSet.new([make_ref()]))
+
+      assert {:noreply, remote_retry} =
                Worker.handle_info({:operation_result, token, {:retry, :remote}}, state)
+
+      # Reaching the bus rule means every handler was removed, so only the
+      # remote rule is retried.
+      assert %{status: :recovering, recovery_attempt: 1, pending_handlers: pending} =
+               remote_retry.rules[key]
+
+      assert MapSet.size(pending) == 0
+      assert is_reference(remote_retry.rules[key].retry_timer)
 
       orphaned = %{state | rules: %{}}
 
@@ -1260,16 +1385,11 @@ defmodule Rebus.MatchRuleTest do
     end
 
     test "covers final removal and successful recovery transitions" do
-      {:ok, conn} = Agent.start_link(fn -> :connection_placeholder end)
+      conn = start_placeholder_conn()
       state = fresh_worker_state(conn)
       rule = test_rule()
       key = MatchRule.to_string(rule)
       ref = make_ref()
-
-      on_exit(fn ->
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
-      end)
 
       {state, token} = operation_state(state, key, rule, :remove, status: :active)
       state = put_subscription_state(state, key, ref)
@@ -1304,13 +1424,8 @@ defmodule Rebus.MatchRuleTest do
     end
 
     test "rejects overlapping well-known sender subscriptions locally" do
-      {:ok, conn} = Agent.start_link(fn -> :connection_placeholder end)
+      conn = start_placeholder_conn()
       state = fresh_worker_state(conn)
-
-      on_exit(fn ->
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
-      end)
 
       existing =
         MatchRule.new!(
@@ -1344,28 +1459,60 @@ defmodule Rebus.MatchRuleTest do
     end
 
     test "covers late successful add completions and failed operation resets" do
-      {:ok, conn} = Agent.start_link(fn -> :connection_placeholder end)
+      conn = start_placeholder_conn()
       rule = test_rule()
       key = MatchRule.to_string(rule)
 
-      on_exit(fn ->
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
-      end)
-
       {state, token} = operation_state(fresh_worker_state(conn), key, rule, :add_new)
+      handler_ref = make_ref()
 
-      assert {:noreply, _state} =
-               Worker.handle_info({:operation_result, token, {:added, make_ref()}}, state)
+      assert {:noreply, late_add} =
+               Worker.handle_info({:operation_result, token, {:added, handler_ref}}, state)
+
+      # Nobody is left to hand the subscription to, so the rule owns both the
+      # local handler and the bus rule and starts recovering them.
+      assert %{
+               status: :recovering,
+               recovery_kind: :rule,
+               remote_may_exist?: true,
+               pending_handlers: pending,
+               operation: recovery
+             } = late_add.rules[key]
+
+      assert MapSet.equal?(pending, MapSet.new([handler_ref]))
+      assert MapSet.member?(late_add.recovering_rules, key)
+      assert late_add.subscriptions == %{}
+      assert is_reference(recovery)
+
+      assert %{key: ^key, type: :recovery, request_id: nil, monitor: monitor} =
+               late_add.operations[recovery]
+
+      assert late_add.operation_monitors[monitor] == recovery
+
+      # An operation is in flight, so the snapshot must not claim the rule is
+      # stable enough to restore.
+      assert {:ok, %{uncertain?: true}} = Rebus.MatchSubscription.load_state(conn)
 
       :ok = Rebus.MatchSubscription.delete_state(conn)
       {state, token} = operation_state(fresh_worker_state(conn), key, rule, :add_existing)
+      handler_ref = make_ref()
 
-      assert {:noreply, _state} =
+      assert {:noreply, late_reuse} =
                Worker.handle_info(
-                 {:operation_result, token, {:added_existing, make_ref()}},
+                 {:operation_result, token, {:added_existing, handler_ref}},
                  state
                )
+
+      # The rule kept no other reference, so the handler installed for the
+      # departed caller is recovered together with the bus rule.
+      assert %{status: :recovering, recovery_kind: :rule, pending_handlers: pending} =
+               late_reuse.rules[key]
+
+      assert MapSet.equal?(pending, MapSet.new([handler_ref]))
+      refute late_reuse.rules[key].remote_may_exist?
+      assert is_reference(late_reuse.rules[key].operation)
+      assert MapSet.member?(late_reuse.recovering_rules, key)
+      assert late_reuse.subscriptions == %{}
 
       :ok = Rebus.MatchSubscription.delete_state(conn)
       {state, token} = operation_state(fresh_worker_state(conn), key, rule, :add_new)
@@ -1381,14 +1528,9 @@ defmodule Rebus.MatchRuleTest do
     end
 
     test "covers nonfinal and ambiguous removal completions" do
-      {:ok, conn} = Agent.start_link(fn -> :connection_placeholder end)
+      conn = start_placeholder_conn()
       rule = test_rule()
       key = MatchRule.to_string(rule)
-
-      on_exit(fn ->
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
-      end)
 
       ref = make_ref()
 
@@ -1400,52 +1542,76 @@ defmodule Rebus.MatchRuleTest do
       assert {:noreply, nonfinal} =
                Worker.handle_info({:operation_result, token, {:removed, ref, :nonfinal}}, state)
 
+      # A non-final removal drops only its own subscription. The rule itself
+      # stays, and having lost its last reference it takes an initial-cleanup
+      # slot rather than being deleted outright.
       refute Map.has_key?(nonfinal.subscriptions, ref)
+      assert Map.has_key?(nonfinal.rules, key)
+      assert %{status: :cleaning, refs: refs} = nonfinal.rules[key]
+      assert MapSet.equal?(refs, MapSet.new())
+      assert MapSet.member?(nonfinal.initial_cleanup_keys, key)
 
       :ok = Rebus.MatchSubscription.delete_state(conn)
       ref = make_ref()
+      definitive_error = {:error, {:bus_error, "denied"}}
 
       {state, token} =
         operation_state(fresh_worker_state(conn), key, rule, :remove, status: :active)
 
       state = put_subscription_state(state, key, ref)
+      {state, request_id, tag} = live_request(state, key, :remove, ref: ref)
+      state = attach_request(state, token, request_id)
 
       assert {:noreply, definitive} =
                Worker.handle_info(
-                 {:operation_result, token,
-                  {:remove_definitive_error, ref, {:error, {:bus_error, "denied"}}}},
+                 {:operation_result, token, {:remove_definitive_error, ref, definitive_error}},
                  state
                )
 
+      # A definitive RemoveMatch error proves the server-side rule is settled,
+      # so the caller is told why and the rule is dispatched onwards without
+      # recovering anything.
+      assert_receive {^tag, ^definitive_error}
       assert definitive.subscriptions[ref].handler == :removed
+      assert %{status: :active, operation: nil, queue: []} = definitive.rules[key]
+      assert definitive.recovering_rules == MapSet.new()
+      assert definitive.operations == %{}
 
       :ok = Rebus.MatchSubscription.delete_state(conn)
       ref = make_ref()
+      ambiguous_error = {:error, {:reply_dropped, :closed}}
 
       {state, token} =
         operation_state(fresh_worker_state(conn), key, rule, :remove, status: :active)
 
       state = put_subscription_state(state, key, ref)
+      {state, request_id, tag} = live_request(state, key, :remove, ref: ref)
+      state = attach_request(state, token, request_id)
 
       assert {:noreply, ambiguous} =
                Worker.handle_info(
-                 {:operation_result, token, {:remove_ambiguous, ref, {:error, :timeout}}},
+                 {:operation_result, token, {:remove_ambiguous, ref, ambiguous_error}},
                  state
                )
 
+      # An ambiguous RemoveMatch leaves the server-side rule unresolved, so the
+      # caller gets the error and the rule enters rule recovery with a fresh
+      # attempt in flight.
+      assert_receive {^tag, ^ambiguous_error}
       assert ambiguous.subscriptions[ref].handler == :removed
+
+      assert %{status: :recovering, recovery_kind: :rule, operation: operation} =
+               ambiguous.rules[key]
+
+      assert is_reference(operation)
+      assert MapSet.member?(ambiguous.recovering_rules, key)
     end
 
     test "restores a stable snapshot and resets an uncertain snapshot" do
-      {:ok, conn} = Agent.start_link(fn -> :connection_placeholder end)
+      conn = start_placeholder_conn()
       rule = test_rule()
       key = MatchRule.to_string(rule)
       rule_state = rule_state(rule)
-
-      on_exit(fn ->
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
-      end)
 
       :ok =
         Rebus.MatchSubscription.persist_state(
@@ -1476,30 +1642,47 @@ defmodule Rebus.MatchRuleTest do
     end
 
     test "covers initial cleanup and recovery operation-loss outcomes" do
-      {:ok, conn} = Agent.start_link(fn -> :connection_placeholder end)
+      conn = start_placeholder_conn()
       rule = test_rule()
       key = MatchRule.to_string(rule)
 
-      on_exit(fn ->
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
-      end)
-
-      for result <- [
-            {:retry, :handlers},
-            {:retry, :remote},
-            {:definitive_bus_error, {:error, {:bus_error, "denied"}}},
-            {:operation_failed, :disconnected}
+      for {result, kind} <- [
+            {{:retry, :handlers}, :handlers},
+            {{:retry, :remote}, :rule},
+            {{:definitive_bus_error, {:error, {:bus_error, "denied"}}}, :rule}
           ] do
-        :ok = Rebus.MatchSubscription.delete_state(conn)
+        {state, token} = cleaning_state(conn, key, rule)
 
-        {state, token} =
-          operation_state(fresh_worker_state(conn), key, rule, :initial_cleanup,
-            status: :cleaning
-          )
+        assert {:noreply, recovering} =
+                 Worker.handle_info({:operation_result, token, result}, state)
 
-        assert {:noreply, _state} = Worker.handle_info({:operation_result, token, result}, state)
+        # A first cleanup that cannot prove what the bus did graduates to the
+        # bounded recovery set and gives its initial-cleanup slot back.
+        assert %{status: :recovering, recovery_kind: ^kind, recovery_attempt: 0} =
+                 recovering.rules[key]
+
+        assert is_reference(recovering.rules[key].operation)
+        assert MapSet.member?(recovering.recovering_rules, key)
+        refute MapSet.member?(recovering.initial_cleanup_keys, key)
       end
+
+      {state, token} = cleaning_state(conn, key, rule)
+
+      assert {:noreply, lost} =
+               Worker.handle_info(
+                 {:operation_result, token, {:operation_failed, :disconnected}},
+                 state
+               )
+
+      # A lost cleanup task cannot report a safe outcome, so the connection is
+      # reset instead of the rule being retried, and the slot is still released.
+      assert lost.state_lost?
+      assert lost.resetting?
+      assert is_reference(lost.reset_token)
+      assert is_reference(lost.reset_task_monitor)
+      assert %{status: :cleaning, operation: nil} = lost.rules[key]
+      assert lost.recovering_rules == MapSet.new()
+      refute MapSet.member?(lost.initial_cleanup_keys, key)
 
       :ok = Rebus.MatchSubscription.delete_state(conn)
 
@@ -1516,15 +1699,10 @@ defmodule Rebus.MatchRuleTest do
     end
 
     test "covers owner, caller, and operation monitor losses" do
-      {:ok, conn} = Agent.start_link(fn -> :connection_placeholder end)
+      conn = start_placeholder_conn()
       state = fresh_worker_state(conn)
       rule = test_rule()
       key = MatchRule.to_string(rule)
-
-      on_exit(fn ->
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
-      end)
 
       owner_monitor = make_ref()
       owner_ref = make_ref()
@@ -1535,18 +1713,61 @@ defmodule Rebus.MatchRuleTest do
           ref_monitors: %{owner_ref => owner_monitor}
       }
 
-      assert {:noreply, _state} =
+      assert {:noreply, stale_owner} =
                Worker.handle_info({:DOWN, owner_monitor, :process, self(), :normal}, owner_lost)
 
+      # The monitor outlived the subscription it watched, so only its
+      # bookkeeping goes and nothing is persisted for the connection.
+      assert stale_owner.owner_monitors == %{}
+      assert stale_owner.ref_monitors == %{}
+      assert stale_owner.subscriptions == %{}
+      assert stale_owner.rules == %{}
+      refute Rebus.MatchSubscription.persisted?(conn)
+
+      ref = make_ref()
+      monitor = make_ref()
+      subscribed = put_rule_state(state, key, rule, [])
+      subscribed = put_in(subscribed.rules[key].status, :active)
+      subscribed = put_subscription_state(subscribed, key, ref)
+
+      subscribed = %{
+        subscribed
+        | owner_monitors: %{monitor => ref},
+          ref_monitors: %{ref => monitor}
+      }
+
+      assert {:noreply, cleaning} =
+               Worker.handle_info({:DOWN, monitor, :process, self(), :normal}, subscribed)
+
+      # The last owner of an active rule died: its handler becomes pending and
+      # the rule takes an initial-cleanup slot to remove the bus rule.
+      assert cleaning.subscriptions == %{}
+      assert cleaning.owner_monitors == %{}
+      assert cleaning.ref_monitors == %{}
+
+      assert %{status: :cleaning, recovery_kind: :rule, refs: refs, pending_handlers: pending} =
+               cleaning.rules[key]
+
+      assert MapSet.size(refs) == 0
+      assert MapSet.equal?(pending, MapSet.new([ref]))
+      assert is_reference(cleaning.rules[key].operation)
+      assert MapSet.member?(cleaning.initial_cleanup_keys, key)
+
+      assert {:ok,
+              %{uncertain?: true, subscriptions: %{}, rules: %{^key => %{status: :cleaning}}}} =
+               Rebus.MatchSubscription.load_state(conn)
+
+      :ok = Rebus.MatchSubscription.delete_state(conn)
       request_id = make_ref()
       request_monitor = make_ref()
+      tag = make_ref()
       timer = Process.send_after(self(), :unused_request_timer, 10_000)
 
       request_lost = %{
         state
         | requests: %{
             request_id => %{
-              from: {self(), make_ref()},
+              from: {self(), tag},
               owner: self(),
               key: key,
               timer: timer,
@@ -1556,11 +1777,18 @@ defmodule Rebus.MatchRuleTest do
           request_monitors: %{request_monitor => request_id}
       }
 
-      assert {:noreply, _state} =
+      assert {:noreply, caller_lost} =
                Worker.handle_info(
                  {:DOWN, request_monitor, :process, self(), :normal},
                  request_lost
                )
+
+      # A caller that dies while waiting is answered rather than left in the
+      # request table holding its rule's queue open.
+      assert_receive {^tag, {:error, :disconnected}}
+      assert caller_lost.requests == %{}
+      assert caller_lost.request_monitors == %{}
+      refute Rebus.MatchSubscription.persisted?(conn)
 
       {state, token} = operation_state(state, key, rule, :add_new)
       operation_monitor = make_ref()
@@ -1571,27 +1799,40 @@ defmodule Rebus.MatchRuleTest do
                Worker.handle_info({:DOWN, operation_monitor, :process, self(), :killed}, state)
 
       assert reset.state_lost?
+      assert reset.resetting?
+      assert reset.operations == %{}
+      assert reset.operation_monitors == %{}
+      assert %{operation: nil} = reset.rules[key]
     end
 
     test "covers expired reuse and operation-failure completion branches" do
-      {:ok, conn} = Agent.start_link(fn -> :connection_placeholder end)
+      conn = start_placeholder_conn()
       rule = test_rule()
       key = MatchRule.to_string(rule)
 
-      on_exit(fn ->
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
-      end)
-
       {state, token} = operation_state(fresh_worker_state(conn), key, rule, :add_existing)
-      {state, request_id} = expired_request(state, key, :add)
-      state = put_in(state.operations[token].request_id, request_id)
+      {state, request_id, tag} = expired_request(state, key, :add)
+      state = attach_request(state, token, request_id)
+      handler_ref = make_ref()
 
-      assert {:noreply, _state} =
+      assert {:noreply, expired} =
                Worker.handle_info(
-                 {:operation_result, token, {:added_existing, make_ref()}},
+                 {:operation_result, token, {:added_existing, handler_ref}},
                  state
                )
+
+      # The caller's deadline passed while the handler was being installed, so
+      # it is told so and the handler is recovered instead of handed over.
+      assert_receive {^tag, {:error, :timeout}}
+      assert expired.requests == %{}
+      assert expired.request_monitors == %{}
+      assert expired.subscriptions == %{}
+
+      assert %{status: :recovering, recovery_kind: :rule, pending_handlers: pending} =
+               expired.rules[key]
+
+      assert MapSet.equal?(pending, MapSet.new([handler_ref]))
+      assert MapSet.member?(expired.recovering_rules, key)
 
       :ok = Rebus.MatchSubscription.delete_state(conn)
       {state, token} = operation_state(fresh_worker_state(conn), key, rule, :add_existing)
@@ -1619,40 +1860,54 @@ defmodule Rebus.MatchRuleTest do
     end
 
     test "covers retry dispatch and initial handler cleanup completion" do
-      {:ok, conn} = Agent.start_link(fn -> :connection_placeholder end)
+      conn = start_placeholder_conn()
       rule = test_rule()
       key = MatchRule.to_string(rule)
 
-      on_exit(fn ->
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
-      end)
+      {state, token} = cleaning_state(conn, key, rule)
+      state = put_in(state.rules[key].pending_handlers, MapSet.new([make_ref()]))
 
-      {state, token} =
-        operation_state(fresh_worker_state(conn), key, rule, :initial_cleanup, status: :cleaning)
-
-      assert {:noreply, _state} =
+      assert {:noreply, handlers_cleared} =
                Worker.handle_info({:operation_result, token, :handlers_cleared}, state)
+
+      # With its handlers gone the rule is briefly active again, and, still
+      # holding no references, immediately starts cleaning up the bus rule.
+      assert %{status: :cleaning, recovery_kind: :rule, pending_handlers: pending} =
+               handlers_cleared.rules[key]
+
+      assert MapSet.size(pending) == 0
+      assert is_reference(handlers_cleared.rules[key].operation)
+      assert handlers_cleared.recovering_rules == MapSet.new()
+      assert MapSet.member?(handlers_cleared.initial_cleanup_keys, key)
 
       :ok = Rebus.MatchSubscription.delete_state(conn)
       state = put_rule_state(fresh_worker_state(conn), key, rule, [])
       timer = Process.send_after(self(), {:retry_recovery, key}, 10_000)
       state = put_in(state.rules[key].status, :recovering)
       state = put_in(state.rules[key].recovery_kind, :rule)
+      state = put_in(state.rules[key].recovery_attempt, 2)
       state = put_in(state.rules[key].retry_timer, timer)
 
-      assert {:noreply, _state} = Worker.handle_info({:retry_recovery, key}, state)
+      assert {:noreply, retried} = Worker.handle_info({:retry_recovery, key}, state)
+
+      # The scheduled retry consumes its timer and starts the next attempt
+      # without counting itself as a further failure.
+      assert %{
+               status: :recovering,
+               recovery_kind: :rule,
+               recovery_attempt: 2,
+               retry_timer: nil,
+               operation: operation
+             } = retried.rules[key]
+
+      assert is_reference(operation)
+      assert %{key: ^key, type: :recovery, request_id: nil} = retried.operations[operation]
     end
 
     test "covers worker no-ops and stale recovery state" do
-      {:ok, conn} = Agent.start_link(fn -> :connection_placeholder end)
+      conn = start_placeholder_conn()
       rule = test_rule()
       key = MatchRule.to_string(rule)
-
-      on_exit(fn ->
-        if Process.alive?(conn), do: Agent.stop(conn)
-        _ = Rebus.MatchSubscription.delete_state(conn)
-      end)
 
       assert {:error, :timeout} =
                Worker.call(self(), :ignored, System.monotonic_time(:millisecond) - 1, 0)
@@ -1670,35 +1925,32 @@ defmodule Rebus.MatchRuleTest do
       assert {:error, :timeout} =
                Worker.call(silent, :ignored, System.monotonic_time(:millisecond) + 10, 0)
 
-      request_id = make_ref()
-      request_monitor = Process.monitor(self())
-      timer = Process.send_after(self(), :unused_terminate_timer, 10_000)
-
-      state = %{
-        fresh_worker_state(conn)
-        | requests: %{
-            request_id => %{
-              from: {self(), make_ref()},
-              owner: self(),
-              key: key,
-              timer: timer,
-              monitor: request_monitor
-            }
-          }
-      }
+      {state, _request_id, tag} = live_request(fresh_worker_state(conn), key, :add)
 
       assert :ok = Worker.terminate(:normal, state)
 
+      # A terminating worker cannot finish what its callers asked for, so each
+      # of them is told rather than left waiting for its own deadline.
+      assert_receive {^tag, {:error, :disconnected}}
+
       {state, token} = operation_state(fresh_worker_state(conn), key, rule, :add_existing)
+      {state, request_id, tag} = live_request(state, key, :add)
+      state = attach_request(state, token, request_id)
       state = %{state | rules: %{}}
 
-      assert {:noreply, _state} =
+      assert {:noreply, orphaned} =
                Worker.handle_info(
                  {:operation_result, token, {:add_existing_failed, {:error, :disconnected}}},
                  state
                )
 
-      :ok = Rebus.MatchSubscription.delete_state(conn)
+      # The rule was already gone. The caller is still answered, and no rule is
+      # recreated for a result nothing is waiting on.
+      assert_receive {^tag, {:error, :disconnected}}
+      assert orphaned.rules == %{}
+      assert orphaned.operations == %{}
+      assert orphaned.requests == %{}
+      refute Rebus.MatchSubscription.persisted?(conn)
 
       {state, token} =
         operation_state(fresh_worker_state(conn), key, rule, :recovery, status: :recovering)
@@ -1706,12 +1958,17 @@ defmodule Rebus.MatchRuleTest do
       timer = Process.send_after(self(), {:retry_recovery, key}, 10_000)
       state = put_in(state.rules[key].retry_timer, timer)
 
-      assert {:noreply, _state} =
+      assert {:noreply, retained} =
                Worker.handle_info(
                  {:operation_result, token,
                   {:definitive_bus_error, {:error, {:bus_error, "denied"}}}},
                  state
                )
+
+      # A retry is already scheduled, so this result must neither schedule a
+      # second one nor charge the rule another attempt.
+      assert %{status: :recovering, retry_timer: ^timer, recovery_attempt: 0, operation: nil} =
+               retained.rules[key]
 
       :ok = Rebus.MatchSubscription.delete_state(conn)
 
@@ -1720,7 +1977,44 @@ defmodule Rebus.MatchRuleTest do
 
       state = put_in(state.rules[key].queue, [make_ref()])
 
-      assert {:noreply, _state} = Worker.handle_info({:operation_result, token, :cleared}, state)
+      assert {:noreply, cleared} = Worker.handle_info({:operation_result, token, :cleared}, state)
+
+      # The only queued request had already gone, so the cleared rule is
+      # dropped rather than reinstalled for it.
+      refute Map.has_key?(cleared.rules, key)
+      assert cleared.recovering_rules == MapSet.new()
+      refute Rebus.MatchSubscription.persisted?(conn)
+    end
+
+    test "reinstalls a cleared rule for the requests still queued behind it" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+
+      {state, token} =
+        operation_state(fresh_worker_state(conn), key, rule, :recovery, status: :recovering)
+
+      {state, remove_id, remove_tag} = live_request(state, key, :remove, ref: make_ref())
+      {state, add_id, add_tag} = live_request(state, key, :add)
+      state = put_in(state.rules[key].queue, [remove_id, add_id])
+
+      assert {:noreply, resumed} = Worker.handle_info({:operation_result, token, :cleared}, state)
+
+      # Clearing the rule satisfies the queued removal outright and reinstalls
+      # the rule for the caller still waiting to add it.
+      assert_receive {^remove_tag, :ok}
+      refute_received {^add_tag, _reply}
+      refute Map.has_key?(resumed.requests, remove_id)
+      assert Map.has_key?(resumed.requests, add_id)
+      assert resumed.recovering_rules == MapSet.new()
+
+      assert %{status: :installing, queue: [], refs: refs, operation: operation} =
+               resumed.rules[key]
+
+      assert MapSet.size(refs) == 0
+      assert is_reference(operation)
+
+      assert %{key: ^key, type: :add_new, request_id: ^add_id} = resumed.operations[operation]
     end
 
     test "resets a connection when ambiguous cleanup reaches its bounded capacity", %{
@@ -1861,31 +2155,31 @@ defmodule Rebus.MatchRuleTest do
 
   defp method_return(serial), do: Message.new!(:method_return, reply_serial: serial)
 
-  defp rule_status(connection, rule) do
+  defp rule_entry(connection, rule) do
     case Registry.lookup(Rebus.MatchSubscription.Registry, connection) do
-      [{worker, _value}] ->
-        state = :sys.get_state(worker)
+      [{worker, _value}] -> Map.get(:sys.get_state(worker).rules, MatchRule.to_string(rule))
+      [] -> nil
+    end
+  end
 
-        case Map.get(state.rules, MatchRule.to_string(rule)) do
-          nil -> nil
-          entry -> entry.status
-        end
-
-      [] ->
-        nil
+  defp rule_status(connection, rule) do
+    case rule_entry(connection, rule) do
+      nil -> nil
+      entry -> entry.status
     end
   end
 
   defp rule_ref_count(connection, rule) do
-    case Registry.lookup(Rebus.MatchSubscription.Registry, connection) do
-      [{worker, _value}] ->
-        case Map.get(:sys.get_state(worker).rules, MatchRule.to_string(rule)) do
-          %{refs: refs} -> MapSet.size(refs)
-          nil -> 0
-        end
+    case rule_entry(connection, rule) do
+      nil -> 0
+      entry -> MapSet.size(entry.refs)
+    end
+  end
 
-      [] ->
-        0
+  defp rule_queue_length(connection, rule) do
+    case rule_entry(connection, rule) do
+      nil -> 0
+      entry -> length(entry.queue)
     end
   end
 
@@ -2014,6 +2308,17 @@ defmodule Rebus.MatchRuleTest do
     {connection, worker}
   end
 
+  defp start_placeholder_conn do
+    {:ok, conn} = PlaceholderConnection.start()
+
+    on_exit(fn ->
+      if Process.alive?(conn), do: Process.exit(conn, :kill)
+      _ = Rebus.MatchSubscription.delete_state(conn)
+    end)
+
+    conn
+  end
+
   defp fresh_worker_state(conn) do
     {:ok, state} = Worker.init(conn)
     state
@@ -2040,13 +2345,17 @@ defmodule Rebus.MatchRuleTest do
     }
   end
 
-  defp persistence_changes(key) do
+  defp empty_persistence do
     %{
-      dirty_rules: MapSet.new([key]),
+      dirty_rules: MapSet.new(),
       removed_rules: MapSet.new(),
       dirty_subscriptions: MapSet.new(),
       removed_subscriptions: MapSet.new()
     }
+  end
+
+  defp persistence_changes(key) do
+    %{empty_persistence() | dirty_rules: MapSet.new([key])}
   end
 
   defp operation_state(state, key, rule, type, opts \\ []) do
@@ -2065,6 +2374,19 @@ defmodule Rebus.MatchRuleTest do
     {state, token}
   end
 
+  # A rule holding one of the bounded initial-cleanup slots, with its
+  # best-effort cleanup operation in flight. Not purely a state builder: it
+  # also clears any rows a previous block persisted for `conn`, so the caller
+  # starts from an empty table.
+  defp cleaning_state(conn, key, rule) do
+    :ok = Rebus.MatchSubscription.delete_state(conn)
+
+    {state, token} =
+      operation_state(fresh_worker_state(conn), key, rule, :initial_cleanup, status: :cleaning)
+
+    {%{state | initial_cleanup_keys: MapSet.new([key])}, token}
+  end
+
   defp put_subscription_state(state, key, ref) do
     rule = %{state.rules[key] | refs: MapSet.new([ref])}
 
@@ -2077,27 +2399,46 @@ defmodule Rebus.MatchRuleTest do
     }
   end
 
+  # A request the worker will treat as still waiting. The `from` tag is
+  # returned so a test can assert the reply the caller receives, since
+  # `GenServer.reply/2` delivers it here as `{tag, reply}`.
+  defp live_request(state, key, kind, opts \\ []) do
+    deadline = System.monotonic_time(:millisecond) + 10_000
+    put_test_request(state, key, kind, deadline, Keyword.get(opts, :ref))
+  end
+
   defp expired_request(state, key, kind) do
+    put_test_request(state, key, kind, System.monotonic_time(:millisecond) - 1, nil)
+  end
+
+  defp put_test_request(state, key, kind, deadline, ref) do
     request_id = make_ref()
+    tag = make_ref()
     monitor = Process.monitor(self())
-    timer = Process.send_after(self(), :unused_expired_request_timer, 10_000)
+    timer = Process.send_after(self(), :unused_test_request_timer, 10_000)
 
     request = %{
-      from: {self(), make_ref()},
+      from: {self(), tag},
       owner: self(),
       kind: kind,
       key: key,
-      ref: nil,
-      deadline: System.monotonic_time(:millisecond) - 1,
+      ref: ref,
+      deadline: deadline,
       timer: timer,
       monitor: monitor
     }
 
-    {%{
-       state
-       | requests: %{request_id => request},
-         request_monitors: %{monitor => request_id}
-     }, request_id}
+    state = %{
+      state
+      | requests: Map.put(state.requests, request_id, request),
+        request_monitors: Map.put(state.request_monitors, monitor, request_id)
+    }
+
+    {state, request_id, tag}
+  end
+
+  defp attach_request(state, token, request_id) do
+    put_in(state.operations[token].request_id, request_id)
   end
 
   defp raw_resource_limited_error_reply(reply_serial, error_name) do
