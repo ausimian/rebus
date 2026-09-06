@@ -11,6 +11,7 @@ defmodule Rebus.Auth do
   @max_cookie_line_size 1_024
   @max_cookie_lines 256
   @max_cookie_size 1_024
+  @max_home_links 8
 
   @type auth_error :: :auth_cookie_unavailable | :auth_failed
 
@@ -89,8 +90,8 @@ defmodule Rebus.Auth do
   defp secure_keyring_dir(uid) do
     with home when is_binary(home) and home != <<>> <- user_home(),
          :absolute <- Path.type(home),
-         {:ok, _home_stat} <- secure_home_stat(home, uid),
-         path <- Path.join(home, ".dbus-keyrings"),
+         {:ok, resolved_home} <- resolve_home(home, uid),
+         path <- Path.join(resolved_home, ".dbus-keyrings"),
          {:ok, _stat} <- secure_lstat(path, :directory, uid) do
       {:ok, path}
     else
@@ -99,18 +100,96 @@ defmodule Rebus.Auth do
   end
 
   # A user may intentionally expose their home through a final symlink (for
-  # example, when the real home is on an encrypted volume). Follow only that
-  # final component, then validate the resolved directory itself. The keyring
-  # directory and cookie remain lstat-checked below and must never be symlinks.
-  defp secure_home_stat(path, uid) do
-    with {:ok, stat} <- File.stat(path),
-         true <- stat.type == :directory,
+  # example, when the real home is on an encrypted volume, behind an
+  # automounter, or under a generated profile). That final component may be a
+  # chain of up to `@max_home_links` symlinks, and we follow the chain
+  # ourselves: each hop has its trailing separators and `.` components
+  # normalised before it is `lstat`ed, so a home written as `~/link/` or
+  # `~/link/.` cannot slip past resolution; a hop that ends in `..` is rejected,
+  # since only following the component before it could reach that parent; and
+  # a relative link target is joined onto the link's parent rather than
+  # lexically expanded, so `.` and `..` components are resolved by the kernel
+  # at the next `lstat` exactly as they are for any path. The directory the
+  # chain finally reaches is the one the owner and private-mode checks apply
+  # to, and the keyring directory and cookie file are derived from it and
+  # lstat-checked, so neither may be a symlink. Intermediate components of the
+  # home path are resolved by the operating system, as they are for any path.
+  defp resolve_home(home, uid) do
+    with {:ok, resolved, stat} <- resolve_home_dir(home),
          true <- is_integer(stat.uid) and stat.uid == uid,
          true <- is_integer(stat.mode) and band(stat.mode, 0o022) == 0 do
-      {:ok, stat}
+      {:ok, resolved}
     else
       _ -> {:error, :auth_cookie_unavailable}
     end
+  end
+
+  defp resolve_home_dir(home) do
+    with {:ok, home} <- normalise_home(home), do: resolve_home_dir(home, @max_home_links)
+  end
+
+  # `hops` counts the links still available to follow, so a chain of exactly
+  # `@max_home_links` links resolves - the last of them lands on a directory
+  # with `hops` down to zero - and one more link is rejected.
+  defp resolve_home_dir(home, hops) do
+    case File.lstat(home) do
+      {:ok, %File.Stat{type: :directory} = stat} ->
+        {:ok, home, stat}
+
+      {:ok, %File.Stat{type: :symlink}} when hops > 0 ->
+        follow_home_link(home, hops)
+
+      _ ->
+        {:error, :auth_cookie_unavailable}
+    end
+  end
+
+  defp follow_home_link(home, hops) do
+    with {:ok, target} <- File.read_link(home),
+         {:ok, resolved} <- expand_home_target(target, home),
+         {:ok, resolved} <- normalise_home(resolved) do
+      resolve_home_dir(resolved, hops - 1)
+    else
+      _ -> {:error, :auth_cookie_unavailable}
+    end
+  end
+
+  # `Path.join/2` rather than `Path.expand/2`: expansion collapses `.` and `..`
+  # lexically, in the base as well as in the target, which names a different
+  # directory than the kernel reaches whenever an earlier component is itself a
+  # symlink. Joining leaves those components in the string for the next `lstat`
+  # to resolve physically.
+  defp expand_home_target(target, home) do
+    case Path.type(target) do
+      :absolute -> {:ok, target}
+      _ -> {:ok, Path.join(Path.dirname(home), target)}
+    end
+  end
+
+  # POSIX `lstat` follows a trailing separator and a trailing `.` component, so
+  # `lstat("~/link/")` and `lstat("~/link/.")` both report the target's type
+  # and would hide the link entirely. Strip them until the last component is a
+  # plain name. A final `..` cannot be stripped - it names the parent of the
+  # component before it, which `lstat` would have to follow to get there - so
+  # the string checked would not be the string used; reject it instead.
+  defp normalise_home(home) do
+    case strip_trailing_dots(home) do
+      "" ->
+        {:ok, "/"}
+
+      normalised ->
+        if Path.basename(normalised) == "..",
+          do: {:error, :auth_cookie_unavailable},
+          else: {:ok, normalised}
+    end
+  end
+
+  defp strip_trailing_dots(home) do
+    stripped = String.replace_trailing(home, "/", "")
+
+    if String.ends_with?(stripped, "/."),
+      do: strip_trailing_dots(binary_part(stripped, 0, byte_size(stripped) - 2)),
+      else: stripped
   end
 
   defp user_home do

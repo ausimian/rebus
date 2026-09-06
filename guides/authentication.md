@@ -35,14 +35,20 @@ Rebus reads the effective user's name, then reads one file under
 unless all of the following hold:
 
 - Your home directory is owned by you and is not group or other writable.
+  Rebus may reach it through up to eight symlinks, following them itself and
+  checking the directory it finally reaches.
 - The keyring directory and the cookie file are owned by you, and are not
   readable or writable by group or other.
-- The keyring directory and the cookie file are real entries, not symlinks. A
-  symlinked home directory is still allowed.
+- The keyring directory and the cookie file are real entries, not symlinks.
+  Both are derived from the resolved home directory.
+- Earlier components of the home path are resolved by the operating system, as
+  they are for any path.
 - The platform reports POSIX owner and mode metadata.
 
 Most `:auth_cookie_unavailable` failures are a permission problem, and
-`chmod go-w ~` with `chmod -R go-rwx ~/.dbus-keyrings` resolves them.
+`chmod go-w ~` with `chmod -R go-rwx ~/.dbus-keyrings` resolves them. A home
+reached through more than eight symlinks, or whose path ends in `..`, or that
+is reached through a symlink whose target does, fails with the same reason.
 
 Once a cookie exchange has started, every failure is terminal. Rebus does not
 cancel it and retry as `ANONYMOUS`, so a misconfigured keyring cannot silently

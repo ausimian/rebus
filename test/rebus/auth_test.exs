@@ -9,6 +9,8 @@ defmodule Rebus.AuthTest do
   alias Rebus.TestImpl
 
   @guid "30313233343536373839414243444546"
+  @lexical_cookie "aaaaaaaaaaaaaaaa"
+  @kernel_cookie "bbbbbbbbbbbbbbbb"
 
   describe "REJECTED parser" do
     test "retains only bounded valid mechanism names" do
@@ -99,6 +101,304 @@ defmodule Rebus.AuthTest do
           System.put_env("HOME", home)
           :ok = File.rm(symlinked_home)
         end
+      end)
+    end
+
+    test "uses a private keyring when HOME is a relative symlink to its directory" do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        symlinked_home = home <> "-relative-symlink"
+
+        with_home(symlinked_home, [symlinked_home], fn ->
+          :ok = File.ln_s(Path.basename(home), symlinked_home)
+
+          assert {:ok, _response} = cookie_response(context, home)
+        end)
+      end)
+    end
+
+    # On macOS `System.tmp_dir!/0` already sits under `/var`, itself a symlink
+    # to `/private/var`, so this case is exercised incidentally there; it earns
+    # its place on Linux, where `/tmp` is a real directory.
+    test "uses a private keyring when an intermediate HOME component is a symlink" do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        linked_parent = home <> "-parent-symlink"
+        linked_home = Path.join(linked_parent, Path.basename(home))
+
+        with_home(linked_home, [linked_parent], fn ->
+          :ok = File.ln_s(Path.dirname(home), linked_parent)
+
+          assert {:ok, _response} = cookie_response(context, home)
+        end)
+      end)
+    end
+
+    test "follows a bounded chain of HOME symlinks" do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        first_link = home <> "-link-1"
+        second_link = home <> "-link-2"
+
+        with_home(first_link, [second_link, first_link], fn ->
+          :ok = File.ln_s(home, first_link)
+          :ok = File.ln_s(first_link, second_link)
+
+          # The single-link case proves the fixture, so the two-link result
+          # below is about the chain rather than about the links themselves.
+          assert {:ok, _one_link} = cookie_response(context, home)
+
+          System.put_env("HOME", second_link)
+          assert {:ok, _two_links} = cookie_response(context, home)
+        end)
+      end)
+    end
+
+    test "follows a chain of HOME symlinks written with a trailing separator" do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        first_link = home <> "-slash-link-1"
+        second_link = home <> "-slash-link-2"
+
+        with_home(second_link, [second_link, first_link], fn ->
+          :ok = File.ln_s(home, first_link)
+          :ok = File.ln_s(first_link, second_link)
+
+          # `lstat` follows a trailing separator, so an unnormalised HOME would
+          # skip resolution entirely. The two spellings must agree.
+          assert {:ok, _plain} = cookie_response(context, home)
+
+          System.put_env("HOME", second_link <> "/")
+          assert {:ok, _trailing_slash} = cookie_response(context, home)
+        end)
+      end)
+    end
+
+    test "rejects a HOME symlink chain longer than the limit" do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        # `link-n` reaches the real home in n hops, so `link-8` sits exactly on
+        # the eight-link limit and `link-9` is one hop beyond it.
+        links = Enum.map(1..9, &(home <> "-chain-link-#{&1}"))
+
+        with_home(home, Enum.reverse(links), fn ->
+          Enum.reduce(links, home, fn link, target ->
+            :ok = File.ln_s(target, link)
+            link
+          end)
+
+          System.put_env("HOME", Enum.at(links, 7))
+          assert {:ok, _eight_links} = cookie_response(context, home)
+
+          System.put_env("HOME", Enum.at(links, 8))
+          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+
+          # `lstat` follows a trailing separator or `.` component, so without
+          # normalisation these spellings would skip resolution and accept the
+          # nine-link chain. Pinning the bound under them pins the normalisation.
+          System.put_env("HOME", Enum.at(links, 8) <> "/")
+          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+
+          System.put_env("HOME", Enum.at(links, 8) <> "/.")
+          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+
+          System.put_env("HOME", Enum.at(links, 8) <> "/./")
+          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+        end)
+      end)
+    end
+
+    test "rejects a HOME whose path or link target ends in .." do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        # `sub/..` names the valid keyring home itself, and `up -> ..` from
+        # inside it does the same, so only the final-`..` rule can reject these:
+        # a build without it accepts both, and the positive control proves the
+        # fixture. The rule exists because reaching that parent means following
+        # the component before `..`, so the string checked would not be the
+        # string used.
+        sub = Path.join(home, "sub")
+        :ok = File.mkdir_p(sub)
+        :ok = File.ln_s("..", Path.join(sub, "up"))
+
+        with_home(home, [], fn ->
+          assert {:ok, _control} = cookie_response(context, home)
+
+          System.put_env("HOME", sub <> "/..")
+          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+
+          System.put_env("HOME", sub <> "/../")
+          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+
+          System.put_env("HOME", Path.join(sub, "up"))
+          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+        end)
+      end)
+    end
+
+    test "reads the kernel's directory for a relative HOME link target that steps upward" do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        base = home <> "-lexical"
+
+        try do
+          # `base/a -> x/y`, so `base/a/link -> ../b/dir` names `base/x/b/dir`
+          # to the kernel and `base/b/dir` to a lexical expansion. Both are
+          # valid keyring homes carrying different cookies, so the response
+          # digest says which of them was read.
+          :ok = File.mkdir_p(Path.join(base, "x/y"))
+          :ok = File.ln_s("x/y", Path.join(base, "a"))
+          :ok = File.ln_s("../b/dir", Path.join(base, "x/y/link"))
+          populate_keyring(Path.join(base, "b/dir"), context, @lexical_cookie)
+          populate_keyring(Path.join(base, "x/b/dir"), context, @kernel_cookie)
+
+          with_home(Path.join(base, "a/link"), [], fn ->
+            assert {:ok, response} = cookie_response(context, home)
+            assert cookie_behind(response) == :kernel
+          end)
+        after
+          File.rm_rf(base)
+        end
+      end)
+    end
+
+    test "reads the kernel's directory when HOME itself contains a .. component" do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        base = home <> "-dotdot-home"
+
+        try do
+          # `base/aa -> xx/yy`, so the kernel reads `base/aa/..` as `base/xx`
+          # and `HOME=base/aa/../link` is `base/xx/link -> bb/dir`, that is
+          # `base/xx/bb/dir`. Expanding the target against the home's dirname
+          # would collapse `base/aa/..` to `base` and name `base/bb/dir`.
+          :ok = File.mkdir_p(Path.join(base, "xx/yy"))
+          :ok = File.ln_s("xx/yy", Path.join(base, "aa"))
+          :ok = File.ln_s("bb/dir", Path.join(base, "xx/link"))
+          populate_keyring(Path.join(base, "bb/dir"), context, @lexical_cookie)
+          populate_keyring(Path.join(base, "xx/bb/dir"), context, @kernel_cookie)
+
+          with_home(Path.join(base, "aa/../link"), [], fn ->
+            assert {:ok, response} = cookie_response(context, home)
+            assert cookie_behind(response) == :kernel
+          end)
+        after
+          File.rm_rf(base)
+        end
+      end)
+    end
+
+    test "reads the kernel's directory through an absolute link target containing .." do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        base = home <> "-dotdot-target"
+
+        try do
+          # `HOME` holds no `..` at all here: the first link's absolute target
+          # carries it, and the hop after that is relative. The kernel reaches
+          # `base/xx/bb/dir`; a lexical expansion of the second hop against
+          # `base/aa/..` would reach `base/bb/dir`.
+          :ok = File.mkdir_p(Path.join(base, "xx/yy"))
+          :ok = File.ln_s("xx/yy", Path.join(base, "aa"))
+          :ok = File.ln_s("bb/dir", Path.join(base, "xx/link2"))
+          :ok = File.ln_s(Path.join(base, "aa/../link2"), Path.join(base, "home"))
+          populate_keyring(Path.join(base, "bb/dir"), context, @lexical_cookie)
+          populate_keyring(Path.join(base, "xx/bb/dir"), context, @kernel_cookie)
+
+          with_home(Path.join(base, "home"), [], fn ->
+            assert {:ok, response} = cookie_response(context, home)
+            assert cookie_behind(response) == :kernel
+          end)
+        after
+          File.rm_rf(base)
+        end
+      end)
+    end
+
+    test "accepts a relative HOME link target that steps back down through .." do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        base = home <> "-benign-dotdot"
+
+        try do
+          # `sub2/../real` is what the kernel resolves for any path, so it must
+          # resolve here too rather than being refused for containing `..`.
+          :ok = File.mkdir_p(Path.join(base, "sub2"))
+          populate_keyring(Path.join(base, "real"), context, cookie)
+          :ok = File.ln_s("sub2/../real", Path.join(base, "link"))
+
+          with_home(Path.join(base, "link"), [], fn ->
+            assert {:ok, _response} = cookie_response(context, home)
+          end)
+        after
+          File.rm_rf(base)
+        end
+      end)
+    end
+
+    test "rejects a HOME symlink that does not resolve to a directory" do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        file_link = home <> "-file-symlink"
+        dangling_link = home <> "-dangling-symlink"
+
+        with_home(file_link, [file_link, dangling_link], fn ->
+          regular = Path.join(home, "not-a-directory")
+          :ok = File.write(regular, "")
+          :ok = File.ln_s(regular, file_link)
+          :ok = File.ln_s(Path.join(home, "missing"), dangling_link)
+
+          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+
+          System.put_env("HOME", dangling_link)
+          assert {:error, :auth_cookie_unavailable} = cookie_response(context, home)
+        end)
+      end)
+    end
+
+    test "rejects a HOME symlink whose target directory is group writable" do
+      context = "rebus_test_context"
+      cookie = "0123456789abcdef"
+
+      with_private_keyring(context, cookie, fn home ->
+        symlinked_home = home <> "-writable-symlink"
+
+        with_home(symlinked_home, [symlinked_home], fn ->
+          %File.Stat{uid: uid, mode: mode} = File.stat!(home)
+          :ok = File.ln_s(home, symlinked_home)
+          :ok = File.chmod(home, 0o775)
+
+          assert {:error, :auth_cookie_unavailable} =
+                   Auth.cookie_response(
+                     "user",
+                     uid,
+                     Base.encode16("#{context} 1 server-challenge", case: :lower)
+                   )
+
+          :ok = File.chmod(home, Bitwise.band(mode, 0o7777))
+        end)
       end)
     end
 
@@ -609,6 +909,60 @@ defmodule Rebus.AuthTest do
   test "rejects a non-boolean anonymous opt-in" do
     assert {:error, :invalid_allow_anonymous} =
              Rebus.connect(%{family: :inet, addr: {127, 0, 0, 1}, port: 1}, allow_anonymous: :yes)
+  end
+
+  # Points `HOME` at `path`, restores the previous value, and removes every
+  # link the test created beside the fixture home.
+  defp with_home(path, links, fun) do
+    previous_home = System.get_env("HOME")
+
+    try do
+      System.put_env("HOME", path)
+      fun.()
+    after
+      if is_nil(previous_home),
+        do: System.delete_env("HOME"),
+        else: System.put_env("HOME", previous_home)
+
+      Enum.each(links, &File.rm/1)
+    end
+  end
+
+  defp cookie_response(context, home) do
+    Auth.cookie_response(
+      "user",
+      File.stat!(home).uid,
+      Base.encode16("#{context} 1 server-challenge", case: :lower)
+    )
+  end
+
+  # Replays the digest with the client challenge the response carries, so a
+  # test with two candidate keyring homes can say which one was read.
+  defp cookie_behind(response) do
+    {:ok, decoded} = Base.decode16(response, case: :mixed)
+    [client_challenge, digest] = :binary.split(decoded, " ", [:global])
+
+    candidates = [lexical: @lexical_cookie, kernel: @kernel_cookie]
+
+    Enum.find_value(candidates, :unknown, fn {name, cookie} ->
+      expected =
+        :crypto.hash(:sha, ["server-challenge", ":", client_challenge, ":", cookie])
+        |> Base.encode16(case: :lower)
+
+      if expected == digest, do: name
+    end)
+  end
+
+  # Builds a keyring that passes every owner and mode check, at an arbitrary
+  # directory rather than at the per-test fixture home.
+  defp populate_keyring(dir, context, cookie) do
+    keyring = Path.join(dir, ".dbus-keyrings")
+
+    :ok = File.mkdir_p(keyring)
+    :ok = File.chmod(dir, 0o755)
+    :ok = File.chmod(keyring, 0o700)
+    :ok = File.write(Path.join(keyring, context), "1 0 #{cookie}\n")
+    :ok = File.chmod(Path.join(keyring, context), 0o600)
   end
 
   defp with_private_keyring(context, cookie, fun) do
