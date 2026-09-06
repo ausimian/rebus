@@ -1190,6 +1190,40 @@ defmodule Rebus.MessageTest do
   end
 
   describe "decode/1 error handling" do
+    test "reports a body array declared over the D-Bus array size limit as too large" do
+      fields = [
+        [1, {"o", "/test"}],
+        [2, {"s", "test.interface"}],
+        [3, {"s", "Test"}],
+        [8, {"g", "ay"}]
+      ]
+
+      limit = Message.max_array_size()
+
+      for endianness <- [:little, :big] do
+        declared = fn length ->
+          case endianness do
+            :little -> <<length::little-32>>
+            :big -> <<length::big-32>>
+          end
+        end
+
+        # The limit is checked on the declared length alone, before the body is
+        # bounded, so a four-byte body is enough to trip it.
+        oversized = wire_message(fields, declared.(limit + 1), endianness)
+
+        assert {:error, :message_too_large} = Message.decode(oversized)
+        assert {:error, :message_too_large} = Message.parse_inbound(oversized)
+
+        # At exactly the limit the frame is wire-valid but truncated, which the
+        # bounds check reports separately.
+        at_limit = wire_message(fields, declared.(limit), endianness)
+
+        assert {:error, :invalid_message} = Message.decode(at_limit)
+        assert {:error, :invalid_message} = Message.parse_inbound(at_limit)
+      end
+    end
+
     test "rejects a body boolean that is neither 0 nor 1" do
       fields = [
         [1, {"o", "/test"}],

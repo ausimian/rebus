@@ -2,7 +2,7 @@ defmodule Rebus.DecoderTest do
   use ExUnit.Case, async: true
   doctest Rebus.Decoder
 
-  alias Rebus.{Decoder, Encoder, Message, ResourceLimitError}
+  alias Rebus.{Decoder, Encoder, Message, ProtocolLimitError, ResourceLimitError}
   alias Rebus.WireValue
 
   defp nested_array_signature(depth), do: String.duplicate("a", depth) <> "i"
@@ -68,6 +68,13 @@ defmodule Rebus.DecoderTest do
       assert_raise MatchError, fn ->
         Decoder.decode("ay", truncated, :little, element_budget: 1, scalar_budget: 1)
       end
+    end
+
+    test "raises a protocol limit for an array declared over the D-Bus limit" do
+      oversized = <<Message.max_array_size() + 1::little-32>>
+
+      assert %ProtocolLimitError{limit: :array} =
+               catch_error(Decoder.decode("ay", oversized))
     end
 
     test "rejects malformed string-like wire values" do
