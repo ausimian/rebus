@@ -19,6 +19,8 @@ It includes several breaking corrections to public results and wire handling.
 
 ### Changed
 
+- Bare version tags now publish the corresponding package and documentation to
+  Hex after the test suite passes.
 - **Breaking:** calls now return the complete reply as `{:ok, message}` or a
   complete D-Bus error reply as `{:error, message}`; operation errors and
   signal-handler registration results also use the new documented shapes.
