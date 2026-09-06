@@ -952,8 +952,8 @@ defmodule RebusTest do
 
           # The retry closes as soon as its Hello is answered. A `NameAcquired`
           # pushed behind that answer would still be unread in the socket, and
-          # closing then draws a reset that crashes the peer and logs the very
-          # `GenServer terminating` line this test refutes.
+          # closing then draws a reset rather than a clean FIN. Suppress it so
+          # the retry's close stays an ordinary teardown on both ends.
           :ok = TestServer.set_auto_hello(svr, true, false)
 
           assert {:ok, retry_cli} = Rebus.connect(addr, name: name)
@@ -961,8 +961,13 @@ defmodule RebusTest do
           assert :ok = Rebus.close(retry_cli)
         end)
 
-      refute log =~ ~r/GenServer \S+ terminating/
-      refute log =~ "** (stop)"
+      # Both connections in this test register under `name` from `start_link`,
+      # so every crash report either could raise names it. Pinning the report
+      # to it keeps an unrelated crash elsewhere from satisfying the assertion
+      # the way a bare `GenServer \S+ terminating` would. A bare `** (stop)`
+      # line is over-broad for the same reason, and adds nothing: the only
+      # `** (stop)` these two could log is the second line of the report above.
+      refute log =~ ~r/GenServer #{Regex.escape(inspect(name))} terminating/
       refute log =~ "D-Bus connection transport stopped:"
       refute log =~ "D-Bus connection protocol stopped:"
     end
