@@ -1,38 +1,12 @@
 defmodule Rebus.Message do
   @moduledoc """
-  D-Bus message protocol implementation.
+  Constructs, validates, encodes, and decodes D-Bus messages.
 
-  This module implements the D-Bus message format as specified in the D-Bus specification.
-  A message consists of a header and a body, where the header contains metadata about
-  the message and the body contains the actual data being transmitted.
-
-  ## Message Structure
-
-  A D-Bus message has the following structure:
-  - Header: Fixed signature "yyyyuua(yv)" containing endianness, type, flags, version,
-    body length, serial, and header fields
-  - Body: Variable content based on the message signature
-
-  ## Message Types
-
-  - `:method_call` - Method call message
-  - `:method_return` - Method reply with returned data
-  - `:error` - Error reply
-  - `:signal` - Signal emission
-
-  ## Header Fields
-
-  - `:path` - Object path (required for METHOD_CALL and SIGNAL)
-  - `:interface` - Interface name (optional for METHOD_CALL, required for SIGNAL)
-  - `:member` - Method or signal name (required for METHOD_CALL and SIGNAL)
-  - `:error_name` - Error name (required for ERROR)
-  - `:reply_serial` - Serial of message being replied to (required for ERROR and METHOD_RETURN)
-  - `:destination` - Target connection name (optional)
-  - `:sender` - Sending connection name (optional, usually set by message bus)
-  - `:signature` - Signature of message body (optional, defaults to empty, automatically added to header_fields when body is present)
-  - `:unix_fds` - Number of Unix file descriptors (optional)
-
-  Note: The signature is stored in `header_fields[:signature]` and can be accessed using `Rebus.Message.signature/1`.
+  A message has a fixed header, typed header fields, and a body described by a
+  D-Bus signature. See the
+  [D-Bus message protocol](https://dbus.freedesktop.org/doc/dbus-specification.html#message-protocol-messages)
+  for the wire layout and required header fields. Use `new/2` for outbound
+  messages and `signature/1` to read the body signature.
 
   ## Unix file descriptors
 
@@ -41,12 +15,6 @@ defmodule Rebus.Message do
   zero-based wire indexes. Inbound descriptors appear in `message.unix_fds`
   only on a `Rebus.call/3` reply, and the calling process then owns them. See
   [Unix file descriptor passing](unix_fds.html).
-
-  ## Message Flags
-
-  - `:no_reply_expected` - Don't expect a reply
-  - `:no_auto_start` - Don't auto-start destination service
-  - `:allow_interactive_authorization` - Allow interactive authorization
 
   ## Examples
 
@@ -116,6 +84,7 @@ defmodule Rebus.Message do
           | :signature
           | :unix_fds
 
+  @typedoc "A reason why `new/2` or `validate/1` rejected a message."
   @type construction_error ::
           :invalid_body
           | :invalid_flags
@@ -130,6 +99,7 @@ defmodule Rebus.Message do
           | {:invalid_header_field, header_field()}
           | {:missing_header_field, header_field()}
           | {:unknown_header_field, term()}
+  @typedoc "A reason why `encode/2` could not produce a valid D-Bus frame."
   @type encoding_error ::
           :invalid_body
           | :invalid_header_fields
@@ -283,14 +253,22 @@ defmodule Rebus.Message do
 
   - `type` - The message type (`:method_call`, `:method_return`, `:error`, `:signal`)
   - `opts` - Keyword list of options:
-    - `:flags` - List of message flags (default: `[]`)
+    - `:flags` - A list of flags (default: `[]`): `:no_reply_expected` suppresses
+      a reply, `:no_auto_start` prevents service activation, and
+      `:allow_interactive_authorization` permits interactive authorization
     - `:version` - Protocol version (default: `1`)
     - `:body` - Message body as list of values (default: `[]`)
     - `:signature` - Message body signature (default: auto-generated from body;
       `:infinity`, `:negative_infinity`, and `:nan` infer `d`)
     - `:fds` - Borrowed Unix file descriptors. Each `h` value in the body is
       an index into this list. Rebus never closes outbound descriptors.
-    - Header fields like `:path`, `:interface`, `:member`, etc.
+    - `:path` - Object path; required for method calls and signals
+    - `:interface` - Interface name; required for signals
+    - `:member` - Method or signal name; required for method calls and signals
+    - `:error_name` - D-Bus error name; required for error replies
+    - `:reply_serial` - Request serial; required for method returns and errors
+    - `:destination` - Optional target connection name
+    - `:sender` - Optional sending connection name, normally supplied by a bus
 
   ## Note
 
@@ -782,15 +760,7 @@ defmodule Rebus.Message do
     Map.get(message.header_fields, :signature, "")
   end
 
-  @doc """
-  Attaches Unix descriptors received as ancillary data to a decoded message.
-
-  This is the boundary between `h` values on the wire (untrusted indexes) and
-  actual process-owned descriptors. The header count, local descriptor bound,
-  and every index in the decoded body must agree before a descriptor is made
-  visible to an application. `fds` must be closed by the caller if this
-  function returns an error.
-  """
+  @doc false
   @spec attach_unix_fds(t(), [Rebus.UnixFD.t()]) ::
           {:ok, t()} | {:error, :invalid_unix_fds | :unix_fd_limit}
   def attach_unix_fds(%__MODULE__{} = message, fds) when is_list(fds) do

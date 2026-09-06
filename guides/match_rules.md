@@ -77,17 +77,12 @@ itself, which only the bus driver can send. A directed signal from anyone else
 is rejected. Both facts come from the bus driver, whose sender header a peer
 cannot forge.
 
-Tracking is best effort. If it fails, Rebus logs a warning naming the well-known
-name and retries the whole sequence after a growing delay, for about half a
-minute. Directed delivery for the name stays off while it retries, and
-broadcast delivery is unaffected. If the last retry fails too, Rebus logs an
-error saying so and leaves the name's owner unknown: directed signals from
-that service stay rejected for the life of the connection. Giving up tracking a name
-no subscription needs any more is not retried; the stale rule it may leave on
-the bus costs nothing but a duplicate signal Rebus already handles. There is
-also a short window, between the subscription being installed and the first
-owner answer arriving, in which a directed signal from the owner is not yet
-delivered.
+Tracking is best effort. If it fails, Rebus logs a warning and retries with
+backoff. Directed delivery for the name stays off until ownership is known;
+broadcast delivery is unaffected. If the retry budget is exhausted, Rebus
+logs an error and keeps rejecting directed signals from that service for the
+life of the connection. A directed signal can also be missed briefly while a
+new subscription obtains its first ownership answer.
 
 D-Bus does not say which rule admitted a signal. Rebus therefore rejects a
 rule that overlaps an existing one with a different sender, returning
@@ -102,29 +97,22 @@ the connection lives. A later `add_match/3` for the same rule waits behind
 that cleanup under its own timeout, and returns
 `{:error, :match_rule_cleanup_pending}` if the cleanup outlasts it.
 
-Two outcomes end differently. Rebus closes the connection when too many rules
-are left uncertain, or when a single rule stays uncertain for more than its
-retry budget, which makes the bus discard all of them. And
-`{:error, :match_subscription_state_lost}` means an operation in flight lost
-its state, and that reference stays unresolved until the connection closes.
-Both closes are `Rebus.close/1`, which only works on a connection created by
-`Rebus.connect/2`; a connection started any other way never gets closed, so the
-lost state lasts as long as that connection process does.
+A reply that exceeds Rebus's local decoding limit before its header fields can
+be trusted also appears as `{:error, :timeout}`: the connection cannot recover
+the reply serial needed to correlate it. This is the same conservative
+fallback described by the fuller `Rebus.call/3` contract.
 
-Closing a connection stops its local handlers, and the bus discards every
-match rule it held.
+Rebus closes the connection when too many rules remain uncertain, when a
+rule's cleanup exhausts its retry budget, or when an operation returns
+`{:error, :match_subscription_state_lost}`. Closing stops the connection's
+handlers and makes the bus discard every rule it held.
 
 Two application environment settings bound that cleanup.
 `:match_recovery_max_rules` (default `64`) is how many rules may be uncertain
 at once before the connection is closed. `:match_recovery_max_attempts`
-(default `30`) is how many times one rule's cleanup is retried before the same
-close happens; with the backoff Rebus uses that is about 26 seconds of
-backoff, and under a minute in total once each attempt's own timeout is
-counted. With the default budget, a rule that has run out of backoff also logs
-a warning once, well before the budget is spent. The count of attempts
-survives a restart of the
-subscription worker, since a restart is not evidence that the bus resolved
-anything.
+(default `30`) is how many cleanup attempts one rule receives before the same
+close happens. Recovery continues across transient local failures because
+those failures do not prove that the bus resolved the rule.
 
 ## Errors
 
@@ -134,7 +122,7 @@ anything.
 | --- | --- |
 | `:not_a_bus` | The connection was opened with `bus: false`. Nothing was sent. |
 | `:sender_routing_ambiguous` | The rule overlaps an existing one with a different sender. |
-| `:timeout` | The operation did not finish in time. The bus may still hold the rule. |
+| `:timeout` | The operation did not finish in time, or the reply header exceeded a local decoding limit. The bus may still hold the rule; see `Rebus.call/3` for the header-limit fallback. |
 | `:match_rule_cleanup_pending` | An earlier ambiguous operation on the same rule is still being cleaned up. |
 | `:match_subscription_state_lost` | An in-flight operation lost its state and cannot be resolved on this connection. Rebus ends it by closing a connection created by `Rebus.connect/2`; the state dies with the connection. |
 | `{:bus_error, error_name}` | The bus returned a D-Bus error reply. |

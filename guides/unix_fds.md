@@ -56,12 +56,17 @@ it anyway, and the number is never safe to reuse. Report or log the reason if it
 matters to you, but never retry the close.
 
 ```elixir
-{:ok, %Rebus.Message{unix_fds: fds} = reply} = Rebus.call(conn, message)
+case Rebus.call(conn, message) do
+  {outcome, %Rebus.Message{unix_fds: fds} = reply}
+  when outcome in [:ok, :error] ->
+    try do
+      handle(outcome, reply)
+    after
+      Enum.each(fds, &Rebus.UnixFD.close/1)
+    end
 
-try do
-  handle(reply)
-after
-  Enum.each(fds, &Rebus.UnixFD.close/1)
+  {:error, reason} ->
+    handle_call_failure(reason)
 end
 ```
 
@@ -77,12 +82,12 @@ call as usual.
 ## Timing
 
 An FD-bearing `Rebus.call/3` can return later than the timeout you supplied.
-Ownership moves to you through a private handshake with the connection, and
-Rebus waits for that handshake to settle rather than leaving ownership
-undecided.
+Rebus waits until descriptor ownership is settled so that every received
+descriptor has exactly one owner.
 
-`{:error, :fd_claim_expired}` means Rebus closed the received descriptors
-instead of handing them over. There is nothing left for you to close.
+If `Rebus.call/3` returns `{:error, :fd_claim_expired}`, Rebus closed the
+reply's descriptors instead of transferring them to you. There is nothing
+left for you to close.
 
 ## Cleanup
 

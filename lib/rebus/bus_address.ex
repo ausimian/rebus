@@ -1,6 +1,6 @@
 defmodule Rebus.BusAddress do
   @moduledoc """
-  Parses the D-Bus address-list syntax used by session and system buses.
+  Parses D-Bus address lists without opening a connection.
 
   `parse/1` accepts a bounded, semicolon-separated list of
   `transport:key=value` entries. It percent-decodes values, but never converts
@@ -11,8 +11,8 @@ defmodule Rebus.BusAddress do
   parameters are deliberately discarded: they may be meaningful to a newer
   implementation, but do not change a socket address Rebus supports.
 
-  A syntactically valid unsupported transport is represented by `:unsupported`
-  so callers can continue to a later address. Malformed input returns
+  A syntactically valid unsupported transport is represented by `:unsupported`.
+  Malformed input returns
   `{:error, {:invalid_bus_address, reason}}`, where `reason` is a fixed atom;
   no supplied address data is retained in that result.
   """
@@ -59,6 +59,14 @@ defmodule Rebus.BusAddress do
   libdbus does; leading, doubled, and otherwise empty entries are rejected. An
   abstract socket is encoded with one leading NUL added by the `abstract`
   transport itself.
+
+  ## Examples
+
+      iex> Rebus.BusAddress.parse("unix:path=/run/dbus/system_bus_socket")
+      {:ok, [{:local, "/run/dbus/system_bus_socket", nil}]}
+
+      iex> Rebus.BusAddress.parse("tcp:host=127.0.0.1,port=1234,family=ipv4")
+      {:ok, [{:tcp, "127.0.0.1", 1234, :inet, nil}]}
   """
   @spec parse(term()) :: {:ok, [candidate()]} | {:error, {:invalid_bus_address, error_reason()}}
   def parse(address) when is_binary(address) do

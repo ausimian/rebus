@@ -92,6 +92,7 @@ defmodule Rebus.MixProject do
       source_url: @source_url,
       extras: [
         "README.md",
+        "CONTRIBUTING.md",
         "guides/unix_fds.md",
         "guides/authentication.md",
         "guides/match_rules.md",

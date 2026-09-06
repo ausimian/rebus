@@ -1,8 +1,10 @@
 defmodule Rebus.Encoder do
   @moduledoc """
-  D-Bus message encoder that marshals data according to D-Bus wire format.
+  Encodes Elixir values using the D-Bus wire format.
 
-  Implements the D-Bus marshaling format with proper alignment and byte ordering.
+  Values must correspond to the supplied signature. See the
+  [D-Bus type system](https://dbus.freedesktop.org/doc/dbus-specification.html#type-system)
+  for the signature grammar and wire layout.
   Double special values use `:infinity`, `:negative_infinity`, and `:nan`;
   `:nan` encodes as a canonical quiet NaN.
   """
@@ -23,6 +25,7 @@ defmodule Rebus.Encoder do
   @max_uint64 18_446_744_073_709_551_615
 
   @type endianness :: :little | :big
+  @typedoc false
   @type encoding_state :: %{
           endianness: endianness(),
           position: non_neg_integer(),
@@ -31,22 +34,14 @@ defmodule Rebus.Encoder do
         }
 
   @doc """
-  Encodes data according to a D-Bus type signature into the wire format.
+  Encodes a list of values for a D-Bus type signature.
 
-  This function takes a D-Bus type signature string and corresponding data,
-  then marshals it into the binary format specified by the D-Bus protocol.
-  The output follows D-Bus alignment rules and byte ordering.
-
-  ## Parameters
-
-    * `signature` - A D-Bus type signature string (e.g., "i", "s", "a(is)", etc.)
-    * `data` - A list of values to encode that match the signature types
-    * `endianness` - Byte order for encoding (`:little` or `:big`). Defaults to `:little`
-
-  ## Returns
-
-  Returns an iodata structure containing the encoded binary data that can be
-  converted to binary using `IO.iodata_to_binary/1`.
+  `endianness` is `:little` by default. The result is iodata; use
+  `IO.iodata_to_binary/1` when a binary is required. Arrays and structs are
+  lists. Dictionary entries are `{key, value}` tuples, so dictionaries are
+  lists of pairs. Variants are `{signature, value}` tuples. Booleans are
+  `true` or `false`, and Unix file descriptors are non-negative indexes into
+  the descriptor list carried separately by a message.
 
   Raises `Rebus.ResourceLimitError` when an encode operation exceeds the local
   fixed-width scalar-array limit, and `Rebus.ProtocolLimitError` when an
@@ -54,50 +49,11 @@ defmodule Rebus.Encoder do
 
   ## Examples
 
-      # Encode a simple integer
       iex> Rebus.Encoder.encode("i", [42]) |> IO.iodata_to_binary()
       <<42, 0, 0, 0>>
 
-      # Encode a string
-      iex> Rebus.Encoder.encode("s", ["hello"]) |> IO.iodata_to_binary()
-      <<5, 0, 0, 0, "hello", 0>>
-
-      # Encode an array of integers
-      iex> Rebus.Encoder.encode("ai", [[1, 2, 3]]) |> IO.iodata_to_binary()
-      <<12, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0>>
-
-      # Encode a struct with mixed types
-      iex> Rebus.Encoder.encode("(si)", [["hello", 42]]) |> IO.iodata_to_binary()
-      <<5, 0, 0, 0, "hello", 0, 0, 0, 42, 0, 0, 0>>
-
-  ## D-Bus Type Signatures
-
-  Common D-Bus type codes:
-    * `"y"` - byte (0-255)
-    * `"b"` - boolean (0 or 1)
-    * `"n"` - signed 16-bit integer
-    * `"q"` - unsigned 16-bit integer
-    * `"i"` - signed 32-bit integer
-    * `"u"` - unsigned 32-bit integer
-    * `"x"` - signed 64-bit integer
-    * `"t"` - unsigned 64-bit integer
-    * `"d"` - IEEE 754 double
-    * `"s"` - UTF-8 string
-    * `"o"` - object path
-    * `"g"` - signature
-    * `"a"` - array (followed by element type)
-    * `"("` and `")"` - struct boundaries
-    * `"v"` - variant
-    * `"{"` and `"}"` - dictionary entry
-
-  ## Alignment Rules
-
-  The encoder automatically handles D-Bus alignment requirements:
-    * 1-byte alignment: byte, boolean
-    * 2-byte alignment: int16, uint16
-    * 4-byte alignment: int32, uint32, string length, array length
-    * 8-byte alignment: int64, uint64, double, struct start
-
+      iex> Rebus.Encoder.encode("v", [{"s", "ready"}]) |> IO.iodata_to_binary()
+      <<1, "s", 0, 0, 5, 0, 0, 0, "ready", 0>>
   """
   @spec encode(binary(), [any()], endianness()) :: iodata()
   def encode(signature, data, endianness \\ :little) do
