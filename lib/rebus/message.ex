@@ -139,6 +139,7 @@ defmodule Rebus.Message do
           | :resource_limit
           | :unix_fd_limit
 
+  @derive {Inspect, except: [:encoded_body]}
   typedstruct enforce: true do
     @typedoc "D-Bus message structure"
     field :type, message_type()
@@ -149,6 +150,18 @@ defmodule Rebus.Message do
     field :header_fields, %{optional(header_field()) => term()}
     field :body, [term()]
     field :unix_fds, [Rebus.UnixFD.t()], default: []
+
+    # Internal little-endian encoding cache populated by `new/2`, holding the
+    # `{body, signature, binary}` the encoded bytes were produced from. Callers
+    # must never set it: `encode/2` ignores it unless the body and signature
+    # still match the struct exactly, and `decode/1` leaves it `nil`. The cache
+    # is flattened to a single binary once at construction because a binary over
+    # 64 bytes is reference-counted and so effectively copy-free between
+    # processes. The body term is still duplicated when the struct is copied to
+    # another process - within one process the `body` field and the copy in the
+    # cache share a single term - which is accepted in exchange for skipping a
+    # second full body encode on the write path.
+    field :encoded_body, {[term()], binary(), binary()} | nil, default: nil
   end
 
   # Message type constants
@@ -326,7 +339,9 @@ defmodule Rebus.Message do
          {:ok, header_fields} <- extract_header_fields(opts),
          {:ok, validated_fields} <- validate_header_fields(header_fields),
          :ok <- validate_required_fields(type, header_fields),
-         {:ok, body_length} <- calculate_body_length(body, signature),
+         {:ok, body_data} <- encode_body(body, signature, :little),
+         body_binary = IO.iodata_to_binary(body_data),
+         body_length = byte_size(body_binary),
          :ok <- UnixFDs.validate_unix_fd_indices(signature, body, unix_fds),
          {:ok, validated_fields} <- put_signature_field(validated_fields, signature),
          {:ok, validated_fields} <- UnixFDs.put_unix_fd_count(validated_fields, unix_fds),
@@ -341,7 +356,8 @@ defmodule Rebus.Message do
          serial: 1,
          header_fields: validated_fields,
          body: body,
-         unix_fds: unix_fds
+         unix_fds: unix_fds,
+         encoded_body: {body, signature, body_binary}
        }}
     else
       {:error, _} = error -> error
@@ -427,7 +443,7 @@ defmodule Rebus.Message do
          :ok <- validate_encodable_header_fields(message.header_fields),
          {:ok, header_fields_encoded} <- encode_header_fields(message.header_fields, endianness),
          {:ok, body_data} <-
-           encode_body(message.body, Map.get(message.header_fields, :signature, ""), endianness),
+           body_iodata(message, Map.get(message.header_fields, :signature, ""), endianness),
          :ok <- UnixFDs.validate_unix_fds(message),
          :ok <-
            validate_encoded_size(
@@ -923,11 +939,23 @@ defmodule Rebus.Message do
     end
   end
 
-  defp calculate_body_length(body, signature) do
-    with {:ok, body_data} <- encode_body(body, signature, :little) do
-      {:ok, IO.iodata_length(body_data)}
-    end
-  end
+  # Reuses the little-endian body encoded by `new/2` when the struct's body and
+  # signature are still exactly the ones it was built from. The cached value is
+  # a flat binary, which is itself valid iodata, so callers need no special
+  # handling. Any other case - big endian, a body or signature replaced after
+  # construction, or a struct built by `decode/1` or by hand - encodes the body
+  # afresh. The repeated `body` and `signature` variables match exactly, so
+  # values such as `1` and `1.0` never alias.
+  defp body_iodata(
+         %__MODULE__{body: body, encoded_body: {body, signature, body_binary}},
+         signature,
+         :little
+       )
+       when is_binary(body_binary),
+       do: {:ok, body_binary}
+
+  defp body_iodata(message, signature, endianness),
+    do: encode_body(message.body, signature, endianness)
 
   defp encode_body([], "", _endianness), do: {:ok, []}
 
