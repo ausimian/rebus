@@ -15,9 +15,10 @@ defmodule Rebus.MatchSubscription.Store do
   # apply it. Callers use the table directly through the functions below
   # rather than through this process; it keeps the table alive and reaps the
   # rows of connections that die while no worker is around to notice.
-  # `persist_state/5` casts `{:watch, conn}` the first time it writes a
-  # connection's meta row, and the monitor set up here covers the window after
-  # a worker-supervisor restart when nothing else is watching that connection.
+  # `mark_writing/1`, the first phase of `persist_state/5`, casts
+  # `{:watch, conn}` the first time it creates a connection's meta row, and the
+  # monitor set up here covers the window after a worker-supervisor restart when
+  # nothing else is watching that connection.
 
   use GenServer
 
@@ -106,10 +107,48 @@ defmodule Rebus.MatchSubscription.Store do
   @doc false
   def persisted?(conn) when is_pid(conn), do: :ets.member(@state_table, {:meta, conn})
 
+  # A write is three phases, each callable on its own so a test can stop
+  # between them: the meta row is claimed as uncertain, the rows move, and only
+  # then does the meta row take the caller's flag. A worker that dies part-way
+  # leaves `uncertain?: true` over a partial row set, so `load_state/1` sends
+  # its replacement down the reset path rather than restoring half a snapshot.
   @doc false
   def persist_state(conn, uncertain?, changes, rules, subscriptions)
       when is_pid(conn) and is_boolean(uncertain?) and is_map(changes) and is_map(rules) and
              is_map(subscriptions) do
+    :ok = mark_writing(conn)
+    :ok = write_rows(conn, changes, rules, subscriptions)
+    :ok = write_meta(conn, uncertain?)
+  end
+
+  @doc false
+  def mark_writing(conn) when is_pid(conn) do
+    # The first write for a connection asks the table owner to monitor it, so
+    # its rows are reaped even if no worker is alive to see the connection go.
+    # The cast keeps the owner off this write path.
+    #
+    # Only that first write may create the meta row. Every later meta write
+    # goes through `replace_meta/2`, which updates the row in place and does
+    # nothing if it is gone, so no write can resurrect a row the owner reaped
+    # for a dead connection. `insert_new` can still create one for a connection
+    # that is already dead, but it is exactly that path which casts `:watch`,
+    # and monitoring a dead pid delivers `:DOWN` at once, so the owner reaps
+    # what it just started watching. Rows written by phase two after such a
+    # reap outlive it. A worker takes its own monitor on the connection in
+    # `init/1`, before its first write, so its `:DOWN` deletes them; a caller
+    # of these functions outside a worker has no such backstop.
+    if :ets.insert_new(@state_table, {{:meta, conn}, %{uncertain?: true}}) do
+      GenServer.cast(__MODULE__, {:watch, conn})
+    else
+      _ = replace_meta(conn, true)
+    end
+
+    :ok
+  end
+
+  @doc false
+  def write_rows(conn, changes, rules, subscriptions)
+      when is_pid(conn) and is_map(changes) and is_map(rules) and is_map(subscriptions) do
     persist_rows(conn, :rule, changes.dirty_rules, changes.removed_rules, rules)
 
     persist_rows(
@@ -120,19 +159,22 @@ defmodule Rebus.MatchSubscription.Store do
       subscriptions
     )
 
-    meta = {{:meta, conn}, %{uncertain?: uncertain?}}
+    :ok
+  end
 
-    # The first write for a connection asks the table owner to monitor it, so
-    # its rows are reaped even if no worker is alive to see the connection go.
-    # The cast keeps the owner off this write path. Nothing may write the meta
-    # row after the cast: the connection may already be dead, in which case the
-    # owner reaps the row it can see and a later write would strand a new one.
-    if :ets.insert_new(@state_table, meta) do
-      GenServer.cast(__MODULE__, {:watch, conn})
-    else
-      true = :ets.insert(@state_table, meta)
-    end
+  @doc false
+  def write_meta(conn, uncertain?) when is_pid(conn) and is_boolean(uncertain?) do
+    _ = replace_meta(conn, uncertain?)
+    :ok
+  end
 
+  # Deletes every row of a connection's rules and subscriptions, keeping the
+  # meta row: a worker that discards an uncertain snapshot still wants the
+  # connection watched and still wants the next read to see `uncertain?: true`.
+  @doc false
+  def discard_rows(conn) when is_pid(conn) do
+    true = :ets.match_delete(@state_table, {{:rule, conn, :_}, :_})
+    true = :ets.match_delete(@state_table, {{:subscription, conn, :_}, :_})
     :ok
   end
 
@@ -186,6 +228,14 @@ defmodule Rebus.MatchSubscription.Store do
     changes
     |> Map.update!(into, &MapSet.put(&1, key))
     |> Map.update!(out_of, &MapSet.delete(&1, key))
+  end
+
+  # Updates an existing meta row in place, atomically, returning 0 when there
+  # is none: a reaped connection stays reaped.
+  defp replace_meta(conn, uncertain?) do
+    :ets.select_replace(@state_table, [
+      {{{:meta, conn}, :_}, [], [{:const, {{:meta, conn}, %{uncertain?: uncertain?}}}]}
+    ])
   end
 
   defp persisted_rows(conn, kind) do

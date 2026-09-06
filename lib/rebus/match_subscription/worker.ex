@@ -177,6 +177,11 @@ defmodule Rebus.MatchSubscription.Worker do
 
     case Store.load_state(conn) do
       {:ok, %{uncertain?: true}} ->
+        # None of the persisted rows is restored here, and nothing else would
+        # ever remove them: the reset below rewrites the meta row over whatever
+        # rows exist, and its own change set is empty. Drop them now, keeping
+        # the meta row so the connection stays watched and stays uncertain.
+        :ok = Store.discard_rows(conn)
         send(self(), :reset_state_lost)
         {:ok, %{state | state_lost?: true}}
 
