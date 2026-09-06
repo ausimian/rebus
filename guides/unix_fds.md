@@ -50,7 +50,10 @@ with an OS or OTP API of your own. Never close one twice. Operating systems
 reuse descriptor numbers, so a second close can close an unrelated resource.
 
 `Rebus.UnixFD.close/1` returns `:ok` on success and `{:error, reason}` when the
-operating system refuses the close, so check the result where that matters.
+descriptor could not be adopted or the operating system refused the close. Once
+a descriptor has been adopted the result is informational: a failed close spends
+it anyway, and the number is never safe to reuse. Report or log the reason if it
+matters to you, but never retry the close.
 
 ```elixir
 {:ok, %Rebus.Message{unix_fds: fds} = reply} = Rebus.call(conn, message)

@@ -46,6 +46,16 @@ defmodule Rebus.UnixFD do
     * `{:error, :invalid_descriptor}` when `fd` is not a non-negative integer.
     * `{:error, :unsupported}` on a non-Unix system, or when this OTP release
       lacks the raw-descriptor primitive.
+
+  After `{:error, reason}` from an adopted descriptor there is nothing to
+  retry: `prim_file` detaches the descriptor from its reference before asking
+  the operating system to close it, so the error is reported after the
+  reference has already let go, and POSIX leaves a descriptor whose close
+  failed either closed or in an undefined state - never safely reusable.  Do
+  not call `close/1` again and do not use the number for anything else; the
+  error is there to be reported or logged, not recovered from.
+  `{:error, :unsupported}` is the exception: nothing was adopted, and the
+  descriptor is still yours to close another way.
   """
   @spec close(t()) :: :ok | {:error, :close_failed | :invalid_descriptor | :unsupported | term()}
   def close(fd) when is_integer(fd) and fd >= 0 do
