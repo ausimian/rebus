@@ -3001,6 +3001,109 @@ defmodule Rebus.MatchRuleTest do
       refute_receive {^server, %Message{header_fields: %{member: "RemoveMatch"}}}, 150
       send(owner, :stop)
     end
+
+    test "reads a torn write as uncertain" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+
+      # The first two phases of a write and no third: exactly what a worker
+      # that dies part-way through `persist_state/5` leaves behind.
+      :ok = Store.mark_writing(conn)
+      :ok = Store.write_rows(conn, persistence_changes(key), %{key => rule_state(rule)}, %{})
+
+      assert {:ok, %{uncertain?: true, rules: rules, subscriptions: %{}}} = Store.load_state(conn)
+      assert Map.has_key?(rules, key)
+
+      # A worker starting on that snapshot must not restore any of it.
+      assert {:ok, state} = Worker.init(conn)
+      assert state.state_lost?
+      assert state.rules == %{}
+      assert state.subscriptions == %{}
+      assert_received :reset_state_lost
+
+      :ok = Store.delete_state(conn)
+    end
+
+    test "completing the write clears the uncertainty a torn one would leave" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      changes = persistence_changes(key)
+      row = rule_state(rule)
+
+      :ok = Store.mark_writing(conn)
+      assert {:ok, %{uncertain?: true, rules: %{}}} = Store.load_state(conn)
+
+      :ok = Store.write_rows(conn, changes, %{key => row}, %{})
+      :ok = Store.write_meta(conn, false)
+
+      assert {:ok, %{uncertain?: false, rules: %{^key => ^row}}} = Store.load_state(conn)
+
+      # The whole-write entry point leaves the same result.
+      :ok = Store.persist_state(conn, false, changes, %{key => row}, %{})
+      assert {:ok, %{uncertain?: false, rules: %{^key => ^row}}} = Store.load_state(conn)
+
+      :ok = Store.delete_state(conn)
+    end
+
+    test "discards the rows an uncertain restart does not restore" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+
+      :ok =
+        Store.persist_state(conn, true, persistence_changes(key), %{key => rule_state(rule)}, %{})
+
+      assert persisted_rows(conn, :rule) != []
+
+      assert {:ok, state} = Worker.init(conn)
+      assert state.state_lost?
+      assert_received :reset_state_lost
+
+      # The rows are gone, but the meta row stays: the connection is still
+      # watched, and the next read still says the snapshot is uncertain.
+      assert Store.persisted?(conn)
+      assert {:ok, %{uncertain?: true, rules: %{}, subscriptions: %{}}} = Store.load_state(conn)
+
+      :ok = Store.delete_state(conn)
+    end
+
+    test "does not resurrect a meta row the owner has already reaped" do
+      conn = spawn(fn -> Process.sleep(:infinity) end)
+      monitor = Process.monitor(conn)
+
+      :ok = Store.mark_writing(conn)
+      assert Store.persisted?(conn)
+
+      Process.exit(conn, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^conn, :killed}, 1_000
+      assert wait_until(fn -> not Store.persisted?(conn) end)
+
+      # The rest of the write lands after the reap. `write_meta/2` replaces in
+      # place, so it strands no meta row; the rows it wrote alongside are the
+      # worker's to clean up.
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      :ok = Store.write_rows(conn, persistence_changes(key), %{key => rule_state(rule)}, %{})
+      :ok = Store.write_meta(conn, false)
+
+      refute Store.persisted?(conn)
+      assert persisted_rows(conn, :rule) != []
+
+      # A worker holds its own monitor on the connection, and that `:DOWN` is
+      # the backstop for exactly these rows.
+      assert {:ok, state} = Worker.init(conn)
+
+      assert {:stop, :normal, _state} =
+               Worker.handle_info(
+                 {:DOWN, state.connection_monitor, :process, conn, :killed},
+                 state
+               )
+
+      assert persisted_rows(conn, :rule) == []
+      refute Store.persisted?(conn)
+    end
   end
 
   defp test_rule(member \\ "Changed") do
