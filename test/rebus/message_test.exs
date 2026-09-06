@@ -4,6 +4,13 @@ defmodule Rebus.MessageTest do
 
   doctest Rebus.Message
 
+  # A list of 1019-byte strings whose encoded array data is exactly
+  # `max_array_size/0` bytes, plus `extra` elements of 1024 bytes each.
+  defp oversized_string_array(extra) do
+    elements = div(Message.max_array_size(), 1024) + extra
+    List.duplicate(String.duplicate("x", 1019), elements)
+  end
+
   # Helper function to encode message and return binary for decoding
   defp encode_to_binary(message, endianness \\ :little) do
     case Message.encode(message, endianness) do
@@ -250,6 +257,59 @@ defmodule Rebus.MessageTest do
       }
 
       assert {:error, :resource_limit} = Message.encode(message)
+    end
+
+    test "accepts a body array of exactly the D-Bus array size limit" do
+      # A 1019-byte string encodes as 4 length bytes, 1019 data bytes and a NUL
+      # terminator: exactly 1024 bytes, with no padding between elements.
+      values = oversized_string_array(0)
+
+      assert {:ok, message} =
+               Message.new(:signal,
+                 path: "/",
+                 interface: "com.example.I",
+                 member: "M",
+                 signature: "as",
+                 body: [values]
+               )
+
+      assert {:ok, _iodata} = Message.encode(message)
+    end
+
+    test "reports a body array over the D-Bus array size limit as too large" do
+      values = oversized_string_array(1)
+
+      opts = [
+        path: "/",
+        interface: "com.example.I",
+        member: "M",
+        signature: "as",
+        body: [values]
+      ]
+
+      assert {:error, :message_too_large} = Message.new(:signal, opts)
+
+      assert_raise ArgumentError, ~r/exceeds the D-Bus size limit/, fn ->
+        Message.new!(:signal, opts)
+      end
+
+      message = %Message{
+        type: :signal,
+        flags: [],
+        version: 1,
+        body_length: 0,
+        serial: 1,
+        header_fields: %{
+          path: "/",
+          interface: "com.example.I",
+          member: "M",
+          signature: "as"
+        },
+        body: [values]
+      }
+
+      assert {:error, :message_too_large} = Message.encode(message)
+      assert {:error, :message_too_large} = Message.validate(message)
     end
 
     test "round-trips byte arrays beyond the composite term budget" do

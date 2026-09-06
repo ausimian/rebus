@@ -113,6 +113,7 @@ defmodule Rebus.MixProject do
           Rebus.BusAddress
         ],
         Errors: [
+          Rebus.ProtocolLimitError,
           Rebus.ResourceLimitError
         ]
       ]
