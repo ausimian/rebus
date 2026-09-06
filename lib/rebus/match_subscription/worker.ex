@@ -158,6 +158,13 @@ defmodule Rebus.MatchSubscription.Worker do
     field :tracked_names, %{binary() => true}, default: %{}
     field :tracking_ops, %{binary() => reference() | nil}, default: %{}
     field :tracking_monitors, %{reference() => binary()}, default: %{}
+    # The retry a failed tracking sequence owes a name: how many retries it has
+    # taken and the timer holding the next one, which is `nil` while the retry
+    # it started is in flight. An entry exists only between a failure and the
+    # attempt that resolves it or the budget running out.
+    field :tracking_retries, %{binary() => %{attempt: pos_integer(), timer: reference() | nil}},
+      default: %{}
+
     # The rules and subscriptions touched since the last write to the table.
     field :persistence, Store.changes(), default: Store.no_changes()
     # The supervisor operation tasks are started under. A field rather than a
@@ -350,7 +357,18 @@ defmodule Rebus.MatchSubscription.Worker do
 
   def handle_info({:tracking_result, name, result}, state) do
     log_tracking(name, result)
-    {:noreply, state |> clear_tracking_op(name) |> reconcile_tracking()}
+
+    state =
+      state
+      |> clear_tracking_op(name)
+      |> settle_tracking_retry(name, result)
+      |> reconcile_tracking()
+
+    {:noreply, state}
+  end
+
+  def handle_info({:retry_tracking, name}, state) do
+    {:noreply, retry_tracking(state, name)}
   end
 
   def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do
@@ -378,9 +396,17 @@ defmodule Rebus.MatchSubscription.Worker do
       name = Map.get(state.tracking_monitors, monitor_ref) ->
         # Owner tracking is best-effort and deliberately outside the rule
         # recovery machinery: a lost task leaves the name tracked but unseeded,
-        # which rejects directed signals exactly as before it was tracked.
+        # which rejects directed signals exactly as before it was tracked,
+        # until one of the bounded retries below seeds it.
         log_tracking(name, {:error, {:task, :lost}})
-        {:noreply, state |> clear_tracking_op(name) |> reconcile_tracking()}
+
+        state =
+          state
+          |> clear_tracking_op(name)
+          |> settle_tracking_retry(name, {:error, {:task, :lost}})
+          |> reconcile_tracking()
+
+        {:noreply, state}
 
       token = Map.get(state.operation_monitors, monitor_ref) ->
         # A task that finishes normally sends its result first. Reaching this
@@ -1207,12 +1233,112 @@ defmodule Rebus.MatchSubscription.Worker do
     end
   end
 
+  # A name that stops being needed drops whatever retry it was owed: the
+  # untrack below is the last word on it, and a retry that fired anyway would
+  # reinstall the tracking rule the untrack has just removed.
   defp stop_name_tracking(state, name) do
     if Map.has_key?(state.tracking_ops, name) do
       state
     else
       state = %{state | tracked_names: Map.delete(state.tracked_names, name)}
+      state = clear_tracking_retry(state, name)
       start_tracking_task(state, name, &Operation.untrack_owner(&1, name))
+    end
+  end
+
+  # A tracking result does not say which sequence produced it. It does not have
+  # to: `stop_name_tracking/2` drops the latch before starting the untrack, so
+  # a result for a name still in `tracked_names` is a track's and one for a
+  # name that has left it is an untrack's.
+  #
+  # An untrack is not retried. A tracking RemoveMatch the bus refused leaves an
+  # internal rule behind, which only costs a duplicate copy of a
+  # NameOwnerChanged the connection already handles, and a later re-track
+  # installs its own rule regardless, since dbus-daemon accepts identical
+  # AddMatch rules.
+  defp settle_tracking_retry(state, name, result) do
+    cond do
+      not Map.has_key?(state.tracked_names, name) -> state
+      result == :ok -> clear_tracking_retry(state, name)
+      true -> schedule_tracking_retry(state, name)
+    end
+  end
+
+  # The whole sequence is retried, not the step that failed: every step is
+  # idempotent, and the worker cannot tell from a failure how far the bus got.
+  # A budget spent without a success is the end of it, exactly as before this
+  # was retried at all: the name stays latched and `:unknown` in the
+  # connection, so directed signals for it stay rejected, and nothing here ever
+  # resets the connection or enters rule recovery.
+  #
+  # A pending timer is not cancelled at `terminate/2`, any more than a recovery
+  # one is: its message would only be delivered to a dead process.
+  defp schedule_tracking_retry(state, name) do
+    %{attempt: attempt} = entry = tracking_retry(state, name)
+    next = attempt + 1
+
+    if next > max_tracking_attempts() do
+      log_tracking_exhausted(name, attempt)
+      clear_tracking_retry(state, name)
+    else
+      timer = Process.send_after(self(), {:retry_tracking, name}, retry_delay(next))
+      put_tracking_retry(state, name, %{entry | attempt: next, timer: timer})
+    end
+  end
+
+  # The retry restarts the task directly rather than going through
+  # `start_name_tracking/2`, whose latch check would skip a name the failed
+  # attempt left marked as tracked.
+  #
+  # A timer is cancelled asynchronously, so a retry can still arrive for a name
+  # that has since stopped being needed, or been picked up by a reconcile of
+  # its own. Anything but a name still owed this retry drops the entry instead.
+  defp retry_tracking(state, name) do
+    state = clear_tracking_retry_timer(state, name)
+
+    if retry_tracking?(state, name) do
+      start_tracking_task(state, name, &Operation.track_owner(&1, name))
+    else
+      clear_tracking_retry(state, name)
+    end
+  end
+
+  # A connection being reset or whose state is lost is not one to retry against,
+  # for the reason `reconcile_tracking/1` gives. Both latches are terminal for
+  # this worker, so the entry goes rather than waiting for them to clear.
+  defp retry_tracking?(%__MODULE__{resetting?: true}, _name), do: false
+  defp retry_tracking?(%__MODULE__{state_lost?: true}, _name), do: false
+
+  defp retry_tracking?(state, name) do
+    Map.has_key?(state.tracking_retries, name) and
+      Map.has_key?(state.tracked_names, name) and
+      not Map.has_key?(state.tracking_ops, name) and
+      Map.has_key?(needed_tracked_names(state), name)
+  end
+
+  defp tracking_retry(state, name) do
+    Map.get(state.tracking_retries, name, %{attempt: 0, timer: nil})
+  end
+
+  defp put_tracking_retry(state, name, entry) do
+    %{state | tracking_retries: Map.put(state.tracking_retries, name, entry)}
+  end
+
+  defp clear_tracking_retry_timer(state, name) do
+    case Map.get(state.tracking_retries, name) do
+      nil -> state
+      entry -> put_tracking_retry(state, name, %{entry | timer: nil})
+    end
+  end
+
+  defp clear_tracking_retry(state, name) do
+    case Map.pop(state.tracking_retries, name) do
+      {nil, _tracking_retries} ->
+        state
+
+      {%{timer: timer}, tracking_retries} ->
+        if is_reference(timer), do: Process.cancel_timer(timer, async: true, info: false)
+        %{state | tracking_retries: tracking_retries}
     end
   end
 
@@ -1618,6 +1744,17 @@ defmodule Rebus.MatchSubscription.Worker do
     Application.get_env(:rebus, :match_recovery_max_attempts, 30)
   end
 
+  # Retries allowed for one failed owner-tracking sequence before the name is
+  # left untracked for good. Shares `@recovery_delays` with rule recovery, so
+  # the default is the same rough half-minute of retrying: long enough to ride
+  # out a slow bus or a momentary AccessDenied, short enough that a name whose
+  # tracking is genuinely refused stops asking. Unlike a recovery attempt, this
+  # count is not persisted: tracking is derived from the restored rules, so a
+  # restarted worker starts the sequence, and its budget, afresh.
+  defp max_tracking_attempts do
+    Application.get_env(:rebus, :match_tracking_max_attempts, 30)
+  end
+
   defp retry_delay(attempt) do
     Enum.at(@recovery_delays, min(attempt - 1, length(@recovery_delays) - 1))
   end
@@ -1657,6 +1794,13 @@ defmodule Rebus.MatchSubscription.Worker do
 
   defp log_tracking(name, _result) do
     Logger.warning("D-Bus name owner tracking failed name=#{name} step=unknown")
+  end
+
+  # Each attempt logs its own warning; this says the retrying has stopped, at a
+  # level that separates a name degraded for good from one still being retried.
+  # It fires once per failure episode, since a success clears the count.
+  defp log_tracking_exhausted(name, attempts) do
+    Logger.error("D-Bus name owner tracking exhausted name=#{name} attempts=#{attempts}")
   end
 
   # The operation type is what makes a worker that cannot start tasks
