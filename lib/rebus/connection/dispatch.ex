@@ -376,7 +376,7 @@ defmodule Rebus.Connection.Dispatch do
     # primitive, one raw descriptor cannot be transferred safely to all of
     # them, so FD-bearing signals are rejected and closed.
     if msg.unix_fds == [] do
-      parse_flat_messages(rest, notify(msg, state), cursor)
+      parse_flat_messages(rest, notify(msg, apply_name_owner_change(msg, state)), cursor)
     else
       close_message_fds(msg)
       Logger.warning("D-Bus FD frame dropped: :signal_ownership", reason: :signal_ownership)
@@ -424,6 +424,41 @@ defmodule Rebus.Connection.Dispatch do
 
   defp close_message_fds(%Message{unix_fds: fds}), do: UnixFD.close_all(fds)
 
+  # The owner table follows the bus driver's own NameOwnerChanged signals, and
+  # only for the names a subscription asked to track. On a message bus the
+  # sender header is set by the bus, so a peer cannot forge
+  # `org.freedesktop.DBus`: that exact match is the trust boundary, and it is
+  # deliberately not relaxed to the interface and member alone, which any peer
+  # can send. The signal is still delivered to handlers afterwards, since a
+  # subscription may be watching NameOwnerChanged itself.
+  defp apply_name_owner_change(
+         %Message{
+           header_fields: %{
+             sender: "org.freedesktop.DBus",
+             interface: "org.freedesktop.DBus",
+             member: "NameOwnerChanged"
+           },
+           body: [name, old_owner, new_owner]
+         },
+         %Connection{name_owners: name_owners} = state
+       )
+       when is_binary(name) and is_binary(old_owner) and is_binary(new_owner) do
+    if Map.has_key?(name_owners, name) do
+      %{state | name_owners: Map.put(name_owners, :binary.copy(name), new_owner(new_owner))}
+    else
+      state
+    end
+  end
+
+  defp apply_name_owner_change(%Message{}, %Connection{} = state), do: state
+
+  # An empty new owner means the name was released. Both the key and the owner
+  # retained above are copied out of the received frame: a map insert for an
+  # existing key retains the new key term, so an uncopied sub-binary would hold
+  # a whole frame alive until the next owner change.
+  defp new_owner(""), do: nil
+  defp new_owner(owner), do: :binary.copy(owner)
+
   # A non-bus connection has no unique name, so nothing can be its own
   # NameAcquired signal. Match the absent name explicitly rather than letting
   # `nil` participate in the header comparison below.
@@ -447,9 +482,11 @@ defmodule Rebus.Connection.Dispatch do
   # Handlers live in this connection's state, so the match rule of a
   # subscription is evaluated here, in the connection process, and only for
   # the signals this connection received.
-  defp dispatch_signal(%Message{} = msg, %Connection{handlers: handlers}) do
+  defp dispatch_signal(%Message{} = msg, %Connection{handlers: handlers} = state) do
+    name_owners = state.name_owners
+
     Enum.each(handlers, fn {handler_ref, %{pid: pid, rule: rule}} ->
-      if is_nil(rule) or MatchRule.matches?(rule, msg) do
+      if is_nil(rule) or MatchRule.matches?(rule, msg, name_owners) do
         send(pid, {handler_ref, msg})
       end
     end)

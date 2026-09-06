@@ -150,6 +150,14 @@ defmodule Rebus.MatchSubscription.Worker do
     field :reset_task_monitor, reference() | nil, default: nil
     # Whether this connection is a bus, `nil` until it has been asked once.
     field :bus?, boolean() | nil, default: nil
+    # The well-known sender names whose owner this worker has asked the
+    # connection to track, and the tracking task in flight for a name with the
+    # monitor watching it. Tracking is derived from the installed rules rather
+    # than persisted: a restarted worker re-runs the sequence for the names its
+    # restored rules still need.
+    field :tracked_names, %{binary() => true}, default: %{}
+    field :tracking_ops, %{binary() => reference() | nil}, default: %{}
+    field :tracking_monitors, %{reference() => binary()}, default: %{}
     # The rules and subscriptions touched since the last write to the table.
     field :persistence, Store.changes(), default: Store.no_changes()
   end
@@ -170,7 +178,7 @@ defmodule Rebus.MatchSubscription.Worker do
       {:ok, persisted} ->
         state = restore_state(state, persisted)
         Enum.each(state.recovering_rules, &send(self(), {:resume_recovery, &1}))
-        {:ok, state}
+        {:ok, reconcile_tracking(state)}
 
       :error ->
         {:ok, state}
@@ -325,8 +333,14 @@ defmodule Rebus.MatchSubscription.Worker do
         {:noreply, state}
 
       {%{key: key} = operation, state} ->
-        {:noreply, state |> complete_operation(key, operation, result) |> persist_state()}
+        state = state |> complete_operation(key, operation, result) |> persist_state()
+        {:noreply, reconcile_tracking(state)}
     end
+  end
+
+  def handle_info({:tracking_result, name, result}, state) do
+    log_tracking(name, result)
+    {:noreply, state |> clear_tracking_op(name) |> reconcile_tracking()}
   end
 
   def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do
@@ -350,6 +364,13 @@ defmodule Rebus.MatchSubscription.Worker do
         state = reply_request(state, request_id, {:error, :disconnected})
         state = if(key, do: maybe_progress_rule(state, key), else: state)
         {:noreply, persist_state(state)}
+
+      name = Map.get(state.tracking_monitors, monitor_ref) ->
+        # Owner tracking is best-effort and deliberately outside the rule
+        # recovery machinery: a lost task leaves the name tracked but unseeded,
+        # which rejects directed signals exactly as before it was tracked.
+        log_tracking(name, {:error, {:task, :lost}})
+        {:noreply, state |> clear_tracking_op(name) |> reconcile_tracking()}
 
       token = Map.get(state.operation_monitors, monitor_ref) ->
         # A task that finishes normally sends its result first. Reaching this
@@ -1040,6 +1061,121 @@ defmodule Rebus.MatchSubscription.Worker do
     %{state | reset_task_monitor: nil, reset_token: nil}
   end
 
+  # The set of names to track is derived from the rules this worker holds, so
+  # no extra refcount is kept: a name is needed while at least one installed
+  # rule names it as a well-known sender. Reconciling after every operation
+  # therefore installs the tracking rule once for the first such rule and
+  # removes it after the last one goes.
+  #
+  # A connection being reset or whose state is lost is not a connection to run
+  # best-effort bus round trips against: leave the table alone until it settles.
+  # `init/1` returns before reconciling on the uncertain-snapshot path, so this
+  # only has to catch the operation results that land during a live reset.
+  defp reconcile_tracking(%__MODULE__{resetting?: true} = state), do: state
+  defp reconcile_tracking(%__MODULE__{state_lost?: true} = state), do: state
+
+  defp reconcile_tracking(state) do
+    needed = needed_tracked_names(state)
+
+    state =
+      Enum.reduce(needed, state, fn {name, true}, acc ->
+        if Map.has_key?(acc.tracked_names, name), do: acc, else: start_name_tracking(acc, name)
+      end)
+
+    Enum.reduce(state.tracked_names, state, fn {name, true}, acc ->
+      if Map.has_key?(needed, name), do: acc, else: stop_name_tracking(acc, name)
+    end)
+  end
+
+  defp needed_tracked_names(state) do
+    Enum.reduce(state.rules, %{}, fn
+      {_key, %Rule{rule: rule, status: :active}}, names ->
+        case trackable_sender(rule) do
+          nil -> names
+          name -> Map.put(names, name, true)
+        end
+
+      {_key, _rule}, names ->
+        names
+    end)
+  end
+
+  # Only a well-known sender needs an owner. A unique sender is compared
+  # directly, and the bus driver sends its own directed signals under the
+  # literal name `org.freedesktop.DBus`, which already matches.
+  defp trackable_sender(%MatchRule{criteria: %{sender: <<":", _::binary>>}}), do: nil
+  defp trackable_sender(%MatchRule{criteria: %{sender: "org.freedesktop.DBus"}}), do: nil
+  defp trackable_sender(%MatchRule{criteria: %{sender: sender}}), do: sender
+  defp trackable_sender(%MatchRule{}), do: nil
+
+  # A name with a task in flight is left alone: that task's result reconciles
+  # again, so an add and a remove for the same name never overlap on the bus.
+  defp start_name_tracking(state, name) do
+    if Map.has_key?(state.tracking_ops, name) do
+      state
+    else
+      state = %{state | tracked_names: Map.put(state.tracked_names, name, true)}
+      start_tracking_task(state, name, &Operation.track_owner(&1, name))
+    end
+  end
+
+  defp stop_name_tracking(state, name) do
+    if Map.has_key?(state.tracking_ops, name) do
+      state
+    else
+      state = %{state | tracked_names: Map.delete(state.tracked_names, name)}
+      start_tracking_task(state, name, &Operation.untrack_owner(&1, name))
+    end
+  end
+
+  # Tracking runs outside the rule state machine: its failures never reset the
+  # connection, never fail a caller's add_match/3, and never enter recovery.
+  # A worker restart re-runs this for every restored rule that still needs it,
+  # which can leave a duplicate tracking rule on the bus, since dbus-daemon
+  # accepts identical AddMatch rules and RemoveMatch drops one. That costs a
+  # second copy of a signal already received and needs no bookkeeping.
+  #
+  # No deadline is passed: unlike a caller operation, a tracking sequence has
+  # no single budget. `Rebus.MatchSubscription.Operation` bounds each of its
+  # bus round trips separately.
+  defp start_tracking_task(state, name, fun) do
+    worker = self()
+    conn = state.conn
+
+    case Task.Supervisor.start_child(Rebus.MatchSubscription.TaskSupervisor, fn ->
+           send(worker, {:tracking_result, name, fun.(conn)})
+         end) do
+      {:ok, pid} ->
+        monitor_ref = Process.monitor(pid)
+
+        %{
+          state
+          | tracking_ops: Map.put(state.tracking_ops, name, monitor_ref),
+            tracking_monitors: Map.put(state.tracking_monitors, monitor_ref, name)
+        }
+
+      {:error, reason} ->
+        send(self(), {:tracking_result, name, {:error, {:start, reason}}})
+        %{state | tracking_ops: Map.put(state.tracking_ops, name, nil)}
+    end
+  end
+
+  defp clear_tracking_op(state, name) do
+    case Map.pop(state.tracking_ops, name) do
+      {nil, tracking_ops} ->
+        %{state | tracking_ops: tracking_ops}
+
+      {monitor_ref, tracking_ops} ->
+        Process.demonitor(monitor_ref, [:flush])
+
+        %{
+          state
+          | tracking_ops: tracking_ops,
+            tracking_monitors: Map.delete(state.tracking_monitors, monitor_ref)
+        }
+    end
+  end
+
   defp put_request(state, from, owner, kind, key, ref, deadline) do
     request_id = make_ref()
     monitor_ref = Process.monitor(owner)
@@ -1366,6 +1502,19 @@ defmodule Rebus.MatchSubscription.Worker do
 
   defp log_recovery(event) do
     Logger.debug("D-Bus match cleanup transition=#{event}")
+  end
+
+  # A well-known bus name is not a secret, and naming it and the failed step is
+  # what makes a silently degraded subscription diagnosable. Neither the unique
+  # name behind it nor any message payload is logged.
+  defp log_tracking(_name, :ok), do: :ok
+
+  defp log_tracking(name, {:error, {step, _reason}}) do
+    Logger.warning("D-Bus name owner tracking failed name=#{name} step=#{step}")
+  end
+
+  defp log_tracking(name, _result) do
+    Logger.warning("D-Bus name owner tracking failed name=#{name} step=unknown")
   end
 
   defp log_reset(event) do

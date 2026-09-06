@@ -91,19 +91,32 @@ defmodule Rebus.MatchRule do
   Rebus compares unique-name `:sender` values, `:interface`, `:member`,
   `:path`, `:path_namespace`, `:destination`, `:args`, `:arg_paths`, and
   `:arg0namespace`. A well-known `:sender` is left to the bus for broadcast
-  signals, and accepted for a directed signal only when the sender header is
-  that exact name. This does not emulate bus access policy or eavesdropping.
+  signals. A directed signal is accepted for a well-known `:sender` when the
+  sender header is that exact name, and, through `matches?/3`, when it is the
+  unique name the bus currently reports as that name's owner. This arity knows
+  no owners, so only the exact name matches. This does not emulate bus access
+  policy or eavesdropping.
   """
   @spec matches?(t(), Message.t()) :: boolean()
-  def matches?(%__MODULE__{criteria: criteria}, %Message{type: :signal} = message) do
+  def matches?(%__MODULE__{} = rule, %Message{} = message), do: matches?(rule, message, %{})
+
+  # The owner table the connection maintains for the well-known names its
+  # subscriptions depend on. `:unknown` is tracked but not yet seeded, `nil` is
+  # a name the bus says nobody owns, and a binary is the owner's unique name.
+  # Neither `:unknown` nor `nil` admits a directed signal.
+  @doc false
+  @spec matches?(t(), Message.t(), %{optional(binary()) => :unknown | nil | binary()}) ::
+          boolean()
+  def matches?(%__MODULE__{criteria: criteria}, %Message{type: :signal} = message, name_owners)
+      when is_map(name_owners) do
     headers = message.header_fields
 
-    well_known_sender_matches?(criteria, headers) and
+    well_known_sender_matches?(criteria, headers, name_owners) and
       header_matches?(criteria, headers) and
       argument_matches?(criteria, message)
   end
 
-  def matches?(_rule, _message), do: false
+  def matches?(_rule, _message, _name_owners), do: false
 
   @type validation_error ::
           :duplicate_match_option
@@ -302,17 +315,28 @@ defmodule Rebus.MatchRule do
   end
 
   # A well-known sender is safely enforced by bus routing only for broadcast
-  # signals. Directed signals bypass that routing, so they need an exact sender
-  # header match. That permits trusted bus-driver signals without treating a
-  # peer's unique sender as the named service.
-  defp well_known_sender_matches?(%{sender: <<":", _::binary>>}, _headers), do: true
+  # signals. Directed signals bypass that routing, so the sender header must be
+  # either that exact name — the trusted bus-driver case — or the unique name
+  # the bus currently reports as owning it. A name that is untracked, tracked
+  # but not yet seeded (`:unknown`), or unowned (`nil`) admits neither, so a
+  # peer's unique sender is never taken for the named service.
+  defp well_known_sender_matches?(%{sender: <<":", _::binary>>}, _headers, _name_owners), do: true
 
-  defp well_known_sender_matches?(%{sender: sender}, %{destination: _destination} = headers),
-    do: Map.get(headers, :sender) == sender
+  defp well_known_sender_matches?(
+         %{sender: sender},
+         %{destination: _destination} = headers,
+         name_owners
+       ) do
+    case Map.get(headers, :sender) do
+      nil -> false
+      ^sender -> true
+      header_sender -> Map.get(name_owners, sender) == header_sender
+    end
+  end
 
-  defp well_known_sender_matches?(%{sender: _sender}, _headers), do: true
+  defp well_known_sender_matches?(%{sender: _sender}, _headers, _name_owners), do: true
 
-  defp well_known_sender_matches?(_criteria, _headers), do: true
+  defp well_known_sender_matches?(_criteria, _headers, _name_owners), do: true
 
   defp path_namespace_matches?(criteria, headers) do
     case Map.fetch(criteria, :path_namespace) do
