@@ -160,6 +160,11 @@ defmodule Rebus.MatchSubscription.Worker do
     field :tracking_monitors, %{reference() => binary()}, default: %{}
     # The rules and subscriptions touched since the last write to the table.
     field :persistence, Store.changes(), default: Store.no_changes()
+    # The supervisor operation tasks are started under. A field rather than a
+    # literal at the call site so a test can point a worker at a supervisor
+    # that refuses to start children and exercise the never-started path.
+    field :task_supervisor, Supervisor.supervisor(),
+      default: Rebus.MatchSubscription.TaskSupervisor
   end
 
   @impl true
@@ -533,7 +538,7 @@ defmodule Rebus.MatchSubscription.Worker do
     operation = %{key: key, type: type, request_id: request_id, monitor: nil}
 
     started =
-      Task.Supervisor.start_child(Rebus.MatchSubscription.TaskSupervisor, fn ->
+      Task.Supervisor.start_child(state.task_supervisor, fn ->
         send(worker, {:operation_result, token, fun.()})
       end)
 
@@ -552,7 +557,12 @@ defmodule Rebus.MatchSubscription.Worker do
           }
 
         {:error, _reason} ->
-          send(self(), {:operation_result, token, {:operation_failed, :disconnected}})
+          # No task ran, therefore nothing was sent to the bus and no local
+          # handler was attached. Report that distinctly from a task that died
+          # mid-flight, whose effect on the bus is genuinely unknown. The
+          # operation is still recorded so the snapshot stays uncertain until
+          # the synthesised result is handled like any other.
+          send(self(), {:operation_result, token, :not_started})
           %{state | operations: Map.put(state.operations, token, operation)}
       end
 
@@ -601,6 +611,53 @@ defmodule Rebus.MatchSubscription.Worker do
          {:operation_failed, _reason}
        ) do
     operation_failed(state, key, type, request_id)
+  end
+
+  # A task that never started is the one unambiguous failure: it sent nothing
+  # to the bus and attached no local handler, so the rule and its references
+  # are exactly what they were before the operation. Unlike `operation_down/2`
+  # there is no unresolved bus state to reset the connection over, and unlike
+  # `{:operation_failed, _}` there is nothing to blame on the connection.
+  defp complete_operation(state, key, %{type: :add_new, request_id: request_id}, :not_started) do
+    log_not_started(:add_new)
+
+    # The rule was created for this operation and installed nothing, so it is
+    # torn down exactly as a definitive AddMatch failure that owes no
+    # RemoveMatch is, redispatching anything queued behind it.
+    state
+    |> reply_request_if_live(request_id, {:error, :not_started})
+    |> maybe_progress_rule(key)
+  end
+
+  defp complete_operation(state, key, %{type: type, request_id: request_id}, :not_started)
+       when type in [:add_existing, :remove] do
+    log_not_started(type)
+
+    # The rule stays `:active` either way: no reference was added, and none was
+    # removed, so the caller's own reference is still good for a retry.
+    state
+    |> reply_request_if_live(request_id, {:error, :not_started})
+    |> dispatch_rule(key)
+  end
+
+  defp complete_operation(state, key, %{type: :recovery}, :not_started) do
+    log_recovery(:recovery_not_started)
+
+    # Nothing was cleared, so the rule stays `:recovering` with its owed
+    # handler removals intact and simply waits for the next attempt.
+    schedule_recovery_retry(state, key)
+  end
+
+  defp complete_operation(state, key, %{type: :initial_cleanup}, :not_started) do
+    log_recovery(:initial_cleanup_not_started)
+
+    # The bus was never asked, so the cleanup is still owed. Give the slot
+    # back, graduate the rule to the bounded recovery set as an unproven
+    # cleanup does, and let the next queued key take the slot.
+    state
+    |> release_initial_cleanup(key)
+    |> enter_recovery(key, :rule)
+    |> start_next_initial_cleanup()
   end
 
   defp complete_operation(state, key, %{type: :add_new, request_id: request_id}, result) do
@@ -1545,6 +1602,13 @@ defmodule Rebus.MatchSubscription.Worker do
 
   defp log_tracking(name, _result) do
     Logger.warning("D-Bus name owner tracking failed name=#{name} step=unknown")
+  end
+
+  # The operation type is what makes a worker that cannot start tasks
+  # diagnosable. The rule it was for is not named: a match rule can carry
+  # caller-supplied arguments.
+  defp log_not_started(type) do
+    Logger.warning("D-Bus match operation not started type=#{type}")
   end
 
   defp log_reset(event) do

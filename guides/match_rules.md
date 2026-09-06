@@ -122,6 +122,7 @@ match rule it held.
 | `:invalid_bus_reply` | The bus reply did not have the expected shape. |
 | `:not_connected` | Connection setup has not completed. |
 | `:disconnected` | The connection stopped. |
+| `:not_started` | Rebus could not start the local task for the operation. Nothing was sent to the bus and the rule and its references are unchanged, so retrying is safe. |
 | `:encode_failed` | The request could not be encoded. |
 | `:serial_exhausted` | Every D-Bus serial is in use. |
 | `:fd_claim_expired` | Descriptors arrived with the bus reply and were closed. |

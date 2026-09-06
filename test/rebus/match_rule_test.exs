@@ -1768,6 +1768,263 @@ defmodule Rebus.MatchRuleTest do
                Store.load_state(conn)
     end
 
+    test "keeps an installing rule's state when its operation never starts" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+
+      {state, token} = operation_state(fresh_worker_state(conn), key, rule, :add_new)
+      {state, request_id, tag} = live_request(state, key, :add)
+      state = attach_request(state, token, request_id)
+
+      log =
+        capture_log(fn ->
+          assert {:noreply, alone} =
+                   Worker.handle_info({:operation_result, token, :not_started}, state)
+
+          # The task never ran, so no AddMatch was sent and no handler was
+          # installed: the rule created for it is simply dropped, the caller is
+          # told the operation never started, and the connection is left alone.
+          assert_receive {^tag, {:error, :not_started}}
+          refute Map.has_key?(alone.rules, key)
+          assert alone.operations == %{}
+          assert alone.requests == %{}
+          assert alone.recovering_rules == MapSet.new()
+          refute alone.resetting?
+          refute alone.state_lost?
+          assert is_nil(alone.reset_token)
+          assert Process.alive?(conn)
+          refute Store.persisted?(conn)
+        end)
+
+      assert log =~ "D-Bus match operation not started type=add_new"
+
+      :ok = Store.delete_state(conn)
+
+      {state, token} = operation_state(fresh_worker_state(conn), key, rule, :add_new)
+      {state, request_id, tag} = live_request(state, key, :add)
+      state = attach_request(state, token, request_id)
+      {state, queued_id, _queued_tag} = live_request(state, key, :add)
+      state = put_in(state.rules[key].queue, [queued_id])
+
+      capture_log(fn ->
+        assert {:noreply, queued} =
+                 Worker.handle_info({:operation_result, token, :not_started}, state)
+
+        # A request waiting behind the failed one is not collateral damage: the
+        # rule survives for it and it starts an operation of its own.
+        assert_receive {^tag, {:error, :not_started}}
+        assert %{status: :installing, queue: [], operation: operation} = queued.rules[key]
+        assert is_reference(operation)
+        assert %{key: ^key, type: :add_new, request_id: ^queued_id} = queued.operations[operation]
+        refute queued.resetting?
+      end)
+    end
+
+    test "keeps an active rule's references when a reuse or removal never starts" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      ref = make_ref()
+
+      {state, token} =
+        operation_state(fresh_worker_state(conn), key, rule, :add_existing, status: :active)
+
+      state = put_subscription_state(state, key, ref)
+      {state, request_id, tag} = live_request(state, key, :add)
+      state = attach_request(state, token, request_id)
+
+      log =
+        capture_log(fn ->
+          assert {:noreply, reuse} =
+                   Worker.handle_info({:operation_result, token, :not_started}, state)
+
+          # Nothing was added, so the rule keeps exactly the references it had.
+          assert_receive {^tag, {:error, :not_started}}
+          assert %{status: :active, operation: nil, queue: []} = reuse.rules[key]
+          assert MapSet.equal?(reuse.rules[key].refs, MapSet.new([ref]))
+          assert reuse.subscriptions[ref].handler == :active
+          assert reuse.recovering_rules == MapSet.new()
+          refute reuse.resetting?
+          refute reuse.state_lost?
+          assert Process.alive?(conn)
+        end)
+
+      assert log =~ "D-Bus match operation not started type=add_existing"
+
+      :ok = Store.delete_state(conn)
+      ref = make_ref()
+
+      {state, token} =
+        operation_state(fresh_worker_state(conn), key, rule, :remove, status: :active)
+
+      state = put_subscription_state(state, key, ref)
+      {state, request_id, tag} = live_request(state, key, :remove, ref: ref)
+      state = attach_request(state, token, request_id)
+
+      log =
+        capture_log(fn ->
+          assert {:noreply, removal} =
+                   Worker.handle_info({:operation_result, token, :not_started}, state)
+
+          # No RemoveMatch was sent and no handler was detached, so the
+          # caller's reference is still good and worth retrying with.
+          assert_receive {^tag, {:error, :not_started}}
+          assert %{status: :active, operation: nil, queue: []} = removal.rules[key]
+          assert MapSet.equal?(removal.rules[key].refs, MapSet.new([ref]))
+          assert removal.subscriptions[ref].handler == :active
+          assert removal.recovering_rules == MapSet.new()
+          refute removal.resetting?
+          refute removal.state_lost?
+          assert Process.alive?(conn)
+
+          assert {:ok, %{uncertain?: false, rules: %{^key => %{status: :active}}}} =
+                   Store.load_state(conn)
+        end)
+
+      assert log =~ "D-Bus match operation not started type=remove"
+    end
+
+    test "retries a recovery whose operation never starts" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      handler_ref = make_ref()
+
+      {state, token} =
+        operation_state(fresh_worker_state(conn), key, rule, :recovery, status: :recovering)
+
+      state = put_in(state.rules[key].pending_handlers, MapSet.new([handler_ref]))
+      state = put_in(state.rules[key].remote_may_exist?, true)
+
+      log =
+        capture_log(fn ->
+          assert {:noreply, retrying} =
+                   Worker.handle_info({:operation_result, token, :not_started}, state)
+
+          # Nothing was cleared, so the attempt is simply owed again: the rule
+          # stays in recovery with its handler removals still pending, and the
+          # connection is not reset over an outcome that never happened.
+          assert %{status: :recovering, recovery_attempt: 1, operation: nil} = retrying.rules[key]
+          assert is_reference(retrying.rules[key].retry_timer)
+          assert MapSet.equal?(retrying.rules[key].pending_handlers, MapSet.new([handler_ref]))
+          assert retrying.rules[key].remote_may_exist?
+          assert retrying.operations == %{}
+          refute retrying.resetting?
+          refute retrying.state_lost?
+          assert Process.alive?(conn)
+        end)
+
+      refute log =~ "D-Bus match operation not started"
+    end
+
+    test "releases the slot when an initial cleanup never starts" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+
+      waiting_rule =
+        MatchRule.new!(interface: "org.example.Waiting", member: "Changed")
+
+      waiting_key = MatchRule.to_string(waiting_rule)
+
+      {state, token} = cleaning_state(conn, key, rule)
+
+      waiting = %{state.rules[key] | rule: waiting_rule, operation: nil, remote_may_exist?: true}
+
+      state = %{
+        state
+        | rules: Map.put(state.rules, waiting_key, waiting),
+          initial_cleanup_queue: :queue.in(waiting_key, state.initial_cleanup_queue)
+      }
+
+      log =
+        capture_log(fn ->
+          assert {:noreply, recovering} =
+                   Worker.handle_info({:operation_result, token, :not_started}, state)
+
+          # The RemoveMatch is still owed, so the rule graduates to the bounded
+          # recovery set rather than being forgotten, and gives its
+          # initial-cleanup slot to the key that was waiting for one.
+          assert %{status: :recovering, recovery_kind: :rule} = recovering.rules[key]
+          assert MapSet.member?(recovering.recovering_rules, key)
+          refute MapSet.member?(recovering.initial_cleanup_keys, key)
+
+          assert %{status: :cleaning, operation: waiting_operation} =
+                   recovering.rules[waiting_key]
+
+          assert is_reference(waiting_operation)
+          assert MapSet.member?(recovering.initial_cleanup_keys, waiting_key)
+          assert :queue.is_empty(recovering.initial_cleanup_queue)
+          refute recovering.resetting?
+          refute recovering.state_lost?
+          assert Process.alive?(conn)
+        end)
+
+      refute log =~ "D-Bus match operation not started"
+    end
+
+    test "answers the caller when the operation task cannot be started at all" do
+      conn = start_placeholder_conn()
+      {:ok, supervisor} = Task.Supervisor.start_link(max_children: 0)
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      tag = make_ref()
+      deadline = System.monotonic_time(:millisecond) + 10_000
+
+      state = %{fresh_worker_state(conn) | bus?: true, task_supervisor: supervisor}
+
+      capture_log(fn ->
+        assert {:noreply, dispatched} =
+                 Worker.handle_call({:add, self(), rule, deadline}, {self(), tag}, state)
+
+        # A supervisor that will not start children makes the real
+        # `start_child/2` failure, and the synthesised result travels the
+        # ordinary operation path from there.
+        assert [token] = Map.keys(dispatched.operations)
+        assert_received {:operation_result, ^token, :not_started}
+
+        assert {:noreply, answered} =
+                 Worker.handle_info({:operation_result, token, :not_started}, dispatched)
+
+        assert_receive {^tag, {:error, :not_started}}
+        refute Map.has_key?(answered.rules, key)
+        assert answered.operations == %{}
+        refute answered.resetting?
+        refute answered.state_lost?
+        assert Process.alive?(conn)
+      end)
+    end
+
+    test "still resets the connection when a removal task dies mid-flight" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      ref = make_ref()
+
+      {state, token} =
+        operation_state(fresh_worker_state(conn), key, rule, :remove, status: :active)
+
+      state = put_subscription_state(state, key, ref)
+      {state, request_id, tag} = live_request(state, key, :remove, ref: ref)
+      state = attach_request(state, token, request_id)
+
+      capture_log(fn ->
+        assert {:noreply, reset} =
+                 Worker.handle_info(
+                   {:operation_result, token, {:operation_failed, :disconnected}},
+                   state
+                 )
+
+        # A task that died in flight may have sent the RemoveMatch, so this
+        # path is unchanged: the outcome is unknown and the connection goes.
+        assert_receive {^tag, {:error, :disconnected}}
+        assert reset.resetting?
+        assert reset.state_lost?
+        assert is_reference(reset.reset_token)
+      end)
+    end
+
     test "covers recovery result classifications and stale operation cleanup" do
       conn = start_placeholder_conn()
       state = fresh_worker_state(conn)
