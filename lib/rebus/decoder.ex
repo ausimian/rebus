@@ -1,9 +1,12 @@
 defmodule Rebus.Decoder do
   @moduledoc """
-  D-Bus message decoder that unmarshals data according to D-Bus wire format.
+  Decodes D-Bus wire data into Elixir values.
 
-  Implements the D-Bus unmarshaling format with proper alignment and byte ordering.
-  All structs and arrays are represented as Elixir lists for consistency.
+  Multiple top-level values, arrays, and structs are represented as lists.
+  Dictionary entries are `{key, value}` tuples, so dictionaries decode as
+  lists of pairs. Variants are `{signature, value}` tuples. See the
+  [D-Bus type system](https://dbus.freedesktop.org/doc/dbus-specification.html#type-system)
+  for the signature grammar and wire layout.
   D-Bus infinities decode as `:infinity`/`:negative_infinity`; all NaNs decode
   as `:nan`, canonically losing their wire sign and payload.
   """
@@ -19,6 +22,7 @@ defmodule Rebus.Decoder do
   @default_scalar_budget 1_000_000
 
   @type endianness :: :little | :big
+  @typedoc false
   @type decoding_state :: %{
           endianness: endianness(),
           position: non_neg_integer(),
@@ -31,21 +35,10 @@ defmodule Rebus.Decoder do
         }
 
   @doc """
-  Decodes binary data based on the provided D-Bus signature.
+  Decodes wire data according to `signature`.
 
-  This function takes a D-Bus type signature string and binary data,
-  then unmarshals it from the D-Bus wire format back into Elixir data structures.
-  Both structs and arrays are represented as Elixir lists.
-
-  ## Parameters
-
-    * `signature` - A D-Bus type signature string (e.g., "i", "s", "a(is)", etc.)
-    * `data` - Binary data in D-Bus wire format
-    * `endianness` - Byte order for decoding (`:little` or `:big`). Defaults to `:little`
-
-  ## Returns
-
-  Returns the decoded Elixir data structure. Multiple values are returned as a list.
+  `endianness` is `:little` by default. The result is a list with one value
+  for each top-level type in the signature.
 
   ## Raises
 
@@ -57,19 +50,9 @@ defmodule Rebus.Decoder do
 
   ## Examples
 
-      # Decode a simple integer
       iex> Rebus.Decoder.decode("i", <<42, 0, 0, 0>>)
       [42]
 
-      # Decode a string
-      iex> Rebus.Decoder.decode("s", <<5, 0, 0, 0, "hello", 0>>)
-      ["hello"]
-
-      # Decode an array of integers
-      iex> Rebus.Decoder.decode("ai", <<12, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0>>)
-      [[1, 2, 3]]
-
-      # Decode a struct (returned as list)
       iex> Rebus.Decoder.decode("(si)", <<5, 0, 0, 0, "hello", 0, 0, 0, 42, 0, 0, 0>>)
       [["hello", 42]]
 
@@ -97,6 +80,11 @@ defmodule Rebus.Decoder do
   Raises `Rebus.ResourceLimitError` when a local structural or scalar-array
   limit is exceeded, and `Rebus.ProtocolLimitError` when a declared array
   length exceeds `Rebus.Message.max_array_size/0`.
+
+  ## Example
+
+      iex> Rebus.Decoder.decode_with_position("y", <<7, 99>>)
+      {[7], 1}
   """
   @spec decode_with_position(binary(), binary(), endianness()) :: {[any()], non_neg_integer()}
   def decode_with_position(signature, data, endianness \\ :little) do

@@ -1,6 +1,6 @@
 defmodule Rebus.ResourceLimitError do
   @moduledoc """
-  Raised when decoding or encoding exceeds a local Rebus resource limit.
+  Raised when encoding or decoding exceeds a local Rebus resource limit.
 
   These limits protect the VM while handling otherwise wire-valid D-Bus data.
   They are distinct from malformed D-Bus grammar and from the protocol's own

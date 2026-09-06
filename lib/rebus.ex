@@ -1,24 +1,12 @@
 defmodule Rebus do
   @moduledoc """
-  An Elixir implementation of the D-Bus message protocol.
+  A D-Bus client for Elixir.
 
-  Rebus provides a clean, Elixir-native interface for communicating over D-Bus,
-  the inter-process communication (IPC) and remote procedure call (RPC) mechanism
-  that is standard on Linux desktop systems.
+  Rebus connects to system and session buses, Unix sockets, and TCP endpoints.
+  Use it to call methods, send messages, subscribe to signals, and pass Unix
+  file descriptors on supported local connections.
 
-  ## Overview
-
-  D-Bus is a message bus system that allows multiple processes to communicate with
-  each other in a structured way. Rebus implements the D-Bus wire protocol and provides
-  an easy-to-use API for:
-
-  - Connecting to D-Bus message buses (system and session buses)
-  - Sending method calls and receiving replies
-  - Emitting and receiving signals
-  - Answering `org.freedesktop.DBus.Peer` and returning `UnknownMethod` for
-    other inbound method calls (there is no service-side API yet)
-
-  ## Quick Start
+  ## Example
 
       # Connect to the session bus
       {:ok, conn} = Rebus.connect(:session)
@@ -32,21 +20,7 @@ defmodule Rebus do
 
       {:ok, %Rebus.Message{type: :method_return, body: [names]}} = Rebus.call(conn, message)
 
-      signal = Rebus.Message.new!(:signal,
-        path: "/org/example/Status",
-        interface: "org.example.Status",
-        member: "Changed",
-        signature: "s",
-        body: ["ready"]
-      )
-
-      :ok = Rebus.send(conn, signal)
-
-      # Add a signal handler to receive all signals.
-      case Rebus.add_signal_handler(conn) do
-        {:ok, ref} -> Rebus.delete_signal_handler(conn, ref)
-        {:error, reason} -> {:error, reason}
-      end
+      :ok = Rebus.close(conn)
 
   ## Supported platforms
 
@@ -54,13 +28,7 @@ defmodule Rebus do
   Other Unix variants are untested; Unix file descriptor passing in particular
   is limited to Linux and macOS. Windows is not supported.
 
-  ## Connection Types
-
-  Rebus connects to the system bus, the session bus, a Unix domain socket, or
-  a TCP endpoint. See `connect/2` for the accepted address forms, the
-  connection options, and the errors each can return.
-
-  ## Configuration
+  ## Configuration and guides
 
   You can configure the system bus address in your application's config:
 
@@ -83,49 +51,15 @@ defmodule Rebus do
 
       config :rebus, :match_recovery_max_attempts, 30
 
-  ## Architecture
-
-  When you connect to a D-Bus bus using `connect/2`, Rebus creates a supervised
-  connection process that handles the low-level protocol details. The connection
-  manages authentication, message serialization/deserialization, and maintains
-  the persistent connection to the bus.
-
-  Inbound method calls are answered by the connection itself. It implements
-  `org.freedesktop.DBus.Peer` (`Ping` and `GetMachineId`) and replies to every
+  Connections implement
+  `org.freedesktop.DBus.Peer` (`Ping` and `GetMachineId`) and reply to every
   other method call with an `org.freedesktop.DBus.Error.UnknownMethod` error,
-  so a peer fails immediately instead of waiting for its own timeout. A call
-  flagged `:no_reply_expected` is dropped silently, and any descriptor received
-  with a call is closed. There is no API to serve method calls from
-  application code.
+  unless the call is marked `:no_reply_expected`. There is no service-side API
+  for application methods.
 
-  Signals are delivered by the connection process itself: each connection keeps
-  its own table of registered handlers and sends every matching signal directly
-  to the handler's owner, so signals received on one connection never reach
-  handlers registered on another.
-
-  ## Error Handling
-
-  `connect/2` returns `{:ok, connection}` or `{:error, reason}`. `call/3`
-  returns `{:ok, %Rebus.Message{}}` for a successful reply and
-  `{:error, %Rebus.Message{type: :error}}` for a D-Bus error reply, while
-  `send/2` and `send/3` return `:ok`. Public operation failures are returned as
-  `{:error, reason}` tuples.
-
-  ## Unix file descriptors
-
-  On Linux and macOS, a local Unix-socket connection can carry raw file
-  descriptors. See [Unix file descriptor passing](unix_fds.html).
-
-  ## Examples
-
-      # Connect to session bus with default options
-      {:ok, conn} = Rebus.connect(:session)
-
-      # Connect to a Unix domain socket
-      {:ok, conn} = Rebus.connect(%{family: :local, path: "/tmp/dbus-socket"})
-
-  For more advanced usage, see the documentation for `Rebus.Message` and other
-  modules in this package.
+  See [Authentication](authentication.html),
+  [Signal subscriptions and match rules](match_rules.html), and
+  [Unix file descriptor passing](unix_fds.html) for practical guidance.
   """
 
   @type address ::
@@ -240,11 +174,8 @@ defmodule Rebus do
     and the bus releases the state that connection held. Inflight callers
     receive `{:error, :disconnected}`. Only a PID on the local node is
     accepted; a remote PID is `:invalid_owner`.
-  - `connect/2` is the only supported way to create a connection: the supervisor
-    owns it until `close/1` or, with `:owner`, until that process exits. A
-    connection process started by any other means is unsupported - `close/1`
-    cannot stop it, and its match-subscription state cannot be recovered (see
-    `add_match/3`).
+  - The supervisor owns the connection until `close/1` or, with `:owner`, until
+    that process exits.
   - A write timeout that accepted no bytes fails only that caller. After a
     partial frame the connection terminates and inflight callers receive
     `{:error, :disconnected}`.
@@ -518,16 +449,16 @@ defmodule Rebus do
   share one bus registration, and each call gets its own reference.
 
   `{:error, :timeout}` is ambiguous: you get no reference, but the bus may
-  already hold the rule. `{:error, :sender_routing_ambiguous}` means the rule
+  already hold the rule. A reply whose header fields exceed a local decoding
+  limit has the same result because its reply serial cannot be trusted; see
+  `call/3` for the fuller contract. `{:error, :sender_routing_ambiguous}` means the rule
   overlaps an existing one with a different sender. `{:error, :not_a_bus}`
   means the connection was opened with `bus: false`, and nothing was sent.
 
   Rebus closes the connection when too many ambiguous cleanups accumulate, or when
-  one of them is still unresolved after its retry budget. A reference
-  that failed with `{:error, :match_subscription_state_lost}` stays unresolved until the
-  connection is closed. Rebus responds by closing a connection created by
-  `connect/2`; on a connection started any other way no close happens, so the
-  lost state is terminal for as long as that process lives.
+  one remains unresolved after its retry budget. It also closes the connection
+  after `{:error, :match_subscription_state_lost}`, because closing makes the bus
+  discard the connection's rules.
 
   ## Return values
 

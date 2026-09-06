@@ -1,108 +1,51 @@
-# Authentication
+# Authentication and bus addresses
 
-`Rebus.connect/2` authenticates before it returns. You do not name a
-mechanism. Rebus selects one, and fails closed when no safe one remains.
+`Rebus.connect/2` authenticates before it returns. Rebus tries `EXTERNAL`
+first, then `DBUS_COOKIE_SHA1` when the peer offers it. It considers
+`ANONYMOUS` only when `allow_anonymous: true` is set.
 
-## At a glance
+`EXTERNAL` uses the local Unix identity and is the normal choice for system
+and session buses. `DBUS_COOKIE_SHA1` proves access to a private cookie file;
+it does not encrypt the connection or protect message integrity, so keep TCP
+endpoints on loopback or within a protected transport. Once cookie
+authentication starts, a failure is final and does not fall back to
+`ANONYMOUS`.
 
-- Rebus tries `EXTERNAL` first, then `DBUS_COOKIE_SHA1`, then `ANONYMOUS`.
-- `ANONYMOUS` is only ever used when you pass `allow_anonymous: true`.
-- A cookie failure is final. Rebus never falls back to `ANONYMOUS` after one.
-- Cookie authentication needs a private keyring under `~/.dbus-keyrings`.
-- Cookie contents, challenges and peer identities never appear in errors or
-  logs.
+## Cookie-file troubleshooting
 
-## Mechanism order
+Cookie authentication reads a file under `~/.dbus-keyrings`. Rebus requires
+the home directory, keyring directory, and selected cookie file to have safe
+POSIX ownership and permissions. The keyring and cookie file cannot be
+symlinks. These commands fix the common permission problems:
 
-`EXTERNAL` passes the calling user's local Unix credentials. It is what the
-system and session buses normally accept, and Rebus always attempts it first.
-The local uid, and the username `DBUS_COOKIE_SHA1` needs, are read from `id(1)`
-once per VM and reused by later connections; a lookup that fails is not
-remembered, so the next connection tries again.
-
-If the peer rejects `EXTERNAL`, Rebus reads the mechanisms the peer
-advertised and prefers `DBUS_COOKIE_SHA1`. `ANONYMOUS` is considered last, and
-only with `allow_anonymous: true`. When no advertised mechanism is usable,
-`connect/2` returns `{:error, {:auth_rejected, mechanisms}}`.
-
-A `REJECTED` line is read leniently, because implementations space its
-mechanism list out differently. Rebus bounds how many space-separated segments
-it will consider, then keeps the ones that are well-formed mechanism names and
-ignores the rest, so a trailing or doubled space costs nothing. A line whose
-segments are all unusable is an `:auth_failed`, while a bare `REJECTED`
-advertises nothing and leaves no alternative to attempt.
-
-## Cookie authentication
-
-`DBUS_COOKIE_SHA1` proves you can read a private cookie file that the peer
-also holds. It suits local TCP and peer-to-peer endpoints, where Unix
-credentials cannot cross the socket. It adds no encryption and no message
-integrity, so keep such TCP endpoints on loopback or inside a protected
-transport.
-
-Rebus reads the effective user's name, then reads one file under
-`$HOME/.dbus-keyrings`. The peer chooses which file. Authentication fails
-unless all of the following hold:
-
-- Your home directory is owned by you and is not group or other writable.
-  Rebus may reach it through up to eight symlinks, following them itself and
-  checking the directory it finally reaches.
-- The keyring directory and the cookie file are owned by you, and are not
-  readable or writable by group or other.
-- The keyring directory and the cookie file are real entries, not symlinks.
-  Both are derived from the resolved home directory.
-- Earlier components of the home path are resolved by the operating system, as
-  they are for any path.
-- The platform reports POSIX owner and mode metadata.
-
-Most `:auth_cookie_unavailable` failures are a permission problem, and
-`chmod go-w ~` with `chmod -R go-rwx ~/.dbus-keyrings` resolves them. A home
-reached through more than eight symlinks, or whose path ends in `..`, or that
-is reached through a symlink whose target does, fails with the same reason.
-
-### Diagnosing a cookie failure
-
-The returned reason is deliberately coarse, so Rebus logs one warning for each
-failed cookie attempt to say which condition was not met:
-
-```
-D-Bus cookie authentication unavailable reason=keyring_unsafe
+```console
+chmod go-w ~
+chmod 0700 ~/.dbus-keyrings
+chmod 0600 ~/.dbus-keyrings/*
 ```
 
-The category is also attached as `reason:` Logger metadata, so a structured
-backend can filter on it. The line never carries a path, a file name, a cookie
-ID, a cookie value, a challenge, a digest, a GUID, an identity, or any raw
-protocol data: only the category below is ever interpolated. Nothing is logged
-for `:auth_failed`, whose inputs are chosen by the peer.
+An `{:error, :auth_cookie_unavailable}` result is deliberately general. Rebus
+logs one warning with a safe reason category and no path, cookie, challenge,
+identity, or protocol data.
 
-The peer chooses the cookie context and ID, so a hostile or misconfigured bus
-can select among the `cookie_*` categories and produce one warning per
-connection attempt; the content stays bounded either way.
-
-| Reason | What to check |
+| Logged reason | What to check |
 | --- | --- |
-| `home_missing` | `HOME` is unset and the system reports no home, or `HOME` is not an absolute path. |
-| `home_unsafe` | The home is not a directory, or `chmod go-w ~` is needed; also a chain of more than eight symlinks, a dangling or non-directory link, a path ending in `..`, or an owner other than you. |
-| `keyring_unsafe` | `~/.dbus-keyrings` is missing, is a symlink, or needs `chmod 0700 ~/.dbus-keyrings` and the right owner. |
-| `cookie_unsafe` | The cookie file the peer named is missing, is a symlink, is over 64 KiB, or needs `chmod 0600` and the right owner. |
-| `cookie_changed` | The file was rewritten while Rebus read it. Retry; if it repeats, another process is churning the keyring. |
-| `cookie_unreadable` | The file could not be opened or read. Check the mode of the file and the search permission of every directory above it. |
-| `keyring_malformed` | The file holds more than 256 records, or the record for the requested ID is malformed. Let the peer regenerate it. |
-| `cookie_missing` | No record in the file the peer named carries the ID it asked for. The peer's keyring and yours have diverged; remove the file and let it be regenerated. |
-| `cookie_duplicate` | Two records in the file the peer named carry that ID. Rebus refuses to guess; remove the file and let it be regenerated. |
-| `unsupported` | The platform reports no POSIX owner and mode metadata, so Rebus cannot prove the file is private. |
-| `internal` | Never expected. Please report it. |
+| `home_missing` | `HOME` is not an absolute path, or it is unset and the system reports no home directory. |
+| `home_unsafe` | The home is not a directory, has unsafe ownership or permissions, or resolves through an unsafe symlink chain. |
+| `keyring_unsafe` | `~/.dbus-keyrings` is missing, a symlink, wrongly owned, or accessible to group or other users. Mode `0700` is suitable. |
+| `cookie_unsafe` | The selected file is missing, a symlink, too large, wrongly owned, or has any permissions for group or other users. Mode `0600` is suitable. |
+| `cookie_changed` | The file changed while it was read. Retry once and inspect the process updating it if this repeats. |
+| `cookie_unreadable` | Check the file mode and directory search permissions. |
+| `keyring_malformed` | The keyring contains too many records or the requested record is malformed. Regenerate it. |
+| `cookie_missing` | The requested ID is absent. Regenerate the keyring so both peers agree. |
+| `cookie_duplicate` | The requested ID appears more than once. Regenerate the keyring. |
+| `unsupported` | The platform cannot report the POSIX metadata needed to prove the file is private. |
+| `internal` | Report this unexpected failure. |
 
-Once a cookie exchange has started, every failure is terminal. Rebus does not
-cancel it and retry as `ANONYMOUS`, so a misconfigured keyring cannot silently
-downgrade your connection.
+## Anonymous peers
 
-## Anonymous connections
-
-`ANONYMOUS` performs no authentication, confidentiality or integrity check.
-Use it only for an endpoint that is meant to be unauthenticated.
-
-Such an endpoint is not a message bus, so it also needs `bus: false`:
+`ANONYMOUS` verifies no identity. Use it only with an endpoint intended to be
+unauthenticated. Such an endpoint must also be a peer connection:
 
 ```elixir
 {:ok, conn} =
@@ -112,55 +55,36 @@ Such an endpoint is not a message bus, so it also needs `bus: false`:
   )
 ```
 
-`:system` and `:session` are message buses by definition and reject
-`bus: false`.
+`:system` and `:session` always identify message buses and reject `bus: false`.
 
 ## Bus addresses
 
 `Rebus.connect(:system)` and `Rebus.connect(:session)` read a D-Bus address
-list and try each supported entry in order until one connects. An entry may
-carry a `guid=` value. Rebus compares it with the identity the server reports
-during authentication, and a mismatch is final rather than a reason to try the
-next entry.
+list and try supported entries in order. Rebus accepts `unix:path=`,
+`unix:abstract=`, and `tcp:host=,port=` entries, with optional `family=ipv4`
+or `family=ipv6`. Values use D-Bus percent escapes. An optional `guid=` must
+match the server identity.
 
-An entry is `unix:path=`, `unix:abstract=`, or `tcp:host=,port=` with an
-optional `family=ipv4` or `family=ipv6`. Values use D-Bus percent escapes. A
-TCP entry without a family tries up to four resolved IPv6 addresses, then up
-to four IPv4 ones, before moving to the next entry. A syntactically valid
-unsupported transport is skipped so a later entry can still be used, while a
-malformed entry rejects the whole list. `Rebus.BusAddress` documents the
-syntax and its limits.
+A malformed entry rejects the list. A syntactically valid unsupported
+transport is skipped so that a later entry can still connect. See
+`Rebus.BusAddress` for parsing results and bounds, and `Rebus.connect/2` for
+the complete connection, option, retry, and timeout contract.
 
-See `Rebus.connect/2` for the complete address, option and timeout contract.
+## Connection failures
 
-## Errors
+- `:auth_id_unavailable` means the local identity for `EXTERNAL` could not be
+  obtained. Later address candidates are not tried.
+- `:auth_cookie_unavailable` means a safe matching cookie or local username
+  was unavailable. This is local to the client, so later address candidates
+  are not tried.
+- `:auth_failed` means the peer sent malformed authentication data or rejected
+  the cookie response.
+- `{:auth_rejected, mechanisms}` means the peer offered no usable mechanism.
+- `:guid_mismatch` means the server identity did not match the address. Later
+  candidates are not tried.
+- `:read_timeout` means setup or authentication exceeded its budget.
 
-| Reason | Meaning |
-| --- | --- |
-| `:auth_id_unavailable` | The local identity needed for `EXTERNAL` could not be obtained. |
-| `:auth_cookie_unavailable` | The peer offered `DBUS_COOKIE_SHA1`, but the local username or a safe matching cookie could not be read. For an address list this is final and no later entry is tried. |
-| `:auth_failed` | The peer sent malformed authentication data, or rejected the cookie response. |
-| `{:auth_rejected, mechanisms}` | The peer rejected the attempted mechanism and advertised no usable alternative. |
-| `:guid_mismatch` | The address named a `guid` that the server's identity did not match. No further address is tried. |
-| `:read_timeout` | Socket setup or authentication did not finish within its budget. |
-
-## Candidate retry policy
-
-When `connect/2` works through an address list, whether an authentication
-failure ends the attempt or moves on to the next candidate follows from what
-the failure describes.
-
-`:auth_failed` and `:read_timeout` describe one peer's behaviour: another
-candidate is a different peer, which may well answer correctly and in time, so
-the next candidate is tried. The list's own budget still bounds that: once it
-is exhausted the attempt ends, whatever remains untried, as `:read_timeout`
-if no candidate had yet failed and `{:read_timeout, reason}` once one had.
-`{:auth_rejected, mechanisms}` is retried on the same grounds: which
-mechanisms a peer offers is that peer's choice, and the next candidate may
-offer a usable one.
-
-`:auth_id_unavailable` and `:auth_cookie_unavailable` describe the local
-environment - no obtainable identity, or no safely readable cookie. Every
-candidate would fail on them identically, so they are final and no later entry
-is tried. `:guid_mismatch` is final for the same kind of reason: the address
-itself named the identity that did not match.
+Peer-specific failures such as rejection, malformed authentication data, and
+timeouts may move to the next address candidate while the shared setup budget
+remains. `Rebus.connect/2` documents the exact final result when earlier
+candidates have also failed.

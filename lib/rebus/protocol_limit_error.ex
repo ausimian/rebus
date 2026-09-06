@@ -1,7 +1,7 @@
 defmodule Rebus.ProtocolLimitError do
   @moduledoc """
-  Raised when encoding or decoding exceeds a size limit set by the D-Bus
-  specification - today, the array limit reported by
+  Raised when encoding or decoding exceeds a wire-size limit set by the D-Bus
+  specification—currently the array limit reported by
   `Rebus.Message.max_array_size/0`.
 
   These limits are part of the wire protocol, so data that trips one can

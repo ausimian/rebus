@@ -1,6 +1,6 @@
 defmodule Rebus.UnixFD do
   @moduledoc """
-  Small, explicit helpers for Unix file descriptors carried by D-Bus messages.
+  Closes Unix file descriptors received in D-Bus replies.
 
   A descriptor is represented as the non-negative integer returned by the
   operating system.  `Rebus` borrows descriptors supplied for an outbound
@@ -28,34 +28,15 @@ defmodule Rebus.UnixFD do
   @doc """
   Closes an owned raw Unix file descriptor.
 
-  This function consumes the descriptor.  The caller must ensure it is called
-  exactly once and must treat the descriptor as unusable afterwards.  A second
-  call is never safe, whatever it returns: the operating system may already
-  have handed the same number to an unrelated resource, in which case the
-  second call closes that resource and reports `:ok`.  An `{:error, :ebadf}`
-  from a second call is therefore luck, not proof that the call was harmless.
+  Returns `:ok` on success or `{:error, reason}` on failure.
 
-  Returns:
-
-    * `:ok` when the descriptor was closed.
-    * `{:error, reason}` - a POSIX error atom when the descriptor could not be
-      adopted or the operating system refused the close (`:ebadf` for a number
-      that is not open), or `:badarg` for a number too large for the operating
-      system's descriptor type (above 2^31 - 1).
-    * `{:error, :close_failed}` on an unexpected internal failure.
-    * `{:error, :invalid_descriptor}` when `fd` is not a non-negative integer.
-    * `{:error, :unsupported}` on a non-Unix system, or when this OTP release
-      lacks the raw-descriptor primitive.
-
-  After `{:error, reason}` from an adopted descriptor there is nothing to
-  retry: `prim_file` detaches the descriptor from its reference before asking
-  the operating system to close it, so the error is reported after the
-  reference has already let go, and POSIX leaves a descriptor whose close
-  failed either closed or in an undefined state - never safely reusable.  Do
-  not call `close/1` again and do not use the number for anything else; the
-  error is there to be reported or logged, not recovered from.
-  `{:error, :unsupported}` is the exception: nothing was adopted, and the
-  descriptor is still yours to close another way.
+  This consumes an adopted descriptor whether it returns `:ok` or a POSIX
+  error. Treat the number as unusable and never retry: the operating system may
+  already have assigned it to another resource. `:invalid_descriptor` rejects
+  a value that is not a non-negative integer, `:close_failed` reports an
+  unexpected close failure, and `:unsupported` means the platform cannot
+  perform this operation. After `:unsupported`, the caller still owns the
+  descriptor and must close it with another API.
   """
   @spec close(t()) :: :ok | {:error, :close_failed | :invalid_descriptor | :unsupported | term()}
   def close(fd) when is_integer(fd) and fd >= 0 do

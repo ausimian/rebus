@@ -1,6 +1,6 @@
 defmodule Rebus.Signature do
   @moduledoc """
-  Parses bounded D-Bus type signatures into Rebus's shared type AST.
+  Parses D-Bus type signatures into structured Elixir type descriptions.
 
   Signature grammar violations are reported as `:invalid_signature`. Container
   nesting is a local resource and safety cap; a grammatically valid signature
@@ -87,6 +87,14 @@ defmodule Rebus.Signature do
     }
   end
 
+  @typedoc """
+  A parsed D-Bus type.
+
+  Basic types are `{name, nil}`. Containers retain their element or field
+  types: `{:array, type}`, `{:struct, fields}`, and
+  `{:dict_entry, key_type, value_type}`. A variant is `{:variant, nil}` because
+  its contained signature is carried in each encoded value.
+  """
   @type ast ::
           {:byte
            | :boolean
@@ -106,6 +114,24 @@ defmodule Rebus.Signature do
           | {:struct, [ast()]}
           | {:dict_entry, ast(), ast()}
 
+  @doc """
+  Parses a D-Bus signature into one AST node per top-level type.
+
+  Returns `{:error, :invalid_signature}` for malformed or over-long input and
+  `{:error, :resource_limit}` when container nesting exceeds Rebus's local
+  limit.
+
+  ## Examples
+
+      iex> Rebus.Signature.parse("sa{sv}")
+      {:ok, [
+        {:string, nil},
+        {:array, {:dict_entry, {:string, nil}, {:variant, nil}}}
+      ]}
+
+      iex> Rebus.Signature.parse("(")
+      {:error, :invalid_signature}
+  """
   @spec parse(binary()) :: {:ok, [ast()]} | {:error, :invalid_signature | :resource_limit}
   def parse(signature) when is_binary(signature) and byte_size(signature) <= @max_length do
     case parse_types(:binary.bin_to_list(signature), 0, 0, 0, []) do
@@ -119,6 +145,17 @@ defmodule Rebus.Signature do
 
   def parse(_signature), do: {:error, :invalid_signature}
 
+  @doc """
+  Parses a D-Bus signature and raises when it is invalid.
+
+  Raises `ArgumentError` for invalid input and `Rebus.ResourceLimitError` when
+  the nesting limit is exceeded.
+
+  ## Example
+
+      iex> Rebus.Signature.parse!("a{si}")
+      [{:array, {:dict_entry, {:string, nil}, {:int32, nil}}}]
+  """
   @spec parse!(binary()) :: [ast()]
   def parse!(signature) do
     case parse(signature) do

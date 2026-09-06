@@ -51,8 +51,12 @@ defmodule Rebus.MatchRule do
 
   ## Examples
 
-      iex> Rebus.MatchRule.new(sender: "org.freedesktop.DBus", member: "NameOwnerChanged")
-      {:ok, %Rebus.MatchRule{}}
+      iex> {:ok, rule} = Rebus.MatchRule.new(
+      ...>   sender: "org.freedesktop.DBus",
+      ...>   member: "NameOwnerChanged"
+      ...> )
+      iex> Rebus.MatchRule.to_string(rule)
+      "type='signal',sender='org.freedesktop.DBus',member='NameOwnerChanged'"
   """
   @spec new(keyword()) :: {:ok, t()} | {:error, validation_error()}
   def new(opts) when is_list(opts) do
@@ -92,10 +96,9 @@ defmodule Rebus.MatchRule do
   `:path`, `:path_namespace`, `:destination`, `:args`, `:arg_paths`, and
   `:arg0namespace`. A well-known `:sender` is left to the bus for broadcast
   signals. A directed signal is accepted for a well-known `:sender` when the
-  sender header is that exact name, and, through `matches?/3`, when it is the
-  unique name the bus currently reports as that name's owner. This arity knows
-  no owners, so only the exact name matches. This does not emulate bus access
-  policy or eavesdropping.
+  sender header is that exact name. Ownership-aware matching for subscribed
+  signals is handled by the connection. This function does not emulate bus
+  access policy or eavesdropping.
   """
   @spec matches?(t(), Message.t()) :: boolean()
   def matches?(%__MODULE__{} = rule, %Message{} = message), do: matches?(rule, message, %{})
