@@ -247,12 +247,12 @@ defmodule Rebus.MatchSubscription.Operation do
 
   defp invoke_bus_method(conn, member, rule, deadline) do
     with {:ok, timeout} <- remaining_timeout(deadline) do
-      # A D-Bus error reply now arrives as {:error, %Message{}}. Both reply
-      # shapes must reach bus_reply_result/1 so any received descriptors are
-      # closed before the reason is classified.
+      # A D-Bus error reply arrives as {:error, {:dbus_error, %Message{}}}.
+      # Both reply shapes must reach bus_reply_result/1 so any received
+      # descriptors are closed before the reason is classified.
       case Rebus.call(conn, bus_message(member, rule), timeout) do
         {:ok, %Message{} = reply} -> bus_reply_result(reply)
-        {:error, %Message{} = reply} -> bus_reply_result(reply)
+        {:error, {:dbus_error, %Message{} = reply}} -> bus_reply_result(reply)
         {:error, _reason} = error -> error
       end
     end
@@ -276,7 +276,7 @@ defmodule Rebus.MatchSubscription.Operation do
     with {:ok, timeout} <- remaining_timeout(deadline) do
       case Rebus.call(conn, bus_message("GetNameOwner", name), timeout) do
         {:ok, %Message{} = reply} -> name_owner_result(reply)
-        {:error, %Message{} = reply} -> name_owner_result(reply)
+        {:error, {:dbus_error, %Message{} = reply}} -> name_owner_result(reply)
         {:error, _reason} = error -> error
       end
     end

@@ -35,12 +35,14 @@ defmodule Rebus.Connection.FDClaims.Client do
   def receive_claim(result, _conn, _deadline), do: result
 
   # A D-Bus error reply is a definitive peer answer, not a transport failure,
-  # but callers should not have to test the type to branch on it. The complete
-  # message is retained in either shape so its error name, body and any owned
-  # descriptors stay available to the caller.
+  # but callers should not have to test the type to branch on it. The
+  # `:dbus_error` tag keeps it apart from local failure reasons under the same
+  # `:error`. The complete message is retained in either shape so its error
+  # name, body and any owned descriptors stay available to the caller.
   @doc false
-  @spec reply_result(Message.t()) :: {:ok, Message.t()} | {:error, Message.t()}
-  def reply_result(%Message{type: :error} = msg), do: {:error, msg}
+  @spec reply_result(Message.t()) ::
+          {:ok, Message.t()} | {:error, {:dbus_error, Message.t()}}
+  def reply_result(%Message{type: :error} = msg), do: {:error, {:dbus_error, msg}}
   def reply_result(%Message{} = msg), do: {:ok, msg}
 
   defp await_reply(conn, claim_ref, delivery_ref, delivery_alias, deadline) do

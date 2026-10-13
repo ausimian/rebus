@@ -361,11 +361,12 @@ defmodule Rebus.UnixFDTest do
     :ok = TestServer.push_with_fds(server, reply, [fd])
 
     assert {:error,
-            %Message{
-              type: :error,
-              header_fields: %{error_name: "org.example.FailedWithFD"},
-              unix_fds: [received]
-            }} = Task.await(task, 1_000)
+            {:dbus_error,
+             %Message{
+               type: :error,
+               header_fields: %{error_name: "org.example.FailedWithFD"},
+               unix_fds: [received]
+             }}} = Task.await(task, 1_000)
 
     assert received != fd
     assert :ok = UnixFD.close(received)
