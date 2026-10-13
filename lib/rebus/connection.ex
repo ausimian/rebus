@@ -30,7 +30,6 @@ defmodule Rebus.Connection do
     :write_timeout,
     :read_timeout,
     :setup_timeout,
-    :aggregate_setup_timeout?,
     :expected_guid,
     :precomputed_auth_id,
     :allow_anonymous?,
@@ -250,7 +249,6 @@ defmodule Rebus.Connection do
     field :write_timeout, pos_integer(), default: @default_write_timeout
     field :read_timeout, pos_integer(), default: @default_read_timeout
     field :setup_timeout, pos_integer(), default: @default_read_timeout
-    field :aggregate_setup_timeout?, boolean(), default: false
     field :expected_guid, binary() | nil, default: nil
     field :precomputed_auth_id, binary() | nil, default: nil
     field :allow_anonymous?, boolean(), default: false
@@ -318,7 +316,6 @@ defmodule Rebus.Connection do
       timeout: timeout,
       read_timeout: Keyword.get(opts, :read_timeout, @default_read_timeout),
       setup_timeout: Map.get(internal, :setup_timeout, Keyword.get(opts, :read_timeout, timeout)),
-      aggregate_setup_timeout?: Map.has_key?(internal, :setup_timeout),
       expected_guid: Map.get(internal, :expected_guid),
       precomputed_auth_id: Map.get(internal, :precomputed_auth_id),
       allow_anonymous?: Keyword.get(opts, :allow_anonymous, false),

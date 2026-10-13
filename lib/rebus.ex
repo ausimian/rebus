@@ -168,7 +168,7 @@ defmodule Rebus do
 
   | Option | Default | Bounds / meaning |
   | --- | --- | --- |
-  | `:timeout` | `5000` | Positive milliseconds for setup: the identity lookup, any DNS lookup, the socket connect and authentication. It bounds nothing after that. |
+  | `:timeout` | `5000` | Positive milliseconds for setup, one budget shared by the identity lookup, any DNS lookup, the socket connect and authentication. It bounds nothing after that. |
   | `:read_timeout` | `5000` | Positive milliseconds for the initial `Hello` reply, and afterwards for gaps between inbound fragments. When given it also replaces `:timeout` for setup. |
   | `:write_timeout` | `5000` | Positive milliseconds an outbound frame, including every authentication write, may wait for the socket to accept it. |
   | `:name` | `nil` | Atom to register the connection process under, for local discovery only. |
@@ -193,8 +193,10 @@ defmodule Rebus do
   - A write timeout that accepted no bytes fails only that caller. After a
     partial frame the connection terminates and inflight callers receive
     `{:error, :disconnected}`.
-  - For an address list, setup shares one budget across every candidate, so a
-    slow candidate leaves less time for the entries after it.
+  - Setup is one budget, not one per step: a slow identity lookup or socket
+    connect leaves less time for authentication. For an address list the
+    budget is shared across every candidate too, so a slow candidate leaves
+    less time for the entries after it.
   - Failed address-list attempts are logged at debug level, without any
     address, host, path or GUID.
 

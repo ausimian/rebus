@@ -177,6 +177,44 @@ defmodule Rebus.Connection.SetupTest do
     end
   end
 
+  # Each phase advances a test clock by the time it spends, and records the
+  # timeout it was handed. A direct address computes no budget of its own, so
+  # these drive `setup/2` the way `Rebus.connect/2` does for one.
+  describe "setup/2 budget" do
+    test "gives each phase only what the phases before it left" do
+      {_sock, state} = budgeted_connection(["OK #{@guid}\r\n"], auth_id: 600, connect: 300)
+
+      assert {:continue, :hello, %Connection{guid: @guid}} = Setup.setup(state, @addr)
+      assert phase_timeouts() == [auth_id: 1_000, connect: 400, recv: 100]
+    end
+
+    test "times out the handshake within the budget the earlier phases spent" do
+      {sock, state} =
+        budgeted_connection(["OK #{@guid}\r\n"], auth_id: 600, connect: 300, recv: :timeout)
+
+      assert {:shutdown, :read_timeout, %Connection{}} = Setup.setup(state, @addr)
+      # The read was given the 100 ms left, not a fresh 1,000 ms.
+      assert phase_timeouts() == [auth_id: 1_000, connect: 400, recv: 100]
+      assert ScriptedTransport.sent(sock) == <<0>> <> "AUTH EXTERNAL #{@auth_id}\r\n"
+    end
+
+    test "stops before authenticating once the earlier phases spent the budget" do
+      {sock, state} = budgeted_connection(["OK #{@guid}\r\n"], auth_id: 600, connect: 400)
+
+      assert {:shutdown, :read_timeout, %Connection{}} = Setup.setup(state, @addr)
+      assert phase_timeouts() == [auth_id: 1_000, connect: 400]
+      assert ScriptedTransport.sent(sock) == <<>>
+    end
+
+    test "does not connect once the identity lookup spent the budget" do
+      {sock, state} = budgeted_connection(["OK #{@guid}\r\n"], auth_id: 1_000)
+
+      assert {:shutdown, :read_timeout, %Connection{}} = Setup.setup(state, @addr)
+      assert phase_timeouts() == [auth_id: 1_000]
+      assert ScriptedTransport.sent(sock) == <<>>
+    end
+  end
+
   describe "hello/1" do
     test "sends Hello and records the serial it must correlate" do
       {sock, state} = connection([])
@@ -310,6 +348,58 @@ defmodule Rebus.Connection.SetupTest do
 
     {sock, state}
   end
+
+  # A `connection/2` that looks up its own identity and reads a test clock.
+  # `spend` maps a phase to the milliseconds it takes; `recv: :timeout` makes
+  # the first handshake read run out its whole timeout and report it.
+  defp budgeted_connection(script, spend) do
+    Process.put(:setup_budget_clock, 0)
+    Process.put(:setup_budget_timeouts, [])
+
+    {sock, state} =
+      connection(script,
+        precomputed_auth_id: nil,
+        impl:
+          Rebus.Impl.build(
+            transport: TestImpl,
+            identity: TestImpl.Identity,
+            clock: TestImpl.Clock
+          )
+      )
+
+    :ok =
+      TestImpl.put(self(), %{
+        monotonic_time: fn -> Process.get(:setup_budget_clock) end,
+        auth_id: fn timeout ->
+          spend(:auth_id, timeout, Keyword.get(spend, :auth_id, 0))
+          {:ok, "501\n"}
+        end,
+        transport_connect: fn _sock, _addr, timeout ->
+          spend(:connect, timeout, Keyword.get(spend, :connect, 0))
+          :ok
+        end,
+        recv: fn sock, length, flags, timeout ->
+          case Keyword.get(spend, :recv, 0) do
+            :timeout ->
+              spend(:recv, timeout, timeout)
+              {:error, :timeout}
+
+            elapsed ->
+              spend(:recv, timeout, elapsed)
+              ScriptedTransport.recv(sock, length, flags, timeout)
+          end
+        end
+      })
+
+    {sock, state}
+  end
+
+  defp spend(phase, timeout, elapsed) do
+    Process.put(:setup_budget_timeouts, [{phase, timeout} | Process.get(:setup_budget_timeouts)])
+    Process.put(:setup_budget_clock, Process.get(:setup_budget_clock) + elapsed)
+  end
+
+  defp phase_timeouts, do: Enum.reverse(Process.get(:setup_budget_timeouts))
 
   defp hello_pending(%Message{} = reply, rest \\ <<>>) do
     {_sock, state} = connection([])

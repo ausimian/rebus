@@ -35,3 +35,8 @@
   its identity once and then expects `OK` or `REJECTED`. A peer `ERROR` now
   cancels `EXTERNAL` and moves on to the next advertised mechanism, as it would
   after `REJECTED`, rather than failing the connection with `:auth_failed`.
+- `Rebus.connect/2` now treats `:timeout` (or `:read_timeout`, when given) as
+  one setup budget for a direct address, as it already did for `:system` and
+  `:session`. The identity lookup, socket connect and authentication share it,
+  so a slow peer can no longer hold setup for up to three times the timeout.
+  An expired budget still returns `{:error, :read_timeout}`.
