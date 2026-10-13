@@ -3,7 +3,6 @@ defmodule Rebus.MatchSubscription do
   use DynamicSupervisor
 
   alias Rebus.MatchRule
-  alias Rebus.MatchSubscription.Store
   alias Rebus.MatchSubscription.Worker
 
   # The caller's timeout is one budget for the whole operation: installing or
@@ -18,8 +17,6 @@ defmodule Rebus.MatchSubscription do
 
   @impl true
   def init(:ok) do
-    # The state table is owned by `Rebus.MatchSubscription.Store`, started
-    # ahead of this supervisor.
     DynamicSupervisor.init(strategy: :one_for_one)
   end
 
@@ -61,22 +58,13 @@ defmodule Rebus.MatchSubscription do
       [{worker, _value}] ->
         Worker.call(worker, {:remove, ref, deadline}, deadline, @call_overhead)
 
+      # A connection without a worker holds no subscriptions, and references
+      # are idempotent and scoped to their original connection.
       [] ->
-        call_remove_without_worker(conn, ref, deadline)
+        :ok
     end
   catch
     :exit, _reason -> {:error, :disconnected}
-  end
-
-  defp call_remove_without_worker(conn, ref, deadline) do
-    if Store.persisted?(conn) do
-      with {:ok, worker} <- worker_for(conn) do
-        Worker.call(worker, {:remove, ref, deadline}, deadline, @call_overhead)
-      end
-    else
-      # References are idempotent and scoped to their original connection.
-      :ok
-    end
   end
 
   defp worker_for(conn) do

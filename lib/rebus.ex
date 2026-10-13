@@ -120,7 +120,6 @@ defmodule Rebus do
           | :match_rule_cleanup_pending
           | :match_rule_uncertain
           | :match_recovery_capacity_exhausted
-          | :match_subscription_state_lost
           | :sender_routing_ambiguous
           | :not_started
           | :not_a_bus
@@ -502,16 +501,17 @@ defmodule Rebus do
   [match rules guide](match_rules.html) explains what else an uncertain rule
   changes.
 
-  Rebus still closes the connection after `{:error, :match_subscription_state_lost}`,
-  because closing makes the bus discard the connection's rules.
+  Rebus manages a connection's match rules in a process linked to the
+  connection. If that process fails, which would be a bug in Rebus, the
+  connection stops with `{:shutdown, {:match_subscription_exited, reason}}`,
+  and the bus discards its rules.
 
   ## Return values
 
   Success is `{:ok, reference}`. Every failure is `{:error, reason}`: `:timeout`, `:not_a_bus`,
   `:sender_routing_ambiguous`, `:match_rule_cleanup_pending`, `:match_rule_uncertain`,
-  `:match_recovery_capacity_exhausted`, `:match_subscription_state_lost`,
-  `{:bus_error, error_name}`, `:invalid_bus_reply`, `:not_connected`, `:disconnected`,
-  `:encode_failed`, `:serial_exhausted`, `:fd_claim_expired`, `:not_started`,
+  `:match_recovery_capacity_exhausted`, `{:bus_error, error_name}`, `:invalid_bus_reply`,
+  `:not_connected`, `:disconnected`, `:encode_failed`, `:serial_exhausted`, `:fd_claim_expired`, `:not_started`,
   `{:reply_dropped, outcome}` and `:remote_connection_unsupported`. The
   [match rules guide](match_rules.html) lists what each one means.
 

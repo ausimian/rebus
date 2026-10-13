@@ -147,13 +147,12 @@ many cleanup attempts one rule receives before it is left uncertain. Recovery
 continues across transient local failures because those failures do not prove
 that the bus resolved the rule.
 
-Rebus still closes the connection in one case. A match-subscription worker
-that restarts while an operation was in flight no longer knows which rules or
-handlers the connection holds, so it cannot mark any of them uncertain or tell
-anyone. It closes a connection created by `Rebus.connect/2` instead, and
-operations in the meantime return `{:error, :match_subscription_state_lost}`.
-Closing stops the connection's handlers and makes the bus discard every rule
-it held.
+Rebus closes the connection itself in one case. Each connection's match
+rules are managed by a process linked to it, and that process is the only
+record of which rules and handlers the connection holds. If it fails, which
+would be a bug in Rebus, the connection stops with
+`{:shutdown, {:match_subscription_exited, reason}}`. Stopping removes the
+connection's handlers and makes the bus discard every rule it held.
 
 ## Errors
 
@@ -167,7 +166,6 @@ it held.
 | `:match_rule_cleanup_pending` | An earlier ambiguous operation on the same rule is still being cleaned up. |
 | `:match_rule_uncertain` | Rebus has left the rule uncertain, or the operation's task was lost and left it so. See [When a subscription fails](#when-a-subscription-fails). |
 | `:match_recovery_capacity_exhausted` | Too many rules on the connection are unresolved to accept a new one. Nothing was sent. |
-| `:match_subscription_state_lost` | An in-flight operation lost its state and cannot be resolved on this connection. Rebus ends it by closing a connection created by `Rebus.connect/2`; the state dies with the connection. |
 | `{:bus_error, error_name}` | The bus returned a D-Bus error reply. |
 | `:invalid_bus_reply` | The bus reply did not have the expected shape. |
 | `:not_connected` | Connection setup has not completed. |

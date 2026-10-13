@@ -223,6 +223,15 @@ defmodule Rebus.Connection do
   def notify_owner(conn, message) when is_pid(conn),
     do: GenServer.cast(conn, {:notify_owner, message})
 
+  # Names the calling match-subscription worker, which has already linked
+  # itself to the connection, so the connection can tell its exit apart from
+  # any other. A cast follows the link from the same process, so it is always
+  # handled before the `:EXIT` the worker's exit sends.
+  @doc false
+  @spec attach_match_worker(pid()) :: :ok
+  def attach_match_worker(conn) when is_pid(conn),
+    do: GenServer.cast(conn, {:attach_match_worker, self()})
+
   # Connections are started with the caller's public options and, separately,
   # the internal arguments Rebus itself computes: the resolved address, the
   # connect waiter, the address-list auth ID, per-candidate setup timeout and
@@ -297,6 +306,10 @@ defmodule Rebus.Connection do
     # directed signal needs this answer synchronously, so it lives here rather
     # than in the process that performs the bus round trips.
     field :name_owners, %{binary() => :unknown | nil | binary()}, default: %{}
+    # The match-subscription worker linked to this connection, once it has
+    # attached. It holds the only record of the match rules and handlers it
+    # installed here, so its exit stops this connection.
+    field :match_worker, pid() | nil, default: nil
     # Implementation modules behind the connection's side effects. Production
     # always uses the defaults; tests substitute a module rather than reaching
     # into per-operation state.
@@ -552,6 +565,19 @@ defmodule Rebus.Connection do
       ),
       do: stop_for_transport_error(reason, state)
 
+  # The match-subscription worker never exits while its connection is up
+  # unless something is wrong with it, a bug in Rebus. The match rules and
+  # handlers it installed here cannot be managed without it, so the connection
+  # stops too, which makes the bus discard the rules. The worker reports its
+  # own crash; this names the reason the connection stopped. A worker that
+  # exits while setup is still running, with exits untrapped, stops the
+  # connection with the worker's own reason instead.
+  def handle_info({:EXIT, pid, reason}, %__MODULE__{match_worker: pid} = state)
+      when is_pid(pid) do
+    Logger.error("D-Bus match subscription worker exited, closing connection")
+    {:stop, {:shutdown, {:match_subscription_exited, reason}}, state}
+  end
+
   # With :trap_exit enabled, preserve the process-link behavior that would
   # otherwise terminate this GenServer. In particular, supervisor shutdown
   # reaches terminate/2 instead of bypassing descriptor cleanup. :kill remains
@@ -792,10 +818,6 @@ defmodule Rebus.Connection do
   # AddMatch, so no NameOwnerChanged for a freshly tracked name can have been
   # applied yet, and GetNameOwner reseeds immediately after; a signal that does
   # arrive between the reset and the seed still wins, exactly as it did before.
-  # A worker restart, which re-tracks names the table still holds a current
-  # owner for, rejects conservatively until that reseed - and, if the sequence
-  # fails before it, until tracking runs again (#168) - which is preferred over
-  # keeping a value that may be stale.
   def handle_call({:track_name_owner, name}, _from, %__MODULE__{} = state) do
     {:reply, :ok, %{state | name_owners: Map.put(state.name_owners, name, :unknown)}}
   end
@@ -854,6 +876,9 @@ defmodule Rebus.Connection do
     if is_pid(owner), do: send(owner, message)
     {:noreply, state}
   end
+
+  def handle_cast({:attach_match_worker, worker}, %__MODULE__{} = state),
+    do: {:noreply, %{state | match_worker: worker}}
 
   # A request that is not waiting for a reply is either an unacknowledged FD
   # claim or a frame still queued or being written.

@@ -9,7 +9,6 @@ defmodule Rebus.MatchSubscription.Worker do
   alias Rebus.MatchRule
   alias Rebus.MatchRule.Overlap
   alias Rebus.MatchSubscription.Operation
-  alias Rebus.MatchSubscription.Store
   alias Rebus.SafeCall
 
   @cleanup_timeout 1_000
@@ -44,7 +43,7 @@ defmodule Rebus.MatchSubscription.Worker do
       # state and does no further bus work for it on this connection.
       field :status, :installing | :active | :cleaning | :recovering | :uncertain
       # The token of the operation in flight for this rule, and the requests
-      # waiting behind it. Neither survives a restart.
+      # waiting behind it.
       field :operation, reference() | nil, default: nil
       field :queue, [reference()], default: []
       # What the current cleanup is clearing, how many attempts it has taken,
@@ -55,11 +54,14 @@ defmodule Rebus.MatchSubscription.Worker do
     end
   end
 
+  # A worker lives and dies with its connection, and is never restarted: the
+  # rules and handlers it manages exist nowhere else, so a replacement would
+  # start without them. See `handle_continue/2` for how the two are tied.
   def child_spec(conn) do
     %{
       id: {__MODULE__, conn},
       start: {__MODULE__, :start_link, [conn]},
-      restart: :transient,
+      restart: :temporary,
       type: :worker
     }
   end
@@ -100,7 +102,6 @@ defmodule Rebus.MatchSubscription.Worker do
 
   typedstruct enforce: true do
     field :conn, pid()
-    field :connection_monitor, reference()
     # The local signal handlers installed on this connection, by handler
     # reference, together with the rule each belongs to. A handler already
     # reported gone to the bus is kept as `:removed` until its rule is settled.
@@ -148,21 +149,11 @@ defmodule Rebus.MatchSubscription.Worker do
     # a compile-time default bakes in.
     field :initial_cleanup_keys, %MapSet{}, default: MapSet.new()
     field :initial_cleanup_queue, :queue.queue()
-    # Whether a connection reset is in flight, and the token and monitor of the
-    # task running it. `state_lost?` latches state that cannot be reconstructed
-    # and turns public operations away. Only an uncertain restart snapshot
-    # resets the connection; every other failure leaves one rule uncertain.
-    field :resetting?, boolean(), default: false
-    field :state_lost?, boolean(), default: false
-    field :reset_token, reference() | nil, default: nil
-    field :reset_task_monitor, reference() | nil, default: nil
     # Whether this connection is a bus, `nil` until it has been asked once.
     field :bus?, boolean() | nil, default: nil
     # The well-known sender names whose owner this worker has asked the
     # connection to track, and the tracking task in flight for a name with the
-    # monitor watching it. Tracking is derived from the installed rules rather
-    # than persisted: a restarted worker re-runs the sequence for the names its
-    # restored rules still need.
+    # monitor watching it. Tracking is derived from the installed rules.
     field :tracked_names, %{binary() => true}, default: %{}
     field :tracking_ops, %{binary() => reference() | nil}, default: %{}
     field :tracking_monitors, %{reference() => binary()}, default: %{}
@@ -173,8 +164,6 @@ defmodule Rebus.MatchSubscription.Worker do
     field :tracking_retries, %{binary() => %{attempt: pos_integer(), timer: reference() | nil}},
       default: %{}
 
-    # The rules and subscriptions touched since the last write to the table.
-    field :persistence, Store.changes(), default: Store.no_changes()
     # The supervisor operation tasks are started under. A field rather than a
     # literal at the call site so a test can point a worker at a supervisor
     # that refuses to start children and exercise the never-started path.
@@ -184,37 +173,25 @@ defmodule Rebus.MatchSubscription.Worker do
 
   @impl true
   def init(conn) do
-    state = %__MODULE__{
-      conn: conn,
-      connection_monitor: Process.monitor(conn),
-      initial_cleanup_queue: :queue.new()
-    }
+    {:ok, %__MODULE__{conn: conn, initial_cleanup_queue: :queue.new()}, {:continue, :link}}
+  end
 
-    case Store.load_state(conn) do
-      {:ok, %{uncertain?: true}} ->
-        # None of the persisted rows is restored here, and nothing else would
-        # ever remove them: the reset below rewrites the meta row over whatever
-        # rows exist, and its own change set is empty. Drop them now, keeping
-        # the meta row so the connection stays watched and stays uncertain.
-        :ok = Store.discard_rows(conn)
-        send(self(), :reset_state_lost)
-        {:ok, %{state | state_lost?: true}}
-
-      {:ok, persisted} ->
-        state = restore_state(state, persisted)
-        Enum.each(state.recovering_rules, &send(self(), {:resume_recovery, &1}))
-        {:ok, state |> admit_restored_cleanups() |> reconcile_tracking()}
-
-      :error ->
-        {:ok, state}
-    end
+  # The worker and its connection are linked, so neither outlives the other.
+  # This worker traps exits, so its connection stopping for any reason,
+  # `:normal` included, arrives as an `:EXIT` it stops on in turn; linking a
+  # connection that is already dead delivers one at once. The connection is
+  # told which process this is, so it can stop with a reason that names it
+  # when this worker exits: a worker failing is a bug in Rebus, and the rules
+  # and handlers it was managing cannot be rebuilt without it.
+  @impl true
+  def handle_continue(:link, state) do
+    Process.flag(:trap_exit, true)
+    true = Process.link(state.conn)
+    :ok = Connection.attach_match_worker(state.conn)
+    {:noreply, state}
   end
 
   @impl true
-  def handle_call({:add, _owner, _rule, _deadline}, _from, %__MODULE__{state_lost?: true} = state) do
-    {:reply, {:error, :match_subscription_state_lost}, state}
-  end
-
   def handle_call({:add, owner, rule, deadline}, from, state) do
     key = MatchRule.to_string(rule)
 
@@ -237,10 +214,6 @@ defmodule Rebus.MatchSubscription.Worker do
       true ->
         add_subscription(state, from, owner, rule, key, deadline)
     end
-  end
-
-  def handle_call({:remove, _ref, _deadline}, _from, %__MODULE__{state_lost?: true} = state) do
-    {:reply, {:error, :match_subscription_state_lost}, state}
   end
 
   def handle_call({:remove, ref, deadline}, from, state) do
@@ -300,51 +273,22 @@ defmodule Rebus.MatchSubscription.Worker do
     end
   end
 
+  # A disconnected bus drops all server-side match state, so there is nothing
+  # left to clean up and no transport to send RemoveMatch through.
   @impl true
-  def handle_info(:reset_state_lost, state) do
-    # An operation was in-flight when this worker died.  Neither the local
-    # handler nor the bus rule can be reconstructed safely, so reject new
-    # public operations while a bounded connection reset clears both.
-    #
-    # This is the one failure that still closes the connection. The rows were
-    # discarded, so this worker does not know which rules or handlers exist,
-    # cannot mark any of them uncertain, and has no subscriber to notify.
-    {:noreply, state |> request_connection_reset() |> persist_state()}
-  end
+  def handle_info({:EXIT, conn, _reason}, %__MODULE__{conn: conn} = state),
+    do: {:stop, :normal, state}
 
-  def handle_info({:resume_recovery, key}, state) do
-    {:noreply, start_recovery_attempt(state, key)}
-  end
-
-  def handle_info({:connection_reset_result, token, :ok}, %__MODULE__{reset_token: token} = state) do
-    state = clear_reset_task(state)
-    log_reset(:close_requested)
-    # Supervisor termination is asynchronous relative to this monitor. Keep
-    # both the reset latch and the stable snapshot until connection DOWN proves
-    # that the bus and local handlers have actually exited.
-    state = %{state | state_lost?: true}
-    {:noreply, persist_state(state)}
-  end
-
-  def handle_info(
-        {:connection_reset_result, token, {:error, _reason}},
-        %__MODULE__{reset_token: token} = state
-      ) do
-    state = clear_reset_task(state)
-    log_reset(:close_not_started)
-    # Do not silently leave every rule behind a reset latch when this is a
-    # direct/non-supervised PID. The unresolved state is explicit to callers.
-    state = %{state | resetting?: false, state_lost?: true}
-    {:noreply, persist_state(state)}
-  end
-
-  def handle_info({:connection_reset_result, _token, _result}, state), do: {:noreply, state}
+  # Any other link keeps its usual meaning: the registry this worker is
+  # registered in, for one.
+  def handle_info({:EXIT, _pid, :normal}, state), do: {:noreply, state}
+  def handle_info({:EXIT, _pid, reason}, state), do: {:stop, reason, state}
 
   def handle_info({:request_timeout, request_id}, state) do
     case Map.fetch(state.requests, request_id) do
       {:ok, %{key: key}} ->
         state = reply_request(state, request_id, {:error, :timeout})
-        {:noreply, state |> maybe_progress_rule(key) |> persist_state()}
+        {:noreply, maybe_progress_rule(state, key)}
 
       :error ->
         {:noreply, state}
@@ -368,7 +312,7 @@ defmodule Rebus.MatchSubscription.Worker do
         {:noreply, state}
 
       {%{key: key} = operation, state} ->
-        state = state |> complete_operation(key, operation, result) |> persist_state()
+        state = complete_operation(state, key, operation, result)
         {:noreply, reconcile_tracking(state)}
     end
   end
@@ -391,28 +335,17 @@ defmodule Rebus.MatchSubscription.Worker do
 
   def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do
     cond do
-      monitor_ref == state.reset_task_monitor ->
-        # The reset task died before reporting whether it closed the
-        # connection. Do not leave a permanent reset latch or guess that the
-        # registration disappeared; expose explicit state loss instead.
-        log_reset(:task_lost)
-
-        state = clear_reset_task(state)
-        state = %{state | resetting?: false, state_lost?: true}
-
-        {:noreply, persist_state(state)}
-
       ref = Map.get(state.owner_monitors, monitor_ref) ->
         # An uncertain rule starts no cleanup whose result would reconcile
         # tracking, so the last owner of one leaving must do it here.
-        state = state |> owner_down(monitor_ref, ref) |> persist_state()
+        state = owner_down(state, monitor_ref, ref)
         {:noreply, reconcile_tracking(state)}
 
       request_id = Map.get(state.request_monitors, monitor_ref) ->
         key = request_key(state, request_id)
         state = reply_request(state, request_id, {:error, :disconnected})
         state = if(key, do: maybe_progress_rule(state, key), else: state)
-        {:noreply, persist_state(state)}
+        {:noreply, state}
 
       name = Map.get(state.tracking_monitors, monitor_ref) ->
         # Owner tracking is best-effort and deliberately outside the rule
@@ -436,12 +369,6 @@ defmodule Rebus.MatchSubscription.Worker do
         # bus-rule state.
         operation_down(state, token)
 
-      monitor_ref == state.connection_monitor ->
-        # A disconnected bus drops all server-side match state. Do not try to
-        # send RemoveMatch through a dead transport.
-        :ok = Store.delete_state(state.conn)
-        {:stop, :normal, state}
-
       true ->
         {:noreply, state}
     end
@@ -454,7 +381,7 @@ defmodule Rebus.MatchSubscription.Worker do
 
       {%{key: key} = operation, state} ->
         state = operation_failed(state, key, operation)
-        {:noreply, state |> persist_state() |> reconcile_tracking()}
+        {:noreply, reconcile_tracking(state)}
     end
   end
 
@@ -610,28 +537,25 @@ defmodule Rebus.MatchSubscription.Worker do
     rule = Map.fetch!(state.rules, key)
     state = put_rule(state, key, %{rule | operation: token})
 
-    state =
-      case started do
-        {:ok, pid} ->
-          monitor_ref = Process.monitor(pid)
+    case started do
+      {:ok, pid} ->
+        monitor_ref = Process.monitor(pid)
 
-          %{
-            state
-            | operations: Map.put(state.operations, token, %{operation | monitor: monitor_ref}),
-              operation_monitors: Map.put(state.operation_monitors, monitor_ref, token)
-          }
+        %{
+          state
+          | operations: Map.put(state.operations, token, %{operation | monitor: monitor_ref}),
+            operation_monitors: Map.put(state.operation_monitors, monitor_ref, token)
+        }
 
-        {:error, _reason} ->
-          # No task ran, therefore nothing was sent to the bus and no local
-          # handler was attached. Report that distinctly from a task that died
-          # mid-flight, whose effect on the bus is genuinely unknown. The
-          # operation is still recorded so the snapshot stays uncertain until
-          # the synthesised result is handled like any other.
-          send(self(), {:operation_result, token, :not_started})
-          %{state | operations: Map.put(state.operations, token, operation)}
-      end
-
-    persist_state(state)
+      {:error, _reason} ->
+        # No task ran, therefore nothing was sent to the bus and no local
+        # handler was attached. Report that distinctly from a task that died
+        # mid-flight, whose effect on the bus is genuinely unknown. The
+        # operation is still recorded so the synthesised result is handled
+        # like any other.
+        send(self(), {:operation_result, token, :not_started})
+        %{state | operations: Map.put(state.operations, token, operation)}
+    end
   end
 
   defp take_operation(state, token) do
@@ -742,7 +666,7 @@ defmodule Rebus.MatchSubscription.Worker do
         state = put_active_rule(state, key)
         state = put_subscription(state, request.owner, key, handler_ref)
         state = dispatch_rule(state, key)
-        reply_request_after_persist(state, request_id, {:ok, handler_ref})
+        reply_request(state, request_id, {:ok, handler_ref})
 
       {:expired, state} ->
         state
@@ -773,7 +697,7 @@ defmodule Rebus.MatchSubscription.Worker do
       {:ok, request, state} ->
         state = put_subscription(state, request.owner, key, handler_ref)
         state = dispatch_rule(state, key)
-        reply_request_after_persist(state, request_id, {:ok, handler_ref})
+        reply_request(state, request_id, {:ok, handler_ref})
 
       {:expired, state} ->
         state = put_pending_handler(state, key, handler_ref)
@@ -801,13 +725,13 @@ defmodule Rebus.MatchSubscription.Worker do
   defp complete_remove(state, key, request_id, {:removed, ref, :nonfinal}) do
     state = drop_subscription(state, ref)
     state = dispatch_rule(state, key)
-    reply_request_if_live_after_persist(state, request_id, :ok)
+    reply_request_if_live(state, request_id, :ok)
   end
 
   defp complete_remove(state, key, request_id, {:removed, ref, :final}) do
     state = drop_subscription(state, ref)
     state = clear_rule_and_resume(state, key)
-    reply_request_if_live_after_persist(state, request_id, :ok)
+    reply_request_if_live(state, request_id, :ok)
   end
 
   defp complete_remove(state, key, request_id, {:remove_definitive_error, ref, error}) do
@@ -909,7 +833,6 @@ defmodule Rebus.MatchSubscription.Worker do
             else: rule.pending_handlers
 
         state = %{state | subscriptions: subscriptions}
-        state = mark_subscription_removed(state, ref)
 
         state =
           put_rule(state, key, %{
@@ -1218,66 +1141,11 @@ defmodule Rebus.MatchSubscription.Worker do
     end
   end
 
-  defp request_connection_reset(state) do
-    # Never include a rule or signal payload in observability. A connection
-    # reset is bounded and makes the bus discard all match state for it. Its
-    # result is observed so a failed task or non-supervised PID cannot leave a
-    # permanent `resetting?` latch.
-    if state.resetting? do
-      state
-    else
-      Logger.warning("D-Bus match cleanup closing connection")
-      start_reset_task(state)
-    end
-  end
-
-  defp start_reset_task(state) do
-    token = make_ref()
-    worker = self()
-    conn = state.conn
-
-    case Task.Supervisor.start_child(Rebus.MatchSubscription.TaskSupervisor, fn ->
-           result = Rebus.close(conn)
-
-           send(worker, {:connection_reset_result, token, result})
-         end) do
-      {:ok, pid} ->
-        %{
-          state
-          | resetting?: true,
-            state_lost?: true,
-            reset_token: token,
-            reset_task_monitor: Process.monitor(pid)
-        }
-
-      {:error, _reason} ->
-        # No task ran, therefore no reset outcome is known. Keep existing
-        # connection authority intact and make the lost state explicit.
-        log_reset(:task_start_failed)
-        %{state | state_lost?: true}
-    end
-  end
-
-  defp clear_reset_task(state) do
-    if is_reference(state.reset_task_monitor),
-      do: Process.demonitor(state.reset_task_monitor, [:flush])
-
-    %{state | reset_task_monitor: nil, reset_token: nil}
-  end
-
   # The set of names to track is derived from the rules this worker holds, so
   # no extra refcount is kept: a name is needed while at least one installed
   # rule names it as a well-known sender. Reconciling after every operation
   # therefore installs the tracking rule once for the first such rule and
   # removes it after the last one goes.
-  #
-  # A connection being reset or whose state is lost is not a connection to run
-  # best-effort bus round trips against: leave the table alone until it settles.
-  # `init/1` returns before reconciling on the uncertain-snapshot path, so this
-  # only has to catch the operation results that land during a live reset.
-  defp reconcile_tracking(%__MODULE__{resetting?: true} = state), do: state
-  defp reconcile_tracking(%__MODULE__{state_lost?: true} = state), do: state
-
   defp reconcile_tracking(state) do
     needed = needed_tracked_names(state)
 
@@ -1361,7 +1229,7 @@ defmodule Rebus.MatchSubscription.Worker do
   # A budget spent without a success is the end of it, exactly as before this
   # was retried at all: the name stays latched and `:unknown` in the
   # connection, so directed signals for it stay rejected, and nothing here ever
-  # resets the connection or enters rule recovery.
+  # closes the connection or enters rule recovery.
   #
   # A pending timer is not cancelled at `terminate/2`, any more than a recovery
   # one is: its message would only be delivered to a dead process.
@@ -1394,12 +1262,6 @@ defmodule Rebus.MatchSubscription.Worker do
       clear_tracking_retry(state, name)
     end
   end
-
-  # A connection being reset or whose state is lost is not one to retry against,
-  # for the reason `reconcile_tracking/1` gives. Both latches are terminal for
-  # this worker, so the entry goes rather than waiting for them to clear.
-  defp retry_tracking?(%__MODULE__{resetting?: true}, _name), do: false
-  defp retry_tracking?(%__MODULE__{state_lost?: true}, _name), do: false
 
   defp retry_tracking?(state, name) do
     Map.has_key?(state.tracking_retries, name) and
@@ -1434,12 +1296,8 @@ defmodule Rebus.MatchSubscription.Worker do
     end
   end
 
-  # Tracking runs outside the rule state machine: its failures never reset the
+  # Tracking runs outside the rule state machine: its failures never close the
   # connection, never fail a caller's add_match/3, and never enter recovery.
-  # A worker restart re-runs this for every restored rule that still needs it,
-  # which can leave a duplicate tracking rule on the bus, since dbus-daemon
-  # accepts identical AddMatch rules and RemoveMatch drops one. That costs a
-  # second copy of a signal already received and needs no bookkeeping.
   #
   # No deadline is passed: unlike a caller operation, a tracking sequence has
   # no single budget. `Rebus.MatchSubscription.Operation` bounds each of its
@@ -1524,16 +1382,10 @@ defmodule Rebus.MatchSubscription.Worker do
     end
   end
 
-  defp reply_request_if_live(state, request_id, reply),
-    do: reply_if_live(state, request_id, reply, false)
-
-  defp reply_request_if_live_after_persist(state, request_id, reply),
-    do: reply_if_live(state, request_id, reply, true)
-
-  defp reply_if_live(state, request_id, reply, persist?) do
+  defp reply_request_if_live(state, request_id, reply) do
     case Map.get(state.requests, request_id) do
       nil -> state
-      request -> take_and_reply(state, request_id, effective_reply(request, reply), persist?)
+      request -> reply_request(state, request_id, effective_reply(request, reply))
     end
   end
 
@@ -1555,13 +1407,7 @@ defmodule Rebus.MatchSubscription.Worker do
   defp reply_request_if_present(state, request_id, reply),
     do: reply_request(state, request_id, reply)
 
-  defp reply_request_after_persist(state, request_id, reply),
-    do: take_and_reply(state, request_id, reply, true)
-
-  defp reply_request(state, request_id, reply),
-    do: take_and_reply(state, request_id, reply, false)
-
-  defp take_and_reply(state, request_id, reply, persist?) do
+  defp reply_request(state, request_id, reply) do
     case Map.pop(state.requests, request_id) do
       {nil, _requests} ->
         state
@@ -1576,11 +1422,6 @@ defmodule Rebus.MatchSubscription.Worker do
             request_monitors: Map.delete(state.request_monitors, monitor_ref)
         }
 
-        # A completed operation may be observed immediately by its caller,
-        # including by stopping this worker. When a caller asks to persist, the
-        # write happens before the reply, so restart recovery never mistakes an
-        # acknowledged stable subscription for an uncertain in-flight operation.
-        state = if persist?, do: persist_state(state), else: state
         GenServer.reply(from, reply)
         state
     end
@@ -1660,15 +1501,13 @@ defmodule Rebus.MatchSubscription.Worker do
     state =
       update_rule(state, key, fn rule -> %{rule | refs: MapSet.put(rule.refs, handler_ref)} end)
 
-    state = %{
+    %{
       state
       | subscriptions:
           Map.put(state.subscriptions, handler_ref, %{owner: owner, key: key, handler: :active}),
         owner_monitors: Map.put(state.owner_monitors, monitor_ref, handler_ref),
         ref_monitors: Map.put(state.ref_monitors, handler_ref, monitor_ref)
     }
-
-    mark_subscription_dirty(state, handler_ref)
   end
 
   defp mark_handler_removed(state, ref) do
@@ -1680,8 +1519,7 @@ defmodule Rebus.MatchSubscription.Worker do
         state
 
       %{handler: :active} ->
-        state = put_in(state.subscriptions[ref].handler, :removed)
-        mark_subscription_dirty(state, ref)
+        put_in(state.subscriptions[ref].handler, :removed)
 
       %{handler: :removed} ->
         state
@@ -1704,110 +1542,13 @@ defmodule Rebus.MatchSubscription.Worker do
             ref_monitors: ref_monitors
         }
 
-        state
-        |> mark_subscription_removed(ref)
-        |> update_rule(key, fn rule -> %{rule | refs: MapSet.delete(rule.refs, ref)} end)
+        update_rule(state, key, fn rule -> %{rule | refs: MapSet.delete(rule.refs, ref)} end)
     end
   end
 
-  # A worker can be restarted by its DynamicSupervisor while the connection is
-  # still alive. Persist only stable ownership/rule facts; queued callers and
-  # in-flight operations are deliberately marked uncertain because their local
-  # handler and bus effects cannot be reconciled from a snapshot. The rows are
-  # incremental: an operation touches only its changed rule/reference rather
-  # than copying every subscription on a busy connection.
-  defp persist_state(state) do
-    uncertain? =
-      state.state_lost? or map_size(state.operations) > 0 or map_size(state.requests) > 0
+  defp put_rule(state, key, rule), do: %{state | rules: Map.put(state.rules, key, rule)}
 
-    if not uncertain? and map_size(state.rules) == 0 and map_size(state.subscriptions) == 0 do
-      :ok = Store.delete_state(state.conn)
-    else
-      Store.persist_state(
-        state.conn,
-        uncertain?,
-        state.persistence,
-        state.rules,
-        state.subscriptions
-      )
-    end
-
-    %{state | persistence: Store.no_changes()}
-  end
-
-  defp restore_state(state, %{rules: rules, subscriptions: subscriptions})
-       when is_map(rules) and is_map(subscriptions) do
-    # A row is a plain map of the rule's fields, so it restores into the record
-    # directly. The operation in flight, the callers queued behind it and the
-    # retry timer belonged to the worker that died, and none of them is a fact
-    # about the bus, so a restored rule starts without them.
-    #
-    # Only the recovering and uncertain rules are indexed here, and an
-    # uncertain one is not notified again. A rule restored as
-    # `:cleaning` still owes the bus its best-effort RemoveMatch, and
-    # `admit_restored_cleanups/1` re-admits it through the same cap the live
-    # path uses: the cap bounds concurrent bus work, and a restart can present
-    # as many cleaning rules at once as a burst of owner exits can, so it must
-    # apply to them identically.
-    rules =
-      Map.new(rules, fn {key, row} ->
-        {key, %{struct!(Rule, row) | operation: nil, queue: [], retry_timer: nil}}
-      end)
-
-    {owner_monitors, ref_monitors} =
-      Enum.reduce(subscriptions, {%{}, %{}}, fn {ref, %{owner: owner}}, {owners, refs} ->
-        monitor_ref = Process.monitor(owner)
-        {Map.put(owners, monitor_ref, ref), Map.put(refs, ref, monitor_ref)}
-      end)
-
-    %{
-      state
-      | rules: rules,
-        subscriptions: subscriptions,
-        owner_monitors: owner_monitors,
-        ref_monitors: ref_monitors,
-        recovering_rules: keys_with_status(rules, :recovering),
-        uncertain_rules: keys_with_status(rules, :uncertain)
-    }
-  end
-
-  defp restore_state(state, _persisted), do: state
-
-  defp keys_with_status(rules, status) do
-    for {key, %Rule{status: ^status}} <- rules, into: MapSet.new(), do: key
-  end
-
-  # Nothing else schedules a restored cleaning rule: it is not in
-  # `recovering_rules`, and the admission that would have started or queued it
-  # ran in the worker that died. Re-admit each one synchronously, since
-  # `start_recovery_attempt/2` only spawns a supervised task and takes a
-  # monitor, so this does not block `init/1`, and the rules restore with
-  # `operation: nil` and `retry_timer: nil` already, which is exactly what it
-  # requires.
-  defp admit_restored_cleanups(state) do
-    state.rules
-    |> Enum.flat_map(fn
-      {key, %Rule{status: :cleaning}} -> [key]
-      {_key, _rule} -> []
-    end)
-    |> Enum.reduce(state, &admit_initial_cleanup(&2, &1))
-  end
-
-  defp put_rule(state, key, rule) do
-    state = %{state | rules: Map.put(state.rules, key, rule)}
-    %{state | persistence: Store.rule_changed(state.persistence, key)}
-  end
-
-  defp delete_rule(state, key) do
-    state = %{state | rules: Map.delete(state.rules, key)}
-    %{state | persistence: Store.rule_removed(state.persistence, key)}
-  end
-
-  defp mark_subscription_dirty(state, ref),
-    do: %{state | persistence: Store.subscription_changed(state.persistence, ref)}
-
-  defp mark_subscription_removed(state, ref),
-    do: %{state | persistence: Store.subscription_removed(state.persistence, ref)}
+  defp delete_rule(state, key), do: %{state | rules: Map.delete(state.rules, key)}
 
   defp update_rule(state, key, fun) do
     case Map.get(state.rules, key) do
@@ -1824,13 +1565,9 @@ defmodule Rebus.MatchSubscription.Worker do
   # uncertain. With `@recovery_delays` the default is roughly 26
   # seconds of retrying per recovery episode: long enough that a transient bus
   # hiccup never trips it, short enough that an operator learns of a stuck rule
-  # within a minute. Attempts rather than wall-clock keeps it deterministic,
-  # and `recovery_attempt` is already persisted, so the budget spans worker
-  # restarts: a restored rule gets one immediate attempt and then only what is
-  # left of its budget, so one restored with the budget already spent escalates
-  # on its next failure. That is intended, since a restart is not evidence that
-  # the bus resolved anything. A successful recovery, and each new episode entered
-  # through `enter_recovery/3`, resets the count to zero.
+  # within a minute. Attempts rather than wall-clock keeps it deterministic. A
+  # successful recovery, and each new episode entered through
+  # `enter_recovery/3`, resets the count to zero.
   defp max_recovery_attempts do
     Application.get_env(:rebus, :match_recovery_max_attempts, 30)
   end
@@ -1839,9 +1576,7 @@ defmodule Rebus.MatchSubscription.Worker do
   # left untracked for good. Shares `@recovery_delays` with rule recovery, so
   # the default is the same rough half-minute of retrying: long enough to ride
   # out a slow bus or a momentary AccessDenied, short enough that a name whose
-  # tracking is genuinely refused stops asking. Unlike a recovery attempt, this
-  # count is not persisted: tracking is derived from the restored rules, so a
-  # restarted worker starts the sequence, and its budget, afresh.
+  # tracking is genuinely refused stops asking.
   defp max_tracking_attempts do
     Application.get_env(:rebus, :match_tracking_max_attempts, 30)
   end
@@ -1899,10 +1634,6 @@ defmodule Rebus.MatchSubscription.Worker do
   # caller-supplied arguments.
   defp log_not_started(type) do
     Logger.warning("D-Bus match operation not started type=#{type}")
-  end
-
-  defp log_reset(event) do
-    Logger.warning("D-Bus match reset transition=#{event}")
   end
 
   # Fires once per rule, since an uncertain rule never leaves that state. As
