@@ -3,6 +3,7 @@ defmodule RebusTest do
   doctest Rebus
   import ExUnit.CaptureLog
 
+  alias Rebus.Auth.CookieSha1
   alias Rebus.Connection
   alias Rebus.Connection.Handshake
   alias Rebus.Connection.Inbound
@@ -470,7 +471,7 @@ defmodule RebusTest do
 
     test "normalizes internal username lookup outcomes" do
       username = fn lookup ->
-        Handshake.get_auth_username(100, TestImpl.identity(username: lookup))
+        CookieSha1.get_auth_username(100, TestImpl.identity(username: lookup))
       end
 
       assert {:ok, "rebus-user"} = username.(fn _timeout -> {:ok, "rebus-user\n"} end)

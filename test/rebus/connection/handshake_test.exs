@@ -356,8 +356,8 @@ defmodule Rebus.Connection.HandshakeTest do
         ])
 
       # No keyring fixture here, so the ambient `$HOME` decides which category
-      # `Rebus.Auth` reports; capturing keeps the suite's output clean either
-      # way.
+      # `Rebus.Auth.CookieSha1` reports; capturing keeps the suite's output
+      # clean either way.
       log =
         capture_log(fn ->
           assert {:error, :auth_cookie_unavailable} =

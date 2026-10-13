@@ -6,8 +6,13 @@ defmodule Rebus.Connection.Handshake do
   # process state: everything it needs arrives in `Options`, every byte moves
   # through the transport module it is given, and the leftover bytes read past
   # BEGIN are handed back to the caller as the start of the message stream.
+  #
+  # The handshake knows the protocol but no mechanism: each one implements
+  # `Rebus.Auth.Mechanism`, and decides what to send and what the server's
+  # answers mean for it.
 
   alias Rebus.Auth
+  alias Rebus.Auth.{Anonymous, CookieSha1, External}
   alias Rebus.Connection.SocketError
 
   @max_auth_line_size 1_024
@@ -41,12 +46,13 @@ defmodule Rebus.Connection.Handshake do
           {:ok, result()} | {:error, term()}
   def run(sock, auth_id, deadline, maximum, %Options{} = options)
       when is_binary(auth_id) and is_integer(deadline) and is_integer(maximum) and maximum > 0 do
-    with {:ok, guid, rest} <- authenticate(options, sock, auth_id, deadline, maximum),
+    # Every send and receive draws on the one setup deadline.
+    io = %{sock: sock, options: options, deadline: deadline, maximum: maximum}
+
+    with {:ok, guid, rest} <- authenticate(io, auth_id),
          :ok <- verify_expected_guid(guid, options.expected_guid),
-         {:ok, unix_fd_negotiated?, rest} <-
-           negotiate_unix_fd(options, sock, rest, deadline, maximum),
-         :ok <-
-           handshake_send_with_deadline(sock, "BEGIN \r\n", options, deadline, maximum) do
+         {:ok, unix_fd_negotiated?, rest} <- negotiate_unix_fd(io, rest),
+         :ok <- send_line(io, "BEGIN \r\n") do
       {:ok, %{guid: guid, unix_fd_negotiated?: unix_fd_negotiated?, rest: rest}}
     end
   end
@@ -54,255 +60,139 @@ defmodule Rebus.Connection.Handshake do
   # EXTERNAL remains the first authentication mechanism. If it is rejected the
   # advertised list determines a bounded, deterministic retry: cookie first,
   # anonymous only when the caller explicitly enabled it. Each mechanism can be
-  # attempted once; later REJECTED lists are parsed for protocol safety but do
-  # not alter the original mechanism selection.
-  defp authenticate(options, sock, auth_id, deadline, maximum) do
-    with :ok <-
-           handshake_send_with_deadline(
-             sock,
-             [0, "AUTH EXTERNAL ", auth_id, "\r\n"],
-             options,
-             deadline,
-             maximum
-           ) do
-      await_external(:waiting_for_data, options, sock, auth_id, <<>>, deadline, maximum)
+  # attempted once, and only the mechanism being rejected decides whether a
+  # rejection allows a fallback at all.
+  defp mechanisms(%Options{allow_anonymous?: true}), do: [External, CookieSha1, Anonymous]
+  defp mechanisms(%Options{}), do: [External, CookieSha1]
+
+  defp authenticate(io, auth_id) do
+    context = %{
+      auth_id: auth_id,
+      identity: io.options.identity,
+      timeout: fn -> remaining_setup_timeout(io) end
+    }
+
+    # The NUL byte that opens the connection travels with the first AUTH.
+    start(mechanisms(io.options), <<0>>, {:error, :auth_failed}, io, context, <<>>)
+  end
+
+  # Sends AUTH for the first candidate able to produce an initial response. A
+  # candidate that cannot has sent nothing, so the next one may be tried; when
+  # none is left, `failure` is the result.
+  defp start([mechanism | candidates], prefix, _failure, io, context, buffer) do
+    case mechanism.initial_response(context) do
+      {:ok, response, state} ->
+        auth = [prefix, "AUTH ", mechanism.name(), initial_response(response), "\r\n"]
+
+        with :ok <- send_line(io, auth) do
+          await({mechanism, state, candidates}, io, context, buffer)
+        end
+
+      {:unavailable, reason} ->
+        start(candidates, prefix, {:error, reason}, io, context, buffer)
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
-  # The client side of the specification's authentication state machine for
-  # EXTERNAL, entered in WaitingForData because AUTH carried an initial
-  # response. The states only move forward, so a peer gets at most one DATA
-  # answer and one CANCEL before it must send OK or REJECTED.
-  defp await_external(state, options, sock, auth_id, buffer, deadline, maximum) do
-    with {:ok, line, rest} <-
-           handshake_recv_with_deadline(options, sock, buffer, deadline, maximum) do
-      case external_step(state, line, auth_id) do
-        {:ok, guid} ->
-          {:ok, guid, rest}
+  defp start([], _prefix, failure, _io, _context, _buffer), do: failure
 
-        {:rejected, mechanisms} ->
-          authenticate_rejected(options, sock, auth_id, mechanisms, rest, deadline, maximum)
+  defp initial_response(nil), do: []
+  defp initial_response(response), do: [" ", response]
 
-        {:reply, reply, next_state} ->
-          reply_external(reply, next_state, options, sock, auth_id, rest, deadline, maximum)
+  # An attempt is the mechanism in progress, its state, and the mechanisms
+  # still allowed after it.
+  defp await({mechanism, state, _candidates} = attempt, io, context, buffer) do
+    with {:ok, line, rest} <- recv_line(io, buffer) do
+      case parse_auth_line(line) do
+        {:data, data} ->
+          data
+          |> mechanism.handle_data(state, context)
+          |> follow_data(attempt, io, context, rest)
 
-        {:error, reason} ->
-          {:error, reason}
+        {:error, _reason} = error ->
+          error
+
+        verdict ->
+          verdict
+          |> verdict_kind()
+          |> mechanism.handle_verdict(state)
+          |> follow_verdict(verdict, attempt, io, context, rest)
       end
     end
   end
 
-  defp reply_external(reply, next_state, options, sock, auth_id, rest, deadline, maximum) do
-    with :ok <- handshake_send_with_deadline(sock, reply, options, deadline, maximum) do
-      await_external(next_state, options, sock, auth_id, rest, deadline, maximum)
+  defp follow_data({:reply, reply, state}, {mechanism, _state, candidates}, io, context, rest) do
+    with :ok <- send_line(io, ["DATA ", reply, "\r\n"]) do
+      await({mechanism, state, candidates}, io, context, rest)
     end
   end
 
-  # EXTERNAL defines only an empty server challenge, to which the client
-  # answers with its authorization identity. Restate the identity already sent
-  # as the initial response and wait for the verdict. A non-empty challenge has
-  # no meaning for EXTERNAL and is refused like any other unexpected line.
-  defp external_step(:waiting_for_data, line, auth_id) when line in ["DATA", "DATA "],
-    do: {:reply, ["DATA ", auth_id, "\r\n"], :waiting_for_ok}
+  defp follow_data(:cancel, {_mechanism, _state, candidates}, io, context, rest),
+    do: cancel(candidates, io, context, rest)
 
-  # ERROR in either waiting state, and any DATA once the identity has been
-  # restated, cancel the mechanism. Only REJECTED may follow a CANCEL.
-  defp external_step(state, line, _auth_id) when state in [:waiting_for_data, :waiting_for_ok] do
-    if cancels_external?(state, line),
-      do: {:reply, "CANCEL\r\n", :waiting_for_reject},
-      else: parse_auth_response(line)
-  end
+  defp follow_data({:error, _reason} = error, _attempt, _io, _context, _rest), do: error
 
-  defp external_step(:waiting_for_reject, line, _auth_id) do
-    case parse_auth_response(line) do
-      {:rejected, mechanisms} -> {:rejected, mechanisms}
-      {:ok, _guid} -> {:error, :auth_failed}
-      {:error, reason} -> {:error, reason}
-    end
-  end
+  defp verdict_kind({:ok, _guid}), do: :ok
+  defp verdict_kind(verdict), do: verdict
 
-  defp cancels_external?(_state, "ERROR"), do: true
-  defp cancels_external?(_state, "ERROR " <> _explanation), do: true
-  defp cancels_external?(:waiting_for_ok, "DATA"), do: true
-  defp cancels_external?(:waiting_for_ok, "DATA " <> _data), do: true
-  defp cancels_external?(_state, _line), do: false
+  defp follow_verdict(:ok, {:ok, guid}, _attempt, _io, _context, rest), do: {:ok, guid, rest}
 
-  defp authenticate_rejected(options, sock, auth_id, mechanisms, rest, deadline, maximum) do
-    cond do
-      "DBUS_COOKIE_SHA1" in mechanisms ->
-        authenticate_cookie(options, sock, auth_id, mechanisms, rest, deadline, maximum)
+  defp follow_verdict(
+         :fallback,
+         {:rejected, mechanisms},
+         {_mechanism, _state, candidates},
+         io,
+         context,
+         rest
+       ),
+       do: fall_back(candidates, mechanisms, io, context, rest)
 
-      options.allow_anonymous? and "ANONYMOUS" in mechanisms ->
-        authenticate_anonymous(options, sock, rest, deadline, maximum)
+  defp follow_verdict(:cancel, _verdict, {_mechanism, _state, candidates}, io, context, rest),
+    do: cancel(candidates, io, context, rest)
 
-      true ->
-        {:error, {:auth_rejected, mechanisms}}
-    end
-  end
+  defp follow_verdict({:error, _reason} = error, _verdict, _attempt, _io, _context, _rest),
+    do: error
 
-  defp authenticate_cookie(options, sock, auth_id, mechanisms, rest, deadline, maximum) do
-    with {:ok, timeout} <- remaining_setup_timeout(options, deadline, maximum) do
-      case get_auth_username(timeout, options.identity) do
-        {:ok, username} ->
-          authenticate_cookie_with_username(
-            options,
-            sock,
-            auth_id,
-            username,
-            rest,
-            deadline,
-            maximum
-          )
-
-        {:error, :auth_cookie_unavailable} ->
-          cookie_unavailable_before_auth(options, sock, mechanisms, rest, deadline, maximum)
-
-        {:error, reason} ->
-          {:error, reason}
+  # Only REJECTED may follow a CANCEL, and it moves on to the next advertised
+  # mechanism as the specification requires: the cancelled mechanism has
+  # already abandoned its exchange.
+  defp cancel(candidates, io, context, buffer) do
+    with :ok <- send_line(io, "CANCEL\r\n"),
+         {:ok, line, rest} <- recv_line(io, buffer) do
+      case parse_auth_line(line) do
+        {:rejected, mechanisms} -> fall_back(candidates, mechanisms, io, context, rest)
+        {:error, _reason} = error -> error
+        _other -> {:error, :auth_failed}
       end
     end
   end
 
-  # A local username is the initial response for DBUS_COOKIE_SHA1. If it cannot
-  # be acquired, no cookie mechanism has started: send ANONYMOUS directly only
-  # when the caller opted in and the server advertised it. Once AUTH has been
-  # sent, no weaker fallback is permitted.
-  defp cookie_unavailable_before_auth(
-         %Options{allow_anonymous?: true} = options,
-         sock,
-         mechanisms,
-         rest,
-         deadline,
-         maximum
-       ) do
-    if "ANONYMOUS" in mechanisms,
-      do: authenticate_anonymous(options, sock, rest, deadline, maximum),
-      else: {:error, :auth_cookie_unavailable}
+  # A later REJECTED list only narrows the original order; it never adds a
+  # mechanism or reorders them.
+  defp fall_back(candidates, mechanisms, io, context, rest) do
+    candidates
+    |> Enum.filter(&(&1.name() in mechanisms))
+    |> start(<<>>, {:error, {:auth_rejected, mechanisms}}, io, context, rest)
   end
 
-  defp cookie_unavailable_before_auth(_options, _sock, _mechanisms, _rest, _deadline, _maximum),
-    do: {:error, :auth_cookie_unavailable}
-
-  defp authenticate_cookie_with_username(
-         options,
-         sock,
-         auth_id,
-         username,
-         rest,
-         deadline,
-         maximum
-       ) do
-    with :ok <-
-           handshake_send_with_deadline(
-             sock,
-             ["AUTH DBUS_COOKIE_SHA1 ", Base.encode16(username, case: :lower), "\r\n"],
-             options,
-             deadline,
-             maximum
-           ),
-         {:ok, line, rest} <-
-           handshake_recv_with_deadline(options, sock, rest, deadline, maximum) do
-      case line do
-        "DATA " <> challenge ->
-          authenticate_cookie_data(
-            options,
-            sock,
-            auth_id,
-            username,
-            challenge,
-            rest,
-            deadline,
-            maximum
-          )
-
-        "REJECTED" <> _rest ->
-          rejected_cookie_auth(line)
-
-        _ ->
-          {:error, :auth_failed}
-      end
-    else
-      # Once DBUS_COOKIE_SHA1 AUTH is on the wire, even a local credential
-      # failure is terminal. A peer must not be able to steer a client toward
-      # ANONYMOUS by offering an unavailable context or cookie ID.
-      {:error, :auth_cookie_unavailable} -> {:error, :auth_cookie_unavailable}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  # A mechanism rejection is terminal: do not silently lower the
-  # authentication level after starting DBUS_COOKIE_SHA1.
-  defp rejected_cookie_auth(line) do
-    case parse_auth_response(line) do
-      {:rejected, advertised} -> {:error, {:auth_rejected, advertised}}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp authenticate_cookie_data(
-         options,
-         sock,
-         auth_id,
-         username,
-         challenge,
-         rest,
-         deadline,
-         maximum
-       ) do
-    with {:ok, timeout} <- remaining_setup_timeout(options, deadline, maximum),
-         {:ok, uid} <- auth_id_uid(auth_id),
-         {:ok, response} <- cookie_response(username, uid, challenge, timeout),
-         :ok <-
-           handshake_send_with_deadline(
-             sock,
-             ["DATA ", response, "\r\n"],
-             options,
-             deadline,
-             maximum
-           ),
-         {:ok, line, rest} <-
-           handshake_recv_with_deadline(options, sock, rest, deadline, maximum) do
-      case parse_auth_response(line) do
-        {:ok, guid} -> {:ok, guid, rest}
-        # A response that reached the server must not be followed by a weaker
-        # mechanism, even when anonymous was explicitly enabled.
-        {:rejected, _mechanisms} -> {:error, :auth_failed}
-        {:error, reason} -> {:error, reason}
-      end
-    else
-      # A received challenge ties the following credential lookup to
-      # DBUS_COOKIE_SHA1. Do not emit CANCEL or attempt ANONYMOUS after a
-      # missing/ambiguous cookie, including a peer-chosen context or ID.
-      {:error, :auth_cookie_unavailable} -> {:error, :auth_cookie_unavailable}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp authenticate_anonymous(options, sock, rest, deadline, maximum) do
-    with :ok <-
-           handshake_send_with_deadline(sock, "AUTH ANONYMOUS\r\n", options, deadline, maximum),
-         {:ok, line, rest} <-
-           handshake_recv_with_deadline(options, sock, rest, deadline, maximum) do
-      case parse_auth_response(line) do
-        {:ok, guid} -> {:ok, guid, rest}
-        {:rejected, mechanisms} -> {:error, {:auth_rejected, mechanisms}}
-        {:error, reason} -> {:error, reason}
-      end
-    end
-  end
-
-  defp parse_auth_response(<<"OK ", guid::binary-size(32)>>) do
+  defp parse_auth_line(<<"OK ", guid::binary-size(32)>>) do
     if valid_guid?(guid), do: {:ok, :binary.copy(guid)}, else: {:error, :auth_failed}
   end
 
-  defp parse_auth_response("REJECTED" <> _rest = line) do
+  defp parse_auth_line("REJECTED" <> _rest = line) do
     case Auth.parse_rejected(line) do
       {:ok, mechanisms} -> {:rejected, mechanisms}
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp parse_auth_response(_line), do: {:error, :auth_failed}
+  defp parse_auth_line("DATA"), do: {:data, <<>>}
+  defp parse_auth_line("DATA " <> data), do: {:data, data}
+  defp parse_auth_line("ERROR"), do: :error
+  defp parse_auth_line("ERROR " <> _explanation), do: :error
+  defp parse_auth_line(_line), do: {:error, :auth_failed}
 
   defp verify_expected_guid(_guid, nil), do: :ok
 
@@ -356,100 +246,6 @@ defmodule Rebus.Connection.Handshake do
       else: {:error, :auth_id_unavailable}
   end
 
-  @doc false
-  @spec get_auth_username(pos_integer(), module()) ::
-          {:ok, binary()} | {:error, :auth_cookie_unavailable | :read_timeout}
-  def get_auth_username(timeout, identity)
-      when is_integer(timeout) and timeout > 0 and is_atom(identity) do
-    case safely_lookup_identity(identity, :username, timeout) do
-      {:ok, output} when is_binary(output) and byte_size(output) <= @max_auth_id_output ->
-        username = String.trim(output)
-
-        if valid_auth_username?(username),
-          do: {:ok, :binary.copy(username)},
-          else: {:error, :auth_cookie_unavailable}
-
-      {:error, :timeout} ->
-        {:error, :read_timeout}
-
-      _ ->
-        {:error, :auth_cookie_unavailable}
-    end
-  end
-
-  defp valid_auth_username?(username) when byte_size(username) in 1..64,
-    do: all_bytes?(username, &visible_ascii_byte?/1)
-
-  defp valid_auth_username?(_username), do: false
-
-  defp visible_ascii_byte?(byte), do: byte in 0x21..0x7E
-
-  defp auth_id_uid(auth_id) when is_binary(auth_id) do
-    with {:ok, uid_bytes} <- Base.decode16(auth_id, case: :mixed),
-         {uid, <<>>} <- Integer.parse(uid_bytes),
-         true <- uid >= 0 and uid <= 4_294_967_295 do
-      {:ok, uid}
-    else
-      _ -> {:error, :auth_failed}
-    end
-  end
-
-  # File metadata and reads are local but can still block on a hostile mount.
-  # Keep the whole credential operation inside the same setup deadline without
-  # retaining either the cookie or server challenge in Connection state.
-  defp cookie_response(username, uid, challenge, timeout) do
-    ref = make_ref()
-    delivery_alias = :erlang.alias([:reply])
-
-    pid =
-      spawn_link(fn ->
-        send(delivery_alias, {ref, safe_cookie_response(username, uid, challenge)})
-      end)
-
-    monitor_ref = Process.monitor(pid)
-
-    await_cookie_response(pid, ref, delivery_alias, monitor_ref, timeout)
-  end
-
-  defp safe_cookie_response(username, uid, challenge) do
-    Auth.cookie_response(username, uid, challenge)
-  rescue
-    _exception -> {:error, :auth_cookie_unavailable}
-  catch
-    _kind, _reason -> {:error, :auth_cookie_unavailable}
-  end
-
-  defp await_cookie_response(pid, ref, delivery_alias, monitor_ref, timeout) do
-    receive do
-      {^ref, result} ->
-        result
-
-      {:DOWN, ^monitor_ref, :process, ^pid, _reason} ->
-        {:error, :auth_cookie_unavailable}
-    after
-      timeout ->
-        Process.unlink(pid)
-        :erlang.unalias(delivery_alias)
-        Process.exit(pid, :kill)
-        {:error, :read_timeout}
-    end
-  after
-    # The one-shot alias rejects a late worker result atomically. Drain a
-    # response queued before unaliasing so a derived digest cannot linger in
-    # this GenServer's mailbox after the bounded credential operation ends.
-    :erlang.unalias(delivery_alias)
-    drain_cookie_response_delivery(ref)
-    Process.demonitor(monitor_ref, [:flush])
-  end
-
-  defp drain_cookie_response_delivery(ref) do
-    receive do
-      {^ref, _result} -> :ok
-    after
-      0 -> :ok
-    end
-  end
-
   defp safely_lookup_identity(identity, function, timeout) do
     apply(identity, function, [timeout])
   rescue
@@ -469,51 +265,33 @@ defmodule Rebus.Connection.Handshake do
   defp all_bytes?(<<byte, rest::binary>>, predicate),
     do: predicate.(byte) and all_bytes?(rest, predicate)
 
-  defp handshake_recv(options, sock, buffer, timeout) when is_binary(buffer) do
-    receive_auth_line(options, sock, buffer, read_deadline(options.clock, timeout), timeout)
-  end
-
-  defp handshake_recv_with_deadline(options, sock, buffer, deadline, maximum) do
-    with {:ok, timeout} <- remaining_setup_timeout(options, deadline, maximum) do
-      handshake_recv(options, sock, buffer, timeout)
-    end
-  end
-
-  defp handshake_send_with_deadline(sock, data, options, deadline, maximum) do
-    with {:ok, timeout} <- remaining_setup_timeout(options, deadline, maximum) do
-      handshake_send(options.transport, sock, data, min(timeout, options.write_timeout))
-    end
-  end
-
   # Unix-FD negotiation is an optional authentication extension. A peer's
   # ERROR leaves the ordinary D-Bus connection usable, but FD-bearing messages
   # will be rejected before any bytes are sent. We only issue it on local Unix
   # stream sockets where SCM_RIGHTS is available to OTP.
-  defp negotiate_unix_fd(
-         %Options{unix_fd_transport?: false},
-         _sock,
-         rest,
-         _deadline,
-         _maximum
-       ),
-       do: {:ok, false, rest}
+  defp negotiate_unix_fd(%{options: %Options{unix_fd_transport?: false}}, rest),
+    do: {:ok, false, rest}
 
-  defp negotiate_unix_fd(%Options{} = options, sock, rest, deadline, maximum) do
-    with :ok <-
-           handshake_send_with_deadline(
-             sock,
-             "NEGOTIATE_UNIX_FD\r\n",
-             options,
-             deadline,
-             maximum
-           ),
-         {:ok, line, rest} <-
-           handshake_recv_with_deadline(options, sock, rest, deadline, maximum) do
+  defp negotiate_unix_fd(io, rest) do
+    with :ok <- send_line(io, "NEGOTIATE_UNIX_FD\r\n"),
+         {:ok, line, rest} <- recv_line(io, rest) do
       case line do
         "AGREE_UNIX_FD" -> {:ok, true, rest}
         "ERROR" <> _reason -> {:ok, false, rest}
         _ -> {:error, :auth_failed}
       end
+    end
+  end
+
+  defp recv_line(%{options: options, sock: sock} = io, buffer) when is_binary(buffer) do
+    with {:ok, timeout} <- remaining_setup_timeout(io) do
+      receive_auth_line(options, sock, buffer, read_deadline(options.clock, timeout), timeout)
+    end
+  end
+
+  defp send_line(%{options: options, sock: sock} = io, data) do
+    with {:ok, timeout} <- remaining_setup_timeout(io) do
+      handshake_send(options.transport, sock, data, min(timeout, options.write_timeout))
     end
   end
 
@@ -604,7 +382,11 @@ defmodule Rebus.Connection.Handshake do
     end
   end
 
-  defp remaining_setup_timeout(%Options{clock: clock}, deadline, maximum) do
+  defp remaining_setup_timeout(%{
+         options: %Options{clock: clock},
+         deadline: deadline,
+         maximum: maximum
+       }) do
     case remaining_timeout(clock, deadline, maximum) do
       {:ok, timeout} -> {:ok, timeout}
       :expired -> {:error, :read_timeout}
