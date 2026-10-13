@@ -4956,8 +4956,8 @@ defmodule RebusTest do
     end
   end
 
-  # The Hello frame only reaches the test server after connect/2 has spawned
-  # `id -u` through a port and completed the EXTERNAL and NEGOTIATE_UNIX_FD
+  # The Hello frame only reaches the test server after connect/2 has looked
+  # up the local uid and completed the EXTERNAL and NEGOTIATE_UNIX_FD
   # handshake, which can exceed the 100ms assert_receive default on a loaded
   # runner. Every Hello wait goes through here so the budget stays generous.
   # An encoded signal padded to exactly `size` bytes. A string body grows the
@@ -5062,7 +5062,7 @@ defmodule RebusTest do
     {opts, Map.new(internal)}
   end
 
-  # `Rebus.Identity.Posix` spawns `id -u` through a port on every connection.
+  # `Rebus.Identity.Posix` looks up the local uid on every connection.
   # Fixtures serve connections that never drive that lookup, so they replay a
   # cached result instead; a test that names its own identity keeps it.
   defp cached_identity(opts) do

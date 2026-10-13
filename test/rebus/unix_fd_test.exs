@@ -28,7 +28,7 @@ defmodule Rebus.UnixFDTest do
     {:ok, address} = TestServer.get_listen_addr(server)
 
     # No test in this module drives the identity lookup, so the connection
-    # replays a cached `id -u` instead of spawning a port of its own.
+    # replays a cached uid instead of looking it up again.
     {:ok, connection} =
       Rebus.connect(address,
         name: @connection_name,

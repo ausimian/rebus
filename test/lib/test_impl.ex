@@ -208,8 +208,8 @@ defmodule Rebus.TestImpl.CachedIdentity do
   @moduledoc false
 
   # A keyless identity double for the connection fixtures that do not exercise
-  # the identity lookup itself. `Rebus.Identity.Posix` spawns `id` through a
-  # port on every connection, which the suite pays a few hundred times; this
+  # the identity lookup itself. `Rebus.Identity.Posix` looks up the local uid
+  # on every connection, which the suite pays a few hundred times; this
   # runs the same lookup once per VM and replays its exact result, so the
   # EXTERNAL handshake still carries the real local credentials.
   #
