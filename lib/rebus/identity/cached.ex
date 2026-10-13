@@ -4,7 +4,8 @@ defmodule Rebus.Identity.Cached do
   # The default identity source: `Rebus.Identity.Posix` looked up once per VM
   # rather than once per connection. Every connection needs the local uid for
   # EXTERNAL, and a peer offering DBUS_COOKIE_SHA1 costs a second lookup, so
-  # without a cache each connection spawns `id` one or two times.
+  # without a cache each connection would spawn `id` up to twice (once on
+  # Linux, where the uid comes from `/proc/self/status`).
   #
   # Only `{:ok, output}` is cached, and the output is stored exactly as the
   # underlying lookup produced it: the connection still trims and validates it,
@@ -14,7 +15,7 @@ defmodule Rebus.Identity.Cached do
   #
   # Storage is `:persistent_term`, which suits a value written at most twice in
   # a VM's lifetime and read by every connection without copying. Two
-  # connections racing the first lookup may both spawn `id` and both write the
+  # connections racing the first lookup may both run it and both write the
   # same result; that is benign, and cheaper than serialising every reader
   # through a process.
   #

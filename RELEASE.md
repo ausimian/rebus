@@ -33,6 +33,11 @@
   `D-Bus connection transport stopped` at `info` rather than `warning`, so a
   bus restart no longer floods logs with warnings. The same stop during
   connection setup, and every other transport error, is still a warning.
+- On Linux, Rebus reads the local uid for `EXTERNAL` authentication from
+  `/proc/self/status` rather than running `id -u`. Where it still runs `id`
+  (on other platforms, and for the `DBUS_COOKIE_SHA1` username), it uses
+  `/usr/bin/id` or `/bin/id` and searches `PATH` only when neither exists,
+  ignoring a relative match.
 
 ### Fixed
 
