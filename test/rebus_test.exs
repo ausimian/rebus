@@ -1890,6 +1890,29 @@ defmodule RebusTest do
       _ = :socket.close(sock)
     end
 
+    test "logs a peer disconnect from an established connection below warning" do
+      {:ok, sock} = :socket.open(:inet, :stream, :default)
+      handle = make_ref()
+      state = %Connection{sock: sock, rref: handle, established?: true}
+
+      abort = fn reason ->
+        Connection.handle_info({:"$socket", sock, :abort, {handle, reason}}, state)
+      end
+
+      for reason <- [:closed, :econnreset] do
+        assert capture_log([level: :info], fn -> abort.(reason) end) =~
+                 "D-Bus connection transport stopped:"
+
+        refute capture_log([level: :warning], fn -> abort.(reason) end) =~
+                 "D-Bus connection transport stopped:"
+      end
+
+      assert capture_log([level: :warning], fn -> abort.(:enetdown) end) =~
+               "D-Bus connection transport stopped:"
+
+      _ = :socket.close(sock)
+    end
+
     test "ignores arbitrary info messages" do
       {:ok, sock} = :socket.open(:inet, :stream, :default)
       state = %Connection{sock: sock}

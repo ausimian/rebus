@@ -869,9 +869,24 @@ defmodule Rebus.Connection do
 
   defp stop_for_transport_error(reason, %__MODULE__{} = state) do
     reason = normalize_socket_error(reason)
-    Logger.warning("D-Bus connection transport stopped: #{inspect(reason)}", reason: reason)
+
+    Logger.log(
+      transport_stop_level(reason, state),
+      "D-Bus connection transport stopped: #{inspect(reason)}",
+      reason: reason
+    )
+
     {:stop, {:shutdown, reason}, state |> Dispatch.discard_inbound_unix_fds() |> fail_pending()}
   end
+
+  # A peer closing or resetting an established connection is how one normally
+  # ends, for example when the bus restarts, so it is not worth a warning. The
+  # same reasons before establishment mean setup failed, and stay warnings.
+  defp transport_stop_level(reason, %__MODULE__{established?: true})
+       when reason in [:closed, :econnreset],
+       do: :info
+
+  defp transport_stop_level(_reason, %__MODULE__{}), do: :warning
 
   defp stop_for_protocol_error(reason, %__MODULE__{} = state) do
     reason = sanitize_protocol_reason(reason)

@@ -23,3 +23,7 @@
   `{:error, :match_rule_uncertain}` rather than `{:error, :disconnected}`. A
   connection is still closed when a restarted match-subscription worker finds
   it lost track of an in-flight operation.
+- An established connection that the peer closes or resets now logs
+  `D-Bus connection transport stopped` at `info` rather than `warning`, so a
+  bus restart no longer floods logs with warnings. The same stop during
+  connection setup, and every other transport error, is still a warning.
