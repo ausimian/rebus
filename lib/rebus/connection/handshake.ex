@@ -62,21 +62,68 @@ defmodule Rebus.Connection.Handshake do
              options,
              deadline,
              maximum
-           ),
-         {:ok, line, rest} <-
-           handshake_recv_with_deadline(options, sock, <<>>, deadline, maximum) do
-      case parse_auth_response(line) do
+           ) do
+      await_external(:waiting_for_data, options, sock, auth_id, <<>>, deadline, maximum)
+    end
+  end
+
+  # The client side of the specification's authentication state machine for
+  # EXTERNAL, entered in WaitingForData because AUTH carried an initial
+  # response. The states only move forward, so a peer gets at most one DATA
+  # answer and one CANCEL before it must send OK or REJECTED.
+  defp await_external(state, options, sock, auth_id, buffer, deadline, maximum) do
+    with {:ok, line, rest} <-
+           handshake_recv_with_deadline(options, sock, buffer, deadline, maximum) do
+      case external_step(state, line, auth_id) do
         {:ok, guid} ->
           {:ok, guid, rest}
 
         {:rejected, mechanisms} ->
           authenticate_rejected(options, sock, auth_id, mechanisms, rest, deadline, maximum)
 
+        {:reply, reply, next_state} ->
+          reply_external(reply, next_state, options, sock, auth_id, rest, deadline, maximum)
+
         {:error, reason} ->
           {:error, reason}
       end
     end
   end
+
+  defp reply_external(reply, next_state, options, sock, auth_id, rest, deadline, maximum) do
+    with :ok <- handshake_send_with_deadline(sock, reply, options, deadline, maximum) do
+      await_external(next_state, options, sock, auth_id, rest, deadline, maximum)
+    end
+  end
+
+  # EXTERNAL defines only an empty server challenge, to which the client
+  # answers with its authorization identity. Restate the identity already sent
+  # as the initial response and wait for the verdict. A non-empty challenge has
+  # no meaning for EXTERNAL and is refused like any other unexpected line.
+  defp external_step(:waiting_for_data, line, auth_id) when line in ["DATA", "DATA "],
+    do: {:reply, ["DATA ", auth_id, "\r\n"], :waiting_for_ok}
+
+  # ERROR in either waiting state, and any DATA once the identity has been
+  # restated, cancel the mechanism. Only REJECTED may follow a CANCEL.
+  defp external_step(state, line, _auth_id) when state in [:waiting_for_data, :waiting_for_ok] do
+    if cancels_external?(state, line),
+      do: {:reply, "CANCEL\r\n", :waiting_for_reject},
+      else: parse_auth_response(line)
+  end
+
+  defp external_step(:waiting_for_reject, line, _auth_id) do
+    case parse_auth_response(line) do
+      {:rejected, mechanisms} -> {:rejected, mechanisms}
+      {:ok, _guid} -> {:error, :auth_failed}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp cancels_external?(_state, "ERROR"), do: true
+  defp cancels_external?(_state, "ERROR " <> _explanation), do: true
+  defp cancels_external?(:waiting_for_ok, "DATA"), do: true
+  defp cancels_external?(:waiting_for_ok, "DATA " <> _data), do: true
+  defp cancels_external?(_state, _line), do: false
 
   defp authenticate_rejected(options, sock, auth_id, mechanisms, rest, deadline, maximum) do
     cond do
