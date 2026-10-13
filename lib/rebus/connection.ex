@@ -387,11 +387,8 @@ defmodule Rebus.Connection do
   defp validate_registered_name(_name), do: {:stop, :invalid_name}
 
   defp open_socket(settings, family, addr) do
-    # DynamicSupervisor stops children with an exit signal. Trap it so the
-    # GenServer loop can return :stop and therefore invoke terminate/2,
-    # which closes raw SCM_RIGHTS descriptors retained in partial frames or
-    # reply claims. The EXIT clauses below preserve normal link semantics.
-    Process.flag(:trap_exit, true)
+    # Exits stay untrapped until setup has authenticated; see the `{:setup,
+    # addr}` continuation.
     impl = settings.impl
 
     case impl.transport.open(family, :stream, :default) do
@@ -603,8 +600,26 @@ defmodule Rebus.Connection do
 
   @impl true
 
-  def handle_continue({:setup, addr}, %__MODULE__{} = state),
-    do: state |> Setup.setup(addr) |> dispatch_result()
+  # DynamicSupervisor stops children with an exit signal, which a trapping
+  # process reads only once the callback it is in returns. Setup blocks on
+  # the identity lookup, the socket connect and the handshake for up to its
+  # whole budget, so it runs with exits untrapped: `Rebus.close/1` stops a
+  # connection stalled there at once instead of waiting out setup or the
+  # child's shutdown timeout. Nothing it holds needs terminate/2. The socket
+  # is closed along with the process that owns it, and the handshake reads
+  # with plain recv, which never hands this process a descriptor.
+  #
+  # The Hello reply and every read after it can carry SCM_RIGHTS
+  # descriptors, which only terminate/2 closes, so exits are trapped from
+  # here on. The GenServer loop then returns :stop on a supervisor shutdown
+  # and runs terminate/2, which closes raw descriptors retained in partial
+  # frames or reply claims. The EXIT clauses above preserve normal link
+  # semantics.
+  def handle_continue({:setup, addr}, %__MODULE__{} = state) do
+    result = Setup.setup(state, addr)
+    Process.flag(:trap_exit, true)
+    dispatch_result(result)
+  end
 
   def handle_continue(:hello, %__MODULE__{} = state),
     do: state |> Setup.hello() |> dispatch_result()

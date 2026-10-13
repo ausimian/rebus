@@ -1657,6 +1657,160 @@ defmodule RebusTest do
     end
   end
 
+  # Each stalled connection here has a setup budget twice the connection's
+  # 5 s shutdown timeout, so a close that waited for setup to give up, or for
+  # the supervisor to kill the connection, would take at least 5 s.
+  describe "Closing a connection during setup" do
+    @stalled_setup_timeout 10_000
+    @prompt_close 1_000
+
+    test "stops a connection stalled in authentication at once" do
+      {:ok, svr} =
+        start_supervised({TestServer, tap: self(), silent_auth: true}, id: :issue_205_silent)
+
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      name = :rebus_issue_205_stalled_auth
+      report_opened_socket(name)
+
+      connect =
+        Task.async(fn ->
+          Rebus.connect(addr,
+            name: name,
+            timeout: @stalled_setup_timeout,
+            __impl__: socket_impl()
+          )
+        end)
+
+      assert_receive {^svr, :auth_received}, 1_000
+      assert_receive {:socket_opened, sock}, 1_000
+
+      assert_prompt_close(Process.whereis(name), connect)
+      assert_socket_closed(sock)
+
+      # The peer sees the connection go rather than a socket left open.
+      %{cli_sock: peer} = :sys.get_state(svr)
+      assert {:error, reason} = :socket.recv(peer, 0, [], 1_000)
+      assert reason in [:closed, :econnreset]
+    end
+
+    test "stops a connection stalled in its socket connect at once" do
+      name = :rebus_issue_205_stalled_connect
+      parent = self()
+      report_opened_socket(name)
+
+      :ok =
+        TestImpl.put(name,
+          transport_connect: fn _sock, _addr, _timeout ->
+            send(parent, :connecting)
+            Process.sleep(:infinity)
+          end
+        )
+
+      addr = %{family: :inet, addr: {127, 0, 0, 1}, port: 9}
+
+      connect =
+        Task.async(fn ->
+          Rebus.connect(addr,
+            name: name,
+            timeout: @stalled_setup_timeout,
+            __impl__: socket_impl()
+          )
+        end)
+
+      assert_receive :connecting, 1_000
+      assert_receive {:socket_opened, sock}, 1_000
+
+      assert_prompt_close(Process.whereis(name), connect)
+      assert_socket_closed(sock)
+    end
+
+    test "does not walk on to the next bus address" do
+      silent_path = socket_path()
+      healthy_path = socket_path()
+
+      {:ok, silent_svr} =
+        start_supervised(
+          {TestServer, tap: self(), family: :local, path: silent_path, silent_auth: true},
+          id: :issue_205_silent_entry
+        )
+
+      {:ok, healthy_svr} =
+        start_supervised(
+          {TestServer, tap: self(), family: :local, path: healthy_path, notify_auth: true},
+          id: :issue_205_healthy_entry
+        )
+
+      put_session_bus_address("unix:path=#{silent_path};unix:path=#{healthy_path}")
+      name = :rebus_issue_205_address_list
+
+      on_exit(fn ->
+        if pid = Process.whereis(name), do: Rebus.close(pid)
+      end)
+
+      log =
+        capture_log(fn ->
+          connect =
+            Task.async(fn ->
+              Rebus.connect(
+                :session,
+                cached_identity(name: name, timeout: @stalled_setup_timeout)
+              )
+            end)
+
+          assert_receive {^silent_svr, :auth_received}, 1_000
+
+          assert_prompt_close(Process.whereis(name), connect)
+        end)
+
+      assert log =~ "candidate=1 ip=0 transport=unix"
+      assert log =~ "reason=shutdown"
+      refute log =~ "candidate=2"
+      refute_receive {^healthy_svr, :auth_received}, 200
+      assert Process.whereis(name) == nil
+    end
+
+    defp socket_impl, do: %{transport: TestImpl, identity: TestImpl.CachedIdentity}
+
+    # The connection registers its name before it opens its socket, so an
+    # override keyed on that name sees the socket the connection will own.
+    defp report_opened_socket(name) do
+      parent = self()
+
+      :ok =
+        TestImpl.put(name,
+          open: fn domain, type, protocol ->
+            {:ok, sock} = Socket.open(domain, type, protocol)
+            send(parent, {:socket_opened, sock})
+            {:ok, sock}
+          end
+        )
+    end
+
+    # `connect/2` monitors the connection once `DynamicSupervisor.start_child/2`
+    # returns. A connection stopped before that has no way to say why, and
+    # `connect/2` can only report `:noproc`, so the close waits for the
+    # monitor.
+    defp assert_prompt_close(conn, %Task{pid: caller} = connect) when is_pid(conn) do
+      assert wait_until(fn ->
+               {:monitored_by, monitors} = Process.info(conn, :monitored_by)
+               caller in monitors
+             end)
+
+      ref = Process.monitor(conn)
+      started_at = System.monotonic_time(:millisecond)
+
+      assert :ok = Rebus.close(conn)
+      assert System.monotonic_time(:millisecond) - started_at < @prompt_close
+      assert_receive {:DOWN, ^ref, :process, ^conn, :shutdown}, @prompt_close
+      assert {:error, :shutdown} = Task.await(connect, @prompt_close)
+    end
+
+    # The socket is closed along with the process that owned it.
+    defp assert_socket_closed(sock) do
+      assert wait_until(fn -> :socket.getopt(sock, :socket, :type) == {:error, :closed} end)
+    end
+  end
+
   describe "Connection callbacks" do
     test "falls back safely when configuring the OTP receive buffer" do
       parent = self()
@@ -3546,6 +3700,27 @@ defmodule RebusTest do
 
       assert_receive {:owner_down, %{path: "/tmp/one"}}
       refute_receive {:owner_down, %{path: "/tmp/two"}}
+
+      # A connection closed during setup reports `:shutdown`, or `:noproc` when
+      # the close beat the connector's monitor.
+      for reason <- [:shutdown, :noproc] do
+        closed_connector = fn address, _args ->
+          send(parent, {reason, address})
+          {:error, reason}
+        end
+
+        assert {:error, ^reason} =
+                 connect_candidates(
+                   [{:local, "/tmp/one", nil}, {:local, "/tmp/two", nil}],
+                   [timeout: 50],
+                   connector: TestImpl.connector(connect_candidate: closed_connector),
+                   identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end),
+                   clock: TestImpl.clock(monotonic_time: monotonic_time)
+                 )
+
+        assert_receive {^reason, %{path: "/tmp/one"}}
+        refute_receive {^reason, %{path: "/tmp/two"}}
+      end
     end
   end
 

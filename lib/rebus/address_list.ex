@@ -397,5 +397,13 @@ defmodule Rebus.AddressList do
   defp retryable_bus_address_error?({:read_timeout, _reason}), do: false
   defp retryable_bus_address_error?({:name_taken, _pid}), do: false
   defp retryable_bus_address_error?({:name_registered, _pid}), do: false
+  # The entry's connection was shut down, by `Rebus.close/1` or by Rebus
+  # stopping, while it was still being set up. Whoever stopped it meant the
+  # connect to end, not to move on to an entry they never saw. `:noproc` is
+  # usually the same stop landing before the connector could monitor the
+  # connection. Setup reports each failure it detects to the connector before
+  # stopping, so `:noproc` never stands in for a retryable one.
+  defp retryable_bus_address_error?(:shutdown), do: false
+  defp retryable_bus_address_error?(:noproc), do: false
   defp retryable_bus_address_error?(_reason), do: true
 end
