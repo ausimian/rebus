@@ -5,11 +5,14 @@ first, then `DBUS_COOKIE_SHA1` when the peer offers it. It considers
 `ANONYMOUS` only when `allow_anonymous: true` is set.
 
 `EXTERNAL` uses the local Unix identity and is the normal choice for system
-and session buses. `DBUS_COOKIE_SHA1` proves access to a private cookie file;
-it does not encrypt the connection or protect message integrity, so keep TCP
-endpoints on loopback or within a protected transport. Once cookie
-authentication starts, a failure is final and does not fall back to
-`ANONYMOUS`.
+and session buses. If the peer answers it with an empty `DATA` challenge,
+Rebus repeats its identity once. It answers `ERROR`, or a second challenge,
+with `CANCEL`, and the peer must then reject the mechanism.
+
+`DBUS_COOKIE_SHA1` proves access to a private cookie file; it does not encrypt
+the connection or protect message integrity, so keep TCP endpoints on loopback
+or within a protected transport. Once cookie authentication starts, a failure
+is final and does not fall back to `ANONYMOUS`.
 
 ## Cookie-file troubleshooting
 

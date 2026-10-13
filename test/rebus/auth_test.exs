@@ -1166,6 +1166,48 @@ defmodule Rebus.AuthTest do
     end
   end
 
+  describe "EXTERNAL" do
+    test "answers an empty DATA challenge before the peer accepts" do
+      {server, addr} =
+        start_auth_server(fn peer ->
+          assert "\0AUTH EXTERNAL " <> external_id = receive_line(peer)
+          :ok = :socket.send(peer, "DATA\r\n")
+          assert "DATA " <> ^external_id = receive_line(peer)
+          :ok = :socket.send(peer, "OK #{@guid}\r\n")
+          assert "BEGIN " = receive_line(peer)
+          reply_to_hello(peer)
+          wait_for_finish()
+        end)
+
+      assert {:ok, connection} = Rebus.connect(addr)
+      assert :ok = Rebus.close(connection)
+      send(server.pid, :finish)
+      assert :ok = Task.await(server, 2_000)
+    end
+
+    test "cancels on ERROR without reporting the peer's explanation" do
+      sentinel = "peer-auth-payload-sentinel"
+
+      {server, addr} =
+        start_auth_server(fn peer ->
+          assert "\0AUTH EXTERNAL " <> _external_id = receive_line(peer)
+          :ok = :socket.send(peer, "ERROR #{sentinel}\r\n")
+          assert "CANCEL" = receive_line(peer)
+          :ok = :socket.send(peer, "REJECTED EXTERNAL\r\n")
+          assert {:error, :closed} = :socket.recv(peer, 0, [], 1_000)
+          :ok
+        end)
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:auth_rejected, ["EXTERNAL"]}} = Rebus.connect(addr)
+        end)
+
+      refute log =~ sentinel
+      assert :ok = Task.await(server, 2_000)
+    end
+  end
+
   test "malformed peer authentication data never appears in errors or logs" do
     sentinel = "peer-auth-payload-sentinel"
 

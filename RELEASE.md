@@ -27,3 +27,11 @@
   `D-Bus connection transport stopped` at `info` rather than `warning`, so a
   bus restart no longer floods logs with warnings. The same stop during
   connection setup, and every other transport error, is still a warning.
+
+### Fixed
+
+- `EXTERNAL` authentication now completes when the peer answers it with an
+  empty `DATA` challenge, which the D-Bus specification permits. Rebus repeats
+  its identity once and then expects `OK` or `REJECTED`. A peer `ERROR` now
+  cancels `EXTERNAL` and moves on to the next advertised mechanism, as it would
+  after `REJECTED`, rather than failing the connection with `:auth_failed`.

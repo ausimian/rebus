@@ -67,6 +67,113 @@ defmodule Rebus.Connection.HandshakeTest do
     end
   end
 
+  describe "EXTERNAL DATA and ERROR" do
+    test "answers an empty DATA challenge with the identity and completes" do
+      for challenge <- ["DATA\r\n", "DATA \r\n"] do
+        sock = ScriptedTransport.start([challenge, "OK #{@guid}\r\n"])
+
+        assert {:ok, %{guid: @guid, rest: <<>>}} = run(sock)
+
+        assert ScriptedTransport.sent(sock) ==
+                 <<0>> <>
+                   "AUTH EXTERNAL #{@auth_id}\r\n" <>
+                   "DATA #{@auth_id}\r\n" <> "BEGIN \r\n"
+      end
+    end
+
+    test "follows a rejection after the identity is restated" do
+      sock = ScriptedTransport.start(["DATA\r\n", "REJECTED KERBEROS_V4\r\n"])
+
+      assert {:error, {:auth_rejected, ["KERBEROS_V4"]}} = run(sock)
+    end
+
+    test "refuses a non-empty DATA challenge without answering it" do
+      sock = ScriptedTransport.start(["DATA 00\r\n", "OK #{@guid}\r\n"])
+
+      assert {:error, :auth_failed} = run(sock)
+      assert ScriptedTransport.sent(sock) == <<0>> <> "AUTH EXTERNAL #{@auth_id}\r\n"
+    end
+
+    test "cancels a second DATA challenge and requires a rejection" do
+      sock =
+        ScriptedTransport.start(["DATA\r\n", "DATA\r\n", "REJECTED EXTERNAL ANONYMOUS\r\n"])
+
+      assert {:error, {:auth_rejected, ["EXTERNAL", "ANONYMOUS"]}} = run(sock)
+
+      assert ScriptedTransport.sent(sock) ==
+               <<0>> <>
+                 "AUTH EXTERNAL #{@auth_id}\r\n" <> "DATA #{@auth_id}\r\n" <> "CANCEL\r\n"
+    end
+
+    test "fails closed when DATA continues past the cancellation" do
+      sock =
+        ScriptedTransport.start([
+          "DATA\r\n",
+          "DATA\r\n",
+          "DATA\r\n",
+          "DATA\r\n",
+          "OK #{@guid}\r\n"
+        ])
+
+      assert {:error, :auth_failed} = run(sock)
+      assert ScriptedTransport.remaining(sock) == ["DATA\r\n", "OK #{@guid}\r\n"]
+
+      assert ScriptedTransport.sent(sock) ==
+               <<0>> <>
+                 "AUTH EXTERNAL #{@auth_id}\r\n" <> "DATA #{@auth_id}\r\n" <> "CANCEL\r\n"
+    end
+
+    test "cancels on ERROR and moves to the next advertised mechanism" do
+      sock =
+        ScriptedTransport.start([
+          "ERROR peer-auth-payload-sentinel\r\n",
+          "REJECTED ANONYMOUS\r\n",
+          "OK #{@guid}\r\n"
+        ])
+
+      assert {:ok, %{guid: @guid}} = run(sock, allow_anonymous?: true)
+
+      assert ScriptedTransport.sent(sock) ==
+               <<0>> <>
+                 "AUTH EXTERNAL #{@auth_id}\r\n" <>
+                 "CANCEL\r\n" <> "AUTH ANONYMOUS\r\n" <> "BEGIN \r\n"
+    end
+
+    test "keeps ANONYMOUS behind the opt-in after a cancellation" do
+      sock =
+        ScriptedTransport.start(["ERROR\r\n", "REJECTED ANONYMOUS\r\n", "OK #{@guid}\r\n"])
+
+      assert {:error, {:auth_rejected, ["ANONYMOUS"]}} = run(sock)
+      refute ScriptedTransport.sent(sock) =~ "AUTH ANONYMOUS"
+    end
+
+    test "cancels on ERROR after the identity is restated" do
+      sock = ScriptedTransport.start(["DATA\r\n", "ERROR\r\n", "REJECTED EXTERNAL\r\n"])
+
+      assert {:error, {:auth_rejected, ["EXTERNAL"]}} = run(sock)
+
+      assert ScriptedTransport.sent(sock) ==
+               <<0>> <>
+                 "AUTH EXTERNAL #{@auth_id}\r\n" <> "DATA #{@auth_id}\r\n" <> "CANCEL\r\n"
+    end
+
+    test "accepts nothing but a rejection after a cancellation" do
+      for reply <- ["OK #{@guid}\r\n", "ERROR\r\n", "DATA\r\n"] do
+        sock = ScriptedTransport.start(["ERROR\r\n", reply])
+
+        assert {:error, :auth_failed} = run(sock)
+        refute ScriptedTransport.sent(sock) =~ "BEGIN"
+      end
+    end
+
+    test "does not treat a look-alike command as ERROR" do
+      sock = ScriptedTransport.start(["ERRORS\r\n"])
+
+      assert {:error, :auth_failed} = run(sock)
+      assert ScriptedTransport.sent(sock) == <<0>> <> "AUTH EXTERNAL #{@auth_id}\r\n"
+    end
+  end
+
   describe "NEGOTIATE_UNIX_FD" do
     test "reports agreement" do
       sock = ScriptedTransport.start(["OK #{@guid}\r\n", "AGREE_UNIX_FD\r\n"])
