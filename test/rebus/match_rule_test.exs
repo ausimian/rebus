@@ -3645,6 +3645,164 @@ defmodule Rebus.MatchRuleTest do
       assert persisted_rows(conn, :rule) == []
       refute Store.persisted?(conn)
     end
+
+    test "only the store writes the state table" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      table = state_table()
+
+      assert :ets.info(table, :protection) == :protected
+      assert :ets.info(table, :owner) == Process.whereis(Store)
+
+      # A process other than the owner, this one included, can read the table
+      # but not write it, whatever the row.
+      assert_raise ArgumentError, fn ->
+        :ets.insert(table, {{:meta, conn}, %{uncertain?: false}})
+      end
+
+      foreign =
+        Task.async(fn ->
+          try do
+            :ets.insert(table, {{:rule, conn, key}, rule_state(rule)})
+          rescue
+            error in ArgumentError -> error
+          end
+        end)
+
+      assert %ArgumentError{} = Task.await(foreign)
+      refute Store.persisted?(conn)
+      assert persisted_rows(conn, :rule) == []
+
+      # The same write through the store lands.
+      :ok =
+        Store.persist_state(
+          conn,
+          false,
+          persistence_changes(key),
+          %{key => rule_state(rule)},
+          %{}
+        )
+
+      assert {:ok, %{uncertain?: false, rules: %{^key => _row}}} = Store.load_state(conn)
+      assert :ets.member(table, {:meta, conn})
+
+      assert_raise ArgumentError, fn -> :ets.delete(table, {:meta, conn}) end
+      assert Store.persisted?(conn)
+
+      :ok = Store.delete_state(conn)
+    end
+
+    test "applies each write call as a whole" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      stale_key = "stale-rule"
+      ref = make_ref()
+      subscription = %{owner: self(), key: key}
+
+      changes = %{
+        empty_persistence()
+        | dirty_rules: MapSet.new([key, stale_key]),
+          dirty_subscriptions: MapSet.new([ref])
+      }
+
+      # A dirty key with no record writes no row.
+      :ok =
+        Store.persist_state(conn, false, changes, %{key => rule_state(rule)}, %{
+          ref => subscription
+        })
+
+      assert {:ok, %{uncertain?: false, rules: rules, subscriptions: %{^ref => ^subscription}}} =
+               Store.load_state(conn)
+
+      assert Map.keys(rules) == [key]
+
+      # Removals, and a dirty key whose record has gone, both delete.
+      changes = %{
+        empty_persistence()
+        | removed_rules: MapSet.new([key]),
+          dirty_subscriptions: MapSet.new([ref])
+      }
+
+      :ok = Store.persist_state(conn, true, changes, %{}, %{})
+
+      assert {:ok, %{uncertain?: true, rules: %{}, subscriptions: %{}}} = Store.load_state(conn)
+
+      # `discard_rows/1` keeps the meta row; `delete_state/1` takes it too.
+      :ok =
+        Store.persist_state(
+          conn,
+          false,
+          persistence_changes(key),
+          %{key => rule_state(rule)},
+          %{}
+        )
+
+      :ok = Store.discard_rows(conn)
+      assert {:ok, %{uncertain?: false, rules: %{}, subscriptions: %{}}} = Store.load_state(conn)
+
+      :ok = Store.delete_state(conn)
+      assert Store.load_state(conn) == :error
+      refute Store.persisted?(conn)
+    end
+
+    test "reaps a whole write for a connection that is already dead" do
+      conn = spawn(fn -> :ok end)
+      monitor = Process.monitor(conn)
+      assert_receive {:DOWN, ^monitor, :process, ^conn, _reason}, 1_000
+
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+
+      # The write creates the meta row, so the store monitors the connection,
+      # and its `:DOWN` reaps every row the same call wrote.
+      :ok =
+        Store.persist_state(
+          conn,
+          false,
+          persistence_changes(key),
+          %{key => rule_state(rule)},
+          %{}
+        )
+
+      assert wait_until(fn -> reaped?(conn) end)
+    end
+
+    test "orders a dead caller's queued write before its successor's read" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      row = rule_state(rule)
+      store = Process.whereis(Store)
+
+      :sys.suspend(store)
+      on_exit(fn -> if Process.alive?(store), do: :sys.resume(store) end)
+
+      # A worker killed while its write is queued: the write is still applied,
+      # after the caller has gone.
+      writer =
+        spawn(fn ->
+          Store.persist_state(conn, false, persistence_changes(key), %{key => row}, %{})
+        end)
+
+      assert wait_until(fn -> queued?(store, writer, :persist_state) end)
+      writer_monitor = Process.monitor(writer)
+      Process.exit(writer, :kill)
+      assert_receive {:DOWN, ^writer_monitor, :process, ^writer, :killed}, 1_000
+
+      # Its replacement reads through the same mailbox, so it sees that write
+      # rather than the table as it stood before it.
+      reader = Task.async(fn -> Store.load_state(conn) end)
+
+      assert wait_until(fn -> queued?(store, reader.pid, :load_state) end)
+
+      :ok = :sys.resume(store)
+
+      assert {:ok, %{uncertain?: false, rules: %{^key => ^row}}} = Task.await(reader)
+
+      :ok = Store.delete_state(conn)
+    end
   end
 
   defp test_rule(member \\ "Changed") do
@@ -3877,6 +4035,16 @@ defmodule Rebus.MatchRuleTest do
   end
 
   defp state_table, do: Store.table()
+
+  # Whether `caller` has a call of this kind waiting in the store's mailbox.
+  defp queued?(store, caller, kind) do
+    {:messages, messages} = Process.info(store, :messages)
+
+    Enum.any?(messages, fn
+      {:"$gen_call", {^caller, _tag}, request} -> elem(request, 0) == kind
+      _message -> false
+    end)
+  end
 
   defp persisted_rows(connection, kind) do
     :ets.match_object(state_table(), {{kind, connection, :_}, :_})
