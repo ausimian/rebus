@@ -1022,6 +1022,15 @@ defmodule Rebus.UnixFDTest do
     assert :sys.get_state(connection).unix_fd_negotiated?
     {:ok, handler_ref} = Rebus.add_signal_handler(connection)
 
+    # The server may still be writing setup traffic such as NameAcquired. A
+    # completed round trip proves the connection has read everything sent
+    # before it, so the only bytes left to read are the ones sent below.
+    sync = Message.new!(:method_call, path: "/test", interface: "test.interface", member: "Sync")
+    task = Task.async(fn -> Rebus.call(connection, sync, 1_000) end)
+    assert_receive {^server, %Message{serial: serial, header_fields: %{member: "Sync"}}}, 1_000
+    :ok = TestServer.push(server, Message.new!(:method_return, reply_serial: serial))
+    assert {:ok, %Message{type: :method_return}} = Task.await(task, 1_000)
+
     :ok =
       TestImpl.install(connection,
         recvmsg: fn sock, length, control_size, flags, timeout ->
