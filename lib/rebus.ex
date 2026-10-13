@@ -37,16 +37,18 @@ defmodule Rebus do
   The `DBUS_SYSTEM_BUS_ADDRESS` environment variable, when set and non-empty,
   overrides this config key.
 
-  `:match_recovery_max_rules` caps how many distinct match rules a single
-  connection may hold whose bus-side state is uncertain. The default is 64, and
-  a connection that reaches the cap is closed. See
+  `:match_recovery_max_rules` bounds the match rules on a single connection
+  whose bus-side state is unresolved. The default is 64. At most that many are
+  cleaned up at once, and a rule that needs cleanup beyond it is left
+  uncertain. While that many rules are unresolved, `add_match/3` refuses a rule
+  the connection does not already hold. See
   [Signal subscriptions and match rules](match_rules.html).
 
       config :rebus, :match_recovery_max_rules, 64
 
   `:match_recovery_max_attempts` caps how many times the cleanup of one such
-  rule is retried before the connection is closed. The default is 30, about 26
-  seconds of backoff. See
+  rule is retried before the rule is left uncertain. The default is 30, about
+  26 seconds of backoff. See
   [Signal subscriptions and match rules](match_rules.html).
 
       config :rebus, :match_recovery_max_attempts, 30
@@ -116,12 +118,24 @@ defmodule Rebus do
           | :fd_claim_expired
           | :invalid_bus_reply
           | :match_rule_cleanup_pending
+          | :match_rule_uncertain
+          | :match_recovery_capacity_exhausted
           | :match_subscription_state_lost
           | :sender_routing_ambiguous
           | :not_started
           | :not_a_bus
           | {:reply_dropped, :method_return | {:error, binary()}}
           | {:bus_error, binary()}
+
+  @typedoc """
+  The message Rebus sends when it leaves a match rule uncertain.
+
+  `{:rebus_match_uncertain, conn, ref, rule}` goes to the process holding each
+  reference `ref` on `rule`, and `{:rebus_match_uncertain, conn, nil, rule}` to
+  the connection's `:owner`, if it has one. See `add_match/3`.
+  """
+  @type match_uncertain_notice ::
+          {:rebus_match_uncertain, pid(), reference() | nil, Rebus.MatchRule.t()}
 
   @default_system_bus_address "unix:path=/run/dbus/system_bus_socket"
 
@@ -455,15 +469,25 @@ defmodule Rebus do
   overlaps an existing one with a different sender. `{:error, :not_a_bus}`
   means the connection was opened with `bus: false`, and nothing was sent.
 
-  Rebus closes the connection when too many ambiguous cleanups accumulate, or when
-  one remains unresolved after its retry budget. It also closes the connection
-  after `{:error, :match_subscription_state_lost}`, because closing makes the bus
-  discard the connection's rules.
+  When Rebus cannot prove what the bus holds for a rule, it leaves the rule
+  uncertain and keeps the connection up. That happens when the rule's cleanup
+  exhausts its retry budget, when too many cleanups are already running, or
+  when an operation's task is lost. Rebus then sends a
+  `t:match_uncertain_notice/0` to each holder of a reference on the rule and to
+  the connection's `:owner`. It is a four-element tuple tagged
+  `:rebus_match_uncertain`, so it never matches a `{ref, %Rebus.Message{}}`
+  pattern. Close the connection if you need the bus to forget the rule. The
+  [match rules guide](match_rules.html) explains what else an uncertain rule
+  changes.
+
+  Rebus still closes the connection after `{:error, :match_subscription_state_lost}`,
+  because closing makes the bus discard the connection's rules.
 
   ## Return values
 
   Success is `{:ok, reference}`. Every failure is `{:error, reason}`: `:timeout`, `:not_a_bus`,
-  `:sender_routing_ambiguous`, `:match_rule_cleanup_pending`, `:match_subscription_state_lost`,
+  `:sender_routing_ambiguous`, `:match_rule_cleanup_pending`, `:match_rule_uncertain`,
+  `:match_recovery_capacity_exhausted`, `:match_subscription_state_lost`,
   `{:bus_error, error_name}`, `:invalid_bus_reply`, `:not_connected`, `:disconnected`,
   `:encode_failed`, `:serial_exhausted`, `:fd_claim_expired`, `:not_started`,
   `{:reply_dropped, outcome}` and `:remote_connection_unsupported`. The
@@ -489,14 +513,15 @@ defmodule Rebus do
 
   Removing a reference is idempotent and scoped to its own connection. A removed
   reference receives no further signals, and the last reference for a rule also removes
-  the rule from the bus. A removal that times out or fails keeps the reference for a
+  the rule from the bus, unless Rebus has left the rule uncertain. A removal that times out or fails keeps the reference for a
   retry, while Rebus clears the rule in the background. Rebus removes the reference and
   the bus rule when the owning process exits. Closing the connection discards both.
 
   ## Return values
 
   Success is `:ok`. Failures are the `{:error, reason}` shapes listed for
-  `add_match/3`, apart from `:not_a_bus` and `:sender_routing_ambiguous`.
+  `add_match/3`, apart from `:not_a_bus`, `:sender_routing_ambiguous` and
+  `:match_recovery_capacity_exhausted`.
   """
   @spec remove_match(pid(), reference(), non_neg_integer()) ::
           :ok | {:error, match_error_reason()}

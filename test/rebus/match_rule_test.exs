@@ -2183,7 +2183,7 @@ defmodule Rebus.MatchRuleTest do
       end)
     end
 
-    test "still resets the connection when a removal task dies mid-flight" do
+    test "leaves the rule uncertain when a removal task dies mid-flight" do
       conn = start_placeholder_conn()
       rule = test_rule()
       key = MatchRule.to_string(rule)
@@ -2196,20 +2196,29 @@ defmodule Rebus.MatchRuleTest do
       {state, request_id, tag} = live_request(state, key, :remove, ref: ref)
       state = attach_request(state, token, request_id)
 
-      capture_log(fn ->
-        assert {:noreply, reset} =
-                 Worker.handle_info(
-                   {:operation_result, token, {:operation_failed, :disconnected}},
-                   state
-                 )
+      log =
+        capture_log(fn ->
+          assert {:noreply, uncertain} =
+                   Worker.handle_info(
+                     {:operation_result, token, {:operation_failed, :disconnected}},
+                     state
+                   )
 
-        # A task that died in flight may have sent the RemoveMatch, so this
-        # path is unchanged: the outcome is unknown and the connection goes.
-        assert_receive {^tag, {:error, :disconnected}}
-        assert reset.resetting?
-        assert reset.state_lost?
-        assert is_reference(reset.reset_token)
-      end)
+          # A task that died in flight may have sent the RemoveMatch, so the
+          # outcome is unknown. The rule is left where it is and its holder is
+          # told, but the connection stays up.
+          assert_receive {^tag, {:error, :match_rule_uncertain}}
+          assert_receive {:rebus_match_uncertain, ^conn, ^ref, ^rule}
+          assert %{status: :uncertain, operation: nil} = uncertain.rules[key]
+          assert MapSet.member?(uncertain.uncertain_rules, key)
+          refute uncertain.resetting?
+          refute uncertain.state_lost?
+          assert is_nil(uncertain.reset_token)
+          assert Process.alive?(conn)
+        end)
+
+      assert log =~ "D-Bus match rule left uncertain transition=operation_lost"
+      refute log =~ "closing connection"
     end
 
     test "covers recovery result classifications and stale operation cleanup" do
@@ -2283,41 +2292,60 @@ defmodule Rebus.MatchRuleTest do
                Worker.handle_info({:operation_result, make_ref(), :late}, orphaned)
     end
 
-    test "resets the connection when a rule's recovery budget is spent" do
+    test "leaves a rule uncertain when its recovery budget is spent" do
       put_app_env(:match_recovery_max_attempts, 2)
 
       conn = start_placeholder_conn()
       rule = test_rule()
       key = MatchRule.to_string(rule)
+      ref = make_ref()
       state = recovering_state(conn, key, rule)
+      state = put_subscription_state(state, key, ref)
+      {state, request_id, tag} = live_request(state, key, :add)
+      state = put_in(state.rules[key].queue, [request_id])
 
       first = fail_recovery(state, key)
       assert %{status: :recovering, recovery_attempt: 1} = first.rules[key]
       assert is_reference(first.rules[key].retry_timer)
-      refute first.resetting?
 
       second = fail_recovery(first, key)
       assert %{status: :recovering, recovery_attempt: 2} = second.rules[key]
       assert is_reference(second.rules[key].retry_timer)
-      refute second.resetting?
+      refute_received {:rebus_match_uncertain, _conn, _ref, _rule}
 
       log =
         capture_log(fn ->
           exhausted = fail_recovery(second, key)
 
           # The budget is spent, so nothing is armed for another attempt. The
-          # rule is not forgotten either: the reset owns it from here, exactly
-          # as it owns the rules held back by the capacity branch.
-          assert %{status: :recovering, operation: nil, retry_timer: nil} = exhausted.rules[key]
-          assert exhausted.resetting?
-          assert exhausted.state_lost?
-          assert is_reference(exhausted.reset_token)
+          # rule is not forgotten either: it is left uncertain, out of the
+          # retried set but still counted against admission, and the
+          # connection is not touched.
+          assert %{status: :uncertain, operation: nil, retry_timer: nil, queue: []} =
+                   exhausted.rules[key]
+
+          refute MapSet.member?(exhausted.recovering_rules, key)
+          assert MapSet.member?(exhausted.uncertain_rules, key)
+          refute exhausted.resetting?
+          refute exhausted.state_lost?
+          assert is_nil(exhausted.reset_token)
+
+          # The reference's holder is told, and the add queued behind the
+          # cleanup is answered now rather than left to time out.
+          assert_received {:rebus_match_uncertain, ^conn, ^ref, ^rule}
+          assert_received {^tag, {:error, :match_rule_uncertain}}
+          assert exhausted.requests == %{}
+
+          # Nothing more is retried for it, so a late retry timer is a no-op.
+          assert {:noreply, ^exhausted} =
+                   Worker.handle_info({:retry_recovery, key}, exhausted)
         end)
 
-      assert log =~ "D-Bus match reset transition=recovery_exhausted"
+      assert log =~ "D-Bus match rule left uncertain transition=recovery_exhausted"
+      refute log =~ "closing connection"
     end
 
-    test "retries a recovery to the default budget before resetting" do
+    test "retries a recovery to the default budget before leaving the rule uncertain" do
       previous = Application.get_env(:rebus, :match_recovery_max_attempts)
       Application.delete_env(:rebus, :match_recovery_max_attempts)
 
@@ -2337,15 +2365,16 @@ defmodule Rebus.MatchRuleTest do
 
             assert %{status: :recovering, recovery_attempt: ^attempt} = acc.rules[key]
             assert is_reference(acc.rules[key].retry_timer)
-            refute acc.resetting?
 
             acc
           end)
 
         exhausted = fail_recovery(spent, key)
 
-        assert %{recovery_attempt: 30, retry_timer: nil} = exhausted.rules[key]
-        assert exhausted.resetting?
+        assert %{status: :uncertain, recovery_attempt: 30, retry_timer: nil} =
+                 exhausted.rules[key]
+
+        refute exhausted.resetting?
       end)
     end
 
@@ -2402,17 +2431,18 @@ defmodule Rebus.MatchRuleTest do
         capture_log(fn ->
           # One attempt is left of the default budget of 30, not a fresh 30.
           last = fail_recovery(restored, key)
-          assert %{recovery_attempt: 30} = last.rules[key]
+          assert %{status: :recovering, recovery_attempt: 30} = last.rules[key]
           assert is_reference(last.rules[key].retry_timer)
-          refute last.resetting?
 
           exhausted = fail_recovery(last, key)
 
-          assert %{recovery_attempt: 30, retry_timer: nil} = exhausted.rules[key]
-          assert exhausted.resetting?
+          assert %{status: :uncertain, recovery_attempt: 30, retry_timer: nil} =
+                   exhausted.rules[key]
+
+          refute exhausted.resetting?
         end)
 
-      assert log =~ "D-Bus match reset transition=recovery_exhausted"
+      assert log =~ "D-Bus match rule left uncertain transition=recovery_exhausted"
 
       :ok = Store.delete_state(conn)
     end
@@ -2431,16 +2461,17 @@ defmodule Rebus.MatchRuleTest do
 
           assert %{status: :recovering, recovery_attempt: 1} = first.rules[key]
           assert is_reference(first.rules[key].retry_timer)
-          refute first.resetting?
 
           exhausted = fail_recovery(first, key, :not_started)
 
-          assert %{recovery_attempt: 1, retry_timer: nil} = exhausted.rules[key]
-          assert exhausted.resetting?
-          assert exhausted.state_lost?
+          assert %{status: :uncertain, recovery_attempt: 1, retry_timer: nil} =
+                   exhausted.rules[key]
+
+          refute exhausted.resetting?
+          refute exhausted.state_lost?
         end)
 
-      assert log =~ "D-Bus match reset transition=recovery_exhausted"
+      assert log =~ "D-Bus match rule left uncertain transition=recovery_exhausted"
     end
 
     test "covers final removal and successful recovery transitions" do
@@ -2517,7 +2548,238 @@ defmodule Rebus.MatchRuleTest do
                )
     end
 
-    test "covers late successful add completions and failed operation resets" do
+    test "cancels the handlers an uncertain rule still owed, including a lost add's" do
+      # The worker's casts to its connection arrive here, so both the handler
+      # cancellations and the owner notice can be observed.
+      conn = self()
+      on_exit(fn -> _ = Store.delete_state(conn) end)
+
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      {state, token} = operation_state(fresh_worker_state(conn), key, rule, :add_new)
+      handler_ref = make_ref()
+      state = put_in(state.operations[token][:handler], handler_ref)
+
+      capture_log(fn ->
+        assert {:noreply, lost} =
+                 Worker.handle_info(
+                   {:operation_result, token, {:operation_failed, :disconnected}},
+                   state
+                 )
+
+        # The worker chose the lost add's handler reference, so the handler
+        # it may have installed is cancelled rather than left delivering.
+        assert_received {:"$gen_cast", {:cancel_signal_handler, ^handler_ref}}
+
+        assert_received {:"$gen_cast",
+                         {:notify_owner, {:rebus_match_uncertain, ^conn, nil, ^rule}}}
+
+        assert %{status: :uncertain, pending_handlers: pending} = lost.rules[key]
+        assert MapSet.size(pending) == 0
+      end)
+
+      put_app_env(:match_recovery_max_attempts, 0)
+      :ok = Store.delete_state(conn)
+      owed = make_ref()
+      state = recovering_state(conn, key, rule)
+      state = put_in(state.rules[key].pending_handlers, MapSet.new([owed]))
+
+      capture_log(fn ->
+        exhausted = fail_recovery(state, key, {:retry, :handlers})
+
+        assert_received {:"$gen_cast", {:cancel_signal_handler, ^owed}}
+        assert %{status: :uncertain, pending_handlers: pending} = exhausted.rules[key]
+        assert MapSet.size(pending) == 0
+      end)
+    end
+
+    test "serves the queue of an uncertain rule after its local removal task is lost" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      [lost_ref, queued_ref] = [make_ref(), make_ref()]
+
+      {state, token} =
+        operation_state(fresh_worker_state(conn), key, rule, :remove, status: :uncertain)
+
+      state = %{
+        state
+        | uncertain_rules: MapSet.new([key]),
+          subscriptions: %{
+            lost_ref => %{owner: self(), key: key, handler: :active},
+            queued_ref => %{owner: self(), key: key, handler: :active}
+          }
+      }
+
+      state = put_in(state.rules[key].refs, MapSet.new([lost_ref, queued_ref]))
+      {state, request_id, _tag} = live_request(state, key, :remove, ref: queued_ref)
+      state = put_in(state.rules[key].queue, [request_id])
+
+      assert {:noreply, lost} =
+               Worker.handle_info(
+                 {:operation_result, token, {:operation_failed, :disconnected}},
+                 state
+               )
+
+      # Nothing is in flight once the lost task is dropped, so the removal
+      # queued behind it starts rather than waiting out its deadline.
+      assert %{status: :uncertain, queue: [], operation: next} = lost.rules[key]
+      assert %{type: :remove, request_id: ^request_id} = lost.operations[next]
+    end
+
+    test "stops tracking the sender when an uncertain rule's last owner exits" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      ref = make_ref()
+      monitor = make_ref()
+      state = put_rule_state(fresh_worker_state(conn), key, rule, [])
+      state = put_in(state.rules[key].status, :uncertain)
+      state = put_subscription_state(state, key, ref)
+
+      state = %{
+        state
+        | uncertain_rules: MapSet.new([key]),
+          owner_monitors: %{monitor => ref},
+          ref_monitors: %{ref => monitor},
+          tracked_names: %{"org.example.Service" => true}
+      }
+
+      assert {:noreply, gone} =
+               Worker.handle_info({:DOWN, monitor, :process, self(), :normal}, state)
+
+      # No cleanup runs for an uncertain rule, so nothing else would
+      # withdraw the tracking its last reference needed.
+      assert gone.tracked_names == %{}
+      assert Map.has_key?(gone.tracking_ops, "org.example.Service")
+      assert %{status: :uncertain} = gone.rules[key]
+    end
+
+    test "refuses new rules while unresolved rules fill the recovery capacity" do
+      put_app_env(:match_recovery_max_rules, 2)
+
+      conn = start_placeholder_conn()
+      recovering_rule = test_rule("Recovering")
+      uncertain_rule = test_rule("Uncertain")
+      active_rule = test_rule("Active")
+      fresh_rule = test_rule("Fresh")
+
+      [recovering_key, uncertain_key, active_key] =
+        Enum.map([recovering_rule, uncertain_rule, active_rule], &MatchRule.to_string/1)
+
+      rule_with = fn rule, status ->
+        %{struct!(Worker.Rule, rule_state(rule)) | status: status}
+      end
+
+      state = %{
+        fresh_worker_state(conn)
+        | bus?: true,
+          rules: %{
+            recovering_key => rule_with.(recovering_rule, :recovering),
+            uncertain_key => rule_with.(uncertain_rule, :uncertain),
+            active_key => rule_with.(active_rule, :active)
+          },
+          recovering_rules: MapSet.new([recovering_key]),
+          uncertain_rules: MapSet.new([uncertain_key])
+      }
+
+      deadline = System.monotonic_time(:millisecond) + 1_000
+
+      add = fn rule, state ->
+        Worker.handle_call({:add, self(), rule, deadline}, {self(), make_ref()}, state)
+      end
+
+      # An uncertain rule is refused outright rather than queued behind a
+      # cleanup that will never run.
+      assert {:reply, {:error, :match_rule_uncertain}, ^state} = add.(uncertain_rule, state)
+
+      # One recovering and one uncertain rule fill a capacity of two, so a rule
+      # the worker does not hold yet is refused.
+      assert {:reply, {:error, :match_recovery_capacity_exhausted}, ^state} =
+               add.(fresh_rule, state)
+
+      # A rule already held adds no bus registration, so it is still served.
+      capture_log(fn -> assert {:noreply, _state} = add.(active_rule, state) end)
+
+      # An uncertain rule never resolves, so it keeps counting once the
+      # retried set has drained.
+      drained = %{
+        state
+        | rules: Map.delete(state.rules, recovering_key),
+          recovering_rules: MapSet.new()
+      }
+
+      put_app_env(:match_recovery_max_rules, 1)
+
+      assert {:reply, {:error, :match_recovery_capacity_exhausted}, ^drained} =
+               add.(fresh_rule, drained)
+
+      put_app_env(:match_recovery_max_rules, 2)
+      capture_log(fn -> assert {:noreply, _state} = add.(fresh_rule, drained) end)
+    end
+
+    test "leaves a rule uncertain when the recovery set is full and keeps its subscribers" do
+      put_app_env(:match_recovery_max_rules, 1)
+
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      ref = make_ref()
+
+      {state, token} =
+        operation_state(fresh_worker_state(conn), key, rule, :add_existing, status: :active)
+
+      state = put_subscription_state(state, key, ref)
+      state = %{state | recovering_rules: MapSet.new(["other-rule"])}
+      state = put_in(state.operations[token].request_id, nil)
+      handler_ref = make_ref()
+
+      log =
+        capture_log(fn ->
+          # A late add-existing leaves a handler owed a removal, which needs a
+          # slot in the full recovery set.
+          assert {:noreply, full} =
+                   Worker.handle_info(
+                     {:operation_result, token, {:added_existing, handler_ref}},
+                     state
+                   )
+
+          assert %{status: :uncertain, operation: nil} = full.rules[key]
+          assert full.recovering_rules == MapSet.new(["other-rule"])
+          assert full.uncertain_rules == MapSet.new([key])
+          refute full.resetting?
+          refute full.state_lost?
+
+          # The live subscription keeps its handler and is told.
+          assert %{^ref => %{handler: :active}} = full.subscriptions
+          assert_received {:rebus_match_uncertain, ^conn, ^ref, ^rule}
+
+          # Its holder can still remove it. The removal is local: the last
+          # reference of an uncertain rule is not final.
+          tag = make_ref()
+          deadline = System.monotonic_time(:millisecond) + 1_000
+
+          assert {:noreply, removing} =
+                   Worker.handle_call({:remove, ref, deadline}, {self(), tag}, full)
+
+          assert [remove_token] = Map.keys(removing.operations)
+          assert %{type: :remove} = removing.operations[remove_token]
+
+          assert {:noreply, removed} =
+                   Worker.handle_info(
+                     {:operation_result, remove_token, {:removed, ref, :nonfinal}},
+                     removing
+                   )
+
+          assert_receive {^tag, :ok}
+          assert removed.subscriptions == %{}
+          assert %{status: :uncertain} = removed.rules[key]
+        end)
+
+      assert log =~ "D-Bus match rule left uncertain transition=capacity_exhausted"
+    end
+
+    test "covers late successful add completions and failed operation outcomes" do
       conn = start_placeholder_conn()
       rule = test_rule()
       key = MatchRule.to_string(rule)
@@ -2575,15 +2837,23 @@ defmodule Rebus.MatchRuleTest do
 
       :ok = Store.delete_state(conn)
       {state, token} = operation_state(fresh_worker_state(conn), key, rule, :add_new)
+      {state, request_id, tag} = live_request(state, key, :add)
+      state = attach_request(state, token, request_id)
 
-      assert {:noreply, reset} =
-               Worker.handle_info(
-                 {:operation_result, token, {:operation_failed, :disconnected}},
-                 state
-               )
+      capture_log(fn ->
+        assert {:noreply, lost} =
+                 Worker.handle_info(
+                   {:operation_result, token, {:operation_failed, :disconnected}},
+                   state
+                 )
 
-      assert reset.state_lost?
-      assert reset.resetting?
+        # The caller is told the rule is uncertain rather than that the
+        # connection went, because it did not.
+        assert_receive {^tag, {:error, :match_rule_uncertain}}
+        assert %{status: :uncertain} = lost.rules[key]
+        refute lost.state_lost?
+        refute lost.resetting?
+      end)
     end
 
     test "covers nonfinal and ambiguous removal completions" do
@@ -2796,34 +3066,81 @@ defmodule Rebus.MatchRuleTest do
 
       {state, token} = cleaning_state(conn, key, rule)
 
-      assert {:noreply, lost} =
-               Worker.handle_info(
-                 {:operation_result, token, {:operation_failed, :disconnected}},
-                 state
-               )
+      capture_log(fn ->
+        assert {:noreply, lost} =
+                 Worker.handle_info(
+                   {:operation_result, token, {:operation_failed, :disconnected}},
+                   state
+                 )
 
-      # A lost cleanup task cannot report a safe outcome, so the connection is
-      # reset instead of the rule being retried, and the slot is still released.
-      assert lost.state_lost?
-      assert lost.resetting?
-      assert is_reference(lost.reset_token)
-      assert is_reference(lost.reset_task_monitor)
-      assert %{status: :cleaning, operation: nil} = lost.rules[key]
-      assert lost.recovering_rules == MapSet.new()
-      refute MapSet.member?(lost.initial_cleanup_keys, key)
+        # A lost cleanup task cannot report a safe outcome, so the rule is left
+        # uncertain instead of being retried, and the slot is still released.
+        refute lost.state_lost?
+        refute lost.resetting?
+        assert is_nil(lost.reset_token)
+        assert %{status: :uncertain, operation: nil} = lost.rules[key]
+        assert lost.recovering_rules == MapSet.new()
+        assert lost.uncertain_rules == MapSet.new([key])
+        refute MapSet.member?(lost.initial_cleanup_keys, key)
+      end)
 
       :ok = Store.delete_state(conn)
 
       {state, token} =
         operation_state(fresh_worker_state(conn), key, rule, :recovery, status: :recovering)
 
-      assert {:noreply, reset} =
-               Worker.handle_info(
-                 {:operation_result, token, {:operation_failed, :disconnected}},
-                 state
-               )
+      state = %{state | recovering_rules: MapSet.new([key])}
 
-      assert reset.state_lost?
+      capture_log(fn ->
+        assert {:noreply, lost} =
+                 Worker.handle_info(
+                   {:operation_result, token, {:operation_failed, :disconnected}},
+                   state
+                 )
+
+        # A lost recovery task gives its slot in the retried set back.
+        assert %{status: :uncertain} = lost.rules[key]
+        assert lost.recovering_rules == MapSet.new()
+        assert lost.uncertain_rules == MapSet.new([key])
+        refute lost.state_lost?
+      end)
+    end
+
+    test "gives the initial-cleanup slot back when a cleanup task is lost" do
+      conn = start_placeholder_conn()
+      rule = test_rule()
+      key = MatchRule.to_string(rule)
+      queued_rule = test_rule("Queued")
+      queued_key = MatchRule.to_string(queued_rule)
+
+      {state, token} = cleaning_state(conn, key, rule)
+      operation_monitor = make_ref()
+      state = put_in(state.operations[token].monitor, operation_monitor)
+
+      # Every other slot is taken and one more cleanup waits for a slot.
+      busy = for n <- 1..15, into: MapSet.new(), do: "busy-#{n}"
+      queued = struct!(Worker.Rule, cleaning_row(queued_rule))
+
+      state = %{
+        state
+        | operation_monitors: %{operation_monitor => token},
+          initial_cleanup_keys: MapSet.union(state.initial_cleanup_keys, busy),
+          initial_cleanup_queue: :queue.from_list([queued_key]),
+          rules: Map.put(state.rules, queued_key, queued)
+      }
+
+      capture_log(fn ->
+        assert {:noreply, lost} =
+                 Worker.handle_info({:DOWN, operation_monitor, :process, self(), :killed}, state)
+
+        # Before, the connection closed and the slot did not matter. Now the
+        # connection stays, so the lost task's slot must go to the waiting rule.
+        assert %{status: :uncertain} = lost.rules[key]
+        refute MapSet.member?(lost.initial_cleanup_keys, key)
+        assert MapSet.member?(lost.initial_cleanup_keys, queued_key)
+        assert :queue.is_empty(lost.initial_cleanup_queue)
+        assert is_reference(lost.rules[queued_key].operation)
+      end)
     end
 
     test "covers owner, caller, and operation monitor losses" do
@@ -2923,14 +3240,16 @@ defmodule Rebus.MatchRuleTest do
       state = put_in(state.operations[token].monitor, operation_monitor)
       state = %{state | operation_monitors: %{operation_monitor => token}}
 
-      assert {:noreply, reset} =
-               Worker.handle_info({:DOWN, operation_monitor, :process, self(), :killed}, state)
+      capture_log(fn ->
+        assert {:noreply, lost} =
+                 Worker.handle_info({:DOWN, operation_monitor, :process, self(), :killed}, state)
 
-      assert reset.state_lost?
-      assert reset.resetting?
-      assert reset.operations == %{}
-      assert reset.operation_monitors == %{}
-      assert %{operation: nil} = reset.rules[key]
+        refute lost.state_lost?
+        refute lost.resetting?
+        assert lost.operations == %{}
+        assert lost.operation_monitors == %{}
+        assert %{status: :uncertain, operation: nil} = lost.rules[key]
+      end)
     end
 
     test "covers expired reuse and operation-failure completion branches" do
@@ -2962,29 +3281,24 @@ defmodule Rebus.MatchRuleTest do
       assert MapSet.equal?(pending, MapSet.new([handler_ref]))
       assert MapSet.member?(expired.recovering_rules, key)
 
-      :ok = Store.delete_state(conn)
-      {state, token} = operation_state(fresh_worker_state(conn), key, rule, :add_existing)
+      for {type, status} <- [add_existing: :installing, remove: :active] do
+        :ok = Store.delete_state(conn)
 
-      assert {:noreply, reset} =
-               Worker.handle_info(
-                 {:operation_result, token, {:operation_failed, :disconnected}},
-                 state
-               )
+        {state, token} =
+          operation_state(fresh_worker_state(conn), key, rule, type, status: status)
 
-      assert reset.state_lost?
+        capture_log(fn ->
+          assert {:noreply, lost} =
+                   Worker.handle_info(
+                     {:operation_result, token, {:operation_failed, :disconnected}},
+                     state
+                   )
 
-      :ok = Store.delete_state(conn)
-
-      {state, token} =
-        operation_state(fresh_worker_state(conn), key, rule, :remove, status: :active)
-
-      assert {:noreply, reset} =
-               Worker.handle_info(
-                 {:operation_result, token, {:operation_failed, :disconnected}},
-                 state
-               )
-
-      assert reset.state_lost?
+          assert %{status: :uncertain} = lost.rules[key]
+          refute lost.state_lost?
+          refute lost.resetting?
+        end)
+      end
     end
 
     test "covers retry dispatch and initial handler cleanup completion" do
@@ -3153,31 +3467,63 @@ defmodule Rebus.MatchRuleTest do
       assert %{key: ^key, type: :add_new, request_id: ^add_id} = resumed.operations[operation]
     end
 
-    test "resets a connection when ambiguous cleanup reaches its bounded capacity", %{
-      server: server,
-      connection: connection
-    } do
-      previous = Application.get_env(:rebus, :match_recovery_max_rules)
-      Application.put_env(:rebus, :match_recovery_max_rules, 1)
+    @tag :capture_log
+    test "keeps the connection and notifies when ambiguous cleanup reaches its capacity" do
+      put_app_env(:match_recovery_max_rules, 1)
 
-      on_exit(fn ->
-        if is_nil(previous),
-          do: Application.delete_env(:rebus, :match_recovery_max_rules),
-          else: Application.put_env(:rebus, :match_recovery_max_rules, previous)
-      end)
+      # The connection is owned by this process so the owner notice can be
+      # observed alongside the subscriber's.
+      {:ok, server} =
+        start_supervised(%{
+          id: {:owned_test_server, make_ref()},
+          start: {TestServer, :start_link, [[tap: self()]]}
+        })
 
-      first_rule = test_rule()
-      second_rule = test_rule("Other")
+      {:ok, address} = TestServer.get_listen_addr(server)
+      {:ok, connection} = Rebus.connect(address, owner: self())
+      assert_receive {^server, %Message{header_fields: %{member: "Hello"}}}, 1_000
+      on_exit(fn -> _ = Rebus.close(connection) end)
 
-      first = Task.async(fn -> Rebus.add_match(connection, first_rule, 50) end)
-      _first_add = assert_add_match(server, first_rule)
-      assert {:error, :timeout} = Task.await(first, 500)
-      _first_cleanup = assert_remove_match(server, first_rule)
+      kept_rule = test_rule("Kept")
+      owner = subscribe_owner(self(), connection, kept_rule)
+      add = assert_add_match(server, kept_rule)
+      :ok = TestServer.push(server, method_return(add.serial))
+      ref = assert_subscription(owner)
+      :ok = answer_tracking(server)
 
-      second = Task.async(fn -> Rebus.add_match(connection, second_rule, 50) end)
-      _second_add = assert_add_match(server, second_rule)
-      assert {:error, :timeout} = Task.await(second, 500)
-      assert wait_until(fn -> not Process.alive?(connection) end)
+      # An ambiguous add takes the only slot in the recovery set, and its
+      # cleanup is left unanswered so it stays there.
+      timed_out_rule = test_rule()
+      timed_out = Task.async(fn -> Rebus.add_match(connection, timed_out_rule, 50) end)
+      _timed_out_add = assert_add_match(server, timed_out_rule)
+      assert {:error, :timeout} = Task.await(timed_out, 500)
+      _cleanup = assert_remove_match(server, timed_out_rule)
+
+      # An ambiguous final removal now has no slot to recover in.
+      assert {:error, :timeout} = Rebus.remove_match(connection, ref, 50)
+      _removal = assert_remove_match(server, kept_rule)
+
+      assert_receive {:rebus_match_uncertain, ^connection, nil, ^kept_rule}, 1_000
+      assert_receive {:notice, ^owner, {:rebus_match_uncertain, ^connection, ^ref, ^kept_rule}}
+      assert Process.alive?(connection)
+
+      # The uncertain rule is refused at once, and with the unresolved rules
+      # at capacity so is a rule the connection does not hold yet.
+      assert {:error, :match_rule_uncertain} = Rebus.add_match(connection, kept_rule, 500)
+
+      assert {:error, :match_recovery_capacity_exhausted} =
+               Rebus.add_match(connection, test_rule("Fresh"), 500)
+
+      # The reference is released locally, without another RemoveMatch.
+      assert :ok = Rebus.remove_match(connection, ref, 500)
+      kept_string = MatchRule.to_string(kept_rule)
+
+      refute_receive {^server,
+                      %Message{header_fields: %{member: "RemoveMatch"}, body: [^kept_string]}},
+                     200
+
+      assert Process.alive?(connection)
+      send(owner, :stop)
     end
 
     test "drops local subscription state without RemoveMatch after connection teardown", %{
@@ -3341,6 +3687,10 @@ defmodule Rebus.MatchRuleTest do
     receive do
       {^ref, %Message{} = message} ->
         send(parent, {:matched, self(), ref, message})
+        subscription_loop(parent, ref)
+
+      {:rebus_match_uncertain, _conn, ^ref, _rule} = notice ->
+        send(parent, {:notice, self(), notice})
         subscription_loop(parent, ref)
 
       :stop ->

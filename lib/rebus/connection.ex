@@ -201,6 +201,23 @@ defmodule Rebus.Connection do
     safe_setup_call(conn, {:delete_signal_handler, ref}, nil, timeout)
   end
 
+  # Removes a handler without waiting for the connection to answer, for a
+  # match subscription that has stopped relying on its calls. Removing a
+  # handler that is already gone is a no-op.
+  @doc false
+  @spec cancel_signal_handler(pid(), reference()) :: :ok
+  def cancel_signal_handler(conn, ref) when is_pid(conn) and is_reference(ref),
+    do: GenServer.cast(conn, {:cancel_signal_handler, ref})
+
+  # Forwards a match-subscription notice to the connection's `:owner`, and
+  # drops it for a connection without one. The owner is only known here, and a
+  # cast keeps a slow or stalled connection from blocking the worker that
+  # reports the notice.
+  @doc false
+  @spec notify_owner(pid(), term()) :: :ok
+  def notify_owner(conn, message) when is_pid(conn),
+    do: GenServer.cast(conn, {:notify_owner, message})
+
   # Connections are started with the caller's public options and, separately,
   # the internal arguments Rebus itself computes: the resolved address, the
   # connect waiter, the address-list auth ID, per-candidate setup timeout and
@@ -802,6 +819,11 @@ defmodule Rebus.Connection do
 
   def handle_cast({:cancel_signal_handler, handler_ref}, %__MODULE__{} = state) do
     {:noreply, remove_signal_handler(state, handler_ref)}
+  end
+
+  def handle_cast({:notify_owner, message}, %__MODULE__{owner: owner} = state) do
+    if is_pid(owner), do: send(owner, message)
+    {:noreply, state}
   end
 
   # A request that is not waiting for a reply is either an unacknowledged FD

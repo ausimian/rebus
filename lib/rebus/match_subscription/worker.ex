@@ -40,7 +40,9 @@ defmodule Rebus.MatchSubscription.Worker do
       # Whether the bus may still hold this rule, and so whether cleanup owes
       # it a RemoveMatch.
       field :remote_may_exist?, boolean(), default: false
-      field :status, :installing | :active | :cleaning | :recovering
+      # `:uncertain` is terminal: Rebus has given up resolving the rule's bus
+      # state and does no further bus work for it on this connection.
+      field :status, :installing | :active | :cleaning | :recovering | :uncertain
       # The token of the operation in flight for this rule, and the requests
       # waiting behind it. Neither survives a restart.
       field :operation, reference() | nil, default: nil
@@ -124,7 +126,8 @@ defmodule Rebus.MatchSubscription.Worker do
               key: String.t(),
               type: :add_new | :add_existing | :remove | :recovery | :initial_cleanup,
               request_id: reference() | nil,
-              monitor: reference() | nil
+              monitor: reference() | nil,
+              handler: reference() | nil
             }
           },
           default: %{}
@@ -135,6 +138,10 @@ defmodule Rebus.MatchSubscription.Worker do
     # that opaque type and every spec naming `t/0` would then be reported as
     # violating it.
     field :recovering_rules, %MapSet{}, default: MapSet.new()
+    # The keys of the rules left `:uncertain`. Together with
+    # `recovering_rules` they are the rules whose bus state is unresolved,
+    # which is what admission of a new rule is bounded by.
+    field :uncertain_rules, %MapSet{}, default: MapSet.new()
     # The keys holding one of the bounded initial-cleanup slots, and the keys
     # waiting for one. `:queue.new/0` is called in `init/1` rather than left to
     # a field default so the queue keeps its opaque type instead of the literal
@@ -143,7 +150,8 @@ defmodule Rebus.MatchSubscription.Worker do
     field :initial_cleanup_queue, :queue.queue()
     # Whether a connection reset is in flight, and the token and monitor of the
     # task running it. `state_lost?` latches state that cannot be reconstructed
-    # and turns public operations away.
+    # and turns public operations away. Only an uncertain restart snapshot
+    # resets the connection; every other failure leaves one rule uncertain.
     field :resetting?, boolean(), default: false
     field :state_lost?, boolean(), default: false
     field :reset_token, reference() | nil, default: nil
@@ -213,6 +221,12 @@ defmodule Rebus.MatchSubscription.Worker do
     cond do
       not before_deadline?(deadline) ->
         {:reply, {:error, :timeout}, state}
+
+      rule_uncertain?(state, key) ->
+        {:reply, {:error, :match_rule_uncertain}, state}
+
+      recovery_capacity_exhausted?(state, key) ->
+        {:reply, {:error, :match_recovery_capacity_exhausted}, state}
 
       queue_full?(state, key) ->
         {:reply, {:error, :match_rule_cleanup_pending}, state}
@@ -291,7 +305,11 @@ defmodule Rebus.MatchSubscription.Worker do
     # An operation was in-flight when this worker died.  Neither the local
     # handler nor the bus rule can be reconstructed safely, so reject new
     # public operations while a bounded connection reset clears both.
-    {:noreply, state |> request_connection_reset(nil) |> persist_state()}
+    #
+    # This is the one failure that still closes the connection. The rows were
+    # discarded, so this worker does not know which rules or handlers exist,
+    # cannot mark any of them uncertain, and has no subscriber to notify.
+    {:noreply, state |> request_connection_reset() |> persist_state()}
   end
 
   def handle_info({:resume_recovery, key}, state) do
@@ -385,7 +403,10 @@ defmodule Rebus.MatchSubscription.Worker do
         {:noreply, persist_state(state)}
 
       ref = Map.get(state.owner_monitors, monitor_ref) ->
-        {:noreply, state |> owner_down(monitor_ref, ref) |> persist_state()}
+        # An uncertain rule starts no cleanup whose result would reconcile
+        # tracking, so the last owner of one leaving must do it here.
+        state = state |> owner_down(monitor_ref, ref) |> persist_state()
+        {:noreply, reconcile_tracking(state)}
 
       request_id = Map.get(state.request_monitors, monitor_ref) ->
         key = request_key(state, request_id)
@@ -411,7 +432,7 @@ defmodule Rebus.MatchSubscription.Worker do
       token = Map.get(state.operation_monitors, monitor_ref) ->
         # A task that finishes normally sends its result first. Reaching this
         # branch means an operation died before reporting a safe outcome, so
-        # reset the connection rather than guessing about a handler or
+        # its rule is left uncertain rather than guessing about a handler or
         # bus-rule state.
         operation_down(state, token)
 
@@ -431,10 +452,9 @@ defmodule Rebus.MatchSubscription.Worker do
       {nil, state} ->
         {:noreply, state}
 
-      {%{key: key, request_id: request_id}, state} ->
-        state = reply_request_if_present(state, request_id, {:error, :disconnected})
-        log_recovery(:operation_lost)
-        {:noreply, state |> request_connection_reset(key) |> persist_state()}
+      {%{key: key} = operation, state} ->
+        state = operation_failed(state, key, operation)
+        {:noreply, state |> persist_state() |> reconcile_tracking()}
     end
   end
 
@@ -480,7 +500,12 @@ defmodule Rebus.MatchSubscription.Worker do
       %{kind: :add} = request when rule.status == :active ->
         start_add(state, key, :add_existing, request_id, request)
 
-      %{kind: :remove, ref: ref} = request when rule.status == :active ->
+      %{kind: :add} when rule.status == :uncertain ->
+        dispatch_rule(reply_request(state, request_id, {:error, :match_rule_uncertain}), key)
+
+      # A reference on an uncertain rule can still be removed, so its holder
+      # can stop its signals, but only locally: see `start_remove/5`.
+      %{kind: :remove, ref: ref} = request when rule.status in [:active, :uncertain] ->
         dispatch_remove(state, key, request_id, request, ref)
 
       %{kind: :remove} ->
@@ -500,19 +525,26 @@ defmodule Rebus.MatchSubscription.Worker do
     conn = state.conn
     owner = request.owner
     deadline = request.deadline
+    handler_ref = make_ref()
 
     fun =
       case type do
-        :add_new -> fn -> Operation.add_new(conn, owner, rule, deadline) end
-        :add_existing -> fn -> Operation.add_existing(conn, owner, rule, deadline) end
+        :add_new ->
+          fn -> Operation.add_new(conn, owner, handler_ref, rule, deadline) end
+
+        :add_existing ->
+          fn -> Operation.add_existing(conn, owner, handler_ref, rule, deadline) end
       end
 
-    start_operation(state, key, type, request_id, fun)
+    start_operation(state, key, type, request_id, fun, handler_ref)
   end
 
+  # The last reference of an uncertain rule is never final: Rebus does no more
+  # bus work for that rule, so its removal deletes the local handler and sends
+  # no RemoveMatch.
   defp start_remove(state, key, request_id, request, subscription) do
     rule = Map.fetch!(state.rules, key)
-    final? = MapSet.size(rule.refs) == 1
+    final? = rule.status == :active and MapSet.size(rule.refs) == 1
     conn = state.conn
     canonical_rule = rule.rule
     ref = request.ref
@@ -563,10 +595,12 @@ defmodule Rebus.MatchSubscription.Worker do
     end
   end
 
-  defp start_operation(state, key, type, request_id, fun) do
+  # `handler` is the local handler an add installs, recorded so a task lost
+  # mid-flight still leaves a known handler to cancel.
+  defp start_operation(state, key, type, request_id, fun, handler \\ nil) do
     token = make_ref()
     worker = self()
-    operation = %{key: key, type: type, request_id: request_id, monitor: nil}
+    operation = %{key: key, type: type, request_id: request_id, monitor: nil, handler: handler}
 
     started =
       Task.Supervisor.start_child(state.task_supervisor, fn ->
@@ -628,27 +662,15 @@ defmodule Rebus.MatchSubscription.Worker do
     end
   end
 
-  defp complete_operation(state, key, %{type: :initial_cleanup}, {:operation_failed, _reason}) do
-    state
-    |> release_initial_cleanup(key)
-    |> operation_failed(key, :initial_cleanup, nil)
-    |> start_next_initial_cleanup()
-  end
-
-  defp complete_operation(
-         state,
-         key,
-         %{type: type, request_id: request_id},
-         {:operation_failed, _reason}
-       ) do
-    operation_failed(state, key, type, request_id)
+  defp complete_operation(state, key, operation, {:operation_failed, _reason}) do
+    operation_failed(state, key, operation)
   end
 
   # A task that never started is the one unambiguous failure: it sent nothing
   # to the bus and attached no local handler, so the rule and its references
   # are exactly what they were before the operation. Unlike `operation_down/2`
-  # there is no unresolved bus state to reset the connection over, and unlike
-  # `{:operation_failed, _}` there is nothing to blame on the connection.
+  # there is no unresolved bus state to leave the rule uncertain over, and
+  # unlike `{:operation_failed, _}` there is nothing to blame on the connection.
   defp complete_operation(state, key, %{type: :add_new, request_id: request_id}, :not_started) do
     log_not_started(:add_new)
 
@@ -854,19 +876,16 @@ defmodule Rebus.MatchSubscription.Worker do
   end
 
   # Every operation type fails the same way: the task died without reporting a
-  # safe outcome, so the connection is reset. The request-bearing types answer
-  # their caller; the recovery tracks, which never carry a request, log the
-  # loss instead.
-  defp operation_failed(state, key, type, _request_id)
-       when type in [:recovery, :initial_cleanup] do
-    log_recovery(:operation_lost)
-    request_connection_reset(state, key)
-  end
-
-  defp operation_failed(state, key, _type, request_id) do
+  # safe outcome, so nothing it may have done to the bus rule can be known, and
+  # its rule is left uncertain. The handler an add may have installed is owed a
+  # removal like any other pending handler, which `mark_uncertain/3` casts. The
+  # request-bearing types answer their caller; the recovery tracks never carry
+  # a request.
+  defp operation_failed(state, key, operation) do
     state
-    |> reply_request_if_present(request_id, {:error, :disconnected})
-    |> request_connection_reset(key)
+    |> reply_request_if_present(operation.request_id, {:error, :match_rule_uncertain})
+    |> maybe_put_pending_handler(key, Map.get(operation, :handler))
+    |> mark_uncertain(key, :operation_lost)
   end
 
   defp owner_down(state, monitor_ref, ref) do
@@ -1005,7 +1024,7 @@ defmodule Rebus.MatchSubscription.Worker do
       nil ->
         state
 
-      %Rule{status: :recovering} ->
+      %Rule{status: status} when status in [:recovering, :uncertain] ->
         state
 
       %Rule{operation: operation} when not is_nil(operation) ->
@@ -1013,8 +1032,7 @@ defmodule Rebus.MatchSubscription.Worker do
 
       rule ->
         if MapSet.size(state.recovering_rules) >= max_recovering_rules() do
-          log_recovery(:capacity_exhausted)
-          request_connection_reset(state, key)
+          mark_uncertain(state, key, :capacity_exhausted)
         else
           rule = %{
             rule
@@ -1036,23 +1054,16 @@ defmodule Rebus.MatchSubscription.Worker do
   # The backoff saturates at one second, so retrying is otherwise unbounded: a
   # bus that stays ambiguous for this one rule would be retried forever,
   # visible only at debug level. A rule whose bus state cannot be proven is
-  # never silently forgotten or permanently quarantined, so when the module
-  # runs out of ways to resolve it the connection is reset, exactly as the
-  # capacity branch of `enter_recovery/3` does for too many such rules at once.
-  # `request_connection_reset/2` is a no-op while a reset is already in flight,
-  # so only the exhaustion that starts one is worth a warning.
-  defp escalate_exhausted_recovery(state, key) do
-    if not state.resetting?, do: log_reset(:recovery_exhausted)
-    request_connection_reset(state, key)
-  end
-
+  # never silently forgotten, so when the budget runs out it is left uncertain
+  # and its subscribers and the connection's owner are told, exactly as the
+  # capacity branch of `enter_recovery/3` does for a rule it has no room for.
   defp schedule_recovery_retry(state, key) do
     case Map.get(state.rules, key) do
       %Rule{status: :recovering, retry_timer: nil} = rule ->
         attempt = rule.recovery_attempt + 1
 
         if attempt > max_recovery_attempts() do
-          escalate_exhausted_recovery(state, key)
+          mark_uncertain(state, key, :recovery_exhausted)
         else
           maybe_log_recovery_saturated(attempt)
           timer = Process.send_after(self(), {:retry_recovery, key}, retry_delay(attempt))
@@ -1086,6 +1097,85 @@ defmodule Rebus.MatchSubscription.Worker do
             retry_timer: nil
         })
     end
+  end
+
+  # Leaves a rule whose bus state Rebus can no longer resolve exactly where it
+  # is, instead of closing the connection to make the bus forget it. The rule
+  # stops all bus work: it is dropped from the recovery set, its retry timer
+  # and any initial-cleanup slot it held are released, and it is never removed
+  # from the bus. Its live references keep their local handlers, and the
+  # requests queued behind it are answered now rather than left to time out.
+  #
+  # The handlers it still owed a removal are local, so they are not left
+  # behind with it: each is cancelled with a cast, which needs no reply from a
+  # connection whose calls may be what kept failing, and which is a no-op for
+  # a handler that is already gone.
+  #
+  # The holder of every reference on the rule, and the connection's owner when
+  # it has one, are sent `{:rebus_match_uncertain, conn, ref | nil, rule}` so
+  # the application can decide what to do, closing the connection included.
+  # A four-element tuple tagged with an atom cannot be mistaken for a
+  # `{ref, %Rebus.Message{}}` delivery by any receive pattern written for one.
+  defp mark_uncertain(state, key, event) do
+    case Map.get(state.rules, key) do
+      nil ->
+        state
+
+      # Already uncertain, so only a local removal can have failed. Nothing
+      # is in flight now, so the requests queued behind it go next.
+      %Rule{status: :uncertain} ->
+        dispatch_rule(state, key)
+
+      rule ->
+        if is_reference(rule.retry_timer),
+          do: Process.cancel_timer(rule.retry_timer, async: true, info: false)
+
+        log_uncertain(event)
+        Enum.each(rule.pending_handlers, &Connection.cancel_signal_handler(state.conn, &1))
+
+        state = %{
+          state
+          | recovering_rules: MapSet.delete(state.recovering_rules, key),
+            uncertain_rules: MapSet.put(state.uncertain_rules, key)
+        }
+
+        state
+        |> put_rule(key, %{
+          rule
+          | status: :uncertain,
+            pending_handlers: MapSet.new(),
+            retry_timer: nil
+        })
+        |> notify_uncertain(rule)
+        |> release_initial_cleanup(key)
+        |> start_next_initial_cleanup()
+        |> dispatch_rule(key)
+    end
+  end
+
+  defp notify_uncertain(state, %Rule{rule: rule, refs: refs}) do
+    Enum.each(refs, fn ref ->
+      case Map.get(state.subscriptions, ref) do
+        %{owner: owner} -> send(owner, {:rebus_match_uncertain, state.conn, ref, rule})
+        nil -> :ok
+      end
+    end)
+
+    :ok = Connection.notify_owner(state.conn, {:rebus_match_uncertain, state.conn, nil, rule})
+    state
+  end
+
+  defp rule_uncertain?(state, key), do: MapSet.member?(state.uncertain_rules, key)
+
+  # Admission is what bounds the uncertain rules now that closing the
+  # connection no longer discards them. A rule can only become unresolved
+  # after it exists, so refusing new rules while the unresolved ones fill the
+  # cap bounds them by the rules that existed when it filled. Equivalent rules
+  # already held are still served: they add no bus registration.
+  defp recovery_capacity_exhausted?(state, key) do
+    not Map.has_key?(state.rules, key) and
+      MapSet.size(state.recovering_rules) + MapSet.size(state.uncertain_rules) >=
+        max_recovering_rules()
   end
 
   defp clear_rule_and_resume(state, key) do
@@ -1128,7 +1218,7 @@ defmodule Rebus.MatchSubscription.Worker do
     end
   end
 
-  defp request_connection_reset(state, _key) do
+  defp request_connection_reset(state) do
     # Never include a rule or signal payload in observability. A connection
     # reset is bounded and makes the bus discard all match state for it. Its
     # result is observed so a failed task or non-supervised PID cannot leave a
@@ -1202,17 +1292,19 @@ defmodule Rebus.MatchSubscription.Worker do
   end
 
   defp needed_tracked_names(state) do
-    Enum.reduce(state.rules, %{}, fn
-      {_key, %Rule{rule: rule, status: :active}}, names ->
-        case trackable_sender(rule) do
-          nil -> names
-          name -> Map.put(names, name, true)
-        end
-
-      {_key, _rule}, names ->
-        names
+    Enum.reduce(state.rules, %{}, fn {_key, %Rule{rule: rule} = entry}, names ->
+      case delivering?(entry) && trackable_sender(rule) do
+        name when is_binary(name) -> Map.put(names, name, true)
+        _none -> names
+      end
     end)
   end
+
+  # An uncertain rule that still holds references keeps its name tracked:
+  # Rebus has stopped managing its bus registration, not its local delivery.
+  defp delivering?(%Rule{status: :active}), do: true
+  defp delivering?(%Rule{status: :uncertain, refs: refs}), do: MapSet.size(refs) > 0
+  defp delivering?(%Rule{}), do: false
 
   # Only a well-known sender needs an owner. A unique sender is compared
   # directly, and the bus driver sends its own directed signals under the
@@ -1650,7 +1742,8 @@ defmodule Rebus.MatchSubscription.Worker do
     # retry timer belonged to the worker that died, and none of them is a fact
     # about the bus, so a restored rule starts without them.
     #
-    # Only the recovering rules are collected here. A rule restored as
+    # Only the recovering and uncertain rules are indexed here, and an
+    # uncertain one is not notified again. A rule restored as
     # `:cleaning` still owes the bus its best-effort RemoveMatch, and
     # `admit_restored_cleanups/1` re-admits it through the same cap the live
     # path uses: the cap bounds concurrent bus work, and a restart can present
@@ -1667,24 +1760,22 @@ defmodule Rebus.MatchSubscription.Worker do
         {Map.put(owners, monitor_ref, ref), Map.put(refs, ref, monitor_ref)}
       end)
 
-    recovering_rules =
-      rules
-      |> Enum.reduce(MapSet.new(), fn
-        {key, %Rule{status: :recovering}}, keys -> MapSet.put(keys, key)
-        {_key, _rule}, keys -> keys
-      end)
-
     %{
       state
       | rules: rules,
         subscriptions: subscriptions,
         owner_monitors: owner_monitors,
         ref_monitors: ref_monitors,
-        recovering_rules: recovering_rules
+        recovering_rules: keys_with_status(rules, :recovering),
+        uncertain_rules: keys_with_status(rules, :uncertain)
     }
   end
 
   defp restore_state(state, _persisted), do: state
+
+  defp keys_with_status(rules, status) do
+    for {key, %Rule{status: ^status}} <- rules, into: MapSet.new(), do: key
+  end
 
   # Nothing else schedules a restored cleaning rule: it is not in
   # `recovering_rules`, and the admission that would have started or queued it
@@ -1729,8 +1820,8 @@ defmodule Rebus.MatchSubscription.Worker do
     Application.get_env(:rebus, :match_recovery_max_rules, 64)
   end
 
-  # Consecutive recovery attempts allowed for a single rule before the
-  # connection is reset. With `@recovery_delays` the default is roughly 26
+  # Consecutive recovery attempts allowed for a single rule before it is left
+  # uncertain. With `@recovery_delays` the default is roughly 26
   # seconds of retrying per recovery episode: long enough that a transient bus
   # hiccup never trips it, short enough that an operator learns of a stuck rule
   # within a minute. Attempts rather than wall-clock keeps it deterministic,
@@ -1769,7 +1860,7 @@ defmodule Rebus.MatchSubscription.Worker do
 
   # Individual retries stay at debug, but a rule that has exhausted the backoff
   # is stuck on the bus and an operator should see it well before the budget
-  # runs out and the connection is reset. The equality fires exactly once per
+  # runs out and the rule is left uncertain. The equality fires exactly once per
   # recovery episode, since a new episode restarts the count at zero. The rule
   # itself is not named: it can carry caller-supplied arguments.
   defp maybe_log_recovery_saturated(attempt) do
@@ -1812,5 +1903,11 @@ defmodule Rebus.MatchSubscription.Worker do
 
   defp log_reset(event) do
     Logger.warning("D-Bus match reset transition=#{event}")
+  end
+
+  # Fires once per rule, since an uncertain rule never leaves that state. As
+  # elsewhere, the rule is not named: it can carry caller-supplied arguments.
+  defp log_uncertain(event) do
+    Logger.warning("D-Bus match rule left uncertain transition=#{event}")
   end
 end

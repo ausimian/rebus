@@ -31,12 +31,15 @@ defmodule Rebus.MatchSubscription.Operation do
           rule: MatchRule.t()
         }
 
+  # The handler reference is chosen by the worker rather than here, so a task
+  # that dies mid-flight still leaves the worker knowing which handler it may
+  # have installed.
   @doc false
-  @spec add_new(pid(), pid(), MatchRule.t(), integer()) ::
+  @spec add_new(pid(), pid(), reference(), MatchRule.t(), integer()) ::
           {:added, reference()} | {:add_failed, error(), reference() | nil}
-  def add_new(conn, owner, rule, deadline) do
+  def add_new(conn, owner, handler_ref, rule, deadline) do
     with {:ok, timeout} <- remaining_timeout(deadline),
-         {:ok, handler_ref} <- install_local_handler(conn, owner, rule, timeout) do
+         :ok <- install_local_handler(conn, owner, handler_ref, rule, timeout) do
       case invoke_bus_method(conn, "AddMatch", rule, deadline) do
         :ok -> {:added, handler_ref}
         {:error, _reason} = error -> {:add_failed, error, handler_ref}
@@ -47,11 +50,11 @@ defmodule Rebus.MatchSubscription.Operation do
   end
 
   @doc false
-  @spec add_existing(pid(), pid(), MatchRule.t(), integer()) ::
+  @spec add_existing(pid(), pid(), reference(), MatchRule.t(), integer()) ::
           {:added_existing, reference()} | {:add_existing_failed, error()}
-  def add_existing(conn, owner, rule, deadline) do
+  def add_existing(conn, owner, handler_ref, rule, deadline) do
     with {:ok, timeout} <- remaining_timeout(deadline),
-         {:ok, handler_ref} <- install_local_handler(conn, owner, rule, timeout) do
+         :ok <- install_local_handler(conn, owner, handler_ref, rule, timeout) do
       {:added_existing, handler_ref}
     else
       {:error, _reason} = error -> {:add_existing_failed, error}
@@ -229,11 +232,9 @@ defmodule Rebus.MatchSubscription.Operation do
   defp ensure_handler_removed(conn, ref, :active, deadline),
     do: delete_local_handler(conn, ref, deadline)
 
-  defp install_local_handler(conn, owner, rule, timeout) do
-    handler_ref = make_ref()
-
+  defp install_local_handler(conn, owner, handler_ref, rule, timeout) do
     case Connection.add_signal_handler(conn, owner, handler_ref, rule, timeout) do
-      {:ok, ^handler_ref} = ok -> ok
+      {:ok, ^handler_ref} -> :ok
       {:error, _reason} = error -> error
     end
   end
