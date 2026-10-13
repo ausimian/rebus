@@ -26,9 +26,14 @@
   is lost is left uncertain and reported instead, and the application decides
   whether to close the connection. Its references keep working and can still
   be removed. An operation whose task is lost now returns
-  `{:error, :match_rule_uncertain}` rather than `{:error, :disconnected}`. A
-  connection is still closed when a restarted match-subscription worker finds
-  it lost track of an in-flight operation.
+  `{:error, :match_rule_uncertain}` rather than `{:error, :disconnected}`.
+- The process that manages a connection's match rules now lives and dies with
+  the connection instead of being restarted from saved state. If it fails,
+  which would be a bug in Rebus, the connection stops with
+  `{:shutdown, {:match_subscription_exited, reason}}` and the bus discards its
+  rules, as it does when that process is stopped by a restart of Rebus's own
+  supervision tree. Rebus no longer returns
+  `{:error, :match_subscription_state_lost}`.
 - An established connection that the peer closes or resets now logs
   `D-Bus connection transport stopped` at `info` rather than `warning`, so a
   bus restart no longer floods logs with warnings. The same stop during
