@@ -234,6 +234,37 @@ defmodule Rebus.MatchRuleTest do
                )
              )
     end
+
+    test "parses the body signature only for argument criteria, and reuses it" do
+      header_only = MatchRule.new!(member: "Changed")
+      first = MatchRule.new!(member: "Changed", args: %{0 => "changed"})
+      second = MatchRule.new!(member: "Changed", arg0namespace: "changed")
+
+      signal =
+        Message.new!(:signal,
+          path: "/org/example",
+          interface: "org.example.Interface",
+          member: "Changed",
+          signature: "s",
+          body: ["changed"]
+        )
+
+      assert {true, :unparsed} = MatchRule.match(header_only, signal, %{}, :unparsed)
+
+      assert {true, {:ok, [{:string, nil}]} = parsed} =
+               MatchRule.match(first, signal, %{}, :unparsed)
+
+      assert {true, ^parsed} = MatchRule.match(second, signal, %{}, parsed)
+
+      # A signature that does not parse fails only the argument criteria.
+      unparseable = %{signal | header_fields: %{signal.header_fields | signature: "("}}
+
+      assert MatchRule.matches?(header_only, unparseable)
+      refute MatchRule.matches?(first, unparseable)
+      assert {false, :error} = MatchRule.match(first, unparseable, %{}, :unparsed)
+      assert {true, :error} = MatchRule.match(header_only, unparseable, %{}, :error)
+      assert {false, :error} = MatchRule.match(second, unparseable, %{}, :error)
+    end
   end
 
   describe "bus match subscriptions" do

@@ -493,14 +493,20 @@ defmodule Rebus.Connection.Dispatch do
 
   # Handlers live in this connection's state, so the match rule of a
   # subscription is evaluated here, in the connection process, and only for
-  # the signals this connection received.
+  # the signals this connection received. The parsed body signature is shared
+  # across the rules for this one signal, so it is parsed at most once.
   defp dispatch_signal(%Message{} = msg, %Connection{handlers: handlers} = state) do
     name_owners = state.name_owners
 
-    Enum.each(handlers, fn {handler_ref, %{pid: pid, rule: rule}} ->
-      if is_nil(rule) or MatchRule.matches?(rule, msg, name_owners) do
+    Enum.reduce(handlers, :unparsed, fn
+      {handler_ref, %{pid: pid, rule: nil}}, body_types ->
         send(pid, {handler_ref, msg})
-      end
+        body_types
+
+      {handler_ref, %{pid: pid, rule: rule}}, body_types ->
+        {matched?, body_types} = MatchRule.match(rule, msg, name_owners, body_types)
+        if matched?, do: send(pid, {handler_ref, msg})
+        body_types
     end)
   end
 

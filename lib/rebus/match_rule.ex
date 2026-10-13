@@ -110,16 +110,42 @@ defmodule Rebus.MatchRule do
   @doc false
   @spec matches?(t(), Message.t(), %{optional(binary()) => :unknown | nil | binary()}) ::
           boolean()
-  def matches?(%__MODULE__{criteria: criteria}, %Message{type: :signal} = message, name_owners)
+  def matches?(rule, message, name_owners) do
+    {matched?, _body_types} = match(rule, message, name_owners, :unparsed)
+    matched?
+  end
+
+  # The signal's parsed body signature: `:unparsed` until a rule with argument
+  # criteria first needs it, then `{:ok, types}`, or `:error` for a signature
+  # that does not parse.
+  @typedoc false
+  @type body_types :: :unparsed | {:ok, [Signature.ast()]} | :error
+
+  # `matches?/3` for a caller evaluating several rules against one signal. The
+  # body signature is parsed at most once: thread the returned `body_types`
+  # into the next call, starting from `:unparsed`. A rule without argument
+  # criteria never parses it.
+  @doc false
+  @spec match(t(), Message.t(), %{optional(binary()) => :unknown | nil | binary()}, body_types()) ::
+          {boolean(), body_types()}
+  def match(
+        %__MODULE__{criteria: criteria},
+        %Message{type: :signal} = message,
+        name_owners,
+        body_types
+      )
       when is_map(name_owners) do
     headers = message.header_fields
 
-    well_known_sender_matches?(criteria, headers, name_owners) and
-      header_matches?(criteria, headers) and
-      argument_matches?(criteria, message)
+    if well_known_sender_matches?(criteria, headers, name_owners) and
+         header_matches?(criteria, headers) do
+      argument_matches?(criteria, message, body_types)
+    else
+      {false, body_types}
+    end
   end
 
-  def matches?(_rule, _message, _name_owners), do: false
+  def match(_rule, _message, _name_owners, body_types), do: {false, body_types}
 
   @type validation_error ::
           :duplicate_match_option
@@ -348,17 +374,34 @@ defmodule Rebus.MatchRule do
     end
   end
 
-  defp argument_matches?(criteria, %Message{} = message) do
-    case Signature.parse(Message.signature(message)) do
-      {:ok, types} ->
-        exact_argument_matches?(Map.get(criteria, :args, %{}), message.body, types) and
-          path_argument_matches?(Map.get(criteria, :arg_paths, %{}), message.body, types) and
-          arg0namespace_matches?(Map.get(criteria, :arg0namespace), message.body, types)
+  defp argument_matches?(criteria, %Message{} = message, body_types) do
+    args = Map.get(criteria, :args, %{})
+    arg_paths = Map.get(criteria, :arg_paths, %{})
+    arg0namespace = Map.get(criteria, :arg0namespace)
 
-      _ ->
-        false
+    if map_size(args) == 0 and map_size(arg_paths) == 0 and is_nil(arg0namespace) do
+      {true, body_types}
+    else
+      case parse_body_types(body_types, message) do
+        {:ok, types} = body_types ->
+          {exact_argument_matches?(args, message.body, types) and
+             path_argument_matches?(arg_paths, message.body, types) and
+             arg0namespace_matches?(arg0namespace, message.body, types), body_types}
+
+        :error ->
+          {false, :error}
+      end
     end
   end
+
+  defp parse_body_types(:unparsed, %Message{} = message) do
+    case Signature.parse(Message.signature(message)) do
+      {:ok, types} -> {:ok, types}
+      {:error, _reason} -> :error
+    end
+  end
+
+  defp parse_body_types(body_types, _message), do: body_types
 
   defp exact_argument_matches?(criteria, body, types) do
     Enum.all?(criteria, fn {index, value} ->
