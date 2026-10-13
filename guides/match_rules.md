@@ -102,17 +102,58 @@ be trusted also appears as `{:error, :timeout}`: the connection cannot recover
 the reply serial needed to correlate it. This is the same conservative
 fallback described by the fuller `Rebus.call/3` contract.
 
-Rebus closes the connection when too many rules remain uncertain, when a
-rule's cleanup exhausts its retry budget, or when an operation returns
-`{:error, :match_subscription_state_lost}`. Closing stops the connection's
-handlers and makes the bus discard every rule it held.
+Sometimes Rebus cannot prove what the bus holds for a rule. It then leaves
+the rule uncertain and keeps the connection up. A rule becomes uncertain when
+its cleanup exhausts its retry budget, when too many other cleanups are
+already running, or when the task running one of its operations is lost.
 
-Two application environment settings bound that cleanup.
-`:match_recovery_max_rules` (default `64`) is how many rules may be uncertain
-at once before the connection is closed. `:match_recovery_max_attempts`
-(default `30`) is how many cleanup attempts one rule receives before the same
-close happens. Recovery continues across transient local failures because
-those failures do not prove that the bus resolved the rule.
+Rebus sends a notice to each process holding a reference on the rule:
+
+```elixir
+receive do
+  {:rebus_match_uncertain, ^conn, ^ref, %Rebus.MatchRule{}} ->
+    # This application would rather start again than live with the rule.
+    Rebus.close(conn)
+end
+```
+
+The connection's `:owner`, if it has one, receives the same notice with `nil`
+in place of the reference, once per rule. A process that is both gets both.
+The notice is a four-element tuple, so a receive pattern written for
+`{ref, %Rebus.Message{}}` never matches it.
+
+An uncertain rule stays that way for the life of the connection:
+
+- Rebus does no more bus work for it. The bus may keep routing its signals to
+  the connection, and the last reference's removal does not send
+  `RemoveMatch`.
+- References on it keep receiving signals until they are removed or their
+  owners exit. `Rebus.remove_match/3` still stops delivery to a reference.
+- `Rebus.add_match/3` for the same rule returns
+  `{:error, :match_rule_uncertain}`.
+
+Closing the connection is the only way to make the bus forget an uncertain
+rule. Whether that is worth the disruption is for your application to decide.
+
+Two application environment settings bound the cleanup.
+`:match_recovery_max_rules` (default `64`) is how many rules are cleaned up
+at once; a rule that needs cleanup beyond that is left uncertain. It also
+bounds admission: while the rules being cleaned up and the uncertain rules
+together reach it, `add_match/3` returns
+`{:error, :match_recovery_capacity_exhausted}` for a rule the connection does
+not already hold. An equivalent rule already held is still served, because it
+adds nothing on the bus. `:match_recovery_max_attempts` (default `30`) is how
+many cleanup attempts one rule receives before it is left uncertain. Recovery
+continues across transient local failures because those failures do not prove
+that the bus resolved the rule.
+
+Rebus still closes the connection in one case. A match-subscription worker
+that restarts while an operation was in flight no longer knows which rules or
+handlers the connection holds, so it cannot mark any of them uncertain or tell
+anyone. It closes a connection created by `Rebus.connect/2` instead, and
+operations in the meantime return `{:error, :match_subscription_state_lost}`.
+Closing stops the connection's handlers and makes the bus discard every rule
+it held.
 
 ## Errors
 
@@ -124,6 +165,8 @@ those failures do not prove that the bus resolved the rule.
 | `:sender_routing_ambiguous` | The rule overlaps an existing one with a different sender. |
 | `:timeout` | The operation did not finish in time, or the reply header exceeded a local decoding limit. The bus may still hold the rule; see `Rebus.call/3` for the header-limit fallback. |
 | `:match_rule_cleanup_pending` | An earlier ambiguous operation on the same rule is still being cleaned up. |
+| `:match_rule_uncertain` | Rebus has left the rule uncertain, or the operation's task was lost and left it so. See [When a subscription fails](#when-a-subscription-fails). |
+| `:match_recovery_capacity_exhausted` | Too many rules on the connection are unresolved to accept a new one. Nothing was sent. |
 | `:match_subscription_state_lost` | An in-flight operation lost its state and cannot be resolved on this connection. Rebus ends it by closing a connection created by `Rebus.connect/2`; the state dies with the connection. |
 | `{:bus_error, error_name}` | The bus returned a D-Bus error reply. |
 | `:invalid_bus_reply` | The bus reply did not have the expected shape. |
