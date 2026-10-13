@@ -96,11 +96,11 @@ defmodule Rebus do
   Failure reasons returned by `call/3`.
 
   A D-Bus error reply from the peer is a definitive answer rather than a
-  transport failure, so it is returned as the complete
-  `%Rebus.Message{type: :error}`. Everything else is a local or transport
-  failure reason.
+  transport failure, so it is returned as `{:dbus_error, message}`, where
+  `message` is the complete `%Rebus.Message{type: :error}`. Everything else is a
+  local or transport failure reason.
   """
-  @type call_error :: Rebus.Message.t() | error_reason()
+  @type call_error :: {:dbus_error, Rebus.Message.t()} | error_reason()
 
   @typedoc """
   Failure reasons returned by `add_match/3` and `remove_match/3`.
@@ -395,12 +395,15 @@ defmodule Rebus do
   Only a method call that expects a reply is accepted, and `timeout` is in
   milliseconds. Each result carries the complete message, including any received
   descriptors in `:unix_fds`. A D-Bus error reply from the peer is returned as
-  `{:error, %Rebus.Message{type: :error}}`.
+  `{:error, {:dbus_error, %Rebus.Message{type: :error}}}`, so it never shares a
+  shape with a local or transport failure.
 
   ## Return values
 
   - `{:ok, %Rebus.Message{type: :method_return}}` - the peer replied successfully.
-  - `{:error, %Rebus.Message{type: :error}}` - the peer returned a D-Bus error reply.
+  - `{:error, {:dbus_error, %Rebus.Message{type: :error}}}` - the peer returned
+    a D-Bus error reply. Its error name is in `header_fields.error_name`, and any
+    descriptors it carried are in `:unix_fds` and owned by the caller.
   - `{:error, :timeout}` - no reply arrived in time, and the request may already
     have reached the peer. A request sent to a named PID whose `connect/2` has
     not yet returned was never written and is safe to retry. A reply that
@@ -432,6 +435,12 @@ defmodule Rebus do
 
       {:ok, %Rebus.Message{type: :method_return, body: [names]}} = Rebus.call(conn, message)
       {:error, :timeout} = Rebus.call(conn, message, 1_000)
+
+      case Rebus.call(conn, message) do
+        {:ok, reply} -> {:ok, reply.body}
+        {:error, {:dbus_error, error}} -> {:error, error.header_fields.error_name}
+        {:error, reason} -> {:error, reason}
+      end
   """
   @spec call(pid(), Rebus.Message.t(), non_neg_integer()) ::
           {:ok, Rebus.Message.t()} | {:error, call_error()}

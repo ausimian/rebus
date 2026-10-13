@@ -94,10 +94,11 @@ defmodule Rebus.Integration.SessionBusTest do
         )
 
       assert {:error,
-              %Message{
-                type: :error,
-                header_fields: %{error_name: "org.freedesktop.DBus.Error.UnknownMethod"}
-              }} = Rebus.call(caller, message, @call_timeout)
+              {:dbus_error,
+               %Message{
+                 type: :error,
+                 header_fields: %{error_name: "org.freedesktop.DBus.Error.UnknownMethod"}
+               }}} = Rebus.call(caller, message, @call_timeout)
     end
 
     test "answers org.freedesktop.DBus.Peer on a peer connection and on the daemon" do
@@ -119,10 +120,11 @@ defmodule Rebus.Integration.SessionBusTest do
 
         {:error, :unavailable} ->
           assert {:error,
-                  %Message{
-                    type: :error,
-                    header_fields: %{error_name: "org.freedesktop.DBus.Error.Failed"}
-                  }} = reply
+                  {:dbus_error,
+                   %Message{
+                     type: :error,
+                     header_fields: %{error_name: "org.freedesktop.DBus.Error.Failed"}
+                   }}} = reply
       end
 
       # The daemon always has one.
@@ -189,10 +191,11 @@ defmodule Rebus.Integration.SessionBusTest do
         )
 
       assert {:error,
-              %Message{
-                type: :error,
-                header_fields: %{error_name: "org.freedesktop.DBus.Error.UnknownMethod"}
-              }} = Rebus.call(caller, message, @call_timeout)
+              {:dbus_error,
+               %Message{
+                 type: :error,
+                 header_fields: %{error_name: "org.freedesktop.DBus.Error.UnknownMethod"}
+               }}} = Rebus.call(caller, message, @call_timeout)
 
       # /proc is Linux-only; elsewhere the refusal above is all this asserts.
       if before do

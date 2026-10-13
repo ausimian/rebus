@@ -3945,7 +3945,7 @@ defmodule RebusTest do
       assert resp.body == ["response"]
     end
 
-    test "returns D-Bus error replies as complete messages", %{cli: cli, svr: svr} do
+    test "returns D-Bus error replies as tagged complete messages", %{cli: cli, svr: svr} do
       method =
         Message.new!(:method_call,
           path: "/org/freedesktop/DBus",
@@ -3966,11 +3966,36 @@ defmodule RebusTest do
       :ok = TestServer.push(svr, error)
 
       assert {:error,
-              %Message{
-                type: :error,
-                header_fields: %{error_name: "org.example.Failed"},
-                body: ["failed"]
-              }} = Task.await(task)
+              {:dbus_error,
+               %Message{
+                 type: :error,
+                 header_fields: %{error_name: "org.example.Failed"},
+                 body: ["failed"],
+                 unix_fds: []
+               }}} = Task.await(task)
+    end
+
+    test "keeps local and transport failures untagged", %{cli: cli, svr: svr} do
+      # Only a peer's error reply carries the :dbus_error tag; every reason
+      # Rebus produces itself stays a bare term under :error.
+      tiny = Message.new!(:method_call, path: "/org/freedesktop/DBus", member: "Tiny")
+      assert Rebus.call(cli, tiny, 0) == {:error, :timeout}
+
+      no_reply =
+        Message.new!(:method_call,
+          path: "/org/freedesktop/DBus",
+          member: "NoReply",
+          flags: [:no_reply_expected]
+        )
+
+      assert Rebus.call(cli, no_reply) == {:error, :no_reply_expected}
+
+      pending = Message.new!(:method_call, path: "/org/freedesktop/DBus", member: "Pending")
+      task = Task.async(fn -> Rebus.call(cli, pending, 5_000) end)
+      assert_receive {^svr, %Message{header_fields: %{member: "Pending"}}}, 1_000
+      :ok = :socket.close(:sys.get_state(cli).sock)
+
+      assert Task.await(task) == {:error, :disconnected}
     end
 
     test "cleans pending calls that time out", %{cli: cli, svr: svr} do

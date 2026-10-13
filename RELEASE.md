@@ -15,6 +15,20 @@
 
 ### Changed
 
+- **Breaking:** `Rebus.call/3` now returns a D-Bus error reply from the peer as
+  `{:error, {:dbus_error, %Rebus.Message{type: :error}}}` rather than
+  `{:error, %Rebus.Message{type: :error}}`, so it no longer shares a shape
+  with local and transport failures such as `{:error, :timeout}`. The message
+  is unchanged and still carries any received descriptors in `:unix_fds`.
+
+  ```elixir
+  # Before
+  {:error, %Rebus.Message{type: :error} = error} -> handle_error(error)
+
+  # After
+  {:error, {:dbus_error, %Rebus.Message{} = error}} -> handle_error(error)
+  ```
+
 - Connections that negotiate Unix file descriptor passing now read inbound
   messages in bulk, as other connections do, rather than with at least two
   reads per message. Received descriptors go to the messages that begin in the

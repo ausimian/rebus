@@ -42,8 +42,9 @@ cannot carry descriptors, or when the peer declined.
 ## Receiving descriptors
 
 A `Rebus.call/3` reply exposes received descriptors in `message.unix_fds`. The
-calling process owns them from that moment. An error reply carries them the
-same way, so check `unix_fds` on both result shapes.
+calling process owns them from that moment. A D-Bus error reply carries them
+the same way, so check `unix_fds` on both `{:ok, reply}` and
+`{:error, {:dbus_error, reply}}`.
 
 Close each descriptor exactly once with `Rebus.UnixFD.close/1`, or adopt it
 with an OS or OTP API of your own. Never close one twice. Operating systems
@@ -57,16 +58,22 @@ matters to you, but never retry the close.
 
 ```elixir
 case Rebus.call(conn, message) do
-  {outcome, %Rebus.Message{unix_fds: fds} = reply}
-  when outcome in [:ok, :error] ->
-    try do
-      handle(outcome, reply)
-    after
-      Enum.each(fds, &Rebus.UnixFD.close/1)
-    end
+  {:ok, reply} ->
+    handle_and_close(reply, &handle_reply/1)
+
+  {:error, {:dbus_error, error}} ->
+    handle_and_close(error, &handle_error_reply/1)
 
   {:error, reason} ->
     handle_call_failure(reason)
+end
+
+defp handle_and_close(%Rebus.Message{unix_fds: fds} = message, handler) do
+  try do
+    handler.(message)
+  after
+    Enum.each(fds, &Rebus.UnixFD.close/1)
+  end
 end
 ```
 
