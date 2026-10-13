@@ -19,13 +19,15 @@ defmodule Rebus.Connection.Handshake do
     use TypedStruct
 
     # The connection settings the handshake reads. `write_timeout` bounds a
-    # single send in addition to the shared setup deadline; the remaining
-    # fields select mechanisms and the optional unix-FD extension.
+    # single send in addition to the shared setup deadline, and `clock` is the
+    # monotonic clock that deadline was taken from; the remaining fields select
+    # mechanisms and the optional unix-FD extension.
 
     typedstruct enforce: true do
       field :transport, module()
       field :identity, module()
       field :write_timeout, pos_integer()
+      field :clock, module(), default: Rebus.Clock.System
       field :allow_anonymous?, boolean(), default: false
       field :unix_fd_transport?, boolean(), default: false
       field :expected_guid, binary() | nil, default: nil
@@ -139,7 +141,7 @@ defmodule Rebus.Connection.Handshake do
   end
 
   defp authenticate_cookie(options, sock, auth_id, mechanisms, rest, deadline, maximum) do
-    with {:ok, timeout} <- remaining_setup_timeout(deadline, maximum) do
+    with {:ok, timeout} <- remaining_setup_timeout(options, deadline, maximum) do
       case get_auth_username(timeout, options.identity) do
         {:ok, username} ->
           authenticate_cookie_with_username(
@@ -247,7 +249,7 @@ defmodule Rebus.Connection.Handshake do
          deadline,
          maximum
        ) do
-    with {:ok, timeout} <- remaining_setup_timeout(deadline, maximum),
+    with {:ok, timeout} <- remaining_setup_timeout(options, deadline, maximum),
          {:ok, uid} <- auth_id_uid(auth_id),
          {:ok, response} <- cookie_response(username, uid, challenge, timeout),
          :ok <-
@@ -467,18 +469,18 @@ defmodule Rebus.Connection.Handshake do
   defp all_bytes?(<<byte, rest::binary>>, predicate),
     do: predicate.(byte) and all_bytes?(rest, predicate)
 
-  defp handshake_recv(transport, sock, buffer, timeout) when is_binary(buffer) do
-    receive_auth_line(transport, sock, buffer, read_deadline(timeout), timeout)
+  defp handshake_recv(options, sock, buffer, timeout) when is_binary(buffer) do
+    receive_auth_line(options, sock, buffer, read_deadline(options.clock, timeout), timeout)
   end
 
   defp handshake_recv_with_deadline(options, sock, buffer, deadline, maximum) do
-    with {:ok, timeout} <- remaining_setup_timeout(deadline, maximum) do
-      handshake_recv(options.transport, sock, buffer, timeout)
+    with {:ok, timeout} <- remaining_setup_timeout(options, deadline, maximum) do
+      handshake_recv(options, sock, buffer, timeout)
     end
   end
 
   defp handshake_send_with_deadline(sock, data, options, deadline, maximum) do
-    with {:ok, timeout} <- remaining_setup_timeout(deadline, maximum) do
+    with {:ok, timeout} <- remaining_setup_timeout(options, deadline, maximum) do
       handshake_send(options.transport, sock, data, min(timeout, options.write_timeout))
     end
   end
@@ -515,7 +517,7 @@ defmodule Rebus.Connection.Handshake do
     end
   end
 
-  defp receive_auth_line(transport, sock, buffer, deadline, timeout) do
+  defp receive_auth_line(options, sock, buffer, deadline, timeout) do
     # Previous reads can contain multiple auth lines. Consume one already in
     # the bounded buffer before touching the socket: the peer may legitimately
     # have closed after coalescing its next response.
@@ -524,25 +526,25 @@ defmodule Rebus.Connection.Handshake do
         result
 
       :incomplete ->
-        receive_auth_socket_data(transport, sock, buffer, deadline, timeout)
+        receive_auth_socket_data(options, sock, buffer, deadline, timeout)
 
       {:error, :auth_failed} = error ->
         error
     end
   end
 
-  defp receive_auth_socket_data(transport, sock, buffer, deadline, timeout) do
-    case remaining_timeout(deadline, timeout) do
+  defp receive_auth_socket_data(options, sock, buffer, deadline, timeout) do
+    case remaining_timeout(options.clock, deadline, timeout) do
       :expired ->
         {:error, :read_timeout}
 
       {:ok, receive_timeout} ->
-        case transport.recv(sock, 0, [], receive_timeout) do
+        case options.transport.recv(sock, 0, [], receive_timeout) do
           {:ok, data} ->
-            consume_auth_data(transport, sock, buffer, data, deadline, timeout)
+            consume_auth_data(options, sock, buffer, data, deadline, timeout)
 
           {:error, {:timeout, data}} when is_binary(data) and byte_size(data) > 0 ->
-            consume_auth_data(transport, sock, buffer, data, deadline, timeout)
+            consume_auth_data(options, sock, buffer, data, deadline, timeout)
 
           {:error, :timeout} ->
             {:error, :read_timeout}
@@ -556,11 +558,11 @@ defmodule Rebus.Connection.Handshake do
     end
   end
 
-  defp consume_auth_data(transport, sock, buffer, data, deadline, timeout) do
+  defp consume_auth_data(options, sock, buffer, data, deadline, timeout) do
     case consume_auth_buffer(buffer <> data) do
       {:ok, _line, _rest} = result -> result
       {:error, :auth_failed} = error -> error
-      :incomplete -> receive_auth_line(transport, sock, buffer <> data, deadline, timeout)
+      :incomplete -> receive_auth_line(options, sock, buffer <> data, deadline, timeout)
     end
   end
 
@@ -591,19 +593,19 @@ defmodule Rebus.Connection.Handshake do
     end
   end
 
-  defp read_deadline(timeout) when is_integer(timeout) and timeout > 0 do
-    System.monotonic_time(:millisecond) + timeout
+  defp read_deadline(clock, timeout) when is_integer(timeout) and timeout > 0 do
+    clock.monotonic_time() + timeout
   end
 
-  defp remaining_timeout(deadline, maximum) when is_integer(deadline) and maximum > 0 do
-    case deadline - System.monotonic_time(:millisecond) do
+  defp remaining_timeout(clock, deadline, maximum) when is_integer(deadline) and maximum > 0 do
+    case deadline - clock.monotonic_time() do
       remaining when remaining > 0 -> {:ok, min(remaining, maximum)}
       _ -> :expired
     end
   end
 
-  defp remaining_setup_timeout(deadline, maximum) do
-    case remaining_timeout(deadline, maximum) do
+  defp remaining_setup_timeout(%Options{clock: clock}, deadline, maximum) do
+    case remaining_timeout(clock, deadline, maximum) do
       {:ok, timeout} -> {:ok, timeout}
       :expired -> {:error, :read_timeout}
     end

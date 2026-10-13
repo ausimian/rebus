@@ -121,20 +121,20 @@ defmodule Rebus.Connection.Setup do
   @doc false
   @spec hello_reply_buffer(Connection.t()) :: Dispatch.result()
   def hello_reply_buffer(%Connection{} = state) do
-    Dispatch.process_inbound(state, {:hello_reply, read_deadline(state.read_timeout)})
+    Dispatch.process_inbound(state, {:hello_reply, read_deadline(state, state.read_timeout)})
   end
 
   @doc false
   @spec hello_reply(Connection.t()) :: Dispatch.result()
   def hello_reply(%Connection{} = state),
-    do: receive_hello_reply(state, read_deadline(state.read_timeout))
+    do: receive_hello_reply(state, read_deadline(state, state.read_timeout))
 
   @doc false
   @spec hello_reply(Connection.t(), integer()) :: Dispatch.result()
   def hello_reply(%Connection{} = state, deadline), do: receive_hello_reply(state, deadline)
 
   defp receive_hello_reply(%Connection{} = state, deadline) do
-    case remaining_timeout(deadline, state.read_timeout) do
+    case remaining_timeout(state, deadline, state.read_timeout) do
       :expired ->
         {:protocol_error, :read_timeout, state}
 
@@ -214,33 +214,18 @@ defmodule Rebus.Connection.Setup do
     end
   end
 
-  defp initialize(%Connection{aggregate_setup_timeout?: true} = state, addr) do
-    sock = state.sock
-    deadline = read_deadline(state.setup_timeout)
-
-    with {:ok, auth_id} <- aggregate_setup_auth_id(state, deadline),
-         {:ok, connect_timeout} <- remaining_setup_timeout(deadline, state.setup_timeout),
-         :ok <- connect_socket(transport(state), sock, addr, connect_timeout),
-         {:ok, %{guid: guid, unix_fd_negotiated?: unix_fd_negotiated?, rest: rest}} <-
-           Handshake.run(
-             sock,
-             auth_id,
-             deadline,
-             state.setup_timeout,
-             handshake_options(state)
-           ) do
-      initialized_connection(%{state | unix_fd_negotiated?: unix_fd_negotiated?}, guid, rest)
-    else
-      {:error, reason} -> stop_and_close(transport(state), sock, reason)
-    end
-  end
-
+  # Setup is one budget. The identity lookup, the socket connect and the
+  # handshake share a single deadline, each phase getting only what the phases
+  # before it left, so a slow phase cannot stretch setup past `setup_timeout`.
+  # An expired budget stops setup with `:read_timeout`, as a phase that timed
+  # out itself would.
   defp initialize(%Connection{} = state, addr) do
     sock = state.sock
+    deadline = read_deadline(state, state.setup_timeout)
 
-    with {:ok, auth_id} <- setup_auth_id(state, state.setup_timeout),
-         :ok <- connect_socket(transport(state), sock, addr, state.setup_timeout),
-         deadline = read_deadline(state.setup_timeout),
+    with {:ok, auth_id} <- setup_auth_id(state, deadline),
+         {:ok, connect_timeout} <- remaining_setup_timeout(state, deadline),
+         :ok <- connect_socket(transport(state), sock, addr, connect_timeout),
          {:ok, %{guid: guid, unix_fd_negotiated?: unix_fd_negotiated?, rest: rest}} <-
            Handshake.run(
              sock,
@@ -259,6 +244,7 @@ defmodule Rebus.Connection.Setup do
     %Handshake.Options{
       transport: impl.transport,
       identity: impl.identity,
+      clock: impl.clock,
       write_timeout: state.write_timeout,
       allow_anonymous?: state.allow_anonymous?,
       unix_fd_transport?: state.unix_fd_transport?,
@@ -280,21 +266,15 @@ defmodule Rebus.Connection.Setup do
   def continuation(%Connection{bus?: false}), do: :established
   def continuation(%Connection{}), do: :hello
 
-  defp aggregate_setup_auth_id(%Connection{precomputed_auth_id: auth_id}, _deadline)
+  defp setup_auth_id(%Connection{precomputed_auth_id: auth_id}, _deadline)
        when is_binary(auth_id),
        do: {:ok, auth_id}
 
-  defp aggregate_setup_auth_id(%Connection{} = state, deadline) do
-    with {:ok, auth_id_timeout} <- remaining_setup_timeout(deadline, state.setup_timeout) do
+  defp setup_auth_id(%Connection{} = state, deadline) do
+    with {:ok, auth_id_timeout} <- remaining_setup_timeout(state, deadline) do
       Handshake.get_auth_id(auth_id_timeout, state.impl.identity)
     end
   end
-
-  defp setup_auth_id(%Connection{precomputed_auth_id: auth_id}, _timeout) when is_binary(auth_id),
-    do: {:ok, auth_id}
-
-  defp setup_auth_id(%Connection{} = state, timeout),
-    do: Handshake.get_auth_id(timeout, state.impl.identity)
 
   defp notify_connect_waiter({pid, ref}, result) when is_pid(pid) and is_reference(ref),
     do: send(pid, {ref, result})
@@ -493,25 +473,28 @@ defmodule Rebus.Connection.Setup do
     end
   end
 
-  @doc false
-  @spec read_deadline(pos_integer()) :: integer()
-  def read_deadline(timeout) when is_integer(timeout) and timeout > 0 do
-    System.monotonic_time(:millisecond) + timeout
+  # Deadlines are read off the connection's clock, the same one the handshake
+  # is given, so a test clock moves every setup phase together.
+  defp read_deadline(%Connection{} = state, timeout) when is_integer(timeout) and timeout > 0 do
+    clock(state).monotonic_time() + timeout
   end
 
-  defp remaining_timeout(deadline, maximum) when is_integer(deadline) and maximum > 0 do
-    case deadline - System.monotonic_time(:millisecond) do
+  defp remaining_timeout(%Connection{} = state, deadline, maximum)
+       when is_integer(deadline) and maximum > 0 do
+    case deadline - clock(state).monotonic_time() do
       remaining when remaining > 0 -> {:ok, min(remaining, maximum)}
       _ -> :expired
     end
   end
 
-  defp remaining_setup_timeout(deadline, maximum) do
-    case remaining_timeout(deadline, maximum) do
+  defp remaining_setup_timeout(%Connection{} = state, deadline) do
+    case remaining_timeout(state, deadline, state.setup_timeout) do
       {:ok, timeout} -> {:ok, timeout}
       :expired -> {:error, :read_timeout}
     end
   end
+
+  defp clock(%Connection{impl: %{clock: clock}}), do: clock
 
   defp transport(%Connection{impl: %{transport: transport}}), do: transport
 end
