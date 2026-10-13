@@ -895,6 +895,7 @@ defmodule Rebus.AuthTest do
 
       try do
         :ok = File.mkdir_p(keyring)
+        :ok = File.chmod(home, 0o755)
         :ok = File.chmod(keyring, 0o700)
         :ok = File.write(path, "#{cookie_id} 0 #{cookie}\n")
         :ok = File.chmod(path, 0o600)
@@ -1312,6 +1313,9 @@ defmodule Rebus.AuthTest do
 
     try do
       :ok = File.mkdir_p(keyring)
+      # Pin the home mode: under a 0002 umask `mkdir_p` leaves it
+      # group-writable, which the home check rightly rejects.
+      :ok = File.chmod(home, 0o755)
       :ok = File.chmod(keyring, 0o700)
       :ok = File.write(Path.join(keyring, context), "1 0 #{cookie}\n")
       :ok = File.chmod(Path.join(keyring, context), 0o600)
