@@ -256,12 +256,15 @@ defmodule Rebus.Connection.Dispatch do
   # `data` is already flat when a complete frame is available. Parse every
   # coalesced frame directly from its sub-binary remainder, retaining only the
   # final incomplete tail. This avoids re-flattening a receive buffer per frame.
+  # A coalesced frame is held to the same size cap as one at the head of the
+  # buffer, so an oversized successor stops the connection as soon as its
+  # header is parsed rather than being retained as the incomplete tail.
   defp parse_flat_messages(<<>>, %Connection{} = state, cursor) do
     process_inbound(state, cursor.continuation)
   end
 
   defp parse_flat_messages(data, %Connection{} = state, cursor) do
-    case Message.parse_inbound(data) do
+    case Message.parse_inbound(data, state.inbound.max_message_size) do
       nil ->
         append_inbound(Inbound.retain_remainder(data, cursor.source), state, cursor.continuation)
 

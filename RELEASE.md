@@ -6,6 +6,12 @@
 - `Rebus.add_match/3` returns `{:error, :match_rule_uncertain}` for an uncertain
   rule, and `{:error, :match_recovery_capacity_exhausted}` for a new rule while
   `:match_recovery_max_rules` rules on the connection are unresolved.
+- `Rebus.connect/2` takes a `:max_message_size` option that caps the size of
+  each inbound message, from 4096 bytes up to the protocol limit of 128 MiB,
+  which stays the default. A peer that declares a larger message stops the
+  connection with `:message_too_large` before Rebus buffers the message body,
+  so an untrusted peer can no longer make a connection hold 128 MiB. An
+  invalid value returns `{:error, :invalid_max_message_size}`.
 
 ### Changed
 

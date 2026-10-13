@@ -199,7 +199,8 @@ defmodule Rebus.Message do
   The largest complete D-Bus message accepted from the wire, in bytes.
 
   This is the D-Bus protocol limit of 2^27 bytes and includes the fixed header,
-  header fields, alignment padding, and body.
+  header fields, alignment padding, and body. A connection can accept less
+  with the `:max_message_size` option of `Rebus.connect/2`.
   """
   @spec max_message_size() :: pos_integer()
   def max_message_size, do: @max_message_size
@@ -481,8 +482,12 @@ defmodule Rebus.Message do
     end
   end
 
+  # `max_message_size` is the receiving connection's inbound cap, which may be
+  # lower than the protocol limit. A frame declared larger than it is rejected
+  # as soon as its header-fields length is available, like one over the
+  # protocol limit.
   @doc false
-  @spec parse_inbound(binary()) ::
+  @spec parse_inbound(binary(), pos_integer()) ::
           {:ok, t(), binary()}
           | {:error, :resource_limit,
              %{
@@ -493,8 +498,8 @@ defmodule Rebus.Message do
              | nil, binary()}
           | {:error, any()}
           | nil
-  def parse_inbound(binary) when is_binary(binary) do
-    case expected_size(binary) do
+  def parse_inbound(binary, max_message_size \\ @max_message_size) when is_binary(binary) do
+    case expected_size(binary, max_message_size) do
       {:ok, total_message_size} when byte_size(binary) >= total_message_size ->
         <<message_binary::binary-size(^total_message_size), remaining_data::binary>> = binary
 
@@ -666,8 +671,11 @@ defmodule Rebus.Message do
   end
 
   @doc false
-  @spec expected_size(binary()) :: {:ok, pos_integer()} | {:error, atom()} | nil
-  def expected_size(binary) when is_binary(binary) and byte_size(binary) >= 12 do
+  @spec expected_size(binary(), pos_integer()) :: {:ok, pos_integer()} | {:error, atom()} | nil
+  def expected_size(binary, max_message_size \\ @max_message_size)
+
+  def expected_size(binary, max_message_size)
+      when is_binary(binary) and byte_size(binary) >= 12 do
     <<endian_flag, type_byte, _flags_byte, version_byte, body_length::binary-size(4),
       _serial::binary-size(4), rest::binary>> = binary
 
@@ -676,14 +684,14 @@ defmodule Rebus.Message do
          :ok <- validate_protocol_version(version_byte) do
       body_length = read_uint32(body_length, endianness)
 
-      case declared_message_size(rest, body_length, endianness) do
+      case declared_message_size(rest, body_length, endianness, max_message_size) do
         {:error, :insufficient_data} -> nil
         result -> result
       end
     end
   end
 
-  def expected_size(_binary), do: nil
+  def expected_size(_binary, _max_message_size), do: nil
 
   @doc """
   Validates that a message is well-formed according to D-Bus rules.
@@ -1045,16 +1053,21 @@ defmodule Rebus.Message do
   defp validate_protocol_version(_), do: {:error, :unsupported_protocol_version}
 
   defp validate_declared_message_size(rest, body_length, endianness) do
-    case declared_message_size(rest, read_uint32(body_length, endianness), endianness) do
+    case declared_message_size(
+           rest,
+           read_uint32(body_length, endianness),
+           endianness,
+           @max_message_size
+         ) do
       {:error, :message_too_large} -> {:error, :message_too_large}
       _ -> :ok
     end
   end
 
-  defp declared_message_size(rest, body_length, endianness) do
+  defp declared_message_size(rest, body_length, endianness, max_message_size) do
     with {:ok, header_fields_length} <- extract_array_length(rest, endianness),
          {:ok, _header_padded_length, total_size} <-
-           frame_geometry(header_fields_length, body_length) do
+           frame_geometry(header_fields_length, body_length, max_message_size) do
       {:ok, total_size}
     end
   end
@@ -1062,16 +1075,20 @@ defmodule Rebus.Message do
   # Bounded padded header length and complete frame size for a header-fields
   # array data length (the array's declared length, excluding its own length
   # field). Callers that are already inside a bounded frame use
-  # `header_padded_length/1` instead of repeating the limit checks.
-  defp frame_geometry(header_fields_length, _body_length)
+  # `header_padded_length/1` instead of repeating the limit checks. Inbound
+  # frames are measured against the receiving connection's cap, which is never
+  # above the protocol limit.
+  defp frame_geometry(header_fields_length, body_length, max_message_size \\ @max_message_size)
+
+  defp frame_geometry(header_fields_length, _body_length, _max_message_size)
        when header_fields_length > @max_array_size,
        do: {:error, :message_too_large}
 
-  defp frame_geometry(header_fields_length, body_length) do
+  defp frame_geometry(header_fields_length, body_length, max_message_size) do
     header_padded_length = header_padded_length(header_fields_length)
     total_size = header_padded_length + body_length
 
-    if total_size <= @max_message_size do
+    if total_size <= max_message_size do
       {:ok, header_padded_length, total_size}
     else
       {:error, :message_too_large}

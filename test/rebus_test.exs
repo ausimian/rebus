@@ -3549,6 +3549,192 @@ defmodule RebusTest do
     end
   end
 
+  describe "Inbound message size cap" do
+    setup [:server_setup]
+
+    test "rejects an invalid max message size", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+
+      for size <- [0, -1, 4_095, Message.max_message_size() + 1, 4_096.0, "4096", :infinity] do
+        assert {:error, :invalid_max_message_size} = Rebus.connect(addr, max_message_size: size)
+      end
+    end
+
+    test "rejects an invalid max message size before trying a bus address" do
+      parent = self()
+
+      connector = fn address, _args ->
+        send(parent, {:connect_candidate, address})
+        {:error, :invalid_max_message_size}
+      end
+
+      assert {:error, :invalid_max_message_size} =
+               connect_candidates(
+                 [{:local, "/tmp/one", nil}, {:local, "/tmp/two", nil}],
+                 [timeout: 50, max_message_size: 0],
+                 connector: TestImpl.connector(connect_candidate: connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end)
+               )
+
+      assert_receive {:connect_candidate, %{path: "/tmp/one"}}
+      refute_receive {:connect_candidate, %{path: "/tmp/two"}}
+    end
+
+    test "defaults to the protocol limit", %{svr: svr} do
+      cli = connect_until_ready(svr)
+
+      assert :sys.get_state(cli).inbound.max_message_size == Message.max_message_size()
+    end
+
+    test "accepts the protocol limit as an explicit cap", %{svr: svr} do
+      cli = connect_until_ready(svr, max_message_size: Message.max_message_size())
+
+      assert :sys.get_state(cli).inbound.max_message_size == Message.max_message_size()
+    end
+
+    test "delivers a message exactly at the cap", %{svr: svr} do
+      frame = sized_signal_frame("AtCap", 5_000)
+      cli = connect_until_ready(svr, max_message_size: 5_000)
+      {:ok, ref} = Rebus.add_signal_handler(cli)
+
+      :ok = TestServer.push_raw(svr, frame)
+
+      assert_receive {^ref, %Message{header_fields: %{member: "AtCap"}}}, 1_000
+      assert Process.alive?(cli)
+    end
+
+    test "stops on a message one byte over the cap", %{svr: svr} do
+      frame = sized_signal_frame("OverCap", 5_001)
+      cli = connect_until_ready(svr, max_message_size: 5_000)
+      {:ok, handler_ref} = Rebus.add_signal_handler(cli)
+      ref = Process.monitor(cli)
+
+      log =
+        capture_log(fn ->
+          :ok = TestServer.push_raw(svr, frame)
+
+          assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :message_too_large}}, 1_000
+        end)
+
+      assert log =~ "D-Bus connection protocol stopped: :message_too_large"
+      refute_received {^handler_ref, _message}
+    end
+
+    test "rejects an over-cap frame from its header before its body is sent", %{svr: svr} do
+      cli = connect_until_ready(svr, max_message_size: 4_096)
+      ref = Process.monitor(cli)
+      body_length = 4_096 - 16 + 1
+      fixed_header = <<?l, 4, 0, 1, body_length::little-32, 1::little-32, 0::little-32>>
+
+      # The protocol limit alone would wait for this frame's body.
+      assert {:ok, 4_097} = Message.expected_size(fixed_header)
+
+      log =
+        capture_log(fn ->
+          # Only the fixed header is ever placed on the socket.
+          :ok = TestServer.push_raw(svr, fixed_header)
+
+          assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :message_too_large}}, 1_000
+        end)
+
+      assert log =~ "D-Bus connection protocol stopped: :message_too_large"
+    end
+
+    test "stops on an over-cap frame coalesced behind a delivered one", %{svr: svr} do
+      cli = connect_until_ready(svr, max_message_size: 4_096)
+      {:ok, handler_ref} = Rebus.add_signal_handler(cli)
+      ref = Process.monitor(cli)
+      leading = sized_signal_frame("BeforeOverCap", 4_096)
+      body_length = 4_096 - 16 + 1
+      fixed_header = <<?l, 4, 0, 1, body_length::little-32, 1::little-32, 0::little-32>>
+
+      log =
+        capture_log(fn ->
+          :ok = TestServer.push_raw(svr, leading <> fixed_header)
+
+          assert_receive {:DOWN, ^ref, :process, ^cli, {:shutdown, :message_too_large}}, 1_000
+        end)
+
+      assert_received {^handler_ref, %Message{header_fields: %{member: "BeforeOverCap"}}}
+      assert log =~ "D-Bus connection protocol stopped: :message_too_large"
+    end
+
+    test "fits the longest Hello reply and NameAcquired under the smallest cap", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      :ok = TestServer.set_auto_hello(svr, false)
+
+      connect_task =
+        Task.async(fn -> Rebus.connect(addr, cached_identity(max_message_size: 4_096)) end)
+
+      hello = await_hello(svr)
+      # The longest unique name the D-Bus specification allows.
+      name = ":1." <> String.duplicate("a", 252)
+      assert byte_size(name) == 255
+
+      reply =
+        Message.new!(:method_return,
+          reply_serial: hello.serial,
+          sender: "org.freedesktop.DBus",
+          destination: name,
+          serial: 1,
+          signature: "s",
+          body: [name]
+        )
+
+      acquired =
+        Message.new!(:signal,
+          sender: "org.freedesktop.DBus",
+          path: "/org/freedesktop/DBus",
+          interface: "org.freedesktop.DBus",
+          member: "NameAcquired",
+          destination: name,
+          serial: 2,
+          signature: "s",
+          body: [name]
+        )
+
+      frames =
+        for message <- [reply, acquired] do
+          {:ok, encoded} = Message.encode(message)
+          frame = IO.iodata_to_binary(encoded)
+          assert byte_size(frame) < 1_024
+          frame
+        end
+
+      :ok = TestServer.push_raw(svr, IO.iodata_to_binary(frames))
+
+      assert {:ok, cli} = Task.await(connect_task, 1_000)
+      assert :sys.get_state(cli).name == name
+    end
+
+    test "applies the cap to the Hello reply", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      :ok = TestServer.set_auto_hello(svr, false)
+
+      connect_task =
+        Task.async(fn -> Rebus.connect(addr, cached_identity(max_message_size: 4_096)) end)
+
+      hello = await_hello(svr)
+
+      reply =
+        Message.new!(:method_return,
+          reply_serial: hello.serial,
+          serial: 1,
+          signature: "ss",
+          body: [":1.100", String.duplicate("x", 4_096)]
+        )
+
+      log =
+        capture_log(fn ->
+          :ok = TestServer.push(svr, reply)
+
+          assert {:error, :message_too_large} = Task.await(connect_task, 1_000)
+        end)
+
+      assert log =~ "D-Bus connection protocol stopped: :message_too_large"
+    end
+  end
+
   describe "Public message API" do
     setup [:server_setup, :client_setup]
 
@@ -4774,6 +4960,28 @@ defmodule RebusTest do
   # `id -u` through a port and completed the EXTERNAL and NEGOTIATE_UNIX_FD
   # handshake, which can exceed the 100ms assert_receive default on a loaded
   # runner. Every Hello wait goes through here so the budget stays generous.
+  # An encoded signal padded to exactly `size` bytes. A string body grows the
+  # frame one byte per character, because nothing follows it to be aligned.
+  defp sized_signal_frame(member, size) do
+    encode = fn padding ->
+      message =
+        Message.new!(:signal,
+          path: "/test",
+          interface: "test.interface",
+          member: member,
+          signature: "s",
+          body: [String.duplicate("x", padding)]
+        )
+
+      {:ok, encoded} = Message.encode(%{message | serial: 1})
+      IO.iodata_to_binary(encoded)
+    end
+
+    frame = encode.(size - byte_size(encode.(0)))
+    assert byte_size(frame) == size
+    frame
+  end
+
   defp await_hello(svr, timeout \\ 1_000) do
     assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}, timeout
     hello

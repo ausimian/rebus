@@ -2238,6 +2238,30 @@ defmodule Rebus.MessageTest do
       end
     end
 
+    test "measures inbound frames against a lower connection cap" do
+      for endianness <- [:little, :big] do
+        at_cap = fixed_header(endianness, 4, 1, 4_096 - 16, 0)
+        over_cap = fixed_header(endianness, 4, 1, 4_096 - 16 + 1, 0)
+
+        assert {:ok, 4_096} = Message.expected_size(at_cap, 4_096)
+        assert {:error, :message_too_large} = Message.expected_size(over_cap, 4_096)
+        assert {:ok, 4_097} = Message.expected_size(over_cap)
+
+        assert nil == Message.parse_inbound(at_cap, 4_096)
+        assert {:error, :message_too_large} = Message.parse_inbound(over_cap, 4_096)
+        assert nil == Message.parse_inbound(over_cap)
+      end
+
+      message = Message.new!(:signal, path: "/test", interface: "test.interface", member: "Cap")
+      {:ok, encoded} = Message.encode(message)
+      frame = IO.iodata_to_binary(encoded)
+
+      assert {:ok, %Message{}, <<>>} = Message.parse_inbound(frame, byte_size(frame))
+
+      assert {:error, :message_too_large} =
+               Message.parse_inbound(frame, byte_size(frame) - 1)
+    end
+
     test "allows a maximum-size message to remain incomplete" do
       for endianness <- [:little, :big] do
         maximum_body = Message.max_message_size() - 16

@@ -6,7 +6,9 @@ defmodule Rebus.Connection.Inbound do
   # process state: no timers, no logging and no socket. Received fragments are
   # appended to a rope of segments, the fixed header is validated as soon as
   # sixteen bytes are retained, and the buffer is materialised exactly once per
-  # complete frame.
+  # complete frame. A frame declared larger than the connection's
+  # `:max_message_size` is rejected as soon as its fixed header and header-fields
+  # length are retained, before any more of it is buffered.
 
   use TypedStruct
 
@@ -23,6 +25,9 @@ defmodule Rebus.Connection.Inbound do
     # Counts whole-frame materialisations, so a test can assert that coalesced
     # frames are flattened once per receive rather than once per message.
     field :flatten_count, non_neg_integer(), default: 0
+    # The largest complete frame this connection accepts. It never exceeds the
+    # protocol limit, and it survives `clear/1`.
+    field :max_message_size, pos_integer(), default: Message.max_message_size()
   end
 
   @spec new() :: t()
@@ -30,11 +35,17 @@ defmodule Rebus.Connection.Inbound do
 
   # The handshake may read message bytes along with its final response. They
   # are ordinary inbound traffic and seed an otherwise empty buffer.
-  @spec new(binary()) :: t()
-  def new(<<>>), do: %__MODULE__{}
+  @spec new(binary(), pos_integer()) :: t()
+  def new(data, max_message_size \\ Message.max_message_size())
 
-  def new(data) when is_binary(data),
-    do: %__MODULE__{segments: [{byte_size(data), data}], size: byte_size(data)}
+  def new(<<>>, max_message_size), do: %__MODULE__{max_message_size: max_message_size}
+
+  def new(data, max_message_size) when is_binary(data),
+    do: %__MODULE__{
+      segments: [{byte_size(data), data}],
+      size: byte_size(data),
+      max_message_size: max_message_size
+    }
 
   @doc false
   @spec pending?(t()) :: boolean()
@@ -75,7 +86,7 @@ defmodule Rebus.Connection.Inbound do
       prefix(inbound, min(size, 16)) <>
         binary_part(data, 0, min(byte_size(data), max(16 - size, 0)))
 
-    case Message.expected_size(header) do
+    case Message.expected_size(header, inbound.max_message_size) do
       {:ok, expected_size} -> size + byte_size(data) > expected_size
       _incomplete_or_invalid -> false
     end
@@ -85,14 +96,16 @@ defmodule Rebus.Connection.Inbound do
     do: size + byte_size(data) > expected_size
 
   # Fixed-header validation happens as soon as sixteen bytes are retained,
-  # without making allocation depend on a peer-declared frame length. The
-  # buffer is flattened only once the whole frame has arrived, and the frame
-  # bytes are returned with the buffer cleared for the next one.
+  # without making allocation depend on a peer-declared frame length. That is
+  # also where the connection's size cap applies, so an oversized frame is
+  # refused before the next read appends any more of it. The buffer is
+  # flattened only once the whole frame has arrived, and the frame bytes are
+  # returned with the buffer cleared for the next one.
   @spec next(t()) :: {:frame, binary(), t()} | {:incomplete, t()} | {:error, atom()}
   def next(%__MODULE__{size: 0} = inbound), do: {:incomplete, inbound}
 
   def next(%__MODULE__{expected_size: nil} = inbound) do
-    case Message.expected_size(prefix(inbound, min(inbound.size, 16))) do
+    case Message.expected_size(prefix(inbound, min(inbound.size, 16)), inbound.max_message_size) do
       {:ok, expected_size} -> next(%{inbound | expected_size: expected_size})
       nil -> {:incomplete, inbound}
       {:error, reason} -> {:error, reason}
