@@ -51,3 +51,9 @@
   `:session`. The identity lookup, socket connect and authentication share it,
   so a slow peer can no longer hold setup for up to three times the timeout.
   An expired budget still returns `{:error, :read_timeout}`.
+- `Rebus.close/1` now stops a connection that is still connecting its socket or
+  authenticating at once. It used to wait until setup finished or timed out,
+  and when setup's budget outlasted the connection's 5-second shutdown timeout
+  the connection was killed. The `connect/2` call waiting for that connection
+  now returns `{:error, :shutdown}`, and a `:system` or `:session` connect no
+  longer moves on to the next bus address.

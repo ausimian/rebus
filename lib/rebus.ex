@@ -346,6 +346,13 @@ defmodule Rebus do
   `{:error, :not_found}` as it does for any other PID that is no longer a
   connection.
 
+  A connection can be closed before its `connect/2` returns, for example
+  through its registered `:name`. One still connecting its socket or
+  authenticating stops at once, and that `connect/2` returns
+  `{:error, :shutdown}`, or `{:error, :noproc}` when the close lands before
+  `connect/2` has started watching the connection. Either way it tries no
+  further bus addresses.
+
   ## Return values
 
   - `:ok` - The supervised connection was stopped.
