@@ -23,6 +23,12 @@ defmodule Rebus.Connection do
   @default_write_timeout 5_000
   @default_read_timeout 5_000
 
+  # The smallest accepted `:max_message_size`. A message-bus `Hello` reply and
+  # the `NameAcquired` signal after it fit well inside this even with the
+  # longest legal unique name, so no accepted cap can make setup impossible.
+  @min_max_message_size 4_096
+  @max_max_message_size Message.max_message_size()
+
   # The settings a connection carries verbatim into its state. Most are read
   # only while the connection is being set up.
   @setting_fields [
@@ -323,6 +329,7 @@ defmodule Rebus.Connection do
       name: Keyword.get(opts, :name),
       connect_waiter: Map.get(internal, :connect_waiter),
       owner: Keyword.get(opts, :owner),
+      max_message_size: Keyword.get(opts, :max_message_size, Message.max_message_size()),
       impl: Map.get_lazy(internal, :impl, &Rebus.Impl.default/0)
     }
   end
@@ -339,7 +346,8 @@ defmodule Rebus.Connection do
          :ok <- validate_precomputed_auth_id(settings.precomputed_auth_id),
          :ok <- validate_flag(:invalid_allow_anonymous, settings.allow_anonymous?),
          :ok <- validate_flag(:invalid_bus_option, settings.bus?),
-         :ok <- validate_owner(settings.owner) do
+         :ok <- validate_owner(settings.owner),
+         :ok <- validate_max_message_size(settings.max_message_size) do
       validate_registered_name(settings.name)
     end
   end
@@ -368,6 +376,13 @@ defmodule Rebus.Connection do
   defp validate_owner(owner) when is_pid(owner) and node(owner) == node(), do: :ok
   defp validate_owner(_owner), do: {:stop, :invalid_owner}
 
+  defp validate_max_message_size(size)
+       when is_integer(size) and size >= @min_max_message_size and
+              size <= @max_max_message_size,
+       do: :ok
+
+  defp validate_max_message_size(_size), do: {:stop, :invalid_max_message_size}
+
   defp validate_registered_name(name) when is_nil(name) or is_atom(name), do: :ok
   defp validate_registered_name(_name), do: {:stop, :invalid_name}
 
@@ -384,13 +399,15 @@ defmodule Rebus.Connection do
         _ = configure_receive_buffer(impl.transport, sock)
 
         # Every setting whose name is also a struct field is copied wholesale;
-        # the rest of the settings map is either validated only (`timeout`) or
+        # the rest of the settings map is either validated only (`timeout`),
         # means something else on the struct (`name` is the registered process
-        # name, not the unique bus name).
+        # name, not the unique bus name), or belongs to the inbound buffer
+        # (`max_message_size`).
         state =
           struct!(
             %__MODULE__{
               sock: sock,
+              inbound: Inbound.new(<<>>, settings.max_message_size),
               connect_waiter_monitor: Setup.monitor_connect_waiter(settings.connect_waiter),
               owner_monitor: monitor_owner(settings.owner),
               unix_fd_transport?: Setup.unix_fd_transport_supported?(family)

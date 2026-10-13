@@ -257,7 +257,7 @@ defmodule Rebus.Connection.Setup do
      %{
        state
        | guid: guid,
-         inbound: Inbound.new(rest)
+         inbound: Inbound.new(rest, state.inbound.max_message_size)
      }, {:continue, continuation(state)}}
   end
 

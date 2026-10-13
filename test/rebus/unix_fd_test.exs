@@ -1014,6 +1014,65 @@ defmodule Rebus.UnixFDTest do
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
   end
 
+  test "closes descriptors held for a frame rejected over the size cap" do
+    path = Rebus.TestTmp.path("ufd-cap")
+
+    {:ok, server} =
+      start_supervised(%{
+        id: {:unix_fd_cap_server, path},
+        start: {TestServer, :start_link, [[tap: self(), family: :local, path: path]]}
+      })
+
+    {:ok, address} = TestServer.get_listen_addr(server)
+
+    {:ok, connection} =
+      Rebus.connect(address,
+        max_message_size: 4_096,
+        __impl__: %{identity: TestImpl.CachedIdentity}
+      )
+
+    on_exit(fn ->
+      if Process.alive?(connection), do: Rebus.close(connection)
+    end)
+
+    assert :sys.get_state(connection).unix_fd_negotiated?
+    {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
+
+    # A frame declared one byte over the cap.
+    body_length = 4_096 - 16 + 1
+    fixed_header = <<?l, 4, 0, 1, body_length::little-32, 1::little-32, 0::little-32>>
+
+    # The descriptor rides with the first half of the fixed header, so the
+    # connection holds it before the frame's size is known.
+    :ok =
+      :socket.sendmsg(
+        :sys.get_state(server).cli_sock,
+        %{
+          iov: [binary_part(fixed_header, 0, 8)],
+          ctrl: [%{level: :socket, type: :rights, data: <<fd::native-signed-32>>}]
+        },
+        [],
+        1_000
+      )
+
+    assert eventually(fn -> :sys.get_state(connection).inbound_fds.fds != [] end)
+    [received] = :sys.get_state(connection).inbound_fds.fds
+    ref = Process.monitor(connection)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        :ok = :socket.send(:sys.get_state(server).cli_sock, binary_part(fixed_header, 8, 8))
+
+        assert_receive {:DOWN, ^ref, :process, ^connection, {:shutdown, :message_too_large}},
+                       1_000
+      end)
+
+    assert log =~ "D-Bus connection protocol stopped: :message_too_large"
+    # Check the exact received descriptor before anything else can reuse its
+    # integer value.
+    assert {:error, :ebadf} = UnixFD.close(received)
+  end
+
   test "reads coalesced frames in one recvmsg once descriptors are negotiated", %{
     server: server,
     connection: connection

@@ -149,6 +149,37 @@ defmodule Rebus.Connection.InboundTest do
 
       assert {:error, :message_too_large} = next_from(fixed_header(body_length: body_length))
     end
+
+    test "waits for a frame declared exactly at the connection's cap" do
+      # The 16-byte fixed header and empty header-fields array occupy the
+      # first 16 bytes of the declared frame.
+      header = fixed_header(body_length: 4_096 - 16)
+
+      assert {:incomplete, inbound} = next_from(header, 4_096)
+      assert inbound.expected_size == 4_096
+    end
+
+    test "rejects a frame declared over the connection's cap before its body arrives" do
+      header = fixed_header(body_length: 4_096 - 16 + 1)
+
+      # The protocol limit alone would wait for this frame's body.
+      assert {:incomplete, _inbound} = next_from(header)
+      assert {:error, :message_too_large} = next_from(header, 4_096)
+    end
+
+    test "delivers a frame at the cap and keeps the cap for the next frame" do
+      frame = encoded_frame("AtCap")
+      {:ok, inbound} = Inbound.append(Inbound.new(<<>>, byte_size(frame)), frame)
+
+      assert {:frame, ^frame, inbound} = Inbound.next(inbound)
+      assert inbound.max_message_size == byte_size(frame)
+
+      over_cap = encoded_frame("OverTheCapByAWholeAlignedWord")
+      assert byte_size(over_cap) > byte_size(frame)
+
+      {:ok, inbound} = Inbound.append(inbound, over_cap)
+      assert {:error, :message_too_large} = Inbound.next(inbound)
+    end
   end
 
   describe "retain_remainder/2" do
@@ -211,12 +242,26 @@ defmodule Rebus.Connection.InboundTest do
     end
   end
 
-  describe "new/1" do
+  describe "new/2" do
     test "seeds an empty buffer with the bytes read past the handshake" do
       assert Inbound.new(<<>>) == Inbound.new()
 
       frame = encoded_frame("Seeded")
       assert {:frame, ^frame, _inbound} = Inbound.next(Inbound.new(frame))
+    end
+
+    test "defaults the cap to the protocol limit" do
+      assert Inbound.new().max_message_size == Message.max_message_size()
+      assert Inbound.new(encoded_frame("Default")).max_message_size == Message.max_message_size()
+    end
+
+    test "carries a cap through seeding and clearing" do
+      frame = encoded_frame("Seeded")
+      inbound = Inbound.new(frame, 4_096)
+
+      assert inbound.max_message_size == 4_096
+      assert Inbound.clear(inbound).max_message_size == 4_096
+      assert Inbound.new(<<>>, 4_096).max_message_size == 4_096
     end
   end
 
@@ -229,8 +274,8 @@ defmodule Rebus.Connection.InboundTest do
     end)
   end
 
-  defp next_from(data) do
-    {:ok, inbound} = Inbound.append(Inbound.new(), data)
+  defp next_from(data, max_message_size \\ Message.max_message_size()) do
+    {:ok, inbound} = Inbound.append(Inbound.new(<<>>, max_message_size), data)
     Inbound.next(inbound)
   end
 

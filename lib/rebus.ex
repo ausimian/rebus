@@ -175,6 +175,7 @@ defmodule Rebus do
   | `:allow_anonymous` | `false` | Allow the `ANONYMOUS` mechanism, which authenticates nothing and also requires `bus: false`. |
   | `:bus` | `true` | Pass `false` for a peer-to-peer endpoint, which sends no `Hello` and has no unique name. |
   | `:owner` | `nil` | A local PID whose exit stops the connection. `nil` leaves the connection alive until `close/1`. |
+  | `:max_message_size` | `134217728` | Largest complete inbound message, in bytes, from `4096` up to the protocol limit, `Rebus.Message.max_message_size/0`. Outbound messages are not affected. |
 
   ## Notes
 
@@ -199,6 +200,17 @@ defmodule Rebus do
     less time for the entries after it.
   - Failed address-list attempts are logged at debug level, without any
     address, host, path or GUID.
+  - `:max_message_size` bounds the memory a peer can make one connection
+    hold for inbound traffic. Rebus buffers one partial message at a time
+    and reads at most 64 KiB at once, so a connection retains about the cap
+    plus one read. The default protocol limit allows a peer to make a
+    connection buffer 128 MiB; lower it for untrusted peer-to-peer or TCP
+    endpoints. A message declared larger than the cap stops the connection
+    with `{:shutdown, :message_too_large}`, as one over the protocol limit
+    does, once its fixed header arrives and before the rest of it is
+    buffered. Any descriptors received with it are closed. The cap also
+    applies to the `Hello` reply, and the `4096` floor leaves room for that
+    reply and the `NameAcquired` signal that follows it.
 
   ## Return values
 
@@ -206,7 +218,8 @@ defmodule Rebus do
 
   - Invalid option: `:invalid_timeout`, `:invalid_read_timeout`,
     `:invalid_write_timeout`, `:invalid_allow_anonymous`,
-    `:invalid_bus_option`, `:invalid_owner`, `:invalid_name`.
+    `:invalid_bus_option`, `:invalid_owner`, `:invalid_name`,
+    `:invalid_max_message_size`.
   - Owner that exited before the connection was established: `:owner_down`.
   - Unusable address: `{:invalid_bus_address, reason}`,
     `:unsupported_bus_transport`, `{:tcp_resolution_failed, reason}`,
