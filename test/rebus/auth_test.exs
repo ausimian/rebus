@@ -4,6 +4,8 @@ defmodule Rebus.AuthTest do
   import ExUnit.CaptureLog
 
   alias Rebus.Auth
+  alias Rebus.Auth.CookieSha1
+  alias Rebus.Auth.CookieSha1.Keyring
   alias Rebus.Connection
   alias Rebus.Message
   alias Rebus.TestImpl
@@ -104,7 +106,7 @@ defmodule Rebus.AuthTest do
           System.put_env("HOME", symlinked_home)
 
           assert {:ok, _response} =
-                   Auth.cookie_response(
+                   CookieSha1.cookie_response(
                      "user",
                      File.stat!(home).uid,
                      Base.encode16("#{context} 1 server-challenge", case: :lower)
@@ -421,7 +423,7 @@ defmodule Rebus.AuthTest do
           reasons =
             logged_reasons(fn ->
               assert {:error, :auth_cookie_unavailable} =
-                       Auth.cookie_response(
+                       CookieSha1.cookie_response(
                          "user",
                          uid,
                          Base.encode16("#{context} 1 server-challenge", case: :lower)
@@ -437,10 +439,14 @@ defmodule Rebus.AuthTest do
 
     test "rejects malicious challenges and unsafe keyring paths without retaining details" do
       assert {:error, :auth_failed} =
-               Auth.cookie_response("user", 0, Base.encode16("../ 1 challenge", case: :lower))
+               CookieSha1.cookie_response(
+                 "user",
+                 0,
+                 Base.encode16("../ 1 challenge", case: :lower)
+               )
 
       assert {:error, :auth_failed} =
-               Auth.cookie_response(
+               CookieSha1.cookie_response(
                  "user",
                  0,
                  Base.encode16("org.example 1 challenge", case: :lower)
@@ -455,7 +461,7 @@ defmodule Rebus.AuthTest do
 
         assert logged_reasons(fn ->
                  assert {:error, :auth_cookie_unavailable} =
-                          Auth.cookie_response(
+                          CookieSha1.cookie_response(
                             "user",
                             File.stat!(keyring).uid,
                             Base.encode16("#{context} 1 challenge", case: :lower)
@@ -472,7 +478,7 @@ defmodule Rebus.AuthTest do
 
         assert logged_reasons(fn ->
                  assert {:error, :auth_cookie_unavailable} =
-                          Auth.cookie_response(
+                          CookieSha1.cookie_response(
                             "user",
                             File.stat!(home).uid,
                             Base.encode16("#{context} 1 challenge", case: :lower)
@@ -488,11 +494,12 @@ defmodule Rebus.AuthTest do
       # The argument guard is the only path that reaches the boundary without a
       # category of its own, so it reports the safety net rather than nothing.
       assert logged_reasons(fn ->
-               assert {:error, :auth_cookie_unavailable} = Auth.cookie_response(:user, 0, "00")
+               assert {:error, :auth_cookie_unavailable} =
+                        CookieSha1.cookie_response(:user, 0, "00")
              end) == ["internal"]
 
-      assert {:error, :auth_failed} = Auth.cookie_response("", 0, "")
-      assert {:error, :auth_failed} = Auth.cookie_response("user", 0, "")
+      assert {:error, :auth_failed} = CookieSha1.cookie_response("", 0, "")
+      assert {:error, :auth_failed} = CookieSha1.cookie_response("user", 0, "")
 
       with_private_keyring(context, cookie, fn home ->
         keyring = Path.join(home, ".dbus-keyrings")
@@ -500,7 +507,7 @@ defmodule Rebus.AuthTest do
         uid = File.stat!(keyring).uid
 
         response = fn cookie_id, challenge ->
-          Auth.cookie_response(
+          CookieSha1.cookie_response(
             "user",
             uid,
             Base.encode16("#{context} #{cookie_id} #{challenge}", case: :lower)
@@ -514,7 +521,7 @@ defmodule Rebus.AuthTest do
         end
 
         assert {:ok, _response} =
-                 Auth.cookie_response(
+                 CookieSha1.cookie_response(
                    "user",
                    uid,
                    Base.encode16("#{context} 1 challenge", case: :lower) |> String.upcase()
@@ -574,14 +581,14 @@ defmodule Rebus.AuthTest do
         :ok = File.chmod(Path.join(keyring, long_context), 0o600)
 
         assert {:ok, _response} =
-                 Auth.cookie_response(
+                 CookieSha1.cookie_response(
                    "user",
                    uid,
                    Base.encode16("#{long_context} 1 challenge", case: :lower)
                  )
 
         assert {:error, :auth_failed} =
-                 Auth.cookie_response(
+                 CookieSha1.cookie_response(
                    "user",
                    uid,
                    Base.encode16("#{String.duplicate("a", 256)} 1 challenge", case: :lower)
@@ -810,9 +817,9 @@ defmodule Rebus.AuthTest do
     # is exercised directly instead, and the boundary log is proved by the
     # categories above that do reach it through the file system.
     test "reports a cookie file that changed under the read" do
-      assert Auth.cookie_unchanged(5, 5, "abcde") == :ok
-      assert Auth.cookie_unchanged(5, 4, "abcde") == {:error, {:unavailable, :cookie_changed}}
-      assert Auth.cookie_unchanged(5, 5, "abcd") == {:error, {:unavailable, :cookie_changed}}
+      assert Keyring.cookie_unchanged(5, 5, "abcde") == :ok
+      assert Keyring.cookie_unchanged(5, 4, "abcde") == {:error, {:unavailable, :cookie_changed}}
+      assert Keyring.cookie_unchanged(5, 5, "abcd") == {:error, {:unavailable, :cookie_changed}}
     end
 
     test "reports a cookie file that cannot be read" do
@@ -875,9 +882,9 @@ defmodule Rebus.AuthTest do
     # and mode metadata, so the fail-closed classification is exercised
     # directly rather than through the file system.
     test "reports a platform without POSIX owner and mode metadata" do
-      assert Auth.posix_metadata(0, 0o700) == :ok
-      assert Auth.posix_metadata(:undefined, 0o700) == {:error, {:unavailable, :unsupported}}
-      assert Auth.posix_metadata(0, :undefined) == {:error, {:unavailable, :unsupported}}
+      assert Keyring.posix_metadata(0, 0o700) == :ok
+      assert Keyring.posix_metadata(:undefined, 0o700) == {:error, {:unavailable, :unsupported}}
+      assert Keyring.posix_metadata(0, :undefined) == {:error, {:unavailable, :unsupported}}
     end
 
     test "never lets a sentinel value reach an error or a log" do
@@ -903,7 +910,7 @@ defmodule Rebus.AuthTest do
         uid = File.stat!(home).uid
 
         respond = fn id ->
-          Auth.cookie_response(
+          CookieSha1.cookie_response(
             username,
             uid,
             Base.encode16("#{context} #{id} #{challenge}", case: :lower)
@@ -1269,7 +1276,7 @@ defmodule Rebus.AuthTest do
   end
 
   defp cookie_response(context, home) do
-    Auth.cookie_response(
+    CookieSha1.cookie_response(
       "user",
       File.stat!(home).uid,
       Base.encode16("#{context} 1 server-challenge", case: :lower)
