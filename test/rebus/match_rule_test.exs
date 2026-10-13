@@ -2991,9 +2991,15 @@ defmodule Rebus.MatchRuleTest do
 
       :ok = TestServer.push(server, test_signal("after the worker"))
       refute_receive {:matched, ^owner, ^ref, _message}, 100
-      assert Registry.lookup(Rebus.MatchSubscription.Registry, connection) == []
-      assert {:error, :disconnected} = Rebus.add_match(connection, rule, 500)
+
+      assert wait_until(fn ->
+               Registry.lookup(Rebus.MatchSubscription.Registry, connection) == []
+             end)
+
+      # With no worker left, the reference is simply gone. An add starts a
+      # worker for the dead connection, which stops again at once.
       assert :ok = Rebus.remove_match(connection, ref, 500)
+      assert {:error, :disconnected} = Rebus.add_match(connection, rule, 500)
 
       assert wait_until(fn ->
                Registry.lookup(Rebus.MatchSubscription.Registry, connection) == []
