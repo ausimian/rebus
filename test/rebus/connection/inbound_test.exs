@@ -4,8 +4,6 @@ defmodule Rebus.Connection.InboundTest do
   alias Rebus.Connection.Inbound
   alias Rebus.Message
 
-  @max_read_chunk 65_536
-
   describe "append/2" do
     test "keeps byte order for increasing fragment sizes" do
       fragments = for size <- 1..12, do: :binary.copy(<<size>>, size)
@@ -170,39 +168,46 @@ defmodule Rebus.Connection.InboundTest do
     end
   end
 
-  describe "receive_size/2" do
-    test "reads up to the fixed header while the frame length is unknown" do
-      assert Inbound.receive_size(Inbound.new(), @max_read_chunk) == 16
-
-      {:ok, inbound} = Inbound.append(Inbound.new(), <<0, 0, 0, 0, 0>>)
-      assert Inbound.receive_size(inbound, @max_read_chunk) == 11
+  describe "starts_frame?/2" do
+    test "is true for any bytes when nothing is buffered" do
+      assert Inbound.starts_frame?(Inbound.new(), <<0>>)
     end
 
-    test "reads up to the frame boundary once the frame length is known" do
-      frame = encoded_frame("Sized")
+    test "is false while the bytes stay inside a frame of known length" do
+      frame = encoded_frame("Inside")
 
       {:ok, inbound} = Inbound.append(Inbound.new(), binary_part(frame, 0, 16))
       assert {:incomplete, inbound} = Inbound.next(inbound)
 
-      assert Inbound.receive_size(inbound, @max_read_chunk) == byte_size(frame) - 16
+      refute Inbound.starts_frame?(inbound, binary_part(frame, 16, 1))
+      # Completing the frame exactly ends it; the next frame begins after.
+      refute Inbound.starts_frame?(inbound, binary_part(frame, 16, byte_size(frame) - 16))
     end
 
-    test "never exceeds the caller's maximum chunk" do
-      frame = encoded_frame("Chunked")
-
-      assert Inbound.receive_size(Inbound.new(), 4) == 4
+    test "is true once the bytes run past the end of the frame being assembled" do
+      frame = encoded_frame("Past")
 
       {:ok, inbound} = Inbound.append(Inbound.new(), binary_part(frame, 0, 16))
       assert {:incomplete, inbound} = Inbound.next(inbound)
 
-      assert Inbound.receive_size(inbound, 4) == 4
+      assert Inbound.starts_frame?(inbound, binary_part(frame, 16, byte_size(frame) - 16) <> "x")
     end
 
-    test "never asks for fewer than one byte" do
-      {:ok, inbound} = Inbound.append(Inbound.new(), :binary.copy(<<0>>, 20))
+    test "reads a fixed header split across the buffer and the bytes" do
+      frame = encoded_frame("Split")
+      size = byte_size(frame)
 
-      assert Inbound.receive_size(inbound, @max_read_chunk) == 1
-      assert Inbound.receive_size(%{inbound | expected_size: 8}, @max_read_chunk) == 1
+      {:ok, inbound} = Inbound.append(Inbound.new(), binary_part(frame, 0, 5))
+
+      refute Inbound.starts_frame?(inbound, binary_part(frame, 5, 6))
+      refute Inbound.starts_frame?(inbound, binary_part(frame, 5, size - 5))
+      assert Inbound.starts_frame?(inbound, binary_part(frame, 5, size - 5) <> frame)
+    end
+
+    test "is false for a fixed header no frame length can be read from" do
+      {:ok, inbound} = Inbound.append(Inbound.new(), <<?x>>)
+
+      refute Inbound.starts_frame?(inbound, :binary.copy(<<0>>, 64))
     end
   end
 

@@ -56,27 +56,16 @@ defmodule Rebus.Connection.Dispatch do
   @doc false
   @spec recv(Connection.t()) :: result()
   def recv(%Connection{} = state) do
-    cond do
-      state.unix_fd_negotiated? ->
-        transport(state).recvmsg(
-          state.sock,
-          Inbound.receive_size(state.inbound, @max_read_chunk),
-          @max_unix_fd_control_size,
-          [],
-          :nowait
-        )
-        |> receive_result(state)
-
-      # OTP documents CtrlSz=0 as its default control-buffer size, not as a
-      # request to discard ancillary data. Keep the normal coalescing byte
-      # path, but receive a bounded cmsg and close any illicit rights before a
-      # partial frame can retain them.
-      state.unix_fd_transport? ->
-        transport(state).recvmsg(state.sock, 0, @max_unix_fd_control_size, [], :nowait)
-        |> receive_result(state)
-
-      true ->
-        receive_result(transport(state).recv(state.sock, 0, [], :nowait), state)
+    # Every read on a local socket goes through recvmsg, negotiated or not:
+    # OTP documents CtrlSz=0 as its default control-buffer size, not as a
+    # request to discard ancillary data. Reads coalesce exactly as plain recv
+    # does; `Rebus.Connection.Rights` attributes any descriptors to the frames
+    # that begin in the bytes they arrived with.
+    if state.unix_fd_transport? do
+      transport(state).recvmsg(state.sock, 0, @max_unix_fd_control_size, [], :nowait)
+      |> receive_result(state)
+    else
+      receive_result(transport(state).recv(state.sock, 0, [], :nowait), state)
     end
   end
 
@@ -134,9 +123,18 @@ defmodule Rebus.Connection.Dispatch do
   @doc false
   @spec append_recvmsg(map(), Connection.t(), term()) :: result()
   def append_recvmsg(message, %Connection{} = state, continuation) do
-    message
-    |> Rights.decode(state.inbound_fds, rights_context(state))
-    |> apply_rights_decision(state, continuation)
+    # The single close-or-deliver ownership path for every received
+    # descriptor: those held for frames stay with the rights, and anything
+    # rejected on receipt is closed here, exactly once.
+    case Rights.decode(message, state.inbound_fds, rights_context(state)) do
+      {:ok, data, inbound_fds, rejected} ->
+        _ = UnixFD.close_all(rejected)
+        append_inbound(data, %{state | inbound_fds: inbound_fds}, continuation)
+
+      {:stop, reason, fds} ->
+        _ = UnixFD.close_all(fds)
+        {:protocol_error, reason, state}
+    end
   end
 
   @doc false
@@ -189,36 +187,32 @@ defmodule Rebus.Connection.Dispatch do
   defp rights_context(%Connection{} = state) do
     %{
       negotiated?: state.unix_fd_negotiated?,
-      frame_pending?: Inbound.pending?(state.inbound),
+      inbound: state.inbound,
       max_bytes: @max_read_chunk
     }
   end
 
-  # The single close-or-deliver ownership path for every received descriptor:
-  # `:frame` retains them for the frame under assembly, and the other two
-  # decisions close exactly the descriptors they name.
-  defp apply_rights_decision({:frame, data, fds}, %Connection{} = state, continuation) do
-    append_inbound(
-      data,
-      %{state | inbound_fds: Rights.retain(state.inbound_fds, fds)},
-      continuation
-    )
-  end
+  # Descriptors that arrived with bytes in which no further frame can begin,
+  # and that no frame claimed, have no owner. They are closed here rather than
+  # being carried into a later frame.
+  defp expire_inbound_fds(%Connection{} = state) do
+    case Rights.expire(state.inbound_fds) do
+      {[], inbound_fds} ->
+        %{state | inbound_fds: inbound_fds}
 
-  defp apply_rights_decision({:quarantine, data, fds}, %Connection{} = state, continuation) do
-    _ = UnixFD.close_all(fds)
-    append_inbound(data, %{state | inbound_fds: Rights.taint(state.inbound_fds)}, continuation)
-  end
-
-  defp apply_rights_decision({:stop, reason, fds}, %Connection{} = state, _continuation) do
-    _ = UnixFD.close_all(fds)
-    {:protocol_error, reason, state}
+      {unclaimed, inbound_fds} ->
+        _ = UnixFD.close_all(unclaimed)
+        Logger.warning("D-Bus descriptors dropped: :unclaimed", reason: :unclaimed)
+        %{state | inbound_fds: inbound_fds}
+    end
   end
 
   # A timer exists only while a nonempty frame is incomplete. Each retained
   # fragment replaces it, so a peer that is making progress remains connected
   # while a peer that stops or dribbles too slowly cannot pin retained data.
   defp buffer_incomplete_message(%Connection{} = state, continuation) do
+    state = expire_inbound_fds(state)
+
     state =
       if Inbound.pending?(state.inbound) do
         %{state | partial_frame_timer: restart_partial_frame_timer(state)}
@@ -275,16 +269,19 @@ defmodule Rebus.Connection.Dispatch do
       # the partial-frame timer is cancelled once here rather than on every
       # way out.
       parsed ->
-        parse_complete_frame(parsed, finish_frame(state), cursor)
+        parse_complete_frame(parsed, byte_size(data), finish_frame(state), cursor)
     end
   end
 
-  defp parse_complete_frame({:ok, %Message{} = msg, rest}, %Connection{} = state, cursor) do
-    parse_attached_message(msg, rest, state, cursor)
+  # A consumed frame is everything before the remainder it was parsed with;
+  # descriptor attribution follows the stream by that size.
+  defp parse_complete_frame({:ok, %Message{} = msg, rest}, available, state, cursor) do
+    parse_attached_message(msg, available - byte_size(rest), rest, state, cursor)
   end
 
   defp parse_complete_frame(
          {:error, :resource_limit, _envelope, _rest},
+         _available,
          %Connection{hello_serial: hello_serial} = state,
          _cursor
        )
@@ -296,21 +293,22 @@ defmodule Rebus.Connection.Dispatch do
   # supplied and this frame can be dropped without rescanning the buffer.
   defp parse_complete_frame(
          {:error, :resource_limit, envelope, rest},
+         available,
          %Connection{} = state,
          cursor
        ) do
     Logger.warning("D-Bus frame dropped: :resource_limit", reason: :resource_limit)
-    state = discard_inbound_unix_fds(state)
+    state = skip_inbound_frame(available - byte_size(rest), state)
     {:ok, state} = drop_resource_limited_reply(envelope, state)
     parse_flat_messages(rest, state, cursor)
   end
 
-  defp parse_complete_frame({:error, reason}, %Connection{} = state, _cursor) do
+  defp parse_complete_frame({:error, reason}, _available, %Connection{} = state, _cursor) do
     {:protocol_error, reason, state}
   end
 
-  defp parse_attached_message(%Message{} = msg, rest, %Connection{} = state, cursor) do
-    case attach_inbound_fds(msg, state) do
+  defp parse_attached_message(%Message{} = msg, size, rest, %Connection{} = state, cursor) do
+    case attach_inbound_fds(msg, size, state) do
       {:ok, msg, state} ->
         dispatch_inbound_message(msg, rest, state, cursor)
 
@@ -319,8 +317,10 @@ defmodule Rebus.Connection.Dispatch do
     end
   end
 
-  defp attach_inbound_fds(%Message{} = msg, %Connection{} = state) do
-    case Rights.attach(state.inbound_fds, msg, state.unix_fd_negotiated?) do
+  defp attach_inbound_fds(%Message{} = msg, size, %Connection{} = state) do
+    state = expire_inbound_fds(state)
+
+    case Rights.attach(state.inbound_fds, msg, size, state.unix_fd_negotiated?) do
       {:ok, msg, inbound_fds} ->
         {:ok, msg, %{state | inbound_fds: inbound_fds}}
 
@@ -328,6 +328,15 @@ defmodule Rebus.Connection.Dispatch do
         _ = UnixFD.close_all(fds)
         {:error, reason, %{state | inbound_fds: inbound_fds}}
     end
+  end
+
+  # A frame dropped before its header could be trusted still occupies its
+  # place in the stream. Whatever its batch held is closed with it.
+  defp skip_inbound_frame(size, %Connection{} = state) do
+    state = expire_inbound_fds(state)
+    {fds, inbound_fds} = Rights.skip(state.inbound_fds, size)
+    _ = UnixFD.close_all(fds)
+    %{state | inbound_fds: inbound_fds}
   end
 
   # Count/index/negotiation checks run after a complete D-Bus frame and its

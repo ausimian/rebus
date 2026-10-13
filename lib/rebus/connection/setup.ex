@@ -169,14 +169,9 @@ defmodule Rebus.Connection.Setup do
   # After local transport negotiation, every peer read—including the initial
   # Hello reply—must observe SCM_RIGHTS. A plain recv/4 here could discard
   # ancillary metadata outside the single close-or-deliver ownership path.
+  # Like every other read it coalesces: frames past the reply are kept.
   defp receive_hello_reply_recvmsg(%Connection{} = state, deadline, timeout) do
-    case transport(state).recvmsg(
-           state.sock,
-           Inbound.receive_size(state.inbound, Dispatch.max_read_chunk()),
-           recvmsg_control_size(state),
-           [],
-           timeout
-         ) do
+    case transport(state).recvmsg(state.sock, 0, recvmsg_control_size(state), [], timeout) do
       {:ok, message} when is_map(message) ->
         continue_hello_reply_recvmsg(message, state, deadline)
 
