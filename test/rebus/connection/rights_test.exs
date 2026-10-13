@@ -1,6 +1,7 @@
 defmodule Rebus.Connection.RightsTest do
   use ExUnit.Case, async: true
 
+  alias Rebus.Connection.Inbound
   alias Rebus.Connection.Rights
   alias Rebus.Message
 
@@ -96,7 +97,7 @@ defmodule Rebus.Connection.RightsTest do
   end
 
   describe "decide/3" do
-    test "delivers descriptors with the frame they arrived with" do
+    test "holds descriptors for the frames beginning in their bytes" do
       assert {:frame, "abc", [3]} = Rights.decide({:ok, [3]}, "abc", context())
     end
 
@@ -109,7 +110,7 @@ defmodule Rebus.Connection.RightsTest do
     end
 
     test "quarantines rights received before the transport was negotiated" do
-      assert {:quarantine, "abc", [3]} =
+      assert {:quarantine, "abc", [3], :unix_fd_not_negotiated} =
                Rights.decide({:ok, [3]}, "abc", context(negotiated?: false))
     end
 
@@ -122,9 +123,9 @@ defmodule Rebus.Connection.RightsTest do
       assert {:stop, :invalid_unix_fds, [3]} = Rights.decide({:ok, [3]}, <<>>, context())
     end
 
-    test "quarantines rights arriving mid-frame" do
-      assert {:quarantine, "abc", [3]} =
-               Rights.decide({:ok, [3]}, "abc", context(frame_pending?: true))
+    test "taints the frame being assembled when no frame begins in the bytes" do
+      assert {:taint, "abc", [3]} =
+               Rights.decide({:ok, [3]}, "abc", context(starts_frame?: false))
     end
 
     test "fails closed on truncated control data even with recoverable bytes" do
@@ -132,9 +133,14 @@ defmodule Rebus.Connection.RightsTest do
                Rights.decide({:error, :unix_fd_truncated, [3]}, "abc", context())
     end
 
-    test "quarantines a malformed control result frame-locally" do
-      assert {:quarantine, "abc", [3]} =
+    test "quarantines a malformed control result for the frames beginning in its bytes" do
+      assert {:quarantine, "abc", [3], :unix_fd_limit} =
                Rights.decide({:error, :unix_fd_limit, [3]}, "abc", context())
+    end
+
+    test "taints the frame being assembled with a malformed result inside it" do
+      assert {:taint, "abc", [3]} =
+               Rights.decide({:error, :unix_fd_limit, [3]}, "abc", context(starts_frame?: false))
     end
 
     test "fails closed on a malformed control result with no bytes" do
@@ -147,14 +153,52 @@ defmodule Rebus.Connection.RightsTest do
     test "reads iodata and control data from a recvmsg result" do
       message = %{iov: ["ab", "c"], ctrl: [rights_cmsg([3])], flags: []}
 
-      assert {:frame, "abc", [3]} = Rights.decode(message, Rights.new(), context())
+      assert {:ok, "abc", rights, []} = Rights.decode(message, Rights.new(), context())
+      assert Rights.fds(rights) == [3]
+      assert rights.batches == [%{start: 0, stop: 3, count: 1, reason: nil}]
     end
 
-    test "treats retained descriptors as a frame in progress" do
-      message = %{iov: ["abc"], ctrl: [rights_cmsg([4])], flags: []}
-      rights = Rights.retain(Rights.new(), [3])
+    test "holds nothing for a result without descriptors" do
+      message = %{iov: ["abc"], ctrl: [], flags: []}
 
-      assert {:quarantine, "abc", [4]} = Rights.decode(message, rights, context())
+      assert {:ok, "abc", rights, []} = Rights.decode(message, Rights.new(), context())
+      assert rights == Rights.new()
+    end
+
+    test "places a batch after the bytes already buffered" do
+      frame = encoded_frame()
+      inbound = Inbound.new(binary_part(frame, 0, 16))
+      data = binary_part(frame, 16, byte_size(frame) - 16) <> "next"
+      message = %{iov: [data], ctrl: [rights_cmsg([3])], flags: []}
+
+      assert {:ok, ^data, rights, []} =
+               Rights.decode(message, Rights.new(), context(inbound: inbound))
+
+      stop = 16 + byte_size(data)
+      assert [%{start: 16, stop: ^stop, count: 1, reason: nil}] = rights.batches
+    end
+
+    test "taints the frame being assembled when no frame begins in the bytes" do
+      frame = encoded_frame()
+      inbound = Inbound.new(binary_part(frame, 0, 16))
+      message = %{iov: [binary_part(frame, 16, 1)], ctrl: [rights_cmsg([4])], flags: []}
+
+      assert {:ok, _data, rights, [4]} =
+               Rights.decode(message, Rights.new(), context(inbound: inbound))
+
+      assert rights.tainted?
+      refute Rights.holding?(rights)
+      assert rights.batches == []
+    end
+
+    test "quarantines rejected rights for the frames beginning in the bytes" do
+      fds = Enum.to_list(3..19)
+      message = %{iov: ["abc"], ctrl: [rights_cmsg(fds)], flags: []}
+
+      assert {:ok, "abc", rights, ^fds} = Rights.decode(message, Rights.new(), context())
+      refute Rights.holding?(rights)
+      assert Rights.quarantined?(rights)
+      assert rights.batches == [%{start: 0, stop: 3, count: 0, reason: :unix_fd_limit}]
     end
 
     test "validates control data before iodata so descriptors cannot leak" do
@@ -190,19 +234,33 @@ defmodule Rebus.Connection.RightsTest do
     end
   end
 
-  describe "attach/3" do
+  describe "attach/4" do
     test "attaches retained descriptors to the frame that completed" do
       rights = Rights.retain(Rights.new(), [3])
 
-      assert {:ok, %Message{unix_fds: [3]}, attached} = Rights.attach(rights, message(1), true)
+      assert {:ok, %Message{unix_fds: [3]}, attached} =
+               Rights.attach(rights, message(1), 40, true)
+
       refute Rights.holding?(attached)
+      assert attached.offset == 40
     end
 
-    test "drops a quarantined frame and names its descriptors" do
+    test "drops a tainted frame and names the descriptors it claimed" do
       rights = Rights.new() |> Rights.retain([3]) |> Rights.taint()
 
-      assert {:error, :invalid_unix_fds, [3], attached} = Rights.attach(rights, message(1), true)
+      assert {:error, :invalid_unix_fds, [3], attached} =
+               Rights.attach(rights, message(1), 40, true)
+
       refute Rights.holding?(attached)
+      refute attached.tainted?
+    end
+
+    test "drops a tainted frame that declares no descriptors" do
+      rights = Rights.taint(Rights.new())
+
+      assert {:error, :invalid_unix_fds, [], attached} =
+               Rights.attach(rights, message(0), 40, true)
+
       refute attached.tainted?
     end
 
@@ -210,19 +268,91 @@ defmodule Rebus.Connection.RightsTest do
       rights = Rights.retain(Rights.new(), [3])
 
       assert {:error, :unix_fd_not_negotiated, [3], _attached} =
-               Rights.attach(rights, message(1), false)
+               Rights.attach(rights, message(1), 40, false)
     end
 
     test "accepts a descriptor-free frame when the transport was not negotiated" do
       assert {:ok, %Message{unix_fds: []}, _attached} =
-               Rights.attach(Rights.new(), message(0), false)
+               Rights.attach(Rights.new(), message(0), 40, false)
     end
 
-    test "rejects a count which disagrees with the header field" do
-      rights = Rights.retain(Rights.new(), [3, 4])
+    test "rejects a frame declaring more descriptors than its batch holds" do
+      rights = Rights.retain(Rights.new(), [3])
 
-      assert {:error, :invalid_unix_fds, [3, 4], _attached} =
-               Rights.attach(rights, message(1), true)
+      assert {:error, :invalid_unix_fds, [3], attached} =
+               Rights.attach(rights, message(2), 40, true)
+
+      refute Rights.holding?(attached)
+    end
+
+    test "rejects a frame declaring descriptors when none arrived with it" do
+      assert {:error, :invalid_unix_fds, [], _attached} =
+               Rights.attach(Rights.new(), message(1), 40, true)
+    end
+
+    test "claims in order across the frames beginning in one read" do
+      rights = received([3, 4, 5], 100)
+
+      assert {:ok, %Message{unix_fds: []}, rights} = Rights.attach(rights, message(0), 20, true)
+      assert {:ok, %Message{unix_fds: [3]}, rights} = Rights.attach(rights, message(1), 30, true)
+
+      assert {:ok, %Message{unix_fds: [4, 5]}, rights} =
+               Rights.attach(rights, message(2), 50, true)
+
+      refute Rights.holding?(rights)
+      assert {[], %Rights{batches: []}} = Rights.expire(rights)
+    end
+
+    test "never carries a batch into a frame that begins after its bytes" do
+      rights = received([3], 30)
+
+      assert {:ok, %Message{unix_fds: []}, rights} = Rights.attach(rights, message(0), 30, true)
+      # The next frame begins where the read ended, so the batch is closed
+      # unclaimed rather than offered to it.
+      assert {[3], rights} = Rights.expire(rights)
+      refute Rights.holding?(rights)
+
+      assert {:error, :invalid_unix_fds, [], _rights} =
+               Rights.attach(rights, message(1), 30, true)
+    end
+
+    test "keeps a batch while a frame may still begin in it" do
+      rights = received([3], 30)
+
+      assert {:ok, %Message{unix_fds: []}, rights} = Rights.attach(rights, message(0), 20, true)
+      assert {[], rights} = Rights.expire(rights)
+      assert {:ok, %Message{unix_fds: [3]}, _rights} = Rights.attach(rights, message(1), 60, true)
+    end
+
+    test "drops a claimant of a quarantined batch but not a frame declaring none" do
+      {:ok, _data, rights, _rejected} =
+        Rights.decode(
+          %{iov: [:binary.copy("x", 60)], ctrl: [rights_cmsg(Enum.to_list(3..19))], flags: []},
+          Rights.new(),
+          context()
+        )
+
+      assert {:ok, %Message{unix_fds: []}, rights} = Rights.attach(rights, message(0), 30, true)
+
+      assert {:error, :unix_fd_limit, [], _rights} =
+               Rights.attach(rights, message(1), 30, true)
+    end
+  end
+
+  describe "skip/2" do
+    test "closes the rest of a skipped frame's batch and poisons it" do
+      rights = received([3, 4], 60)
+
+      assert {[3, 4], rights} = Rights.skip(rights, 30)
+      refute Rights.holding?(rights)
+      assert Rights.quarantined?(rights)
+
+      assert {:error, :invalid_unix_fds, [], _rights} =
+               Rights.attach(rights, message(1), 30, true)
+    end
+
+    test "advances past a frame outside any batch" do
+      assert {[], %Rights{offset: 30}} = Rights.skip(Rights.new(), 30)
     end
   end
 
@@ -245,6 +375,8 @@ defmodule Rebus.Connection.RightsTest do
     test "taints a buffer without adding descriptors" do
       assert Rights.new() |> Rights.taint() |> Rights.fds() == []
       assert Rights.taint(Rights.new()).tainted?
+      assert Rights.quarantined?(Rights.taint(Rights.new()))
+      refute Rights.quarantined?(Rights.retain(Rights.new(), [3]))
     end
   end
 
@@ -261,8 +393,21 @@ defmodule Rebus.Connection.RightsTest do
   end
 
   defp context(overrides \\ []) do
-    %{negotiated?: true, frame_pending?: false, max_bytes: @max_read_chunk}
+    %{negotiated?: true, starts_frame?: true, inbound: Inbound.new(), max_bytes: @max_read_chunk}
     |> Map.merge(Map.new(overrides))
+  end
+
+  # Rights holding one batch received with `size` bytes into an empty buffer,
+  # so every frame beginning in those bytes may claim from it.
+  defp received(fds, size) do
+    message = %{iov: [:binary.copy("x", size)], ctrl: [rights_cmsg(fds)], flags: []}
+    {:ok, _data, rights, []} = Rights.decode(message, Rights.new(), context())
+    rights
+  end
+
+  defp encoded_frame do
+    {:ok, encoded} = Message.encode(%{message(0) | serial: 1})
+    IO.iodata_to_binary(encoded)
   end
 
   defp rights_data(fds), do: for(fd <- fds, into: <<>>, do: <<fd::native-signed-32>>)

@@ -3,6 +3,7 @@ defmodule Rebus.UnixFDTest do
 
   alias Rebus.Connection.FDClaims
   alias Rebus.Connection.Inbound
+  alias Rebus.Connection.Rights
   alias Rebus.{Message, TestImpl, TestServer, UnixFD}
   alias Rebus.UnixFD.Raw
 
@@ -1013,6 +1014,141 @@ defmodule Rebus.UnixFDTest do
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
   end
 
+  test "reads coalesced frames in one recvmsg once descriptors are negotiated", %{
+    server: server,
+    connection: connection
+  } do
+    parent = self()
+    assert :sys.get_state(connection).unix_fd_negotiated?
+    {:ok, handler_ref} = Rebus.add_signal_handler(connection)
+
+    # The server may still be writing setup traffic such as NameAcquired. A
+    # completed round trip proves the connection has read everything sent
+    # before it, so the only bytes left to read are the ones sent below.
+    sync = Message.new!(:method_call, path: "/test", interface: "test.interface", member: "Sync")
+    task = Task.async(fn -> Rebus.call(connection, sync, 1_000) end)
+    assert_receive {^server, %Message{serial: serial, header_fields: %{member: "Sync"}}}, 1_000
+    :ok = TestServer.push(server, Message.new!(:method_return, reply_serial: serial))
+    assert {:ok, %Message{type: :method_return}} = Task.await(task, 1_000)
+
+    :ok =
+      TestImpl.install(connection,
+        recvmsg: fn sock, length, control_size, flags, timeout ->
+          result = :socket.recvmsg(sock, length, control_size, flags, timeout)
+
+          case result do
+            {:ok, %{iov: iov}} ->
+              send(parent, {:negotiated_recvmsg, length, IO.iodata_length(iov)})
+
+            _no_data ->
+              :ok
+          end
+
+          result
+        end
+      )
+
+    frames =
+      for member <- ["First", "Second", "Third"], into: <<>> do
+        signal = Message.new!(:signal, path: "/test", interface: "test.interface", member: member)
+        {:ok, encoded} = Message.encode(signal)
+        IO.iodata_to_binary(encoded)
+      end
+
+    :ok = :socket.send(:sys.get_state(server).cli_sock, frames, [], 1_000)
+
+    for member <- ["First", "Second", "Third"] do
+      assert_receive {^handler_ref, %Message{header_fields: %{member: ^member}}}, 1_000
+    end
+
+    # One zero-length read takes every frame the single send queued, rather
+    # than a fixed header and a remainder per frame.
+    size = byte_size(frames)
+    assert_received {:negotiated_recvmsg, 0, ^size}
+    refute_received {:negotiated_recvmsg, _length, _size}
+  end
+
+  test "attributes a coalesced descriptor to the frame that declares it", %{
+    server: server,
+    connection: connection
+  } do
+    {:ok, handler_ref} = Rebus.add_signal_handler(connection)
+
+    method =
+      Message.new!(:method_call,
+        path: "/test",
+        interface: "test.interface",
+        member: "CoalescedFD"
+      )
+
+    task = Task.async(fn -> Rebus.call(connection, method, 1_000) end)
+
+    assert_receive {^server, %Message{serial: serial, header_fields: %{member: "CoalescedFD"}}},
+                   1_000
+
+    {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
+
+    leading =
+      Message.new!(:signal,
+        path: "/test",
+        interface: "test.interface",
+        member: "BeforeFDReply"
+      )
+
+    reply =
+      Message.new!(:method_return,
+        reply_serial: serial,
+        signature: "h",
+        body: [0],
+        fds: [fd]
+      )
+
+    {:ok, leading_encoded} = Message.encode(leading)
+    {:ok, reply_encoded} = Message.encode(%{reply | serial: 77})
+
+    # One write, one control message: the descriptor rides with bytes that
+    # begin with a frame declaring none, and belongs to the reply after it.
+    :ok =
+      :socket.sendmsg(
+        :sys.get_state(server).cli_sock,
+        %{
+          iov: [IO.iodata_to_binary(leading_encoded), IO.iodata_to_binary(reply_encoded)],
+          ctrl: [%{level: :socket, type: :rights, data: <<fd::native-signed-32>>}]
+        },
+        [],
+        1_000
+      )
+
+    assert_receive {^handler_ref, %Message{header_fields: %{member: "BeforeFDReply"}}}, 1_000
+    assert {:ok, %Message{type: :method_return, unix_fds: [received]}} = Task.await(task, 1_000)
+    assert received != fd
+    assert :ok = UnixFD.close(received)
+  end
+
+  test "delivers descriptors with consecutive replies in separate reads", %{
+    server: server,
+    connection: connection
+  } do
+    {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
+
+    for member <- ["FirstFD", "SecondFD"] do
+      method =
+        Message.new!(:method_call, path: "/test", interface: "test.interface", member: member)
+
+      task = Task.async(fn -> Rebus.call(connection, method, 1_000) end)
+
+      assert_receive {^server, %Message{serial: serial, header_fields: %{member: ^member}}},
+                     1_000
+
+      reply =
+        Message.new!(:method_return, reply_serial: serial, signature: "h", body: [0], fds: [fd])
+
+      :ok = TestServer.push_with_fds(server, reply, [fd])
+      assert {:ok, %Message{unix_fds: [received]}} = Task.await(task, 1_000)
+      assert :ok = UnixFD.close(received)
+    end
+  end
+
   test "answers an FD-bearing inbound method call and closes its descriptor", %{
     server: server,
     connection: connection
@@ -1162,10 +1298,12 @@ defmodule Rebus.UnixFDTest do
       )
 
     # The illicit descriptor is closed before the first D-Bus frame completes;
-    # only a taint bit remains while the eight-byte prefix is buffered.
+    # only a quarantine mark remains while the eight-byte prefix is buffered.
     assert eventually(fn ->
              state = :sys.get_state(connection)
-             state.inbound_fds.tainted? and state.inbound.size == byte_size(prefix)
+
+             Rights.quarantined?(state.inbound_fds) and not Rights.holding?(state.inbound_fds) and
+               state.inbound.size == byte_size(prefix)
            end)
 
     :ok =
@@ -1388,11 +1526,16 @@ defmodule Rebus.UnixFDTest do
     before_fds = fd_set!()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 
+    # Descriptors are attributed by header count, so the over-limit batch
+    # belongs to the frame that declares one.
     rejected =
       Message.new!(:signal,
         path: "/test",
         interface: "test.interface",
-        member: "TooManyFDs"
+        member: "TooManyFDs",
+        signature: "h",
+        body: [0],
+        fds: [fd]
       )
 
     following =

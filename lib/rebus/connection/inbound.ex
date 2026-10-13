@@ -63,15 +63,26 @@ defmodule Rebus.Connection.Inbound do
     end
   end
 
-  # How many bytes to ask the socket for: enough to complete the fixed header
-  # while the frame length is unknown, and no more than the rest of the frame
-  # once it is. Never zero, so a receive always makes progress.
-  @spec receive_size(t(), pos_integer()) :: pos_integer()
-  def receive_size(%__MODULE__{expected_size: nil, size: size}, max_chunk),
-    do: max(1, min(16 - size, max_chunk))
+  # Whether a new frame begins inside `data` once it is appended: true when
+  # nothing is buffered, or when `data` runs past the end of the frame being
+  # assembled. A fixed header that is still incomplete, or invalid, cannot end
+  # inside these bytes, so it answers false; parsing rejects an invalid one.
+  @spec starts_frame?(t(), binary()) :: boolean()
+  def starts_frame?(%__MODULE__{size: 0}, _data), do: true
 
-  def receive_size(%__MODULE__{expected_size: expected, size: size}, max_chunk),
-    do: max(1, min(expected - size, max_chunk))
+  def starts_frame?(%__MODULE__{expected_size: nil, size: size} = inbound, data) do
+    header =
+      prefix(inbound, min(size, 16)) <>
+        binary_part(data, 0, min(byte_size(data), max(16 - size, 0)))
+
+    case Message.expected_size(header) do
+      {:ok, expected_size} -> size + byte_size(data) > expected_size
+      _incomplete_or_invalid -> false
+    end
+  end
+
+  def starts_frame?(%__MODULE__{expected_size: expected_size, size: size}, data),
+    do: size + byte_size(data) > expected_size
 
   # Fixed-header validation happens as soon as sixteen bytes are retained,
   # without making allocation depend on a peer-declared frame length. The
