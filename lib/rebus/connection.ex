@@ -144,7 +144,7 @@ defmodule Rebus.Connection do
   # `bus: false`, which sends no Hello.
   @doc false
   @spec unique_name(pid(), non_neg_integer()) ::
-          binary() | nil | {:error, :timeout | :disconnected | :not_connected}
+          {:ok, binary() | nil} | {:error, :timeout | :disconnected | :not_connected}
   def unique_name(conn, timeout \\ @default_read_timeout)
       when is_pid(conn) and is_integer(timeout) and timeout >= 0 do
     safe_setup_call(conn, :unique_name, nil, timeout)
@@ -828,7 +828,7 @@ defmodule Rebus.Connection do
   end
 
   def handle_call(:unique_name, _from, %__MODULE__{} = state) do
-    {:reply, state.name, state}
+    {:reply, {:ok, state.name}, state}
   end
 
   def handle_call(

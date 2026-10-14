@@ -4514,13 +4514,13 @@ defmodule RebusTest do
     test "are the name Hello returned on a bus connection", %{svr: svr} do
       %{cli: cli} = client_setup(%{svr: svr})
 
-      assert Rebus.unique_name(cli) == ":1.100"
+      assert Rebus.unique_name(cli) == {:ok, ":1.100"}
     end
 
     test "are nil on a bus: false connection", %{svr: svr} do
       cli = connect_peer(svr)
 
-      assert Rebus.unique_name(cli) == nil
+      assert Rebus.unique_name(cli) == {:ok, nil}
       assert :ok = Rebus.close(cli)
     end
 
@@ -4530,7 +4530,7 @@ defmodule RebusTest do
       {result, cli} = while_connecting(:rebus_unique_name_while_connecting, &Rebus.unique_name/1)
 
       assert {:error, :not_connected} = result
-      assert Rebus.unique_name(cli) == ":1.100"
+      assert Rebus.unique_name(cli) == {:ok, ":1.100"}
       assert :ok = Rebus.close(cli)
     end
 

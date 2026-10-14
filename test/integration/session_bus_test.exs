@@ -53,7 +53,7 @@ defmodule Rebus.Integration.SessionBusTest do
 
       # The daemon addresses its replies to the name it assigned, so the
       # accessor is checked against the wire rather than against itself.
-      name = Rebus.unique_name(conn)
+      assert {:ok, name} = Rebus.unique_name(conn)
       assert name == unique_name!(conn)
 
       assert {:ok, %Message{body: [^name]}} =
