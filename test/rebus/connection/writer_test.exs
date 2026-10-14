@@ -81,6 +81,44 @@ defmodule Rebus.Connection.WriterTest do
       assert Writer.serial(writer) == 2
     end
 
+    test "writes a handler's reply on the :send path and answers the handler" do
+      sock = scripted()
+      ctx = ctx(sock)
+      return = reply_msg()
+
+      error =
+        Message.new!(:error,
+          reply_serial: 2,
+          error_name: "org.example.Error.Failed",
+          signature: "s",
+          body: ["failed"]
+        )
+
+      return_ref = make_ref()
+      error_ref = make_ref()
+
+      writer =
+        Writer.new()
+        |> Writer.queue(op(:send, return, from: {self(), return_ref}))
+        |> Writer.queue(op(:send, error, from: {self(), error_ref}))
+
+      # A handler's reply has a caller to answer, so it never counts against
+      # the cap on connection-originated replies.
+      assert writer.replies == 0
+
+      assert {{:ok, writer}, _ctx, []} = run(Writer.advance(writer, ctx), ctx)
+
+      assert_receive {^return_ref, :ok}
+      assert_receive {^error_ref, :ok}
+
+      assert ScriptedTransport.writes(sock) == [
+               {:send, encoded(return, 1)},
+               {:send, encoded(error, 2)}
+             ]
+
+      assert Writer.active(writer) == nil
+    end
+
     test "hands a written :call back with the entry the connection must index" do
       sock = scripted()
       ctx = ctx(sock)

@@ -7,6 +7,7 @@ defmodule Rebus.Connection do
   alias Rebus.Connection.FDClaims
   alias Rebus.Connection.Handshake
   alias Rebus.Connection.Inbound
+  alias Rebus.Connection.InboundCalls
   alias Rebus.Connection.Pending
   alias Rebus.Connection.Rights
   alias Rebus.Connection.Setup
@@ -116,6 +117,37 @@ defmodule Rebus.Connection do
     SafeCall.call(pid, {:send, msg, deadline, request_ref}, dispatch_timeout,
       cancel: {:cancel, request_ref}
     )
+  end
+
+  # Queues a `:method_return` or `:error` frame built by the handler of an
+  # inbound call. It takes the `:send` path with the handler as the waiting
+  # caller, so `:ok` means the frame was handed to the socket and the dispatch
+  # timeout gives the handler backpressure. `dispatch/3` keeps refusing these
+  # types, so callers cannot forge replies through `Rebus.send/2`.
+  @doc false
+  @spec send_reply(pid(), Message.t(), non_neg_integer()) :: :ok | {:error, term()}
+  def send_reply(pid, %Message{} = msg, dispatch_timeout \\ @default_write_timeout)
+      when is_pid(pid) and is_integer(dispatch_timeout) and dispatch_timeout >= 0 do
+    if node(pid) == node() do
+      request_ref = make_ref()
+      deadline = System.monotonic_time(:millisecond) + dispatch_timeout
+
+      SafeCall.call(pid, {:send_reply, msg, deadline, request_ref}, dispatch_timeout,
+        cancel: {:cancel, request_ref}
+      )
+    else
+      {:error, :remote_connection_unsupported}
+    end
+  end
+
+  # The unique name Hello returned, or `nil` on a connection created with
+  # `bus: false`, which sends no Hello.
+  @doc false
+  @spec unique_name(pid(), non_neg_integer()) ::
+          binary() | nil | {:error, :timeout | :disconnected | :not_connected}
+  def unique_name(conn, timeout \\ @default_read_timeout)
+      when is_pid(conn) and is_integer(timeout) and timeout >= 0 do
+    safe_setup_call(conn, :unique_name, nil, timeout)
   end
 
   # Whether this connection completed the message-bus handshake. A connection
@@ -292,6 +324,9 @@ defmodule Rebus.Connection do
     # Replies whose descriptors have been handed to a caller but not yet
     # acknowledged, and the terminal outcomes retained just after.
     field :fd_claims, FDClaims.t(), default: FDClaims.new()
+    # Inbound method calls handed to a handler and not yet answered, with the
+    # descriptors they carried.
+    field :inbound_calls, InboundCalls.t(), default: InboundCalls.new()
     # Signal handlers registered against this connection. Delivery and match
     # filtering happen in the connection process itself, so a signal arriving
     # here can never reach a handler installed on another connection.
@@ -447,12 +482,14 @@ defmodule Rebus.Connection do
           impl: impl,
           partial_frame_timer: timer_ref,
           inbound_fds: inbound_fds,
-          fd_claims: fd_claims
+          fd_claims: fd_claims,
+          inbound_calls: inbound_calls
         }
       ) do
     Dispatch.cancel_partial_frame_timer(timer_ref)
     _ = UnixFD.close_all(Rights.fds(inbound_fds))
     FDClaims.close_all(fd_claims)
+    InboundCalls.close_all(inbound_calls)
     _ = impl.transport.close(sock)
     :ok
   end
@@ -728,21 +765,23 @@ defmodule Rebus.Connection do
     {:reply, {:error, :not_connected}, state}
   end
 
-  def handle_call({:send, %Message{} = msg, deadline, request_ref}, from, %__MODULE__{} = state) do
-    case validate_send_message(msg) do
-      :ok ->
-        enqueue_write(state, %{
-          kind: :send,
-          from: from,
-          msg: msg,
-          deadline: deadline,
-          request_ref: request_ref
-        })
+  def handle_call({:send, %Message{} = msg, deadline, request_ref}, from, %__MODULE__{} = state),
+    do: enqueue_send(validate_send_message(msg), state, from, msg, deadline, request_ref)
 
-      {:error, _} = error ->
-        {:reply, error, state}
-    end
+  def handle_call(
+        {:send_reply, %Message{}, _deadline, _request_ref},
+        _from,
+        %__MODULE__{established?: false} = state
+      ) do
+    {:reply, {:error, :not_connected}, state}
   end
+
+  def handle_call(
+        {:send_reply, %Message{} = msg, deadline, request_ref},
+        from,
+        %__MODULE__{} = state
+      ),
+      do: enqueue_send(validate_reply_message(msg), state, from, msg, deadline, request_ref)
 
   def handle_call(
         {:claim_fd_reply, claim_ref, delivery_ref, delivery_alias},
@@ -780,6 +819,16 @@ defmodule Rebus.Connection do
 
   def handle_call(:bus?, _from, %__MODULE__{} = state) do
     {:reply, state.bus?, state}
+  end
+
+  # Before establishment a bus connection has no name yet, which `nil` would
+  # misreport as a peer-to-peer connection.
+  def handle_call(:unique_name, _from, %__MODULE__{established?: false} = state) do
+    {:reply, {:error, :not_connected}, state}
+  end
+
+  def handle_call(:unique_name, _from, %__MODULE__{} = state) do
+    {:reply, state.name, state}
   end
 
   def handle_call(
@@ -1007,6 +1056,27 @@ defmodule Rebus.Connection do
 
   defp validate_send_message(%Message{type: type}), do: {:error, {:invalid_message_type, type}}
 
+  # The only types a handler answers an inbound call with.
+  defp validate_reply_message(%Message{type: type}) when type in [:method_return, :error],
+    do: :ok
+
+  defp validate_reply_message(%Message{type: type}), do: {:error, {:invalid_message_type, type}}
+
+  # Both `Rebus.send/2` frames and handler replies are written on the `:send`
+  # path; they differ only in which message types they accept.
+  defp enqueue_send(:ok, %__MODULE__{} = state, from, msg, deadline, request_ref) do
+    enqueue_write(state, %{
+      kind: :send,
+      from: from,
+      msg: msg,
+      deadline: deadline,
+      request_ref: request_ref
+    })
+  end
+
+  defp enqueue_send({:error, _} = error, %__MODULE__{} = state, _from, _msg, _deadline, _ref),
+    do: {:reply, error, state}
+
   defp validate_outbound_fd_transport(%Message{unix_fds: []}, _state), do: :ok
 
   defp validate_outbound_fd_transport(%Message{}, %__MODULE__{unix_fd_transport?: false}),
@@ -1075,6 +1145,7 @@ defmodule Rebus.Connection do
       state
       | pending: Pending.fail_all(state.pending),
         fd_claims: FDClaims.fail_all(state.fd_claims),
+        inbound_calls: InboundCalls.fail_all(state.inbound_calls),
         writer: writer
     }
   end
