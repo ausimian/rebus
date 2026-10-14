@@ -390,6 +390,32 @@ defmodule Rebus do
   end
 
   @doc """
+  Returns the unique name the message bus assigned to the connection.
+
+  A connection to a message bus is given its unique name, such as `":1.42"`,
+  by the `Hello` call it makes during `connect/2`, and keeps it for its whole
+  life. Peers address method calls and replies to that name, and the bus puts
+  it in the `sender` field of everything the connection sends. A connection
+  created with `bus: false` sends no `Hello` and has no unique name, so this
+  returns `nil` for it.
+
+  ## Return values
+
+  - `name` - the unique name, a binary starting with `":"`.
+  - `nil` - the connection was created with `bus: false`.
+  - `{:error, :not_connected}` - connection setup has not completed.
+  - `{:error, :timeout}` - the connection did not service the request in time.
+  - `{:error, :disconnected}` - the connection has stopped.
+
+  ## Examples
+
+      {:ok, conn} = Rebus.connect(:session)
+      ":" <> _ = Rebus.unique_name(conn)
+  """
+  @spec unique_name(pid()) :: binary() | nil | {:error, :not_connected | :timeout | :disconnected}
+  def unique_name(conn) when is_pid(conn), do: Rebus.Connection.unique_name(conn)
+
+  @doc """
   Sends a method call and waits for its correlated reply.
 
   Only a method call that expects a reply is accepted, and `timeout` is in

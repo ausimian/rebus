@@ -3,8 +3,9 @@ defmodule Rebus.UnixFDTest do
 
   alias Rebus.Connection.FDClaims
   alias Rebus.Connection.Inbound
+  alias Rebus.Connection.InboundCalls
   alias Rebus.Connection.Rights
-  alias Rebus.{Message, TestImpl, TestServer, UnixFD}
+  alias Rebus.{Message, TestFD, TestImpl, TestServer, UnixFD}
   alias Rebus.UnixFD.Raw
 
   @connection_name :rebus_unix_fd_test_connection
@@ -657,6 +658,29 @@ defmodule Rebus.UnixFDTest do
              {_id, ^connection, _type, _modules} -> true
              _child -> false
            end)
+  end
+
+  test "Rebus.close closes descriptors held by unanswered inbound calls", %{
+    connection: connection
+  } do
+    fd = hold_inbound_call_fd!(connection)
+
+    ref = Process.monitor(connection)
+    assert :ok = Rebus.close(connection)
+    assert_receive {:DOWN, ^ref, :process, ^connection, :shutdown}, 1_000
+    assert {:error, :ebadf} = UnixFD.close(fd)
+  end
+
+  test "a transport stop closes descriptors held by unanswered inbound calls", %{
+    server: server,
+    connection: connection
+  } do
+    fd = hold_inbound_call_fd!(connection)
+
+    ref = Process.monitor(connection)
+    :ok = :socket.shutdown(:sys.get_state(server).cli_sock, :write)
+    assert_receive {:DOWN, ^ref, :process, ^connection, {:shutdown, :closed}}, 1_000
+    assert {:error, :ebadf} = UnixFD.close(fd)
   end
 
   test "Rebus.close resolves an unacknowledged claim as disconnected", %{
@@ -1958,6 +1982,22 @@ defmodule Rebus.UnixFDTest do
           monitor_index: %{monitor_ref => claim_ref}
         }
     }
+  end
+
+  # Nothing routes inbound calls to a handler yet, so an unanswered call is
+  # planted in the connection's table directly. The insert runs in the
+  # connection process, which owns the expiry timer it starts.
+  defp hold_inbound_call_fd!(connection) do
+    fd = TestFD.dup!()
+
+    call = %{ref: make_ref(), serial: 1, sender: ":1.99", handler: self(), unix_fds: [fd]}
+
+    :sys.replace_state(connection, fn state ->
+      {_entry, calls} = InboundCalls.insert(state.inbound_calls, call, 60_000)
+      %{state | inbound_calls: calls}
+    end)
+
+    fd
   end
 
   defp eventually(fun, attempts \\ 20)

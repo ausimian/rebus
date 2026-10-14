@@ -4508,6 +4508,139 @@ defmodule RebusTest do
     end
   end
 
+  describe "Unique names" do
+    setup [:server_setup]
+
+    test "are the name Hello returned on a bus connection", %{svr: svr} do
+      %{cli: cli} = client_setup(%{svr: svr})
+
+      assert Rebus.unique_name(cli) == ":1.100"
+    end
+
+    test "are nil on a bus: false connection", %{svr: svr} do
+      cli = connect_peer(svr)
+
+      assert Rebus.unique_name(cli) == nil
+      assert :ok = Rebus.close(cli)
+    end
+
+    test "are not reported before the connection is established" do
+      # nil would claim a peer-to-peer connection, so the absent name is an
+      # error until setup completes.
+      {result, cli} = while_connecting(:rebus_unique_name_while_connecting, &Rebus.unique_name/1)
+
+      assert {:error, :not_connected} = result
+      assert Rebus.unique_name(cli) == ":1.100"
+      assert :ok = Rebus.close(cli)
+    end
+
+    test "report a stopped connection as disconnected", %{svr: svr} do
+      %{cli: cli} = client_setup(%{svr: svr})
+      ref = Process.monitor(cli)
+      assert :ok = Rebus.close(cli)
+      assert_receive {:DOWN, ^ref, :process, ^cli, _reason}, 1_000
+
+      assert {:error, :disconnected} = Rebus.unique_name(cli)
+    end
+  end
+
+  describe "Handler replies" do
+    setup [:server_setup, :client_setup]
+
+    # Nothing routes inbound calls to a handler yet, and this path does not
+    # look calls up, so these replies answer serials no call used.
+    test "write a method return the handler built and answer the handler", %{
+      cli: cli,
+      svr: svr
+    } do
+      reply =
+        Message.new!(:method_return,
+          reply_serial: 41,
+          destination: ":1.99",
+          signature: "s",
+          body: ["done"]
+        )
+
+      assert :ok = Connection.send_reply(cli, reply)
+
+      assert_receive {^svr,
+                      %Message{type: :method_return, header_fields: fields, body: ["done"]}},
+                     1_000
+
+      assert fields.reply_serial == 41
+      assert fields.destination == ":1.99"
+      assert_method_call_round_trip(svr, cli)
+    end
+
+    test "write an error the handler built", %{cli: cli, svr: svr} do
+      error =
+        Message.new!(:error,
+          reply_serial: 42,
+          destination: ":1.99",
+          error_name: "org.example.Error.Refused",
+          signature: "s",
+          body: ["refused"]
+        )
+
+      assert :ok = Connection.send_reply(cli, error)
+
+      assert_receive {^svr, %Message{type: :error, header_fields: fields, body: ["refused"]}},
+                     1_000
+
+      assert fields.reply_serial == 42
+      assert fields.error_name == "org.example.Error.Refused"
+    end
+
+    test "accept only replies", %{cli: cli, svr: svr} do
+      call = Message.new!(:method_call, path: "/org/example/Object", member: "NotAReply")
+
+      signal =
+        Message.new!(:signal,
+          path: "/org/example/Object",
+          interface: "org.example.Iface",
+          member: "NotAReply"
+        )
+
+      assert {:error, {:invalid_message_type, :method_call}} = Connection.send_reply(cli, call)
+      assert {:error, {:invalid_message_type, :signal}} = Connection.send_reply(cli, signal)
+      refute_receive {^svr, %Message{}}, 100
+    end
+
+    test "cannot be forged through Rebus.send", %{cli: cli, svr: svr} do
+      return = Message.new!(:method_return, reply_serial: 41)
+
+      error =
+        Message.new!(:error,
+          reply_serial: 42,
+          error_name: "org.example.Error.Forged"
+        )
+
+      assert {:error, {:invalid_message_type, :method_return}} = Rebus.send(cli, return)
+      assert {:error, {:invalid_message_type, :error}} = Rebus.send(cli, error)
+      assert {:error, {:invalid_message_type, :method_return}} = Rebus.send(cli, return, 1_000)
+      refute_receive {^svr, %Message{}}, 100
+    end
+
+    test "are refused before the connection is established" do
+      reply = Message.new!(:method_return, reply_serial: 1)
+
+      {result, cli} =
+        while_connecting(:rebus_send_reply_while_connecting, &Connection.send_reply(&1, reply))
+
+      assert {:error, :not_connected} = result
+      assert :ok = Rebus.close(cli)
+    end
+
+    test "report a stopped connection as disconnected", %{cli: cli} do
+      ref = Process.monitor(cli)
+      assert :ok = Rebus.close(cli)
+      assert_receive {:DOWN, ^ref, :process, ^cli, _reason}, 1_000
+
+      reply = Message.new!(:method_return, reply_serial: 1)
+      assert {:error, :disconnected} = Connection.send_reply(cli, reply)
+    end
+  end
+
   describe "Signals" do
     setup [:server_setup, :client_setup]
 
@@ -5185,6 +5318,43 @@ defmodule RebusTest do
   defp await_hello(svr, timeout \\ 1_000) do
     assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}, timeout
     hello
+  end
+
+  # Runs `operation` against a connection found by name while it is still
+  # authenticating, and returns its result with the connection once
+  # `connect/2` has returned. The server stalls authentication long enough for
+  # the operation to queue behind setup, so the connection answers it before
+  # it is established.
+  defp while_connecting(name, operation) do
+    auth_response = "OK 30313233343536373839414243444546\r\n"
+
+    {:ok, svr} =
+      start_supervised(
+        {Rebus.TestServer,
+         tap: self(),
+         notify_auth: true,
+         auth_response_fragments: [
+           binary_part(auth_response, 0, 8),
+           binary_part(auth_response, 8, byte_size(auth_response) - 8)
+         ],
+         auth_fragment_delay: 300},
+        id: name
+      )
+
+    on_exit(fn ->
+      if connection = Process.whereis(name), do: Rebus.close(connection)
+    end)
+
+    {:ok, addr} = TestServer.get_listen_addr(svr)
+    connect_task = Task.async(fn -> Rebus.connect(addr, name: name) end)
+    assert_receive {^svr, :auth_received}, 1_000
+    pid = Process.whereis(name)
+    assert is_pid(pid)
+
+    operation_task = Task.async(fn -> operation.(pid) end)
+
+    assert {:ok, ^pid} = Task.await(connect_task, 1_000)
+    {Task.await(operation_task, 1_000), pid}
   end
 
   defp connect_until_hello(svr, opts \\ []) do

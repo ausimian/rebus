@@ -48,6 +48,18 @@ defmodule Rebus.Integration.SessionBusTest do
       assert unique_name!(conn) in names
     end
 
+    test "reports the unique name Hello assigned" do
+      conn = connect!()
+
+      # The daemon addresses its replies to the name it assigned, so the
+      # accessor is checked against the wire rather than against itself.
+      name = Rebus.unique_name(conn)
+      assert name == unique_name!(conn)
+
+      assert {:ok, %Message{body: [^name]}} =
+               driver_call(conn, "GetNameOwner", signature: "s", body: [name])
+    end
+
     test "routes NameOwnerChanged to a subscriber while a peer takes and releases a name" do
       observer = connect!()
       owner = connect!()
@@ -277,8 +289,9 @@ defmodule Rebus.Integration.SessionBusTest do
     )
   end
 
-  # Rebus exposes no accessor for the name Hello returned, so it is read back
-  # off the wire: every driver reply is directed at the caller's unique name.
+  # The name Hello returned, read back off the wire independently of
+  # `Rebus.unique_name/1`: every driver reply is directed at the caller's
+  # unique name.
   defp unique_name!(conn) do
     assert {:ok, %Message{header_fields: %{destination: name}}} = driver_call(conn, "GetId")
     assert String.starts_with?(name, ":")

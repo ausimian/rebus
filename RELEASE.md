@@ -1,5 +1,8 @@
 ### Added
 
+- `Rebus.unique_name/1` returns the unique name the message bus assigned to a
+  connection in reply to `Hello`, such as `":1.42"`, or `nil` for a connection
+  created with `bus: false`.
 - `{:rebus_match_uncertain, conn, ref, rule}` notices tell each holder of a
   reference on a match rule, and the connection's `:owner` with `nil` for the
   reference, that Rebus can no longer prove what the bus holds for that rule.
