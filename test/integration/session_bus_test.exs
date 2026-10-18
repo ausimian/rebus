@@ -101,6 +101,34 @@ defmodule Rebus.Integration.SessionBusTest do
       assert :ok = Rebus.remove_match(observer, ref, @call_timeout)
     end
 
+    test "requests, queues for and releases a name, notifying each owner" do
+      first = connect!()
+      second = connect!()
+      opts = [timeout: @call_timeout]
+
+      assert {:ok, :primary_owner} = Rebus.Bus.request_name(first, @well_known_name, [], opts)
+      assert_receive {:rebus_name, ^first, :acquired, @well_known_name}, @window
+
+      assert {:ok, :already_owner} = Rebus.Bus.request_name(first, @well_known_name, [], opts)
+
+      assert {:ok, :exists} =
+               Rebus.Bus.request_name(second, @well_known_name, [:do_not_queue], opts)
+
+      assert {:ok, :in_queue} = Rebus.Bus.request_name(second, @well_known_name, [], opts)
+
+      # The release hands the name to the queued connection.
+      assert {:ok, :released} = Rebus.Bus.release_name(first, @well_known_name, opts)
+      assert_receive {:rebus_name, ^first, :lost, @well_known_name}, @window
+      assert_receive {:rebus_name, ^second, :acquired, @well_known_name}, @window
+
+      assert {:ok, :not_owner} = Rebus.Bus.release_name(first, @well_known_name, opts)
+      assert {:ok, :released} = Rebus.Bus.release_name(second, @well_known_name, opts)
+      assert_receive {:rebus_name, ^second, :lost, @well_known_name}, @window
+      assert {:ok, :non_existent} = Rebus.Bus.release_name(second, @well_known_name, opts)
+
+      refute_receive {:rebus_name, _conn, _event, _name}, 300
+    end
+
     test "returns UnknownObject for a call to a path another connection has not exported" do
       caller = connect!()
       callee = connect!()

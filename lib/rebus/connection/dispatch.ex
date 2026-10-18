@@ -499,6 +499,9 @@ defmodule Rebus.Connection.Dispatch do
     name_owners = state.name_owners
 
     Enum.reduce(handlers, :unparsed, fn
+      {_handler_ref, %{name: _name} = watch}, body_types ->
+        notify_name_watch(watch, msg, name_owners, body_types)
+
       {handler_ref, %{pid: pid, rule: nil}}, body_types ->
         send(pid, {handler_ref, msg})
         body_types
@@ -509,6 +512,24 @@ defmodule Rebus.Connection.Dispatch do
         body_types
     end)
   end
+
+  # A name watch turns the driver's NameAcquired and NameLost for its name
+  # into the notice `Rebus.Bus` documents, rather than passing the signal on.
+  defp notify_name_watch(%{pid: pid, rule: rule, name: name}, msg, name_owners, body_types) do
+    case name_event(msg) do
+      nil ->
+        body_types
+
+      event ->
+        {matched?, body_types} = MatchRule.match(rule, msg, name_owners, body_types)
+        if matched?, do: send(pid, {:rebus_name, self(), event, name})
+        body_types
+    end
+  end
+
+  defp name_event(%Message{header_fields: %{member: "NameAcquired"}}), do: :acquired
+  defp name_event(%Message{header_fields: %{member: "NameLost"}}), do: :lost
+  defp name_event(%Message{}), do: nil
 
   defp reply(%Message{} = msg, %Connection{} = state) do
     case Map.fetch(msg.header_fields, :reply_serial) do
