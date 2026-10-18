@@ -1,3 +1,7 @@
+# The introspection tests parse generated XML with OTP's xmerl, which Rebus
+# does not depend on at runtime, so Mix leaves it off the code path.
+Mix.ensure_application!(:xmerl)
+
 :ok = Rebus.TestImpl.setup!()
 
 # One scratch directory per run, holding every path the fixtures create.

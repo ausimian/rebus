@@ -1,5 +1,13 @@
 ### Added
 
+- `Rebus.Interface` declares a D-Bus interface's methods, signals, properties
+  and annotations, validating every name and signature once. It provides the
+  standard `Peer`, `Introspectable`, `Properties` and `ObjectManager`
+  interfaces, and builds signals, `PropertiesChanged` signals and `a{sv}`
+  property bodies typed by the declaration. It is the groundwork for exporting
+  objects from Rebus.
+- `Rebus.Introspection.to_xml/1` renders a `Rebus.Introspection.Node` as
+  D-Bus introspection XML, with no XML library dependency.
 - `Rebus.unique_name/1` returns `{:ok, name}` with the unique name the message
   bus assigned to a connection in reply to `Hello`, such as `":1.42"`, or
   `{:ok, nil}` for a connection created with `bus: false`.

@@ -107,6 +107,15 @@ defmodule Rebus.MixProject do
           Rebus.MatchRule,
           Rebus.UnixFD
         ],
+        Services: [
+          Rebus.Interface,
+          Rebus.Interface.Arg,
+          Rebus.Interface.Method,
+          Rebus.Interface.Signal,
+          Rebus.Interface.Property,
+          Rebus.Introspection,
+          Rebus.Introspection.Node
+        ],
         "Wire format": [
           Rebus.Encoder,
           Rebus.Decoder,
