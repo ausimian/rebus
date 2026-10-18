@@ -19,9 +19,15 @@
   declarations, so `busctl tree`, `busctl introspect`, `gdbus introspect` and
   `d-feet` can find and describe them. Every path above an exported object,
   from `/` down, answers with its child nodes. A path served by a subtree
-  export lists the subtree's interfaces and no child nodes. Exported objects
-  list the standard `Properties` interface, but calls to it are answered with
-  `org.freedesktop.DBus.Error.UnknownInterface` for now.
+  export lists the subtree's interfaces and no child nodes.
+- Exported objects answer `org.freedesktop.DBus.Properties`. The connection
+  checks each `Get`, `Set` and `GetAll` against the declaration of the
+  interface it names and answers `UnknownInterface`, `UnknownProperty`,
+  `PropertyReadOnly` or `InvalidArgs` for a call that does not fit, including
+  a `Set` value of the wrong type. Anything else goes to the handler that
+  exported the interface, as a `Rebus.Service.Call` whose `out_signature` is
+  `"v"`, `""` or `"a{sv}"`. `GetAll` for an interface with no readable
+  property answers an empty dictionary.
 - `Rebus.connect/2` takes a `:max_pending_calls` option, 1024 by default,
   that bounds how many inbound calls may wait for a handler's answer at once.
   Calls beyond it are answered with `org.freedesktop.DBus.Error.LimitsExceeded`.

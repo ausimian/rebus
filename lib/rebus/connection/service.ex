@@ -15,6 +15,12 @@ defmodule Rebus.Connection.Service do
   # D-Bus error, and so the handler sees only calls that name a declared
   # member with arguments of the declared types.
   #
+  # `org.freedesktop.DBus.Properties` is checked against the declaration of
+  # the interface it names, and goes to the handler that exported that
+  # interface. Only reading the values is left to the handler: the target
+  # interface, the property, its access and, for `Set`, the type of the new
+  # value have all been checked by then.
+  #
   # Calls that expect a reply are recorded in `Rebus.Connection.InboundCalls`
   # until their handler answers, they expire, or their export goes away. A
   # call sent with `NO_REPLY_EXPECTED` is not recorded: it carries no
@@ -31,7 +37,9 @@ defmodule Rebus.Connection.Service do
   alias Rebus.Connection.Objects.Export
   alias Rebus.Connection.Peer
   alias Rebus.Connection.Writer
+  alias Rebus.Interface
   alias Rebus.Interface.Method
+  alias Rebus.Interface.Property
   alias Rebus.Message
   alias Rebus.Service.Call
 
@@ -39,6 +47,8 @@ defmodule Rebus.Connection.Service do
 
   @peer_interface "org.freedesktop.DBus.Peer"
   @introspectable_interface "org.freedesktop.DBus.Introspectable"
+  @properties Interface.properties()
+  @properties_interface @properties.name
 
   # Every refusal carries a fixed sentence. Member, interface and path names
   # are grammar-checked, but they are never echoed: one policy is easier to
@@ -52,6 +62,15 @@ defmodule Rebus.Connection.Service do
       {"org.freedesktop.DBus.Error.UnknownMethod", "Method not implemented by this object"},
     invalid_args:
       {"org.freedesktop.DBus.Error.InvalidArgs", "Arguments do not match the method signature"},
+    invalid_value:
+      {"org.freedesktop.DBus.Error.InvalidArgs", "Value does not match the property signature"},
+    unknown_property:
+      {"org.freedesktop.DBus.Error.UnknownProperty", "Property not declared by this interface"},
+    # The specification names no error for reading a write-only property, and
+    # this is the one it gives for the access mismatch the other way.
+    property_read_only: {"org.freedesktop.DBus.Error.PropertyReadOnly", "Property is read-only"},
+    property_write_only:
+      {"org.freedesktop.DBus.Error.PropertyReadOnly", "Property is write-only"},
     limits_exceeded:
       {"org.freedesktop.DBus.Error.LimitsExceeded", "Too many method calls are pending"},
     handler_exited: {"org.freedesktop.DBus.Error.Failed", "Handler exited"},
@@ -75,6 +94,11 @@ defmodule Rebus.Connection.Service do
 
       :introspect ->
         answer_internally(msg, state, &introspect/2)
+
+      :no_properties ->
+        answer_internally(msg, state, fn _msg, state ->
+          {[type: :method_return, signature: "a{sv}", body: [[]]], state}
+        end)
 
       {:error, error} ->
         answer_internally(msg, state, fn _msg, state -> {error_reply(error), state} end)
@@ -169,6 +193,11 @@ defmodule Rebus.Connection.Service do
       @peer_interface ->
         :peer
 
+      @properties_interface ->
+        objects
+        |> Objects.resolve(fields.path)
+        |> resolve_property(fields.member, msg)
+
       interface ->
         objects
         |> Objects.resolve(fields.path)
@@ -209,6 +238,50 @@ defmodule Rebus.Connection.Service do
   defp resolve_member(:intermediate, _interface, _member), do: {:error, :unknown_interface}
   defp resolve_member(:unknown, nil, member), do: peer_or(member, :unknown_object)
   defp resolve_member(:unknown, _interface, _member), do: {:error, :unknown_object}
+
+  # A Properties call names its target interface, and for `Get` and `Set` the
+  # property, in its body, which can only be read once the signature is known
+  # to be the declared one. It is routed to the export serving the target
+  # interface, which an object that declares no readable property there is
+  # spared: `GetAll` then answers an empty dictionary without it.
+  defp resolve_property({:object, interfaces}, member, %Message{body: body} = msg) do
+    with {:ok, %Method{} = method} <- fetch(@properties.methods, member, :unknown_method),
+         :ok <- check(Message.signature(msg) == method.in_signature, :invalid_args),
+         [target | args] = body,
+         {:ok, %Export{} = export} <- fetch(interfaces, target, :unknown_interface),
+         :ok <- check_property(member, export.interfaces[target], args) do
+      {:ok, export, @properties_interface, method}
+    end
+  end
+
+  defp resolve_property(resolution, member, _msg),
+    do: resolve_member(resolution, @properties_interface, member)
+
+  defp check_property("GetAll", %Interface{properties: properties}, []) do
+    if Enum.any?(properties, fn {_name, property} -> property.access != :write end),
+      do: :ok,
+      else: :no_properties
+  end
+
+  defp check_property("Get", %Interface{} = interface, [name]) do
+    with {:ok, %Property{} = property} <- fetch_property(interface, name) do
+      check(property.access != :write, :property_write_only)
+    end
+  end
+
+  # Variants decode as `{signature, value}`.
+  defp check_property("Set", %Interface{} = interface, [name, {signature, _value}]) do
+    with {:ok, %Property{} = property} <- fetch_property(interface, name),
+         :ok <- check(property.access != :read, :property_read_only) do
+      check(signature == property.signature, :invalid_value)
+    end
+  end
+
+  defp fetch_property(%Interface{properties: properties}, name),
+    do: fetch(properties, name, :unknown_property)
+
+  defp check(true, _error), do: :ok
+  defp check(false, error), do: {:error, error}
 
   defp fetch(map, key, error) do
     case Map.fetch(map, key) do

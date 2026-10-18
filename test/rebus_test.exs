@@ -4938,6 +4938,59 @@ defmodule RebusTest do
       assert :ok = Rebus.close(cli)
     end
 
+    test "answer Properties Get, Set and GetAll from their handler", %{cli: cli, svr: svr} do
+      settings =
+        Rebus.Interface.new!("org.example.Settings",
+          properties: [{"Precision", "u", :readwrite}, {"Version", "s", :read}]
+        )
+
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator, settings])
+
+      {:ok, serial} = TestServer.push_call(svr, properties_call("Get", "ss", ["Version"]))
+      assert_receive {^ref, %Call{member: "Get", out_signature: "v"} = call}, 1_000
+      assert :ok = Service.reply(call, [{"s", "1.0"}])
+
+      assert_receive {^svr, %Message{type: :method_return, header_fields: fields} = reply},
+                     1_000
+
+      assert fields.reply_serial == serial
+      assert Message.signature(reply) == "v"
+      assert reply.body == [{"s", "1.0"}]
+
+      {:ok, serial} =
+        TestServer.push_call(svr, properties_call("Set", "ssv", ["Precision", {"u", 3}]))
+
+      assert_receive {^ref, %Call{member: "Set", out_signature: ""} = call}, 1_000
+      assert call.body == ["org.example.Settings", "Precision", {"u", 3}]
+      assert :ok = Service.reply(call, [])
+
+      assert_receive {^svr, %Message{type: :method_return, header_fields: fields, body: []}},
+                     1_000
+
+      assert fields.reply_serial == serial
+
+      {:ok, serial} = TestServer.push_call(svr, properties_call("GetAll", "s", []))
+      assert_receive {^ref, %Call{member: "GetAll", out_signature: "a{sv}"} = call}, 1_000
+
+      values = %{"Precision" => 3, "Version" => "1.0"}
+      assert :ok = Service.reply(call, [Rebus.Interface.wrap_properties!(settings, values)])
+
+      assert_receive {^svr, %Message{type: :method_return, header_fields: fields} = reply},
+                     1_000
+
+      assert fields.reply_serial == serial
+      assert reply.body == [[{"Precision", {"u", 3}}, {"Version", {"s", "1.0"}}]]
+
+      # A write to a read-only property never reaches the handler.
+      {:ok, serial} =
+        TestServer.push_call(svr, properties_call("Set", "ssv", ["Version", {"s", "2.0"}]))
+
+      assert_receive {^svr, %Message{type: :error, header_fields: fields}}, 1_000
+      assert fields.error_name == "org.freedesktop.DBus.Error.PropertyReadOnly"
+      assert fields.reply_serial == serial
+      refute_received {^ref, %Call{}}
+    end
+
     test "report a stopped connection as disconnected", %{cli: cli, svr: svr} do
       {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
       {:ok, _serial} = TestServer.push_call(svr, calc_call("Add", [2, 3]))
@@ -5525,6 +5578,18 @@ defmodule RebusTest do
         ],
         opts
       )
+    )
+  end
+
+  # A Properties call on `org.example.Settings` at `@calc_path`.
+  defp properties_call(member, signature, args) do
+    Message.new!(:method_call,
+      path: @calc_path,
+      interface: "org.freedesktop.DBus.Properties",
+      member: member,
+      sender: ":1.99",
+      signature: signature,
+      body: ["org.example.Settings" | args]
     )
   end
 

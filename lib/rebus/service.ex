@@ -56,6 +56,9 @@ defmodule Rebus.Service do
   | Interface not exported on the object | `org.freedesktop.DBus.Error.UnknownInterface` |
   | Method not declared, or, without an interface, declared by no exported interface or by more than one | `org.freedesktop.DBus.Error.UnknownMethod` |
   | Argument signature differs from the declaration | `org.freedesktop.DBus.Error.InvalidArgs` |
+  | Property not declared by the interface a `Properties` call names | `org.freedesktop.DBus.Error.UnknownProperty` |
+  | `Get` of a write-only property, or `Set` of a read-only one | `org.freedesktop.DBus.Error.PropertyReadOnly` |
+  | `Set` value of a type other than the declared one | `org.freedesktop.DBus.Error.InvalidArgs` |
   | `:max_pending_calls` calls already waiting | `org.freedesktop.DBus.Error.LimitsExceeded` |
   | Handler exited with the call pending | `org.freedesktop.DBus.Error.Failed` |
   | Object unexported with the call pending | `org.freedesktop.DBus.Error.Failed` |
@@ -67,6 +70,37 @@ defmodule Rebus.Service do
   it cannot be exported, and neither can
   `org.freedesktop.DBus.Introspectable` or `org.freedesktop.DBus.Properties`,
   which the connection reserves for itself.
+
+  ## Properties
+
+  The connection checks every `org.freedesktop.DBus.Properties` call against
+  the declaration of the interface it names, and sends it to the handler that
+  exported that interface. The call arrives with
+  `interface: "org.freedesktop.DBus.Properties"`, `member` `"Get"`, `"Set"`
+  or `"GetAll"`, and the body as sent, whose first element names the
+  interface. By then the interface is exported on the object, a `Get` or
+  `Set` names a declared property that can be read or written, and a `Set`
+  value has the declared type, so the handler only reads or writes values:
+
+      alias Rebus.Service.Call
+
+      receive do
+        {^ref, %Call{member: "Get", body: [_iface, "Precision"]} = call} ->
+          Rebus.Service.reply(call, [{"u", precision}])
+
+        {^ref, %Call{member: "Set", body: [_iface, "Precision", {"u", value}]} = call} ->
+          Rebus.Service.reply(call, [])
+
+        {^ref, %Call{member: "GetAll"} = call} ->
+          values = Rebus.Interface.wrap_properties!(settings, %{"Precision" => precision})
+          Rebus.Service.reply(call, [values])
+      end
+
+  `call.out_signature` is `"v"` for `Get`, so the value is a
+  `{signature, value}` variant; `""` for `Set`; and `"a{sv}"` for `GetAll`,
+  which `Rebus.Interface.wrap_properties/2` builds from the declaration. A
+  `GetAll` for an interface that declares no readable property is answered
+  with an empty dictionary without reaching the handler.
 
   ## Introspection
 

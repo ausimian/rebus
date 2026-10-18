@@ -24,12 +24,15 @@ defmodule Rebus.Service.Call do
     path at or below the exported one.
   - `interface` - the interface the call was routed to. A caller may omit the
     interface when only one exported interface declares the member; this is
-    then the interface that does.
+    then the interface that does. A property access has
+    `"org.freedesktop.DBus.Properties"` here, and names the interface it
+    targets as the first element of `body`.
   - `member` - the method name.
   - `signature` - the signature of `body`, which equals the method's declared
     in-signature.
   - `out_signature` - the declared out-signature, which `Rebus.Service.reply/3`
-    encodes the reply body with.
+    encodes the reply body with: for a property access, `"v"` for `Get`, `""`
+    for `Set` and `"a{sv}"` for `GetAll`.
   - `body` - the arguments.
   - `flags` - the message flags.
   - `no_reply?` - whether the caller asked for no reply. Answering such a

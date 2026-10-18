@@ -36,6 +36,9 @@ defmodule Rebus.Integration.SessionBusTest do
   @calculator Rebus.Interface.new!("org.example.RebusIntegration.Calculator",
                 methods: [{"Add", in: [a: "i", b: "i"], out: [sum: "i"]}]
               )
+  @settings Rebus.Interface.new!("org.example.RebusIntegration.Settings",
+              properties: [{"Precision", "u", :readwrite}, {"Version", "s", :read}]
+            )
 
   # Every reply and signal crosses the daemon socket.
   @call_timeout 5_000
@@ -237,6 +240,56 @@ defmodule Rebus.Integration.SessionBusTest do
       assert {output, 0} = System.cmd("dbus-send", args, stderr_to_stdout: true)
       assert output =~ ~s(<interface name="org.freedesktop.DBus.Introspectable">)
       assert output =~ ~s(<node name="example"/>)
+    end
+
+    test "serves Properties Get, Set and GetAll to another Rebus connection" do
+      caller = connect!()
+      exporter = connect!()
+      {:ok, ref} = Service.export(exporter, @object_path, [@settings])
+
+      properties = fn member, signature, args ->
+        message =
+          Message.new!(:method_call,
+            destination: unique_name!(exporter),
+            path: @object_path,
+            interface: "org.freedesktop.DBus.Properties",
+            member: member,
+            signature: signature,
+            body: ["org.example.RebusIntegration.Settings" | args]
+          )
+
+        Task.async(fn -> Rebus.call(caller, message, @call_timeout) end)
+      end
+
+      task = properties.("Get", "ss", ["Precision"])
+      assert_receive {^ref, %Call{member: "Get"} = call}, @window
+      assert :ok = Service.reply(call, [{"u", 3}])
+      assert {:ok, %Message{body: [{"u", 3}]}} = Task.await(task, @window)
+
+      task = properties.("Set", "ssv", ["Precision", {"u", 4}])
+
+      assert_receive {^ref,
+                      %Call{member: "Set", body: [_interface, "Precision", {"u", 4}]} = call},
+                     @window
+
+      assert :ok = Service.reply(call, [])
+      assert {:ok, %Message{type: :method_return, body: []}} = Task.await(task, @window)
+
+      task = properties.("GetAll", "s", [])
+      assert_receive {^ref, %Call{member: "GetAll"} = call}, @window
+      values = %{"Precision" => 4, "Version" => "1.0"}
+      assert :ok = Service.reply(call, [Rebus.Interface.wrap_properties!(@settings, values)])
+
+      assert {:ok, %Message{body: [[{"Precision", {"u", 4}}, {"Version", {"s", "1.0"}}]]}} =
+               Task.await(task, @window)
+
+      task = properties.("Set", "ssv", ["Version", {"s", "2.0"}])
+
+      assert {:error,
+              {:dbus_error,
+               %Message{
+                 header_fields: %{error_name: "org.freedesktop.DBus.Error.PropertyReadOnly"}
+               }}} = Task.await(task, @window)
     end
 
     test "answers org.freedesktop.DBus.Peer on a peer connection and on the daemon" do
