@@ -6,8 +6,9 @@ defmodule Rebus.Connection.Service do
   # itself.
   #
   # A call for `org.freedesktop.DBus.Peer` is answered by
-  # `Rebus.Connection.Peer` on any path. Anything else is resolved against
-  # the export table, checked against the interface declaration, bounded by
+  # `Rebus.Connection.Peer` on any path, and `Introspect` from the export
+  # table on any path it resolves. Anything else is resolved against the
+  # export table, checked against the interface declaration, bounded by
   # `max_pending_calls`, and only then sent to the handler as
   # `{export_ref, %Rebus.Service.Call{}}`. The connection never runs
   # application code; it answers every call it refuses with a fixed-text
@@ -37,6 +38,7 @@ defmodule Rebus.Connection.Service do
   require Logger
 
   @peer_interface "org.freedesktop.DBus.Peer"
+  @introspectable_interface "org.freedesktop.DBus.Introspectable"
 
   # Every refusal carries a fixed sentence. Member, interface and path names
   # are grammar-checked, but they are never echoed: one policy is easier to
@@ -70,6 +72,9 @@ defmodule Rebus.Connection.Service do
 
       :peer ->
         answer_internally(msg, state, &Peer.reply/2)
+
+      :introspect ->
+        answer_internally(msg, state, &introspect/2)
 
       {:error, error} ->
         answer_internally(msg, state, fn _msg, state -> {error_reply(error), state} end)
@@ -154,8 +159,9 @@ defmodule Rebus.Connection.Service do
     %{msg | header_fields: Map.put(fields, :reply_serial, serial)}
   end
 
-  # Routing order: Peer on any path; then the object at the path; then, for
-  # a call without an interface, the one exported interface that declares
+  # Routing order: Peer on any path; then the object at the path, where
+  # `Introspect` is answered on objects and intermediate nodes alike; then,
+  # for a call without an interface, the one exported interface that declares
   # the member, with Peer's own members tried only when none does; then the
   # argument signature. Every step that refuses names the error it answers with.
   defp route(%Message{header_fields: fields} = msg, %Objects{} = objects) do
@@ -170,6 +176,14 @@ defmodule Rebus.Connection.Service do
         |> check_args(msg)
     end
   end
+
+  # `Introspectable` cannot be exported, so no object's interfaces include it.
+  defp resolve_member(resolution, @introspectable_interface, "Introspect")
+       when resolution != :unknown,
+       do: :introspect
+
+  defp resolve_member({:object, _interfaces}, @introspectable_interface, _member),
+    do: {:error, :unknown_method}
 
   defp resolve_member({:object, interfaces}, nil, member) do
     declared =
@@ -212,6 +226,9 @@ defmodule Rebus.Connection.Service do
   defp check_args({:ok, _export, _interface, %Method{in_signature: signature}} = routed, msg) do
     if Message.signature(msg) == signature, do: routed, else: {:error, :invalid_args}
   end
+
+  defp check_args(:introspect, msg),
+    do: if(Message.signature(msg) == "", do: :introspect, else: {:error, :invalid_args})
 
   defp check_args(refused, _msg), do: refused
 
@@ -302,6 +319,13 @@ defmodule Rebus.Connection.Service do
         {reply_opts, state} = build.(msg, state)
         queue_reply(reply_opts, msg.serial, reply_destination(msg), state)
     end
+  end
+
+  # The table resolved the path when the call was routed, and nothing has
+  # changed it since.
+  defp introspect(%Message{header_fields: %{path: path}}, %Connection{} = state) do
+    {:ok, xml, objects} = Objects.introspect(state.objects, path)
+    {[type: :method_return, signature: "s", body: [xml]], %{state | objects: objects}}
   end
 
   defp error_reply(error) do
