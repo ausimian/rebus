@@ -9,6 +9,11 @@ defmodule Rebus.UnixFD do
   that successfully receives that message.  The owner must close it exactly
   once, or adopt it with its own OS/OTP API.
 
+  The exception is an inbound method call delivered to a `Rebus.Service`
+  handler: the descriptors in its `Rebus.Service.Call`, and in the message it
+  carries, are borrowed from the connection, which closes them when the call
+  completes. Close one only after taking it with `Rebus.Service.take_fds/2`.
+
   `close/1` consumes an owned descriptor exactly once. Do not call it again:
   operating systems may reuse descriptor numbers, so a second close could close
   an unrelated resource. It is suitable for `after` blocks and does not log
@@ -22,7 +27,7 @@ defmodule Rebus.UnixFD do
 
   alias Rebus.UnixFD.Raw
 
-  @typedoc "A raw, process-owned Unix file descriptor."
+  @typedoc "A raw Unix file descriptor, owned by a process or borrowed from one."
   @type t :: non_neg_integer()
 
   @doc """

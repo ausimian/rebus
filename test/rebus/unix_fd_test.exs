@@ -3,12 +3,16 @@ defmodule Rebus.UnixFDTest do
 
   alias Rebus.Connection.FDClaims
   alias Rebus.Connection.Inbound
-  alias Rebus.Connection.InboundCalls
   alias Rebus.Connection.Rights
-  alias Rebus.{Message, TestFD, TestImpl, TestServer, UnixFD}
+  alias Rebus.{Message, Service, TestImpl, TestServer, UnixFD}
+  alias Rebus.Service.Call
   alias Rebus.UnixFD.Raw
 
   @connection_name :rebus_unix_fd_test_connection
+  @files_path "/org/example/Files"
+  @files Rebus.Interface.new!("org.example.Files",
+           methods: [{"Take", in: [fd: "h"]}, {"Echo", in: [fd: "h"], out: [fd: "h"]}]
+         )
 
   @moduletag skip:
                if(
@@ -661,9 +665,10 @@ defmodule Rebus.UnixFDTest do
   end
 
   test "Rebus.close closes descriptors held by unanswered inbound calls", %{
+    server: server,
     connection: connection
   } do
-    fd = hold_inbound_call_fd!(connection)
+    fd = hold_inbound_call_fd!(server, connection)
 
     ref = Process.monitor(connection)
     assert :ok = Rebus.close(connection)
@@ -675,7 +680,7 @@ defmodule Rebus.UnixFDTest do
     server: server,
     connection: connection
   } do
-    fd = hold_inbound_call_fd!(connection)
+    fd = hold_inbound_call_fd!(server, connection)
 
     ref = Process.monitor(connection)
     :ok = :socket.shutdown(:sys.get_state(server).cli_sock, :write)
@@ -1311,6 +1316,339 @@ defmodule Rebus.UnixFDTest do
 
     assert Process.alive?(connection)
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
+  end
+
+  test "lends a call's descriptor to its handler until an answer completes the call", %{
+    server: server,
+    connection: connection
+  } do
+    before_fds = fd_set!()
+    {:ok, ref} = Service.export(connection, @files_path, [@files])
+
+    for answer <- [
+          &Service.reply(&1, []),
+          &Service.reply_error(&1, "org.example.Error.Refused", "no"),
+          &Service.reply_message(&1, Message.new!(:method_return, reply_serial: 1))
+        ] do
+      serial = push_fd_call!(server, "Take")
+
+      assert_receive {^ref, %Call{serial: ^serial, unix_fds: [borrowed]} = call}, 1_000
+      assert call.message.unix_fds == [borrowed]
+      assert open_fd?(borrowed)
+
+      assert :ok = answer.(call)
+      assert_receive {^server, %Message{header_fields: %{reply_serial: ^serial}}}, 1_000
+      assert no_new_fds?(before_fds)
+    end
+  end
+
+  test "closes the descriptor of a call that asked for no reply once it is answered", %{
+    server: server,
+    connection: connection
+  } do
+    before_fds = fd_set!()
+    {:ok, ref} = Service.export(connection, @files_path, [@files])
+    serial = push_fd_call!(server, "Take", flags: [:no_reply_expected])
+
+    assert_receive {^ref, %Call{serial: ^serial, no_reply?: true, unix_fds: [borrowed]} = call},
+                   1_000
+
+    assert open_fd?(borrowed)
+    assert :ok = Service.reply(call, [])
+    assert no_new_fds?(before_fds)
+    assert {:error, :unknown_call} = Service.reply(call, [])
+    refute_receive {^server, %Message{header_fields: %{reply_serial: _}}}, 100
+  end
+
+  test "closes a borrowed descriptor when its call expires", %{
+    server: server,
+    connection: connection
+  } do
+    before_fds = fd_set!()
+    {_ref, %Call{serial: serial}} = fd_call!(server, connection, "Take", call_timeout: 50)
+
+    assert_receive {^server,
+                    %Message{
+                      type: :error,
+                      header_fields: %{
+                        reply_serial: ^serial,
+                        error_name: "org.freedesktop.DBus.Error.NoReply"
+                      }
+                    }},
+                   1_000
+
+    assert no_new_fds?(before_fds)
+
+    # One that asked for no reply expires as quietly as it would be answered.
+    push_fd_call!(server, "Take", flags: [:no_reply_expected])
+    assert_receive {_ref, %Call{no_reply?: true, unix_fds: [_borrowed]} = call}, 1_000
+    assert no_new_fds?(before_fds)
+    refute_receive {^server, %Message{header_fields: %{reply_serial: _}}}, 100
+    assert {:error, :unknown_call} = Service.reply(call, [])
+  end
+
+  test "closes a borrowed descriptor when its handler exits", %{
+    server: server,
+    connection: connection
+  } do
+    parent = self()
+    before_fds = fd_set!()
+
+    handler =
+      spawn(fn ->
+        receive do
+          {_ref, %Call{} = call} -> send(parent, {:handled, call})
+        end
+
+        Process.sleep(:infinity)
+      end)
+
+    {_ref, serial} = fd_call!(server, connection, "Take", handler: handler)
+    assert_receive {:handled, %Call{unix_fds: [borrowed]}}, 1_000
+    assert open_fd?(borrowed)
+
+    Process.exit(handler, :kill)
+
+    assert_receive {^server,
+                    %Message{
+                      type: :error,
+                      header_fields: %{
+                        reply_serial: ^serial,
+                        error_name: "org.freedesktop.DBus.Error.Failed"
+                      }
+                    }},
+                   1_000
+
+    assert no_new_fds?(before_fds)
+  end
+
+  test "closes a borrowed descriptor when its object is unexported", %{
+    server: server,
+    connection: connection
+  } do
+    before_fds = fd_set!()
+    {ref, %Call{serial: serial}} = fd_call!(server, connection, "Take")
+
+    assert :ok = Service.unexport(connection, ref)
+
+    assert_receive {^server,
+                    %Message{
+                      type: :error,
+                      header_fields: %{
+                        reply_serial: ^serial,
+                        error_name: "org.freedesktop.DBus.Error.Failed"
+                      }
+                    }},
+                   1_000
+
+    assert no_new_fds?(before_fds)
+  end
+
+  test "closes the descriptors of calls refused at max_pending_calls", %{
+    server: server,
+    connection: connection
+  } do
+    before_fds = fd_set!()
+    :sys.replace_state(connection, &%{&1 | max_pending_calls: 1})
+    {ref, %Call{} = pending} = fd_call!(server, connection, "Take")
+
+    serial = push_fd_call!(server, "Take")
+
+    assert_receive {^server,
+                    %Message{
+                      type: :error,
+                      header_fields: %{
+                        reply_serial: ^serial,
+                        error_name: "org.freedesktop.DBus.Error.LimitsExceeded"
+                      }
+                    }},
+                   1_000
+
+    push_fd_call!(server, "Take", flags: [:no_reply_expected])
+    refute_receive {^ref, %Call{}}, 100
+
+    assert :ok = Service.reply(pending, [])
+    assert no_new_fds?(before_fds)
+  end
+
+  test "transfers a call's descriptors with take_fds, leaving the call to answer", %{
+    server: server,
+    connection: connection
+  } do
+    before_fds = fd_set!()
+    {_ref, %Call{unix_fds: [borrowed]} = call} = fd_call!(server, connection, "Take")
+
+    assert {:ok, [^borrowed]} = Service.take_fds(call)
+    assert {:error, :unknown_call} = Service.take_fds(call)
+    assert :sys.get_state(connection).fd_claims.claims == %{}
+
+    assert :ok = Service.reply(call, [])
+    assert_receive {^server, %Message{type: :method_return}}, 1_000
+    assert {:error, :unknown_call} = Service.take_fds(call)
+
+    # Completing the call closed nothing: the descriptor is this process's.
+    assert open_fd?(borrowed)
+    assert :ok = UnixFD.close(borrowed)
+    assert no_new_fds?(before_fds)
+  end
+
+  test "sends descriptors with a reply, but not the call's borrowed ones", %{
+    server: server,
+    connection: connection
+  } do
+    before_fds = fd_set!()
+
+    {_ref, %Call{serial: serial, unix_fds: [borrowed]} = call} =
+      fd_call!(server, connection, "Echo")
+
+    assert {:error, :unix_fd_borrowed} = Service.reply(call, [0], fds: [borrowed])
+    refute_receive {^server, %Message{header_fields: %{reply_serial: _}}}, 100
+
+    {:ok, [taken]} = Service.take_fds(call)
+    assert :ok = Service.reply(call, [0], fds: [taken])
+
+    assert_receive {^server,
+                    %Message{
+                      type: :method_return,
+                      header_fields: %{reply_serial: ^serial},
+                      body: [0],
+                      unix_fds: [received]
+                    }},
+                   1_000
+
+    # The reply borrowed the descriptor, so it is still the handler's to close,
+    # as the server's received duplicate is the server's.
+    assert :ok = UnixFD.close(received)
+
+    # An error reply carries them the same way.
+    {:ok, ref} = Service.export(connection, @files_path <> "/Errors", [@files])
+    serial = push_fd_call!(server, "Echo", path: @files_path <> "/Errors")
+    assert_receive {^ref, %Call{serial: ^serial, unix_fds: [borrowed]} = call}, 1_000
+
+    assert {:error, :unix_fd_borrowed} =
+             Service.reply_error(call, "org.example.Error.Refused", "no", fds: [borrowed])
+
+    assert {:ok, [error_taken]} = Service.take_fds(call)
+
+    assert :ok =
+             Service.reply_error(call, "org.example.Error.Refused", "no", fds: [taken])
+
+    assert_receive {^server,
+                    %Message{
+                      type: :error,
+                      header_fields: %{reply_serial: ^serial},
+                      unix_fds: [received]
+                    }},
+                   1_000
+
+    assert :ok = UnixFD.close(received)
+    assert :ok = UnixFD.close(error_taken)
+    assert :ok = UnixFD.close(taken)
+    assert no_new_fds?(before_fds)
+  end
+
+  test "closes call descriptors whose taker timed out during the hand-over while it lived", %{
+    server: server,
+    connection: connection
+  } do
+    parent = self()
+    before_fds = fd_set!()
+    {_ref, call} = fd_call!(server, connection, "Take")
+
+    TestImpl.install(connection,
+      fd_claim_handoff: fn ->
+        send(parent, :take_handoff_waiting)
+
+        receive do
+          :continue_take_handoff -> :ok
+        end
+      end
+    )
+
+    taker =
+      spawn(fn ->
+        send(parent, {:take_result, Service.take_fds(call, 100)})
+
+        receive do
+          :stop_taker -> :ok
+        end
+      end)
+
+    assert_receive :take_handoff_waiting, 1_000
+    assert_receive {:take_result, {:error, :timeout}}, 1_000
+    assert Process.alive?(taker)
+
+    # The taker is alive, but its call alias is gone. Releasing the hook sends
+    # the claim token into it, and the cancellation queued behind closes it.
+    send(connection, :continue_take_handoff)
+    assert {:error, :unknown_call} = Service.take_fds(call)
+    assert no_new_fds?(before_fds)
+    assert :ok = Service.reply(call, [])
+    send(taker, :stop_taker)
+  end
+
+  test "closes call descriptors whose taker exits before acknowledging", %{
+    server: server,
+    connection: connection
+  } do
+    parent = self()
+    before_fds = fd_set!()
+    {_ref, call} = fd_call!(server, connection, "Take")
+
+    TestImpl.install(connection,
+      fd_claim_delivery: fn ->
+        send(parent, :take_delivery_waiting)
+
+        receive do
+          :continue_take_delivery -> :ok
+        end
+      end
+    )
+
+    taker = spawn(fn -> send(parent, {:take_result, Service.take_fds(call, 1_000)}) end)
+    assert_receive :take_delivery_waiting, 1_000
+
+    taker_ref = Process.monitor(taker)
+    Process.exit(taker, :kill)
+    assert_receive {:DOWN, ^taker_ref, :process, ^taker, :killed}, 1_000
+
+    send(connection, :continue_take_delivery)
+    refute_receive {:take_result, _result}, 50
+    assert eventually(fn -> :sys.get_state(connection).fd_claims.claims == %{} end)
+    assert no_new_fds?(before_fds)
+    assert :ok = Service.reply(call, [])
+  end
+
+  test "closes call descriptors whose acknowledgement stalls past the claim deadline", %{
+    server: server,
+    connection: connection
+  } do
+    parent = self()
+    before_fds = fd_set!()
+    {_ref, call} = fd_call!(server, connection, "Take")
+
+    TestImpl.install(connection,
+      fd_claim_ack: fn _claim ->
+        send(parent, :take_ack_waiting)
+
+        receive do
+          :continue_take_ack -> :ok
+        end
+      end
+    )
+
+    task = Task.async(fn -> Service.take_fds(call, 200) end)
+    assert_receive :take_ack_waiting, 1_000
+
+    # As for a reply's claim: hold the acknowledgement beyond the 450ms claim
+    # deadline, so the connection must close rather than transfer.
+    Process.sleep(550)
+    send(connection, :continue_take_ack)
+
+    assert {:error, :fd_claim_expired} = Task.await(task, 1_000)
+    assert no_new_fds?(before_fds)
+    assert {:error, :unknown_call} = Service.take_fds(call)
+    assert :ok = Service.reply(call, [])
   end
 
   test "closes a reply whose original caller died before delivery", %{
@@ -2029,28 +2367,62 @@ defmodule Rebus.UnixFDTest do
     }
   end
 
-  # Nothing routes inbound calls to a handler yet, so an unanswered call is
-  # planted in the connection's table directly. The insert runs in the
-  # connection process, which owns the expiry timer it starts.
-  defp hold_inbound_call_fd!(connection) do
-    fd = TestFD.dup!()
-
-    call = %{
-      ref: make_ref(),
-      serial: 1,
-      sender: ":1.99",
-      export: make_ref(),
-      handler: self(),
-      unix_fds: [fd]
-    }
-
-    :sys.replace_state(connection, fn state ->
-      {_entry, calls} = InboundCalls.insert(state.inbound_calls, call, 60_000)
-      %{state | inbound_calls: calls}
-    end)
-
+  # A descriptor an exported object's handler is holding: a call routed to
+  # this process and left unanswered, so the connection still owns what it
+  # carried.
+  defp hold_inbound_call_fd!(server, connection) do
+    {_ref, %Call{unix_fds: [fd]}} = fd_call!(server, connection, "Take")
     fd
   end
+
+  # Exports `@files` to this process, or to `opts[:handler]`, and pushes a call
+  # to `member` carrying a descriptor; see `push_fd_call!/3`. Returns the
+  # export and, unless another process handles it, the call as delivered.
+  defp fd_call!(server, connection, member, opts \\ []) do
+    {:ok, ref} =
+      Service.export(
+        connection,
+        @files_path,
+        [@files],
+        Keyword.take(opts, [:handler, :call_timeout])
+      )
+
+    serial = push_fd_call!(server, member, opts)
+
+    if Keyword.has_key?(opts, :handler) do
+      {ref, serial}
+    else
+      assert_receive {^ref, %Call{serial: ^serial, unix_fds: [_borrowed]} = call}, 1_000
+      {ref, call}
+    end
+  end
+
+  # Pushes a call to `member` of `@files` from the test server. It carries the
+  # server's own socket descriptor, which the connection receives as a number
+  # of its own, so whatever the connection closes is never the server's.
+  defp push_fd_call!(server, member, opts \\ []) do
+    {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
+
+    call =
+      Message.new!(:method_call,
+        path: Keyword.get(opts, :path, @files_path),
+        interface: "org.example.Files",
+        member: member,
+        sender: ":1.99",
+        signature: "h",
+        body: [0],
+        fds: [fd],
+        flags: Keyword.get(opts, :flags, [])
+      )
+
+    {:ok, serial} = TestServer.push_call_with_fds(server, call, [fd])
+    serial
+  end
+
+  defp open_fd?(fd), do: MapSet.member?(fd_set!(), Integer.to_string(fd))
+
+  defp no_new_fds?(before_fds),
+    do: eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
 
   defp eventually(fun, attempts \\ 20)
 

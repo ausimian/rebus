@@ -402,9 +402,8 @@ defmodule Rebus.Connection.Dispatch do
          %Connection{} = state,
          cursor
        ) do
-    # Inbound calls do not yet hand descriptors to their handler, so any
-    # received descriptor is closed before the call is routed.
-    close_message_fds(msg)
+    # The call's descriptors go with it: a handler borrows them until the
+    # call completes, and every call that reaches no handler closes them.
     parse_flat_messages(rest, Service.answer(msg, state), cursor)
   end
 

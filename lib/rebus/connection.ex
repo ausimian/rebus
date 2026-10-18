@@ -148,6 +148,42 @@ defmodule Rebus.Connection do
     end
   end
 
+  # Completes the inbound call `ref`, whose caller asked for no reply, without
+  # sending anything. Only a call that carried descriptors is recorded, and
+  # completing it releases them.
+  @doc false
+  @spec complete_call(pid(), reference(), non_neg_integer()) :: :ok | {:error, term()}
+  def complete_call(pid, ref, timeout)
+      when is_pid(pid) and is_reference(ref) and is_integer(timeout) and timeout >= 0 do
+    if node(pid) == node() do
+      SafeCall.call(pid, {:complete_call, ref}, timeout)
+    else
+      {:error, :remote_connection_unsupported}
+    end
+  end
+
+  # Takes ownership of the descriptors the inbound call `ref` borrowed. The
+  # connection hands them over as it hands over a reply's to `call/3`,
+  # through an FD claim, so they move only when the claim is acknowledged
+  # and are closed by the connection on any other outcome.
+  @doc false
+  @spec take_call_fds(pid(), reference(), non_neg_integer()) ::
+          {:ok, Message.t()} | {:error, term()}
+  def take_call_fds(pid, ref, timeout)
+      when is_pid(pid) and is_reference(ref) and is_integer(timeout) and timeout >= 0 do
+    if node(pid) == node() do
+      request_ref = make_ref()
+      deadline = System.monotonic_time(:millisecond) + timeout
+
+      SafeCall.call(pid, {:take_call_fds, ref, deadline, request_ref}, timeout,
+        cancel: {:cancel, request_ref},
+        then: &FDClaims.Client.receive_claim(&1, pid, deadline)
+      )
+    else
+      {:error, :remote_connection_unsupported}
+    end
+  end
+
   # Makes a local call to an object this connection exports, built and
   # checked by `Rebus.Service.invoke/7`. It is routed, bounded and recorded
   # as a call from a peer would be, and answered with what `call/3` would
@@ -908,6 +944,21 @@ defmodule Rebus.Connection do
       enqueue_send(:ok, state, from, msg, deadline, request_ref)
     else
       {:answered, state} -> {:reply, :ok, state}
+      {:error, _} = error -> {:reply, error, state}
+    end
+  end
+
+  def handle_call({:complete_call, ref}, _from, %__MODULE__{} = state) do
+    case Service.release(state, ref) do
+      {:ok, state} -> {:reply, :ok, state}
+      {:error, _} = error -> {:reply, error, state}
+    end
+  end
+
+  # The claim answers the taker itself, as a reply's claim answers `call/3`.
+  def handle_call({:take_call_fds, ref, deadline, request_ref}, from, %__MODULE__{} = state) do
+    case Service.take_fds(state, ref, from, deadline, request_ref) do
+      {:ok, state} -> {:noreply, state}
       {:error, _} = error -> {:reply, error, state}
     end
   end

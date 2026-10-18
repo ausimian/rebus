@@ -52,6 +52,17 @@ defmodule Rebus.Connection.InboundCallsTest do
       assert open?(fd)
     end
 
+    test "records whether the caller asked for no reply" do
+      {entry, calls} = insert(InboundCalls.new())
+      refute entry.no_reply?
+
+      {entry, calls} = insert(calls, no_reply?: true)
+      assert entry.no_reply?
+      refute entry.taken?
+
+      InboundCalls.close_all(calls)
+    end
+
     test "starts no timer for a call that never expires" do
       {entry, calls} = insert(InboundCalls.new(), call_timeout: :infinity)
 
@@ -174,6 +185,42 @@ defmodule Rebus.Connection.InboundCallsTest do
     end
   end
 
+  describe "take_fds/2" do
+    test "moves the descriptors out and leaves the call pending" do
+      fd = TestFD.dup!()
+      {entry, calls} = insert(InboundCalls.new(), unix_fds: [fd])
+
+      assert {:ok, ^entry, calls} = InboundCalls.take_fds(calls, entry.ref)
+
+      assert {:ok, %Entry{unix_fds: [], taken?: true} = taken} =
+               InboundCalls.fetch(calls, entry.ref)
+
+      assert taken.timer_ref == entry.timer_ref
+
+      # Completing the call no longer closes what was taken. The probe closes
+      # it instead.
+      assert {%Entry{}, _calls} = InboundCalls.complete(calls, entry.ref)
+      assert open?(fd)
+    end
+
+    test "takes descriptors only once" do
+      fd = TestFD.dup!()
+      {entry, calls} = insert(InboundCalls.new(), unix_fds: [fd])
+      {:ok, ^entry, calls} = InboundCalls.take_fds(calls, entry.ref)
+
+      assert :error = InboundCalls.take_fds(calls, entry.ref)
+      assert open?(fd)
+      InboundCalls.close_all(calls)
+    end
+
+    test "finds nothing for a call that is gone" do
+      {entry, calls} = insert(InboundCalls.new())
+      {^entry, calls} = InboundCalls.complete(calls, entry.ref)
+
+      assert :error = InboundCalls.take_fds(calls, entry.ref)
+    end
+  end
+
   describe "expire/2" do
     test "the timer reports the call by reference once its timeout passes" do
       {entry, calls} = insert(InboundCalls.new(), call_timeout: 10)
@@ -251,7 +298,8 @@ defmodule Rebus.Connection.InboundCallsTest do
       sender: Keyword.get(opts, :sender, ":1.99"),
       export: Keyword.get_lazy(opts, :export, &make_ref/0),
       handler: self(),
-      unix_fds: Keyword.get(opts, :unix_fds, [])
+      unix_fds: Keyword.get(opts, :unix_fds, []),
+      no_reply?: Keyword.get(opts, :no_reply?, false)
     }
 
     InboundCalls.insert(calls, call, Keyword.get(opts, :call_timeout, 60_000))

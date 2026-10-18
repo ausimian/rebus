@@ -22,10 +22,18 @@ defmodule Rebus.Connection.Service do
   # value have all been checked by then.
   #
   # Calls that expect a reply are recorded in `Rebus.Connection.InboundCalls`
-  # until their handler answers, they expire, or their export goes away. A
-  # call sent with `NO_REPLY_EXPECTED` is not recorded: it carries no
-  # descriptors in this slice, so nothing would be left to release, and
-  # `Rebus.Service` answers it as a no-op in the handler process.
+  # until their handler answers, they expire, or their export goes away. So
+  # is a call sent with `NO_REPLY_EXPECTED` that carries descriptors, so that
+  # something releases them, but nothing is ever sent for it. One that
+  # carries none is not recorded, and `Rebus.Service` answers it as a no-op
+  # in the handler process.
+  #
+  # The descriptors that arrive with a call are the connection's until the
+  # call completes: a handler borrows them, and the table closes them when
+  # the call leaves it. A call that reaches no handler has them closed as it
+  # is answered. `take_fds/5` hands them over through the FD-claim protocol
+  # of `Rebus.Connection.FDClaims`, which then owns them until the taker
+  # acknowledges.
   #
   # A local call made with `Rebus.Service.invoke/7` takes the same route and
   # is recorded the same way, but every answer to it, the handler's or the
@@ -37,17 +45,20 @@ defmodule Rebus.Connection.Service do
   # connection.
 
   alias Rebus.Connection
+  alias Rebus.Connection.FDClaims
   alias Rebus.Connection.InboundCalls
   alias Rebus.Connection.InboundCalls.Entry
   alias Rebus.Connection.Objects
   alias Rebus.Connection.Objects.Export
   alias Rebus.Connection.Peer
+  alias Rebus.Connection.Rights
   alias Rebus.Connection.Writer
   alias Rebus.Interface
   alias Rebus.Interface.Method
   alias Rebus.Interface.Property
   alias Rebus.Message
   alias Rebus.Service.Call
+  alias Rebus.UnixFD
 
   require Logger
 
@@ -89,8 +100,8 @@ defmodule Rebus.Connection.Service do
   # or a local process, answered directly.
   @typep caller :: :remote | {:local, GenServer.from(), reference()}
 
-  # Routes one inbound method call. Descriptors that arrived with it have
-  # already been closed by the caller.
+  # Routes one inbound method call, which brings the descriptors that
+  # arrived with it: a handler borrows them, and anything else closes them.
   @doc false
   @spec answer(Message.t(), Connection.t()) :: Connection.t()
   def answer(%Message{} = msg, %Connection{} = state), do: route_call(msg, :remote, state)
@@ -199,32 +210,116 @@ defmodule Rebus.Connection.Service do
   # for the caller to write; one to a local call is delivered here, and
   # `:answered` says so. Descriptors cannot be handed to a local caller, so a
   # reply that carries any is refused and the call stays open.
+  #
+  # A reply is written after the call completes, so it cannot carry a
+  # descriptor the connection still owns: one lent to a pending call, this
+  # one or another, held by an FD claim that has not settled, or received
+  # for a frame not yet complete. Completing
+  # a call, or a claim failing, closes it before the frame is written, and
+  # the reply would carry a closed descriptor or whatever reused its number.
+  # Such a reply is refused, and the call stays open for the handler to take
+  # them first.
   @doc false
   @spec complete(Connection.t(), reference(), Message.t()) ::
           {:ok, Message.t(), Connection.t()}
           | {:answered, Connection.t()}
-          | {:error, :unknown_call | :unix_fd_unsupported}
+          | {:error, :unknown_call | :unix_fd_unsupported | :unix_fd_borrowed}
   def complete(%Connection{} = state, ref, %Message{} = msg) do
     case InboundCalls.fetch(state.inbound_calls, ref) do
       :error ->
         {:error, :unknown_call}
 
+      {:ok, %Entry{no_reply?: true}} ->
+        {:error, :unknown_call}
+
       {:ok, %Entry{from: from}} when from != nil and msg.unix_fds != [] ->
         {:error, :unix_fd_unsupported}
 
-      {:ok, %Entry{} = entry} ->
+      {:ok, %Entry{}} ->
+        if lent?(state, msg.unix_fds),
+          do: {:error, :unix_fd_borrowed},
+          else: complete_entry(state, ref, msg)
+    end
+  end
+
+  # The scan is bounded by `max_pending_calls`, each call's descriptor limit,
+  # the open claims and the receive buffer's own bound, and only a reply that
+  # carries descriptors pays it.
+  defp lent?(%Connection{}, []), do: false
+
+  defp lent?(%Connection{} = state, fds) do
+    owned =
+      MapSet.new(
+        InboundCalls.fds(state.inbound_calls) ++
+          FDClaims.fds(state.fd_claims) ++ Rights.fds(state.inbound_fds)
+      )
+
+    Enum.any?(fds, &MapSet.member?(owned, &1))
+  end
+
+  defp complete_entry(%Connection{} = state, ref, %Message{} = msg) do
+    {%Entry{} = entry, calls} = InboundCalls.complete(state.inbound_calls, ref)
+    reply = address(msg, entry.serial, entry.sender)
+    state = %{state | inbound_calls: calls}
+
+    case entry.from do
+      nil ->
+        {:ok, reply, state}
+
+      from ->
+        GenServer.reply(from, local_result(reply))
+        {:answered, state}
+    end
+  end
+
+  # The handler answered a call that expects no reply. Nothing is sent, but
+  # the call leaves the table, which releases its descriptors.
+  @doc false
+  @spec release(Connection.t(), reference()) :: {:ok, Connection.t()} | {:error, :unknown_call}
+  def release(%Connection{} = state, ref) do
+    case InboundCalls.fetch(state.inbound_calls, ref) do
+      {:ok, %Entry{no_reply?: true}} ->
         {_entry, calls} = InboundCalls.complete(state.inbound_calls, ref)
-        reply = address(msg, entry.serial, entry.sender)
-        state = %{state | inbound_calls: calls}
+        {:ok, %{state | inbound_calls: calls}}
 
-        case entry.from do
-          nil ->
-            {:ok, reply, state}
+      _expects_reply_or_missing ->
+        {:error, :unknown_call}
+    end
+  end
 
-          from ->
-            GenServer.reply(from, local_result(reply))
-            {:answered, state}
-        end
+  # Hands a pending call's descriptors to `from` through an FD claim, which
+  # owns them from here on: it closes them on every way out but the taker's
+  # acknowledgement. The call stays pending, with nothing left for its
+  # completion to close, and the claim monitors the taker rather than the
+  # handler, since any process holding the call may take them.
+  @doc false
+  @spec take_fds(Connection.t(), reference(), GenServer.from(), integer(), reference()) ::
+          {:ok, Connection.t()} | {:error, :unknown_call}
+  def take_fds(%Connection{} = state, ref, {pid, _tag} = from, deadline, request_ref)
+      when is_reference(request_ref) do
+    case InboundCalls.take_fds(state.inbound_calls, ref) do
+      {:ok, %Entry{serial: serial, unix_fds: fds}, calls} ->
+        # The claim delivers a message, so the descriptors travel in one
+        # that is never sent anywhere.
+        carrier = %{Message.new!(:method_return, reply_serial: serial) | unix_fds: fds}
+
+        claims =
+          FDClaims.open(
+            state.fd_claims,
+            %{
+              msg: carrier,
+              from: from,
+              request_ref: request_ref,
+              monitor_ref: Process.monitor(pid),
+              deadline: deadline
+            },
+            Connection.fd_claims_context(state)
+          )
+
+        {:ok, %{state | inbound_calls: calls, fd_claims: claims}}
+
+      :error ->
+        {:error, :unknown_call}
     end
   end
 
@@ -360,9 +455,13 @@ defmodule Rebus.Connection.Service do
 
   defp check_args(refused, _msg), do: refused
 
+  # A call that expects no reply and carries no descriptors leaves nothing
+  # to answer or release, so it is sent without being recorded or bounded. A
+  # recorded one beyond the bound is refused, which for a call that expects
+  # no reply means it is dropped, its descriptors closed.
   defp deliver(%Message{} = msg, caller, %Export{} = export, interface, %Method{} = method, state) do
     cond do
-      no_reply?(msg) ->
+      no_reply?(msg) and msg.unix_fds == [] ->
         send_call(msg, export, interface, method, make_ref(), nil)
         state
 
@@ -380,7 +479,8 @@ defmodule Rebus.Connection.Service do
               sender: Map.get(msg.header_fields, :sender),
               export: export.ref,
               handler: export.handler,
-              unix_fds: []
+              unix_fds: msg.unix_fds,
+              no_reply?: no_reply?(msg)
             }),
             export.call_timeout
           )
@@ -390,8 +490,7 @@ defmodule Rebus.Connection.Service do
     end
   end
 
-  # Descriptors are closed before routing in this slice, so neither the call
-  # nor the message it carries lists any.
+  # The call and the message it carries both list the borrowed descriptors.
   defp send_call(%Message{} = msg, %Export{} = export, interface, method, ref, deadline) do
     fields = msg.header_fields
     no_reply? = no_reply?(msg)
@@ -410,9 +509,9 @@ defmodule Rebus.Connection.Service do
       body: msg.body,
       flags: msg.flags,
       no_reply?: no_reply?,
-      unix_fds: [],
+      unix_fds: msg.unix_fds,
       deadline: deadline,
-      message: %{msg | unix_fds: []}
+      message: msg
     }
 
     send(export.handler, {export.ref, call})
@@ -428,8 +527,10 @@ defmodule Rebus.Connection.Service do
     Enum.reduce(entries, %{state | inbound_calls: calls}, &fail(&2, &1, error))
   end
 
-  # Only calls that expect a reply are recorded, so every failed call is
-  # answered.
+  # A failed call that expects no reply is recorded only for its
+  # descriptors, which leaving the table has released, so nothing is sent.
+  defp fail(%Connection{} = state, %Entry{no_reply?: true}, _error), do: state
+
   defp fail(%Connection{} = state, %Entry{from: from} = entry, error) when from != nil do
     answer_local(from, error_reply(error), entry.serial, entry.sender)
     state
@@ -443,16 +544,23 @@ defmodule Rebus.Connection.Service do
     end
   end
 
+  # A call answered here reaches no handler, so nothing borrows its
+  # descriptors and they are closed first, whether or not an answer is sent.
+  defp answer_internally(%Message{unix_fds: fds} = msg, caller, %Connection{} = state, build) do
+    _ = UnixFD.close_all(fds)
+    respond(msg, caller, state, build)
+  end
+
   # A local caller is answered directly; nothing is written, so the cap on
   # replies the connection writes does not apply.
-  defp answer_internally(%Message{} = msg, {:local, from, _request_ref}, state, build) do
+  defp respond(%Message{} = msg, {:local, from, _request_ref}, state, build) do
     {reply_opts, state} = build.(msg, state)
     answer_local(from, reply_opts, msg.serial, reply_destination(msg))
     state
   end
 
   # A caller that asked for no reply gets none, including an error.
-  defp answer_internally(%Message{} = msg, :remote, %Connection{} = state, build) do
+  defp respond(%Message{} = msg, :remote, %Connection{} = state, build) do
     cond do
       no_reply?(msg) ->
         state

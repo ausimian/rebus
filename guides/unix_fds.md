@@ -11,7 +11,9 @@ supports this on connections where the platform and the peer both allow it.
 - Rebus borrows outbound descriptors. The sender keeps ownership.
 - A reply's descriptors arrive in `unix_fds`. The caller owns them and must
   close each one exactly once.
-- Signals and inbound method calls never hand a descriptor to your code.
+- Signals never hand a descriptor to your code.
+- An inbound method call lends its descriptors to the handler until the call
+  completes. `Rebus.Service.take_fds/2` takes ownership of them.
 
 ## Sending descriptors
 
@@ -77,20 +79,68 @@ defp handle_and_close(%Rebus.Message{unix_fds: fds} = message, handler) do
 end
 ```
 
-## Signals and inbound method calls
+## Signals
 
 Rebus closes the descriptors on an inbound signal and drops that signal. One
 raw descriptor cannot be shared safely between several subscribers. The
 connection stays up and later signals arrive normally.
 
-Rebus also closes the descriptors on an inbound method call, then answers the
-call as usual.
+## Inbound method calls
+
+A method call to an object exported with `Rebus.Service.export/4` arrives with
+its descriptors in `call.unix_fds`. The handler borrows them: it may read them,
+or pass them on, while the call is pending, but the connection still owns them
+and closes each one exactly once when the call completes. That happens when the
+call is answered, including the answer to a call that asked for no reply, when
+it expires, when its handler exits, when its object is unexported, and when the
+connection closes. A handler that ignores the descriptors leaks nothing, and
+must never close one it has not taken.
+
+To keep the descriptors beyond the call, take ownership before answering it:
+
+```elixir
+receive do
+  {^ref, %Rebus.Service.Call{member: "TakeFile", unix_fds: [_]} = call} ->
+    case Rebus.Service.take_fds(call) do
+      {:ok, [fd]} ->
+        :ok = Rebus.Service.reply(call, [])
+        keep_and_later_close(fd)
+
+      {:error, _reason} ->
+        Rebus.Service.reply_error(call, "com.example.Error.Failed", "Not received")
+    end
+end
+```
+
+`take_fds/2` hands the descriptors over the same way an FD-bearing reply is
+handed to `Rebus.call/3`, so ownership moves only once the handover is
+settled. On `{:error, reason}` the connection has already closed them, and
+there is nothing left for you to close. A second `take_fds/2` for the same call
+returns `{:error, :unknown_call}`. The call stays pending either way and still
+needs its answer.
+
+A call that reaches no handler, because nothing is exported at its path, it
+names an undeclared method, or too many calls are already pending, has its
+descriptors closed as the connection answers it.
+
+### Descriptors in replies
+
+`Rebus.Service.reply/3` and `Rebus.Service.reply_error/4` take the same `fds:`
+option as `Rebus.Message.new/2`, and `Rebus.Service.reply_message/3` sends whatever descriptors its message
+carries. Rebus borrows them, as it does for every outbound message, so the
+handler still owns them and closes them once the answer returns.
+
+A reply cannot carry a descriptor the connection still owns, such as one of
+the call's own borrowed descriptors, which answering the call closes before the
+reply is written, or one borrowed by another pending call. Such a reply returns
+`{:error, :unix_fd_borrowed}` and leaves the call open. Take the descriptor
+with `take_fds/2` first, then send it back.
 
 ## Timing
 
-An FD-bearing `Rebus.call/3` can return later than the timeout you supplied.
-Rebus waits until descriptor ownership is settled so that every received
-descriptor has exactly one owner.
+An FD-bearing `Rebus.call/3`, like `Rebus.Service.take_fds/2`, can return later
+than the timeout you supplied. Rebus waits until descriptor ownership is
+settled so that every received descriptor has exactly one owner.
 
 If `Rebus.call/3` returns `{:error, :fd_claim_expired}`, Rebus closed the
 reply's descriptors instead of transferring them to you. There is nothing
@@ -98,7 +148,8 @@ left for you to close.
 
 ## Cleanup
 
-`Rebus.close/1` closes any descriptor the connection still holds. An
+`Rebus.close/1` closes any descriptor the connection still holds, including
+those lent to the handlers of pending calls. An
 untrappable `:kill` bypasses that cleanup, so stop connections with
 `Rebus.close/1`.
 
@@ -109,5 +160,6 @@ untrappable `:kill` bypasses that cleanup, so stop connections with
 | `:unix_fd_unsupported` | This connection cannot pass descriptors at all. It is a TCP connection, or the platform lacks support. |
 | `:unix_fd_not_negotiated` | The peer did not agree to descriptor passing. |
 | `:unix_fd_send_failed` | An outbound descriptor could not be passed. No byte of the frame was written, the connection remains usable, and the sender still owns the descriptor. |
+| `:unix_fd_borrowed` | A reply named a descriptor the connection still owns, such as one a pending call borrowed. Take it with `Rebus.Service.take_fds/2` first. |
 | `:fd_claim_expired` | Rebus closed the received descriptors rather than transferring them. |
 | `:disconnected` | The connection stopped before ownership transferred. |

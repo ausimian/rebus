@@ -11,7 +11,9 @@ defmodule Rebus.Connection.InboundCalls do
   # its expiry timer and the descriptors that arrived with the call, which the
   # connection keeps until the call completes. Taking an entry out of the table
   # therefore cancels that timer and closes those descriptors here rather than
-  # at each call site, so every way out closes them exactly once.
+  # at each call site, so every way out closes them exactly once. The one
+  # exception is `take_fds/2`, which moves the descriptors out of the entry
+  # for an FD claim to hand over, and leaves the entry itself in place.
   #
   # Every entry is bound to the export it was routed through, so unexporting
   # an object, or losing its handler, fails exactly the calls made on it.
@@ -32,6 +34,9 @@ defmodule Rebus.Connection.InboundCalls do
     # are `nil` for a call that never expires. `from` is the local process
     # waiting for the answer to a call made with `Rebus.Service.invoke/7`,
     # and `nil` for a call from a peer, whose answer goes to the socket.
+    # `no_reply?` marks a call whose caller asked for no reply, which is
+    # recorded only to release its descriptors, and `taken?` one whose
+    # descriptors `take_fds/2` has already moved out.
 
     typedstruct enforce: true do
       field :ref, reference()
@@ -43,6 +48,8 @@ defmodule Rebus.Connection.InboundCalls do
       field :timer_ref, reference() | nil
       field :deadline, integer() | nil
       field :from, GenServer.from() | nil, default: nil
+      field :no_reply?, boolean(), default: false
+      field :taken?, boolean(), default: false
     end
   end
 
@@ -54,7 +61,8 @@ defmodule Rebus.Connection.InboundCalls do
           required(:export) => reference(),
           required(:handler) => pid(),
           required(:unix_fds) => [UnixFD.t()],
-          optional(:from) => GenServer.from()
+          optional(:from) => GenServer.from(),
+          optional(:no_reply?) => boolean()
         }
 
   typedstruct enforce: true do
@@ -83,7 +91,8 @@ defmodule Rebus.Connection.InboundCalls do
       unix_fds: call.unix_fds,
       timer_ref: timer_ref,
       deadline: deadline,
-      from: Map.get(call, :from)
+      from: Map.get(call, :from),
+      no_reply?: Map.get(call, :no_reply?, false)
     }
 
     {entry, %{calls | entries: Map.put(calls.entries, ref, entry)}}
@@ -91,6 +100,11 @@ defmodule Rebus.Connection.InboundCalls do
 
   @spec fetch(t(), reference()) :: {:ok, Entry.t()} | :error
   def fetch(%__MODULE__{entries: entries}, ref), do: Map.fetch(entries, ref)
+
+  # Every descriptor the table still holds for its calls.
+  @spec fds(t()) :: [UnixFD.t()]
+  def fds(%__MODULE__{entries: entries}),
+    do: Enum.flat_map(entries, fn {_ref, %Entry{unix_fds: fds}} -> fds end)
 
   # How many calls are waiting, which the connection bounds.
   @spec size(t()) :: non_neg_integer()
@@ -100,6 +114,22 @@ defmodule Rebus.Connection.InboundCalls do
   # and its descriptors closed, so a second answer finds nothing.
   @spec complete(t(), reference()) :: {Entry.t() | nil, t()}
   def complete(%__MODULE__{} = calls, ref), do: pop(calls, ref)
+
+  # Moves a call's descriptors out for the connection to hand over, leaving
+  # the call pending with nothing of its own to close. The entry is returned
+  # as it was, holding them. Descriptors can be taken only once, so a second
+  # take, like a take of a call that is gone, finds nothing.
+  @spec take_fds(t(), reference()) :: {:ok, Entry.t(), t()} | :error
+  def take_fds(%__MODULE__{entries: entries} = calls, ref) do
+    case Map.fetch(entries, ref) do
+      {:ok, %Entry{taken?: false} = entry} ->
+        taken = %{entry | unix_fds: [], taken?: true}
+        {:ok, entry, %{calls | entries: Map.put(entries, ref, taken)}}
+
+      _taken_or_missing ->
+        :error
+    end
+  end
 
   # The expiry timer fired. A timer that fires after the call completed is
   # stale and finds nothing, which is the expected outcome rather than an
