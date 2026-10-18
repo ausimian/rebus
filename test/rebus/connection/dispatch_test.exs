@@ -53,6 +53,9 @@ defmodule Rebus.Connection.DispatchTest do
   @display Interface.new!("org.example.Display",
              methods: [{"Show", in: [text: "s"]}, {"Reset", []}]
            )
+  @files Interface.new!("org.example.Files",
+           methods: [{"Take", in: [fd: "h"]}, {"Echo", in: [fd: "h"], out: [fd: "h"]}]
+         )
   @settings Interface.new!("org.example.Settings",
               properties: [
                 {"Precision", "u", :readwrite},
@@ -872,6 +875,179 @@ defmodule Rebus.Connection.DispatchTest do
     end
   end
 
+  describe "descriptors on inbound calls" do
+    @describetag skip: TestFD.skip_reason()
+
+    test "are lent to the handler with the call and recorded with it" do
+      fd = descriptor()
+      {export_ref, state} = exported(fd_connection(fd), interfaces: [@files])
+
+      assert {:continue, :recv, %Connection{} = state} = dispatch(fd_call("Take", fd), state)
+
+      assert_received {^export_ref, %Call{unix_fds: [^fd], message: message} = call}
+      assert message.unix_fds == [fd]
+      assert call.body == [0]
+
+      assert {:ok, %{unix_fds: [^fd], no_reply?: false}} =
+               InboundCalls.fetch(state.inbound_calls, call.ref)
+
+      InboundCalls.close_all(state.inbound_calls)
+    end
+
+    test "are recorded for a call that asked for no reply, which fails with nothing sent" do
+      handler = spawn(fn -> Process.sleep(:infinity) end)
+
+      for fail <- [
+            fn state, export_ref, _call -> Service.unexport(state, export_ref) end,
+            fn state, _export_ref, %Call{ref: ref} -> Service.expire(state, ref) end,
+            fn state, export_ref, _call ->
+              monitor_ref = Map.fetch!(state.objects.exports, export_ref).monitor_ref
+              {:ok, state} = Service.handler_down(state, monitor_ref)
+              state
+            end
+          ] do
+        fd = descriptor()
+        {export_ref, state} = exported(fd_connection(fd), interfaces: [@files])
+        call = %{fd_call("Take", fd) | flags: [:no_reply_expected]}
+
+        {:continue, :recv, state} = dispatch(call, state)
+
+        assert_received {^export_ref, %Call{no_reply?: true, unix_fds: [^fd]} = delivered}
+        assert is_integer(delivered.deadline)
+        assert {:ok, %{no_reply?: true}} = InboundCalls.fetch(state.inbound_calls, delivered.ref)
+
+        state = fail.(state, export_ref, delivered)
+
+        assert state.inbound_calls == InboundCalls.new()
+        assert :queue.is_empty(state.writer.queue)
+      end
+
+      refute_received :advance_writes
+      Process.exit(handler, :kill)
+    end
+
+    test "on a call that asked for no reply beyond max_pending_calls drop the call" do
+      fd = descriptor()
+      state = %{connection() | max_pending_calls: 1, unix_fd_negotiated?: true}
+      {export_ref, state} = exported(state, interfaces: [@calculator, @files])
+      {:continue, :recv, state} = dispatch(app_call("Add", signature: "ii", body: [2, 3]), state)
+      assert_received {^export_ref, %Call{}}
+
+      state = %{state | inbound_fds: Rights.retain(state.inbound_fds, [fd])}
+      call = %{fd_call("Take", fd) | flags: [:no_reply_expected]}
+
+      log =
+        capture_log(fn ->
+          assert {:continue, :recv, %Connection{} = after_call} = dispatch(call, state)
+          send(self(), {:after_call, after_call})
+        end)
+
+      assert_received {:after_call, after_call}
+      refute log =~ "dropped"
+      refute_received {^export_ref, %Call{}}
+      assert Rights.fds(after_call.inbound_fds) == []
+      assert after_call.inbound_calls == state.inbound_calls
+      assert :queue.is_empty(after_call.writer.queue)
+      InboundCalls.close_all(state.inbound_calls)
+    end
+
+    test "cannot be sent back in the reply that completes the call" do
+      fd = descriptor()
+      {call, state} = fd_routed(fd, "Echo")
+      reply = Message.new!(:method_return, reply_serial: 5, signature: "h", body: [0], fds: [fd])
+
+      assert {:error, :unix_fd_borrowed} = Service.complete(state, call.ref, reply)
+
+      assert {:ok, %{unix_fds: [^fd]}} = InboundCalls.fetch(state.inbound_calls, call.ref)
+
+      # Nor can the reply to another call, which may be written after this
+      # one completes.
+      {export_ref, state} = exported(state, path: "/calc")
+
+      {:continue, :recv, state} =
+        dispatch(app_call("Add", path: "/calc", signature: "ii", body: [2, 3]), state)
+
+      assert_received {^export_ref, %Call{ref: other_ref}}
+      assert {:error, :unix_fd_borrowed} = Service.complete(state, other_ref, reply)
+
+      # Nor one received for a frame still being read.
+      buffering = %{state | inbound_fds: Rights.retain(state.inbound_fds, [:buffered])}
+
+      assert {:error, :unix_fd_borrowed} =
+               Service.complete(buffering, call.ref, %{reply | unix_fds: [:buffered]})
+
+      # Any other descriptor is the handler's own to lend.
+      assert {:ok, %Message{unix_fds: [:not_a_descriptor]}, state} =
+               Service.complete(state, call.ref, %{reply | unix_fds: [:not_a_descriptor]})
+
+      # Once that call completed, its descriptor is no longer the connection's.
+      assert {:ok, _reply, state} = Service.complete(state, other_ref, reply)
+      assert state.inbound_calls == InboundCalls.new()
+    end
+
+    test "are released without a reply only for a call that asked for none" do
+      fd = descriptor()
+      {export_ref, state} = exported(fd_connection(fd), interfaces: [@files])
+
+      {:continue, :recv, state} =
+        dispatch(%{fd_call("Take", fd) | flags: [:no_reply_expected]}, state)
+
+      assert_received {^export_ref, %Call{ref: ref}}
+
+      assert {:error, :unknown_call} =
+               Service.complete(state, ref, Message.new!(:method_return, reply_serial: 5))
+
+      assert {:ok, state} = Service.release(state, ref)
+      assert state.inbound_calls == InboundCalls.new()
+      assert :queue.is_empty(state.writer.queue)
+      assert {:error, :unknown_call} = Service.release(state, ref)
+
+      {%Call{ref: ref}, state} = routed()
+      assert {:error, :unknown_call} = Service.release(state, ref)
+      assert {:ok, _entry} = InboundCalls.fetch(state.inbound_calls, ref)
+    end
+
+    test "are handed over once, through an FD claim, leaving the call pending" do
+      fd = descriptor()
+      {call, state} = fd_routed(fd, "Take")
+      {from, tag} = local_caller()
+      request_ref = make_ref()
+      deadline = System.monotonic_time(:millisecond) + 60_000
+
+      assert {:ok, state} = Service.take_fds(state, call.ref, from, deadline, request_ref)
+      assert_received {^tag, {:fd_claim, claim_ref}}
+      assert {:ok, ^claim_ref} = FDClaims.fetch_by_request(state.fd_claims, request_ref)
+      assert %{msg: %Message{unix_fds: [^fd]}} = state.fd_claims.claims[claim_ref]
+
+      assert {:ok, %{unix_fds: [], taken?: true}} =
+               InboundCalls.fetch(state.inbound_calls, call.ref)
+
+      assert {:error, :unknown_call} =
+               Service.take_fds(state, call.ref, from, deadline, make_ref())
+
+      # Until the claim settles the descriptor is still the connection's, so
+      # a reply cannot send it.
+      echo = Message.new!(:method_return, reply_serial: 5, fds: [fd])
+      assert {:error, :unix_fd_borrowed} = Service.complete(state, call.ref, echo)
+
+      # Once it is acknowledged the taker owns it, and may.
+      acked = FDClaims.drop(state.fd_claims, claim_ref, close?: false, outcome: :acknowledged)
+
+      assert {:ok, %Message{unix_fds: [^fd]}, _state} =
+               Service.complete(%{state | fd_claims: acked}, call.ref, echo)
+
+      # The call is still answered as usual, and the claim keeps the descriptor.
+      reply = Message.new!(:method_return, reply_serial: 5)
+      assert {:ok, _reply, state} = Service.complete(state, call.ref, reply)
+      assert map_size(state.fd_claims.claims) == 1
+
+      assert {:error, :unknown_call} =
+               Service.take_fds(state, call.ref, from, deadline, make_ref())
+
+      FDClaims.close_all(state.fd_claims)
+    end
+  end
+
   describe "local calls" do
     test "are recorded under the caller's request reference and delivered" do
       {export_ref, state} = exported(connection())
@@ -1093,11 +1269,37 @@ defmodule Rebus.Connection.DispatchTest do
         member: member,
         sender: Keyword.get(opts, :sender, ":1.7"),
         signature: Keyword.get(opts, :signature, ""),
-        body: Keyword.get(opts, :body, [])
+        body: Keyword.get(opts, :body, []),
+        fds: Keyword.get(opts, :fds)
       ]
       |> Enum.reject(fn {_key, value} -> is_nil(value) end)
 
     %{Message.new!(:method_call, fields) | serial: 5}
+  end
+
+  # A connection that has received `fd` and negotiated descriptor passing, so
+  # the next frame dispatched that declares one descriptor is handed it.
+  defp fd_connection(fd),
+    do: %{
+      connection()
+      | unix_fd_negotiated?: true,
+        inbound_fds: Rights.retain(Rights.new(), [fd])
+    }
+
+  defp fd_call(member, fd, opts \\ []),
+    do:
+      app_call(
+        member,
+        opts ++ [interface: "org.example.Files", signature: "h", body: [0], fds: [fd]]
+      )
+
+  # A call to `member` of `@files` carrying `fd`, routed to this process and
+  # recorded.
+  defp fd_routed(fd, member) do
+    {export_ref, state} = exported(fd_connection(fd), interfaces: [@files])
+    {:continue, :recv, state} = dispatch(fd_call(member, fd), state)
+    assert_received {^export_ref, %Call{} = call}
+    {call, state}
   end
 
   defp introspect_call(path), do: app_call("Introspect", path: path, interface: @introspectable)

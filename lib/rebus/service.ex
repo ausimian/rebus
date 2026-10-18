@@ -42,7 +42,8 @@ defmodule Rebus.Service do
 
   A call whose caller asked for no reply has `no_reply?: true`. Answering it
   sends nothing and returns `:ok`, so a handler can treat every call the same
-  way.
+  way. For such a call that carries descriptors, the answer is also what
+  releases them.
 
   A second answer to the same call returns `{:error, :unknown_call}`, as does
   an answer to a call that has expired or whose export is gone. The caller
@@ -133,8 +134,34 @@ defmodule Rebus.Service do
   no children, since nothing tells the connection which paths the handler
   serves.
 
-  Descriptors sent with an inbound call are closed before the call is
-  routed, and `call.unix_fds` is always `[]`.
+  ## Unix file descriptors
+
+  Descriptors sent with a call arrive in `call.unix_fds`, indexed by the
+  call's `h` arguments, and the handler borrows them until the call
+  completes. It may read them, or pass them to a port or another D-Bus call,
+  while the call is pending, but the connection closes them, exactly once,
+  when the call completes, however it does: when it is answered, expires,
+  or is failed because its handler exited or its object was unexported. A
+  handler that ignores them therefore leaks nothing. To keep them,
+  `take_fds/2` transfers their ownership before the call completes:
+
+      receive do
+        {^ref, %Rebus.Service.Call{member: "TakeLog"} = call} ->
+          {:ok, [fd]} = Rebus.Service.take_fds(call)
+          :ok = Rebus.Service.reply(call, [])
+          # fd is now the handler's to close with Rebus.UnixFD.close/1
+      end
+
+  A reply carries descriptors with `reply/3`'s `:fds` option, or the
+  `unix_fds` of a message answered with `reply_message/3`. Rebus borrows
+  these, as it does every outbound descriptor: the handler still owns them
+  and closes them once the answer returns. A reply cannot send a descriptor
+  the connection still owns, such as one of the call's own borrowed
+  descriptors, which the answer closes as it completes the call; take them
+  with `take_fds/2` first.
+
+  See [Unix file descriptor passing](unix_fds.html) for the rest of the
+  ownership rules.
   """
 
   alias Rebus.Connection
@@ -176,8 +203,12 @@ defmodule Rebus.Service do
   @type reply_error ::
           :unknown_call
           | :signature_mismatch
+          | :unix_fd_borrowed
           | Message.construction_error()
           | Rebus.error_reason()
+
+  @typedoc "A reason why `take_fds/2` did not transfer a call's descriptors."
+  @type take_fds_error :: :unknown_call | :fd_claim_expired | :timeout | :disconnected
 
   @doc """
   Exports `interfaces` at `path` on `conn`.
@@ -273,6 +304,9 @@ defmodule Rebus.Service do
 
   ## Options
 
+  - `:fds` - borrowed Unix file descriptors to send with the reply, which
+    `h` values in `body` index, as for `Rebus.Message.new/2`. The handler
+    keeps ownership and closes them once this returns. Defaults to `[]`.
   - `:timeout` - milliseconds to wait for the connection to accept the
     reply. Defaults to `5000`.
 
@@ -283,6 +317,13 @@ defmodule Rebus.Service do
   - `{:error, :signature_mismatch}` - `body` does not fit `call.out_signature`.
   - `{:error, :unknown_call}` - the call was already answered, expired, or
     its export is gone.
+  - `{:error, :unix_fd_borrowed}` - `:fds` names a descriptor the
+    connection still owns, such as one this call or another pending call
+    borrowed, which it may close before the reply is written; take it with
+    `take_fds/2` first. The call stays open.
+  - `{:error, :unix_fd_unsupported}` and `{:error, :unix_fd_not_negotiated}`
+    - the reply carries descriptors this connection cannot send, as for
+    `Rebus.send/3`. The call stays open.
   - `{:error, :timeout}` - delivery is ambiguous, as for `Rebus.send/3`. The
     call is complete either way.
   - `{:error, :disconnected}` - the connection stopped.
@@ -294,7 +335,8 @@ defmodule Rebus.Service do
     case Message.new(:method_return,
            reply_serial: call.serial,
            signature: call.out_signature,
-           body: body
+           body: body,
+           fds: Keyword.get(opts, :fds, [])
          ) do
       {:ok, msg} -> send_reply(call, msg, opts)
       {:error, :invalid_body} -> {:error, :signature_mismatch}
@@ -308,7 +350,9 @@ defmodule Rebus.Service do
   `name` must be a valid D-Bus error name, such as
   `"org.example.Error.Refused"`; an invalid one returns
   `{:error, {:invalid_header_field, :error_name}}` and leaves the call open.
-  Takes the same options and returns the same values as `reply/3`.
+  Takes the same options and returns the same values as `reply/3`. The
+  body has no `h` values, so descriptors passed as `:fds` travel with the
+  error unindexed.
   """
   @spec reply_error(Call.t(), binary(), binary(), keyword()) :: :ok | {:error, reply_error()}
   def reply_error(%Call{} = call, name, message, opts \\ [])
@@ -317,7 +361,8 @@ defmodule Rebus.Service do
            reply_serial: call.serial,
            error_name: name,
            signature: "s",
-           body: [message]
+           body: [message],
+           fds: Keyword.get(opts, :fds, [])
          ) do
       {:ok, msg} -> send_reply(call, msg, opts)
       {:error, _} = error -> error
@@ -333,8 +378,9 @@ defmodule Rebus.Service do
   `reply_serial` and `destination` the message holds are replaced with the
   call's own. The message is encoded in the calling process first, so one
   that cannot be encoded returns the encoding error, as `Rebus.Message.encode/2`
-  reports it, and leaves the call open. Takes the same options and returns
-  the same values as `reply/3`, plus `{:error, {:invalid_message_type, type}}`
+  reports it, and leaves the call open. Takes the same options as `reply/3`
+  but `:fds`, since the message carries its own descriptors in `unix_fds`,
+  and returns the same values, plus `{:error, {:invalid_message_type, type}}`
   for any other message type.
   """
   @spec reply_message(Call.t(), Message.t(), keyword()) ::
@@ -357,13 +403,61 @@ defmodule Rebus.Service do
   defp check_reply_message(%Call{}, %Message{type: type}),
     do: {:error, {:invalid_message_type, type}}
 
-  # A call that expects no reply is not tracked by the connection, so there
-  # is nothing to complete there and nothing to send.
-  defp send_reply(%Call{no_reply?: true}, %Message{}, _opts), do: :ok
+  # A call that expects no reply is tracked by the connection only when it
+  # carried descriptors, which completing it releases, and nothing is sent
+  # either way. The struct is a snapshot, so a call whose descriptors were
+  # taken still lists them and is still completed there.
+  defp send_reply(%Call{no_reply?: true, unix_fds: []}, %Message{}, _opts), do: :ok
+
+  defp send_reply(%Call{no_reply?: true} = call, %Message{}, opts) do
+    timeout = Keyword.get(opts, :timeout, @default_timeout)
+    Connection.complete_call(call.conn, call.ref, timeout)
+  end
 
   defp send_reply(%Call{} = call, %Message{} = msg, opts) do
     timeout = Keyword.get(opts, :timeout, @default_timeout)
     Connection.reply_call(call.conn, call.ref, msg, timeout)
+  end
+
+  @doc """
+  Takes ownership of the descriptors that arrived with a call.
+
+  Until a call completes, its descriptors are borrowed from the connection,
+  which closes them when the call is answered, expires or fails. This
+  transfers them to the calling process instead, which then owns them and
+  must close each one exactly once, with `Rebus.UnixFD.close/1` or an API
+  of its own. The call stays pending, and still has to be answered.
+
+  Ownership moves only once the connection has handed the descriptors over
+  and the calling process has acknowledged them. On every other outcome the
+  connection closes them, and there is nothing left for the caller to
+  close. As for an FD-bearing `Rebus.call/3`, this can return later than
+  `timeout`, while that is settled.
+
+  ## Return values
+
+  - `{:ok, fds}` - the descriptors, in the order of `call.unix_fds`. A call
+    that carried none returns `{:ok, []}` without reaching the connection.
+  - `{:error, :unknown_call}` - the descriptors were already taken, or the
+    call was answered, expired, or its export is gone.
+  - `{:error, :fd_claim_expired}` - the connection closed the descriptors
+    rather than hand them over.
+  - `{:error, :timeout}` - the hand-over did not complete within `timeout`,
+    and the connection closed the descriptors.
+  - `{:error, :disconnected}` - the connection stopped, closing them.
+  """
+  @spec take_fds(Call.t(), non_neg_integer()) ::
+          {:ok, [Rebus.UnixFD.t()]} | {:error, take_fds_error()}
+  def take_fds(call, timeout \\ @default_timeout)
+
+  def take_fds(%Call{unix_fds: []}, timeout) when is_integer(timeout) and timeout >= 0,
+    do: {:ok, []}
+
+  def take_fds(%Call{} = call, timeout) when is_integer(timeout) and timeout >= 0 do
+    case Connection.take_call_fds(call.conn, call.ref, timeout) do
+      {:ok, %Message{unix_fds: fds}} -> {:ok, fds}
+      {:error, _reason} = error -> error
+    end
   end
 
   @doc """

@@ -37,12 +37,17 @@ defmodule Rebus.Service.Call do
   - `flags` - the message flags.
   - `no_reply?` - whether the caller asked for no reply. Answering such a
     call still completes it, but sends nothing.
-  - `unix_fds` - always `[]`: descriptors sent with an inbound call are closed
-    before the call is routed.
+  - `unix_fds` - the descriptors sent with the call, which its `h`
+    arguments index. The handler borrows them until the call completes, when
+    the connection closes them, unless `Rebus.Service.take_fds/2` has taken
+    them first. Never close one of them yourself without taking it.
   - `deadline` - the `System.monotonic_time(:millisecond)` at which the
-    connection answers the caller with `org.freedesktop.DBus.Error.NoReply`,
-    or `nil` when the call never expires or expects no reply.
+    connection completes the call itself: it answers the caller with
+    `org.freedesktop.DBus.Error.NoReply`, or, for a call that expects no
+    reply, closes the descriptors it carried. `nil` when the call never
+    expires, or expects no reply and carried no descriptors.
   - `message` - the whole inbound message, for anything not lifted above.
+    Its `unix_fds` are the same borrowed descriptors.
   """
 
   use TypedStruct

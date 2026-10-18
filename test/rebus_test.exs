@@ -4715,6 +4715,19 @@ defmodule RebusTest do
       assert_method_call_round_trip(svr, cli)
     end
 
+    test "hand over no descriptors for a call that carried none", %{cli: cli, svr: svr} do
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
+      {:ok, serial} = TestServer.push_call(svr, calc_call("Add", [2, 3]))
+      assert_receive {^ref, %Call{unix_fds: []} = call}, 1_000
+
+      assert {:ok, []} = Service.take_fds(call)
+      assert :ok = Service.reply(call, [5])
+
+      assert_receive {^svr,
+                      %Message{type: :method_return, header_fields: %{reply_serial: ^serial}}},
+                     1_000
+    end
+
     test "fail their pending calls when unexported", %{cli: cli, svr: svr} do
       {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
       {:ok, serial} = TestServer.push_call(svr, calc_call("Add", [2, 3]))

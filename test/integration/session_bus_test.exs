@@ -36,6 +36,9 @@ defmodule Rebus.Integration.SessionBusTest do
   @calculator Rebus.Interface.new!("org.example.RebusIntegration.Calculator",
                 methods: [{"Add", in: [a: "i", b: "i"], out: [sum: "i"]}]
               )
+  @files Rebus.Interface.new!("org.example.RebusIntegration.Files",
+           methods: [{"TakeDescriptor", in: [fd: "h"]}]
+         )
   @settings Rebus.Interface.new!("org.example.RebusIntegration.Settings",
               properties: [{"Precision", "u", :readwrite}, {"Version", "s", :read}]
             )
@@ -420,16 +423,14 @@ defmodule Rebus.Integration.SessionBusTest do
       assert :ok = Rebus.remove_match(subscriber, match_ref, @call_timeout)
     end
 
-    test "refuses an FD-bearing method call over the daemon socket without leaking it" do
-      # The daemon does pass the descriptor: both connections negotiated
-      # NEGOTIATE_UNIX_FD over the session socket. What cannot be exercised yet
-      # is a *successful* transfer, because inbound calls do not yet hand their
-      # descriptors to a handler, and FD-bearing signals are dropped by design.
-      # So this test pins the two halves that are observable today: the call
-      # to a path with nothing exported is refused, and the descriptor the
-      # receiving connection was handed is closed rather than retained.
+    test "hands an FD-bearing method call's descriptor to the exporter's handler" do
+      # Both connections negotiated NEGOTIATE_UNIX_FD over the session socket,
+      # so the daemon passes the descriptor through. The handler takes it and
+      # closes it itself, and the count check confirms the exporter kept
+      # nothing else open.
       caller = connect!()
       callee = connect!()
+      {:ok, ref} = Service.export(callee, @object_path, [@files])
       fd = borrowed_fd!()
 
       before = open_fd_count()
@@ -438,21 +439,26 @@ defmodule Rebus.Integration.SessionBusTest do
         Message.new!(:method_call,
           destination: unique_name!(callee),
           path: @object_path,
-          interface: @signal_interface,
+          interface: "org.example.RebusIntegration.Files",
           member: "TakeDescriptor",
           signature: "h",
           body: [0],
           fds: [fd]
         )
 
-      assert {:error,
-              {:dbus_error,
-               %Message{
-                 type: :error,
-                 header_fields: %{error_name: "org.freedesktop.DBus.Error.UnknownObject"}
-               }}} = Rebus.call(caller, message, @call_timeout)
+      task = Task.async(fn -> Rebus.call(caller, message, @call_timeout) end)
 
-      # /proc is Linux-only; elsewhere the refusal above is all this asserts.
+      assert_receive {^ref,
+                      %Call{member: "TakeDescriptor", body: [0], unix_fds: [borrowed]} = call},
+                     @window
+
+      assert borrowed != fd
+      assert {:ok, [^borrowed]} = Service.take_fds(call)
+      assert :ok = Service.reply(call, [])
+      assert {:ok, %Message{type: :method_return}} = Task.await(task, @window)
+      assert :ok = Rebus.UnixFD.close(borrowed)
+
+      # /proc is Linux-only; elsewhere the transfer above is all this asserts.
       if before do
         assert eventually(fn -> open_fd_count() <= before end),
                "the received descriptor was not closed: #{open_fd_count()} open, #{before} before"

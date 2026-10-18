@@ -332,6 +332,13 @@ defmodule Rebus.Connection.FDClaims do
     end
   end
 
+  # Every descriptor the table still holds: those of claims not yet
+  # acknowledged, which the connection will close on any other outcome.
+  @doc false
+  @spec fds(t()) :: [UnixFD.t()]
+  def fds(%__MODULE__{claims: claims}),
+    do: Enum.flat_map(claims, fn {_claim_ref, %{msg: %Message{unix_fds: fds}}} -> fds end)
+
   # Closes every retained descriptor without touching the rest of the table.
   # Used from `terminate/2`, where nothing survives the return.
   @doc false

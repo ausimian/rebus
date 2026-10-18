@@ -12,8 +12,10 @@ defmodule Rebus.Message do
 
   The `unix_fds` struct field is separate from the `:unix_fds` header count.
   Construct outbound messages with `fds: [fd, ...]`; `h` body values are their
-  zero-based wire indexes. Inbound descriptors appear in `message.unix_fds`
-  only on a `Rebus.call/3` reply, and the calling process then owns them. See
+  zero-based wire indexes. Inbound descriptors appear in `message.unix_fds` on
+  a `Rebus.call/3` reply, and the calling process then owns them, and on the
+  message of an inbound call delivered to a `Rebus.Service` handler, which
+  only borrows them until the call completes. See
   [Unix file descriptor passing](unix_fds.html).
 
   ## Examples

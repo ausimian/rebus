@@ -22,6 +22,18 @@
   object is unexported (`Rebus.Service.unexport/3`), and expire with
   `org.freedesktop.DBus.Error.NoReply` after the export's `:call_timeout`,
   60 seconds by default.
+- A handler receives the Unix file descriptors sent with a method call in
+  `call.unix_fds`, and borrows them until the call completes. The connection
+  closes them exactly once, whether the call is answered, expires, or fails
+  because its handler exited or its object was unexported, including for a
+  call that asked for no reply. `Rebus.Service.take_fds/2` transfers their
+  ownership to the handler instead, through the same handover as an
+  FD-bearing reply to `Rebus.call/3`. `Rebus.Service.reply/3` takes an
+  `:fds` option to send descriptors with a reply, as does
+  `Rebus.Service.reply_error/4`, and Rebus borrows them as it does for every
+  outbound message. A reply that sends a descriptor the connection still
+  owns, such as one the call itself borrowed, returns
+  `{:error, :unix_fd_borrowed}`.
 - A connection answers `org.freedesktop.DBus.Introspectable.Introspect` for
   the objects it exports, with XML generated from their `Rebus.Interface`
   declarations, so `busctl tree`, `busctl introspect`, `gdbus introspect` and

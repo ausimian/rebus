@@ -177,7 +177,7 @@ defmodule Rebus do
   | `:bus` | `true` | Pass `false` for a peer-to-peer endpoint, which sends no `Hello` and has no unique name. |
   | `:owner` | `nil` | A local PID whose exit stops the connection. `nil` leaves the connection alive until `close/1`. |
   | `:max_message_size` | `134217728` | Largest complete inbound message, in bytes, from `4096` up to the protocol limit, `Rebus.Message.max_message_size/0`. Outbound messages are not affected. |
-  | `:max_pending_calls` | `1024` | Positive number of inbound method calls handed to `Rebus.Service` handlers that may wait for their answers at once. Calls beyond it are answered with `org.freedesktop.DBus.Error.LimitsExceeded`. |
+  | `:max_pending_calls` | `1024` | Positive number of inbound method calls handed to `Rebus.Service` handlers that may wait for their answers at once. Calls beyond it are answered with `org.freedesktop.DBus.Error.LimitsExceeded`. A call that asks for no reply counts only if it carries descriptors, and beyond the limit is dropped with them closed. |
 
   ## Notes
 
