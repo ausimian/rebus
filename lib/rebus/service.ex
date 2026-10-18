@@ -52,7 +52,7 @@ defmodule Rebus.Service do
   | Condition | Error name |
   | --- | --- |
   | Nothing exported at the path or below it | `org.freedesktop.DBus.Error.UnknownObject` |
-  | A path with exports only below it | `org.freedesktop.DBus.Error.UnknownInterface` |
+  | A path with exports only below it, for anything but `Introspect` | `org.freedesktop.DBus.Error.UnknownInterface` |
   | Interface not exported on the object | `org.freedesktop.DBus.Error.UnknownInterface` |
   | Method not declared, or, without an interface, declared by no exported interface or by more than one | `org.freedesktop.DBus.Error.UnknownMethod` |
   | Argument signature differs from the declaration | `org.freedesktop.DBus.Error.InvalidArgs` |
@@ -67,6 +67,19 @@ defmodule Rebus.Service do
   it cannot be exported, and neither can
   `org.freedesktop.DBus.Introspectable` or `org.freedesktop.DBus.Properties`,
   which the connection reserves for itself.
+
+  ## Introspection
+
+  The connection answers `org.freedesktop.DBus.Introspectable.Introspect`
+  itself, with XML generated from the exported declarations, so tools such as
+  `busctl` and `d-feet` can find and describe the objects. An exported object
+  lists its own interfaces, then `Peer`, `Introspectable` and `Properties`,
+  then the next path element of every export below it. A path with exports
+  only below it, such as `/` or `/org` for `/org/example/Calculator`, lists
+  `Introspectable` and those child elements, so a tool can walk the tree from
+  `/`. A path served by a subtree export lists the subtree's interfaces and
+  no children, since nothing tells the connection which paths the handler
+  serves.
 
   Descriptors sent with an inbound call are closed before the call is
   routed, and `call.unix_fds` is always `[]`.

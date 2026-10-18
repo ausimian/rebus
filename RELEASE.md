@@ -14,6 +14,14 @@
   object is unexported (`Rebus.Service.unexport/3`), and expire with
   `org.freedesktop.DBus.Error.NoReply` after the export's `:call_timeout`,
   60 seconds by default.
+- A connection answers `org.freedesktop.DBus.Introspectable.Introspect` for
+  the objects it exports, with XML generated from their `Rebus.Interface`
+  declarations, so `busctl tree`, `busctl introspect`, `gdbus introspect` and
+  `d-feet` can find and describe them. Every path above an exported object,
+  from `/` down, answers with its child nodes. A path served by a subtree
+  export lists the subtree's interfaces and no child nodes. Exported objects
+  list the standard `Properties` interface, but calls to it are answered with
+  `org.freedesktop.DBus.Error.UnknownInterface` for now.
 - `Rebus.connect/2` takes a `:max_pending_calls` option, 1024 by default,
   that bounds how many inbound calls may wait for a handler's answer at once.
   Calls beyond it are answered with `org.freedesktop.DBus.Error.LimitsExceeded`.

@@ -193,6 +193,52 @@ defmodule Rebus.Integration.SessionBusTest do
       assert output =~ "int32 5"
     end
 
+    test "answers Introspect on the object and on every node above it" do
+      caller = connect!()
+      exporter = connect!()
+      {:ok, _ref} = Service.export(exporter, @object_path, [@calculator])
+
+      introspect = fn path ->
+        message =
+          Message.new!(:method_call,
+            destination: unique_name!(exporter),
+            path: path,
+            interface: "org.freedesktop.DBus.Introspectable",
+            member: "Introspect"
+          )
+
+        assert {:ok, %Message{type: :method_return, body: [xml]}} =
+                 Rebus.call(caller, message, @call_timeout)
+
+        xml
+      end
+
+      assert introspect.("/") =~ ~s(<node name="org"/>)
+      assert introspect.("/org/example") =~ ~s(<node name="RebusIntegration"/>)
+
+      object = introspect.(@object_path)
+      assert object =~ ~s(<interface name="org.example.RebusIntegration.Calculator">)
+      assert object =~ ~s(<interface name="org.freedesktop.DBus.Peer">)
+      refute object =~ "<node name="
+    end
+
+    test "answers dbus-send's introspection request" do
+      exporter = connect!()
+      {:ok, _ref} = Service.export(exporter, @object_path, [@calculator])
+
+      args = [
+        "--session",
+        "--print-reply",
+        "--dest=#{unique_name!(exporter)}",
+        "/org",
+        "org.freedesktop.DBus.Introspectable.Introspect"
+      ]
+
+      assert {output, 0} = System.cmd("dbus-send", args, stderr_to_stdout: true)
+      assert output =~ ~s(<interface name="org.freedesktop.DBus.Introspectable">)
+      assert output =~ ~s(<node name="example"/>)
+    end
+
     test "answers org.freedesktop.DBus.Peer on a peer connection and on the daemon" do
       caller = connect!()
       callee = connect!()

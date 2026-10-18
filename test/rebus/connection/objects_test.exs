@@ -183,6 +183,108 @@ defmodule Rebus.Connection.ObjectsTest do
     end
   end
 
+  describe "introspect/2" do
+    test "refuses a path with nothing exported at it or below it" do
+      assert Objects.introspect(Objects.new(), "/") == :error
+
+      {:ok, objects} = Objects.add(Objects.new(), export("/org/example/Calc"))
+      assert Objects.introspect(objects, "/org/example/Calc/below") == :error
+      assert Objects.introspect(objects, "/org/ex") == :error
+    end
+
+    test "lists exported and subtree paths as children, once each" do
+      {:ok, objects} = Objects.add(Objects.new(), export("/org/a"))
+      {:ok, objects} = Objects.add(objects, export("/org/a", interfaces: [@display]))
+      {:ok, objects} = Objects.add(objects, export("/org/a/x/y"))
+      {:ok, objects} = Objects.add(objects, export("/org/b", subtree?: true))
+      {:ok, objects} = Objects.add(objects, export("/orgx"))
+
+      assert {:ok, xml, objects} = Objects.introspect(objects, "/org")
+      assert children(xml) == ["a", "b"]
+      assert {:ok, xml, _objects} = Objects.introspect(objects, "/org/a")
+      assert children(xml) == ["x"]
+      assert {:ok, xml, _objects} = Objects.introspect(objects, "/")
+      assert children(xml) == ["org", "orgx"]
+    end
+
+    test "lists a root export's children" do
+      {:ok, objects} = Objects.add(Objects.new(), export("/"))
+      {:ok, objects} = Objects.add(objects, export("/a/b"))
+
+      assert {:ok, xml, _objects} = Objects.introspect(objects, "/")
+      assert xml =~ ~s(<interface name="org.example.Calculator">)
+      assert children(xml) == ["a"]
+    end
+
+    test "answers from the cache until the table changes" do
+      {:ok, objects} = Objects.add(Objects.new(), export("/obj"))
+      {:ok, xml, objects} = Objects.introspect(objects, "/obj")
+
+      # A sentinel in place of the cached document shows which one is served.
+      objects = %{objects | introspection: %{{:path, "/obj"} => "cached"}}
+      assert {:ok, "cached", ^objects} = Objects.introspect(objects, "/obj")
+
+      {:ok, added} = Objects.add(objects, export("/other", interfaces: [@display]))
+      assert added.introspection == %{}
+      assert {:ok, ^xml, _objects} = Objects.introspect(added, "/obj")
+    end
+
+    test "forgets cached documents on unexport and when a handler goes down" do
+      handler = spawn_handler()
+      ref = make_ref()
+      {:ok, objects} = Objects.add(Objects.new(), export("/obj", ref: ref))
+      {:ok, objects} = Objects.add(objects, export("/other", handler: handler))
+      {:ok, _xml, objects} = Objects.introspect(objects, "/")
+      assert map_size(objects.introspection) == 1
+
+      assert {%Export{}, removed} = Objects.remove(objects, ref)
+      assert removed.introspection == %{}
+
+      Process.exit(handler, :kill)
+      assert_receive {:DOWN, monitor_ref, :process, ^handler, :killed}, 1_000
+      assert {%Export{}, down} = Objects.remove_by_monitor(objects, monitor_ref)
+      assert down.introspection == %{}
+    end
+
+    test "shares one cached document between every path a subtree serves" do
+      {:ok, objects} = Objects.add(Objects.new(), export("/tree", subtree?: true))
+      {:ok, objects} = Objects.add(objects, export("/tree/a/b"))
+
+      objects =
+        Enum.reduce(["/tree", "/tree/a", "/tree/c/d"], objects, fn path, objects ->
+          assert {:ok, xml, objects} = Objects.introspect(objects, path)
+          assert xml =~ ~s(<interface name="org.example.Calculator">)
+          assert children(xml) == []
+          objects
+        end)
+
+      assert Map.keys(objects.introspection) == [{:subtree, "/tree"}]
+    end
+
+    test "keys a cached document by a copy of the path it was asked for" do
+      # The VM copies a sub-binary of 64 bytes or fewer by itself, so only a
+      # longer path can still point into the buffer it was read from.
+      node = "/" <> String.duplicate("a", 100)
+      {:ok, objects} = Objects.add(Objects.new(), export(node <> "/Calc"))
+      buffer = node <> :binary.copy("x", 4096)
+      path = binary_part(buffer, 0, byte_size(node))
+      assert :binary.referenced_byte_size(path) > byte_size(path)
+
+      {:ok, _xml, objects} = Objects.introspect(objects, path)
+
+      assert [{:path, key}] = Map.keys(objects.introspection)
+      assert key == path
+      assert :binary.referenced_byte_size(key) == byte_size(key)
+    end
+  end
+
+  # Child node names in an introspection document.
+  defp children(xml) do
+    ~r/^  <node name="([^"]+)"\/>$/m
+    |> Regex.scan(xml, capture: :all_but_first)
+    |> List.flatten()
+  end
+
   defp export(path, opts \\ []) do
     %{
       ref: Keyword.get_lazy(opts, :ref, &make_ref/0),

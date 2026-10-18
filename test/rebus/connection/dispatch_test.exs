@@ -3,6 +3,8 @@ defmodule Rebus.Connection.DispatchTest do
 
   import ExUnit.CaptureLog, only: [capture_log: 1]
 
+  require Record
+
   alias Rebus.Connection
   alias Rebus.Connection.Dispatch
   alias Rebus.Connection.FDClaims
@@ -20,6 +22,14 @@ defmodule Rebus.Connection.DispatchTest do
   alias Rebus.Service.Call
   alias Rebus.TestFD
 
+  # xmerl only checks the documents Introspect answers with; it is not a
+  # runtime dependency of Rebus.
+  Record.defrecordp(
+    :xml_attribute,
+    :xmlAttribute,
+    Record.extract(:xmlAttribute, from_lib: "xmerl/include/xmerl.hrl")
+  )
+
   @machine_id "0123456789abcdef0123456789abcdef"
   @unknown_object_error "org.freedesktop.DBus.Error.UnknownObject"
   @unknown_interface_error "org.freedesktop.DBus.Error.UnknownInterface"
@@ -28,6 +38,7 @@ defmodule Rebus.Connection.DispatchTest do
   @limits_exceeded_error "org.freedesktop.DBus.Error.LimitsExceeded"
   @no_reply_error "org.freedesktop.DBus.Error.NoReply"
   @failed_error "org.freedesktop.DBus.Error.Failed"
+  @introspectable "org.freedesktop.DBus.Introspectable"
 
   @path "/org/example/Calc"
   @calculator Interface.new!("org.example.Calculator",
@@ -328,13 +339,15 @@ defmodule Rebus.Connection.DispatchTest do
       end
     end
 
-    test "refuses everything on an intermediate node with UnknownInterface" do
+    test "refuses everything but Introspect on an intermediate node with UnknownInterface" do
       {_export_ref, state} = exported(connection())
 
       for {path, interface, member} <- [
             {"/org/example", "org.example.Calculator", "Add"},
-            {"/", "org.freedesktop.DBus.Introspectable", "Introspect"},
-            {"/org", nil, "Anything"}
+            {"/", "org.freedesktop.DBus.Introspectable", "Nope"},
+            {"/org", "org.freedesktop.DBus.Properties", "GetAll"},
+            {"/org", nil, "Anything"},
+            {"/org", nil, "Introspect"}
           ] do
         call = app_call(member, path: path, interface: interface)
         assert_refused(call, state, @unknown_interface_error)
@@ -466,6 +479,115 @@ defmodule Rebus.Connection.DispatchTest do
 
       assert_received {^export_ref, %Call{deadline: nil, ref: ref}}
       assert {:ok, %{timer_ref: nil}} = InboundCalls.fetch(state.inbound_calls, ref)
+    end
+  end
+
+  describe "Introspect" do
+    test "answers on an exported object with its interfaces, the standard ones and children" do
+      {_export_ref, state} = exported(connection(), interfaces: [@display, @calculator])
+      {_export_ref, state} = exported(state, path: @path <> "/History")
+
+      assert %{interfaces: interfaces, children: ["History"]} = introspected(@path, state)
+
+      assert interfaces == [
+               "org.example.Calculator",
+               "org.example.Display",
+               "org.freedesktop.DBus.Peer",
+               "org.freedesktop.DBus.Introspectable",
+               "org.freedesktop.DBus.Properties"
+             ]
+    end
+
+    test "answers on every intermediate node with Introspectable and its children" do
+      {_export_ref, state} = exported(connection())
+      {_export_ref, state} = exported(state, path: "/org/other", subtree?: true)
+
+      introspectable = ["org.freedesktop.DBus.Introspectable"]
+      assert %{interfaces: ^introspectable, children: ["org"]} = introspected("/", state)
+
+      assert %{interfaces: ^introspectable, children: ["example", "other"]} =
+               introspected("/org", state)
+
+      assert %{interfaces: ^introspectable, children: ["Calc"]} =
+               introspected("/org/example", state)
+    end
+
+    test "answers on a subtree with its interfaces and no children" do
+      {_export_ref, state} = exported(connection(), path: "/org/example", subtree?: true)
+      {_export_ref, state} = exported(state, path: "/org/example/a/b")
+
+      for path <- ["/org/example", "/org/example/a"] do
+        assert %{interfaces: ["org.example.Calculator" | _standard], children: []} =
+                 introspected(path, state)
+      end
+    end
+
+    test "answers the reply to the caller with the call's serial" do
+      {_export_ref, state} = exported(connection())
+
+      assert [%{kind: :reply, msg: reply}] = queued_replies(introspect_call("/"), state)
+      assert %Message{type: :method_return, body: [xml]} = reply
+      assert reply.header_fields.reply_serial == 5
+      assert reply.header_fields.destination == ":1.7"
+      assert Message.signature(reply) == "s"
+      assert xml =~ ~r/\A<!DOCTYPE node /
+    end
+
+    test "refuses a path with nothing exported at it or below it with UnknownObject" do
+      assert_refused(introspect_call("/"), connection(), @unknown_object_error)
+
+      {_export_ref, state} = exported(connection())
+      assert_refused(introspect_call("/elsewhere"), state, @unknown_object_error)
+      assert_refused(introspect_call(@path <> "/below"), state, @unknown_object_error)
+    end
+
+    test "refuses arguments with InvalidArgs" do
+      {_export_ref, state} = exported(connection())
+
+      for path <- [@path, "/org"] do
+        call =
+          app_call("Introspect",
+            path: path,
+            interface: @introspectable,
+            signature: "s",
+            body: ["x"]
+          )
+
+        assert_refused(call, state, @invalid_args_error)
+      end
+    end
+
+    test "refuses another Introspectable member on an exported object with UnknownMethod" do
+      {_export_ref, state} = exported(connection())
+
+      assert_refused(
+        app_call("Nope", interface: @introspectable),
+        state,
+        @unknown_method_error
+      )
+    end
+
+    test "never answers a call that asked for no reply" do
+      {_export_ref, state} = exported(connection())
+      call = %{introspect_call(@path) | flags: [:no_reply_expected]}
+
+      assert queued_replies(call, state) == []
+    end
+
+    test "caches each document until the export table changes" do
+      {export_ref, state} = exported(connection())
+
+      {:continue, :recv, introspected} = dispatch(introspect_call("/org"), state)
+      assert Map.keys(introspected.objects.introspection) == [{:path, "/org"}]
+
+      # A connection with nothing queued yet, and the cache just filled.
+      state = %{state | objects: introspected.objects}
+      {_ref, state} = exported(state, path: "/org/other")
+      assert state.objects.introspection == %{}
+      assert %{children: ["example", "other"]} = introspected("/org", state)
+
+      state = Service.unexport(state, export_ref)
+      assert %{children: ["other"]} = introspected("/org", state)
     end
   end
 
@@ -671,6 +793,29 @@ defmodule Rebus.Connection.DispatchTest do
       |> Enum.reject(fn {_key, value} -> is_nil(value) end)
 
     %{Message.new!(:method_call, fields) | serial: 5}
+  end
+
+  defp introspect_call(path), do: app_call("Introspect", path: path, interface: @introspectable)
+
+  # The interface names and children of the document `Introspect` answers on
+  # `path`, after checking that it parses.
+  defp introspected(path, %Connection{} = state) do
+    assert [%{msg: %Message{type: :method_return, body: [xml]}}] =
+             queued_replies(introspect_call(path), state)
+
+    {document, []} = xml |> :binary.bin_to_list() |> :xmerl_scan.string(quiet: true)
+
+    %{
+      interfaces: attribute_values(document, "/node/interface/@name"),
+      children: attribute_values(document, "/node/node/@name")
+    }
+  end
+
+  defp attribute_values(document, xpath) do
+    xpath
+    |> String.to_charlist()
+    |> :xmerl_xpath.string(document)
+    |> Enum.map(&(&1 |> xml_attribute(:value) |> :unicode.characters_to_binary()))
   end
 
   defp assert_refused(%Message{} = call, %Connection{} = state, error_name) do

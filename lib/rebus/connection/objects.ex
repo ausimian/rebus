@@ -17,10 +17,18 @@ defmodule Rebus.Connection.Objects do
   # Only local code creates exports, so nothing a peer sends can grow the
   # table, and the linear scans below are bounded by what the application
   # exported.
+  #
+  # The table also answers `Introspect`, and caches each document it renders
+  # until the next export or unexport. A cached document is keyed by the node
+  # it describes, never by the path a peer asked for: every path a subtree
+  # covers below its own shares the subtree's document, so the cache is
+  # bounded by the table as well.
 
   use TypedStruct
 
   alias Rebus.Interface
+  alias Rebus.Introspection
+  alias Rebus.Introspection.Node
 
   defmodule Export do
     @moduledoc false
@@ -64,6 +72,8 @@ defmodule Rebus.Connection.Objects do
     field :exact, %{binary() => [reference()]}, default: %{}
     field :subtrees, %{binary() => [reference()]}, default: %{}
     field :monitor_index, %{reference() => reference()}, default: %{}
+    # Rendered introspection documents, emptied by every change to the table.
+    field :introspection, %{{:path | :subtree, binary()} => binary()}, default: %{}
   end
 
   @spec new() :: t()
@@ -111,9 +121,84 @@ defmodule Rebus.Connection.Objects do
 
   @spec resolve(t(), binary()) :: resolution()
   def resolve(%__MODULE__{} = objects, path) when is_binary(path) do
+    case locate(objects, path) do
+      {:exact, refs} -> {:object, object(objects, refs)}
+      {:subtree, prefix} -> {:object, object(objects, Map.fetch!(objects.subtrees, prefix))}
+      other -> other
+    end
+  end
+
+  # The introspection document for a path, from the cache when the node it
+  # describes has not changed since it was rendered. An exported object lists
+  # its interfaces and the standard ones, an intermediate node only
+  # `Introspectable`, and both list their children. A path a subtree serves
+  # lists none, because nothing can enumerate what a subtree's handler serves.
+  @spec introspect(t(), binary()) :: {:ok, binary(), t()} | :error
+  def introspect(%__MODULE__{} = objects, path) when is_binary(path) do
+    case locate(objects, path) do
+      :unknown ->
+        :error
+
+      location ->
+        key = cache_key(location, path)
+
+        case Map.fetch(objects.introspection, key) do
+          {:ok, xml} ->
+            {:ok, xml, objects}
+
+          :error ->
+            xml =
+              objects |> node(location, path) |> Introspection.to_xml() |> IO.iodata_to_binary()
+
+            {:ok, xml, %{objects | introspection: Map.put(objects.introspection, key, xml)}}
+        end
+    end
+  end
+
+  # Every path a subtree serves shares one document. Any other path that
+  # resolves is an exported or intermediate path, which the table bounds. A
+  # peer-supplied path is copied before it becomes a key, so a cached entry
+  # cannot pin the receive buffer the path was parsed from.
+  defp cache_key({:subtree, prefix}, _path), do: {:subtree, prefix}
+  defp cache_key(_location, path), do: {:path, :binary.copy(path)}
+
+  defp node(%__MODULE__{} = objects, {:exact, refs}, path),
+    do: object_node(objects, refs, children(objects, path))
+
+  defp node(%__MODULE__{} = objects, {:subtree, prefix}, _path),
+    do: object_node(objects, Map.fetch!(objects.subtrees, prefix), [])
+
+  defp node(%__MODULE__{} = objects, :intermediate, path),
+    do: %Node{interfaces: [Interface.introspectable()], children: children(objects, path)}
+
+  # Application interfaces by name, then the standard ones the connection
+  # answers for every exported object.
+  defp object_node(%__MODULE__{} = objects, refs, children) do
+    exported =
+      for {name, %Export{} = export} <- Enum.sort(object(objects, refs)),
+          do: export.interfaces[name]
+
+    standard = [Interface.peer(), Interface.introspectable(), Interface.properties()]
+    %Node{interfaces: exported ++ standard, children: children}
+  end
+
+  # The next path element of every exported path strictly below `path`.
+  defp children(%__MODULE__{} = objects, path) do
+    prefix = descendant_prefix(path)
+    size = byte_size(prefix)
+
+    for exported <- Map.keys(objects.exact) ++ Map.keys(objects.subtrees),
+        exported != path,
+        <<^prefix::binary-size(^size), rest::binary>> <- [exported],
+        uniq: true,
+        do: rest |> :binary.split("/") |> hd()
+  end
+
+  # What a path names in the table.
+  defp locate(%__MODULE__{} = objects, path) do
     case Map.fetch(objects.exact, path) do
-      {:ok, refs} -> {:object, object(objects, refs)}
-      :error -> resolve_subtree(objects, path)
+      {:ok, refs} -> {:exact, refs}
+      :error -> locate_subtree(objects, path)
     end
   end
 
@@ -121,14 +206,14 @@ defmodule Rebus.Connection.Objects do
   # size, so the search runs over the exported subtrees, which local code
   # bounds, checking each against the path once, rather than over the path's
   # ancestors. Of the subtrees covering the path, the longest wins.
-  defp resolve_subtree(%__MODULE__{} = objects, path) do
+  defp locate_subtree(%__MODULE__{} = objects, path) do
     objects.subtrees
     |> Map.keys()
     |> Enum.filter(&covers?(&1, path))
     |> Enum.max_by(&byte_size/1, fn -> nil end)
     |> case do
       nil -> if intermediate?(objects, path), do: :intermediate, else: :unknown
-      prefix -> {:object, object(objects, Map.fetch!(objects.subtrees, prefix))}
+      prefix -> {:subtree, prefix}
     end
   end
 
@@ -158,13 +243,17 @@ defmodule Rebus.Connection.Objects do
   end
 
   defp intermediate?(%__MODULE__{} = objects, path) do
-    prefix = if path == "/", do: "/", else: path <> "/"
+    prefix = descendant_prefix(path)
 
     Enum.any?(
       Map.keys(objects.exact) ++ Map.keys(objects.subtrees),
       &(&1 != path and String.starts_with?(&1, prefix))
     )
   end
+
+  # What every path strictly below `path` starts with.
+  defp descendant_prefix("/"), do: "/"
+  defp descendant_prefix(path), do: path <> "/"
 
   defp conflict(%__MODULE__{} = objects, path, subtree?, interfaces) do
     taken =
@@ -196,6 +285,7 @@ defmodule Rebus.Connection.Objects do
     )
     |> Map.update!(:exports, &Map.put(&1, export.ref, entry))
     |> Map.update!(:monitor_index, &Map.put(&1, monitor_ref, export.ref))
+    |> Map.put(:introspection, %{})
   end
 
   defp delete(%__MODULE__{} = objects, %Export{} = export) do
@@ -203,6 +293,7 @@ defmodule Rebus.Connection.Objects do
     |> update_paths(export.subtree?, &delete_path(&1, export.path, export.ref))
     |> Map.update!(:exports, &Map.delete(&1, export.ref))
     |> Map.update!(:monitor_index, &Map.delete(&1, export.monitor_ref))
+    |> Map.put(:introspection, %{})
   end
 
   defp paths(%__MODULE__{subtrees: subtrees}, true), do: subtrees
