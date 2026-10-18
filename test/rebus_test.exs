@@ -4991,6 +4991,91 @@ defmodule RebusTest do
       refute_received {^ref, %Call{}}
     end
 
+    test "answer local calls without writing to the socket", %{cli: cli, svr: svr} do
+      scaler =
+        Rebus.Interface.new!("org.example.Scaler",
+          methods: [{"Scale", in: [factor: "d"], out: [scaled: "d"]}]
+        )
+
+      {:ok, ref} = Service.export(cli, @calc_path, [scaler])
+
+      task =
+        Task.async(fn ->
+          Service.invoke(cli, @calc_path, "org.example.Scaler", "Scale", [2], "d", 1_000)
+        end)
+
+      # The handler sees the value as a peer's call would carry it, not as given.
+      assert_receive {^ref, %Call{body: [2.0], sender: ":1.100"} = call}, 1_000
+      assert :ok = Service.reply(call, [4.0])
+
+      assert {:ok, %Message{type: :method_return, header_fields: fields, body: [4.0]}} =
+               Task.await(task)
+
+      assert fields.reply_serial == call.serial
+
+      task =
+        Task.async(fn -> Service.invoke(cli, @calc_path, nil, "Scale", [3.0], "d", 1_000) end)
+
+      assert_receive {^ref, %Call{interface: "org.example.Scaler", body: [3.0]} = call}, 1_000
+      assert :ok = Service.reply_error(call, "org.example.Error.Overflow", "too big")
+
+      assert {:error, {:dbus_error, %Message{header_fields: %{error_name: error_name}}}} =
+               Task.await(task)
+
+      assert error_name == "org.example.Error.Overflow"
+
+      assert {:error, {:dbus_error, %Message{header_fields: %{error_name: error_name}}}} =
+               Service.invoke(cli, "/elsewhere", "org.example.Scaler", "Scale", [1.0], "d", 1_000)
+
+      assert error_name == "org.freedesktop.DBus.Error.UnknownObject"
+
+      assert {:error, :invalid_body} =
+               Service.invoke(cli, @calc_path, nil, "Scale", ["x"], "d", 1_000)
+
+      refute_received {^svr, %Message{}}
+    end
+
+    test "fail a local call when the handler exits or does not answer in time", %{cli: cli} do
+      handler = spawn(fn -> Process.sleep(:infinity) end)
+      {:ok, _ref} = Service.export(cli, @calc_path, [@calculator], handler: handler)
+
+      task =
+        Task.async(fn -> Service.invoke(cli, @calc_path, nil, "Add", [2, 3], "ii", 1_000) end)
+
+      assert wait_until(fn ->
+               Process.info(handler, :message_queue_len) == {:message_queue_len, 1}
+             end)
+
+      Process.exit(handler, :kill)
+
+      assert {:error, {:dbus_error, %Message{header_fields: fields, body: ["Handler exited"]}}} =
+               Task.await(task)
+
+      assert fields.error_name == "org.freedesktop.DBus.Error.Failed"
+
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator], call_timeout: 50)
+
+      task =
+        Task.async(fn -> Service.invoke(cli, @calc_path, nil, "Add", [2, 3], "ii", 1_000) end)
+
+      assert_receive {^ref, %Call{} = call}, 1_000
+
+      assert {:error, {:dbus_error, %Message{header_fields: fields}}} = Task.await(task)
+      assert fields.error_name == "org.freedesktop.DBus.Error.NoReply"
+      assert {:error, :unknown_call} = Service.reply(call, [5])
+    end
+
+    test "withdraw a local call whose caller stopped waiting", %{cli: cli} do
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
+
+      assert {:error, :timeout} = Service.invoke(cli, @calc_path, nil, "Add", [2, 3], "ii", 0)
+
+      # The cancellation was cast before this call, so it has been handled.
+      assert {:ok, _name} = Rebus.unique_name(cli)
+      assert_receive {^ref, %Call{} = call}, 1_000
+      assert {:error, :unknown_call} = Service.reply(call, [5])
+    end
+
     test "report a stopped connection as disconnected", %{cli: cli, svr: svr} do
       {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
       {:ok, _serial} = TestServer.push_call(svr, calc_call("Add", [2, 3]))

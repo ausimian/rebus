@@ -27,12 +27,18 @@ defmodule Rebus.Connection.Service do
   # descriptors in this slice, so nothing would be left to release, and
   # `Rebus.Service` answers it as a no-op in the handler process.
   #
+  # A local call made with `Rebus.Service.invoke/7` takes the same route and
+  # is recorded the same way, but every answer to it, the handler's or the
+  # connection's own, goes to the process waiting for it rather than to the
+  # socket.
+  #
   # Like `Rebus.Connection.Dispatch` this works on the connection struct
   # directly, but it decides nothing about framing, so it answers with a
   # connection.
 
   alias Rebus.Connection
   alias Rebus.Connection.InboundCalls
+  alias Rebus.Connection.InboundCalls.Entry
   alias Rebus.Connection.Objects
   alias Rebus.Connection.Objects.Export
   alias Rebus.Connection.Peer
@@ -80,28 +86,59 @@ defmodule Rebus.Connection.Service do
 
   @type error :: unquote(Enum.reduce(Map.keys(@errors), &{:|, [], [&1, &2]}))
 
+  # Who is waiting for the answer to a call: a peer, answered on the socket,
+  # or a local process, answered directly.
+  @typep caller :: :remote | {:local, GenServer.from(), reference()}
+
   # Routes one inbound method call. Descriptors that arrived with it have
   # already been closed by the caller.
   @doc false
   @spec answer(Message.t(), Connection.t()) :: Connection.t()
-  def answer(%Message{} = msg, %Connection{} = state) do
+  def answer(%Message{} = msg, %Connection{} = state), do: route_call(msg, :remote, state)
+
+  # Routes a local call, which `from` waits for. The call is recorded under
+  # the caller's request reference, so a caller that stops waiting can
+  # withdraw it with `cancel/2`.
+  @doc false
+  @spec invoke(Message.t(), GenServer.from(), reference(), Connection.t()) :: Connection.t()
+  def invoke(%Message{} = msg, from, request_ref, %Connection{} = state)
+      when is_reference(request_ref),
+      do: route_call(msg, {:local, from, request_ref}, state)
+
+  # A local caller stopped waiting. Its call leaves the table unanswered, and
+  # an answer from the handler afterwards finds nothing, as after expiry.
+  @doc false
+  @spec cancel(Connection.t(), reference()) :: {:ok, Connection.t()} | :error
+  def cancel(%Connection{} = state, request_ref) do
+    case InboundCalls.fetch(state.inbound_calls, request_ref) do
+      {:ok, %Entry{from: from}} when from != nil ->
+        {_entry, calls} = InboundCalls.complete(state.inbound_calls, request_ref)
+        {:ok, %{state | inbound_calls: calls}}
+
+      _remote_or_missing ->
+        :error
+    end
+  end
+
+  @spec route_call(Message.t(), caller(), Connection.t()) :: Connection.t()
+  defp route_call(%Message{} = msg, caller, %Connection{} = state) do
     case route(msg, state.objects) do
       {:ok, export, interface, method} ->
-        deliver(msg, export, interface, method, state)
+        deliver(msg, caller, export, interface, method, state)
 
       :peer ->
-        answer_internally(msg, state, &Peer.reply/2)
+        answer_internally(msg, caller, state, &Peer.reply/2)
 
       :introspect ->
-        answer_internally(msg, state, &introspect/2)
+        answer_internally(msg, caller, state, &introspect/2)
 
       :no_properties ->
-        answer_internally(msg, state, fn _msg, state ->
+        answer_internally(msg, caller, state, fn _msg, state ->
           {[type: :method_return, signature: "a{sv}", body: [[]]], state}
         end)
 
       {:error, error} ->
-        answer_internally(msg, state, fn _msg, state -> {error_reply(error), state} end)
+        answer_internally(msg, caller, state, fn _msg, state -> {error_reply(error), state} end)
     end
   end
 
@@ -159,17 +196,36 @@ defmodule Rebus.Connection.Service do
   # The handler answered a call with `msg`. The call leaves the table, and
   # the reply is addressed from what the table retained rather than from
   # anything the handler supplied, so it can only answer the serial it was
-  # handed and only to the peer that sent it.
+  # handed and only to the peer that sent it. A reply to a peer is returned
+  # for the caller to write; one to a local call is delivered here, and
+  # `:answered` says so. Descriptors cannot be handed to a local caller, so a
+  # reply that carries any is refused and the call stays open.
   @doc false
   @spec complete(Connection.t(), reference(), Message.t()) ::
-          {:ok, Message.t(), Connection.t()} | {:error, :unknown_call}
+          {:ok, Message.t(), Connection.t()}
+          | {:answered, Connection.t()}
+          | {:error, :unknown_call | :unix_fd_unsupported}
   def complete(%Connection{} = state, ref, %Message{} = msg) do
-    case InboundCalls.complete(state.inbound_calls, ref) do
-      {nil, _calls} ->
+    case InboundCalls.fetch(state.inbound_calls, ref) do
+      :error ->
         {:error, :unknown_call}
 
-      {entry, calls} ->
-        {:ok, address(msg, entry.serial, entry.sender), %{state | inbound_calls: calls}}
+      {:ok, %Entry{from: from}} when from != nil and msg.unix_fds != [] ->
+        {:error, :unix_fd_unsupported}
+
+      {:ok, %Entry{} = entry} ->
+        {_entry, calls} = InboundCalls.complete(state.inbound_calls, ref)
+        reply = address(msg, entry.serial, entry.sender)
+        state = %{state | inbound_calls: calls}
+
+        case entry.from do
+          nil ->
+            {:ok, reply, state}
+
+          from ->
+            GenServer.reply(from, local_result(reply))
+            {:answered, state}
+        end
     end
   end
 
@@ -305,27 +361,28 @@ defmodule Rebus.Connection.Service do
 
   defp check_args(refused, _msg), do: refused
 
-  defp deliver(%Message{} = msg, %Export{} = export, interface, %Method{} = method, state) do
+  defp deliver(%Message{} = msg, caller, %Export{} = export, interface, %Method{} = method, state) do
     cond do
       no_reply?(msg) ->
         send_call(msg, export, interface, method, make_ref(), nil)
         state
 
       InboundCalls.size(state.inbound_calls) >= state.max_pending_calls ->
-        answer_internally(msg, state, fn _msg, state -> {error_reply(:limits_exceeded), state} end)
+        answer_internally(msg, caller, state, fn _msg, state ->
+          {error_reply(:limits_exceeded), state}
+        end)
 
       true ->
         {entry, calls} =
           InboundCalls.insert(
             state.inbound_calls,
-            %{
-              ref: make_ref(),
+            Map.merge(local_entry(caller), %{
               serial: msg.serial,
               sender: Map.get(msg.header_fields, :sender),
               export: export.ref,
               handler: export.handler,
               unix_fds: []
-            },
+            }),
             export.call_timeout
           )
 
@@ -362,6 +419,9 @@ defmodule Rebus.Connection.Service do
     send(export.handler, {export.ref, call})
   end
 
+  defp local_entry(:remote), do: %{ref: make_ref()}
+  defp local_entry({:local, from, request_ref}), do: %{ref: request_ref, from: from}
+
   defp no_reply?(%Message{flags: flags}), do: :no_reply_expected in flags
 
   defp fail_export(%Connection{} = state, %Export{ref: ref}, error) do
@@ -371,7 +431,12 @@ defmodule Rebus.Connection.Service do
 
   # Only calls that expect a reply are recorded, so every failed call is
   # answered.
-  defp fail(%Connection{} = state, %InboundCalls.Entry{} = entry, error) do
+  defp fail(%Connection{} = state, %Entry{from: from} = entry, error) when from != nil do
+    answer_local(from, error_reply(error), entry.serial, entry.sender)
+    state
+  end
+
+  defp fail(%Connection{} = state, %Entry{} = entry, error) do
     if Writer.replies_saturated?(state.writer) do
       %{state | writer: Writer.refuse_reply(state.writer)}
     else
@@ -379,8 +444,16 @@ defmodule Rebus.Connection.Service do
     end
   end
 
+  # A local caller is answered directly; nothing is written, so the cap on
+  # replies the connection writes does not apply.
+  defp answer_internally(%Message{} = msg, {:local, from, _request_ref}, state, build) do
+    {reply_opts, state} = build.(msg, state)
+    answer_local(from, reply_opts, msg.serial, reply_destination(msg))
+    state
+  end
+
   # A caller that asked for no reply gets none, including an error.
-  defp answer_internally(%Message{} = msg, %Connection{} = state, build) do
+  defp answer_internally(%Message{} = msg, :remote, %Connection{} = state, build) do
     cond do
       no_reply?(msg) ->
         state
@@ -418,10 +491,7 @@ defmodule Rebus.Connection.Service do
   # has no caller: a peer that floods calls into a stalled socket has its
   # replies dropped rather than growing the write queue without bound.
   defp queue_reply(reply_opts, serial, destination, %Connection{} = state) do
-    {type, reply_opts} = Keyword.pop!(reply_opts, :type)
-    reply_opts = reply_opts ++ [reply_serial: serial] ++ destination_opts(destination)
-
-    case Message.new(type, reply_opts) do
+    case build_reply(reply_opts, serial, destination) do
       {:ok, reply} ->
         writer =
           Writer.queue(state.writer, %{
@@ -438,6 +508,27 @@ defmodule Rebus.Connection.Service do
         Logger.warning("D-Bus internal reply dropped: #{inspect(reason)}", reason: reason)
         state
     end
+  end
+
+  # The answer a local caller gets is what `Rebus.call/3` would return for
+  # the same reply from a peer.
+  defp answer_local(from, reply_opts, serial, destination) do
+    case build_reply(reply_opts, serial, destination) do
+      {:ok, reply} ->
+        GenServer.reply(from, local_result(reply))
+
+      {:error, reason} ->
+        Logger.warning("D-Bus internal reply dropped: #{inspect(reason)}", reason: reason)
+        GenServer.reply(from, {:error, reason})
+    end
+  end
+
+  defp local_result(%Message{type: :method_return} = reply), do: {:ok, reply}
+  defp local_result(%Message{type: :error} = reply), do: {:error, {:dbus_error, reply}}
+
+  defp build_reply(reply_opts, serial, destination) do
+    {type, reply_opts} = Keyword.pop!(reply_opts, :type)
+    Message.new(type, reply_opts ++ [reply_serial: serial] ++ destination_opts(destination))
   end
 
   defp destination_opts(nil), do: []

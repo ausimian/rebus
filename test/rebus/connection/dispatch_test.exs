@@ -863,6 +863,127 @@ defmodule Rebus.Connection.DispatchTest do
     end
   end
 
+  describe "local calls" do
+    test "are recorded under the caller's request reference and delivered" do
+      {export_ref, state} = exported(connection())
+      {from, _tag} = local_caller()
+      request_ref = make_ref()
+
+      state =
+        Service.invoke(app_call("Add", signature: "ii", body: [2, 3]), from, request_ref, state)
+
+      assert_received {^export_ref, %Call{ref: ^request_ref, body: [2, 3]}}
+
+      assert {:ok, %{from: ^from, serial: 5}} =
+               InboundCalls.fetch(state.inbound_calls, request_ref)
+
+      assert :queue.is_empty(state.writer.queue)
+      InboundCalls.close_all(state.inbound_calls)
+    end
+
+    test "deliver the handler's reply to the caller instead of the socket" do
+      {state, request_ref, tag} = invoked()
+      reply = Message.new!(:method_return, reply_serial: 99, signature: "i", body: [5])
+
+      assert {:answered, state} = Service.complete(state, request_ref, reply)
+      assert_received {^tag, {:ok, %Message{type: :method_return, body: [5]} = answered}}
+      assert answered.header_fields.reply_serial == 5
+      assert state.inbound_calls == InboundCalls.new()
+      assert :queue.is_empty(state.writer.queue)
+
+      error = Message.new!(:error, reply_serial: 5, error_name: "org.example.Error.No")
+      {state, request_ref, tag} = invoked()
+      assert {:answered, _state} = Service.complete(state, request_ref, error)
+      assert_received {^tag, {:error, {:dbus_error, %Message{type: :error}}}}
+    end
+
+    test "refuse a reply carrying descriptors and keep the call open" do
+      {state, request_ref, tag} = invoked()
+      reply = Message.new!(:method_return, reply_serial: 5, signature: "i", body: [5])
+
+      assert {:error, :unix_fd_unsupported} =
+               Service.complete(state, request_ref, %{reply | unix_fds: [:not_a_descriptor]})
+
+      refute_received {^tag, _result}
+      assert {:answered, _state} = Service.complete(state, request_ref, reply)
+      assert_received {^tag, {:ok, %Message{}}}
+    end
+
+    test "are answered directly when the connection refuses or answers them itself" do
+      {_export_ref, state} = exported(connection(), interfaces: [@calculator, @settings])
+
+      for {call, expected} <- [
+            {app_call("Nope"), {:error, @unknown_method_error}},
+            {app_call("Add", path: "/elsewhere"), {:error, @unknown_object_error}},
+            {properties_call("Get", signature: "ss", body: ["org.example.Settings", "Secret"]),
+             {:error, @property_read_only_error}},
+            {properties_call("GetAll", signature: "s", body: ["org.example.Calculator"]),
+             {:ok, [[]]}},
+            {app_call("Ping", interface: "org.freedesktop.DBus.Peer"), {:ok, []}}
+          ] do
+        {from, tag} = local_caller()
+        after_call = Service.invoke(call, from, make_ref(), state)
+
+        assert :queue.is_empty(after_call.writer.queue)
+        refute_received :advance_writes
+
+        case expected do
+          {:ok, body} ->
+            assert_received {^tag, {:ok, %Message{type: :method_return, body: ^body}}}
+
+          {:error, name} ->
+            assert_received {^tag, {:error, {:dbus_error, %Message{} = reply}}}
+            assert reply.header_fields.error_name == name
+            assert reply.header_fields.reply_serial == 5
+        end
+      end
+    end
+
+    test "are refused with LimitsExceeded beyond max_pending_calls" do
+      {state, _request_ref, _tag} = invoked(%{connection() | max_pending_calls: 1})
+      {from, tag} = local_caller()
+
+      after_call =
+        Service.invoke(app_call("Add", signature: "ii", body: [2, 3]), from, make_ref(), state)
+
+      assert_received {^tag, {:error, {:dbus_error, reply}}}
+      assert reply.header_fields.error_name == @limits_exceeded_error
+      assert after_call.inbound_calls == state.inbound_calls
+      InboundCalls.close_all(state.inbound_calls)
+    end
+
+    test "are failed to the caller when their object is unexported" do
+      {state, _request_ref, tag} = invoked()
+      [export_ref] = Map.keys(state.objects.exports)
+
+      state = Service.unexport(state, export_ref)
+
+      assert_received {^tag, {:error, {:dbus_error, reply}}}
+      assert reply.header_fields.error_name == @failed_error
+      assert reply.body == ["Object unexported"]
+      assert :queue.is_empty(state.writer.queue)
+    end
+
+    test "are withdrawn when their caller stops waiting" do
+      {state, request_ref, tag} = invoked()
+
+      assert {:ok, state} = Service.cancel(state, request_ref)
+      assert state.inbound_calls == InboundCalls.new()
+
+      reply = Message.new!(:method_return, reply_serial: 5, signature: "i", body: [5])
+      assert {:error, :unknown_call} = Service.complete(state, request_ref, reply)
+      refute_received {^tag, _result}
+    end
+
+    test "leave calls from peers alone on cancellation" do
+      {%Call{ref: ref}, state} = routed()
+
+      assert :error = Service.cancel(state, ref)
+      assert :error = Service.cancel(state, make_ref())
+      InboundCalls.close_all(state.inbound_calls)
+    end
+  end
+
   describe "receive_result/2" do
     test "parks on a select notification without touching the buffer" do
       handle = make_ref()
@@ -971,6 +1092,25 @@ defmodule Rebus.Connection.DispatchTest do
   defp introspect_call(path), do: app_call("Introspect", path: path, interface: @introspectable)
 
   defp properties_call(member, opts), do: app_call(member, [interface: @properties] ++ opts)
+
+  # A local caller's `from`: `GenServer.reply/2` sends `{tag, result}` here.
+  defp local_caller do
+    tag = make_ref()
+    {{self(), tag}, tag}
+  end
+
+  # A local call to `Add` routed to this process and recorded.
+  defp invoked(state \\ connection()) do
+    {export_ref, state} = exported(state)
+    {from, tag} = local_caller()
+    request_ref = make_ref()
+
+    state =
+      Service.invoke(app_call("Add", signature: "ii", body: [2, 3]), from, request_ref, state)
+
+    assert_received {^export_ref, %Call{ref: ^request_ref}}
+    {state, request_ref, tag}
+  end
 
   # A handler other than this process, which hands every message it receives
   # back here, so a test can tell which handler a call was routed to.

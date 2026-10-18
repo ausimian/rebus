@@ -475,6 +475,39 @@ defmodule Rebus.Service do
     end
   end
 
+  # Makes a method call to an object exported on `conn` without leaving the
+  # node, so local code such as an object manager can ask another object's
+  # handler something through the same routing, checks and bounds a peer's
+  # call meets. The call is encoded and decoded first, so its handler sees
+  # exactly what it would for the same call from a peer. Returns what
+  # `Rebus.call/3` would; a handler's reply that carries descriptors is
+  # refused with `{:error, :unix_fd_unsupported}`. The handler must not be
+  # the calling process, which would wait for itself until `timeout`.
+  @doc false
+  @spec invoke(pid(), binary(), binary() | nil, binary(), [term()], binary(), non_neg_integer()) ::
+          {:ok, Message.t()}
+          | {:error, {:dbus_error, Message.t()} | Message.encoding_error() | Rebus.error_reason()}
+  def invoke(conn, path, interface, member, body, signature, timeout)
+      when is_pid(conn) and is_list(body) and is_integer(timeout) and timeout >= 0 do
+    fields =
+      [path: path, interface: interface, member: member, signature: signature, body: body]
+      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+
+    with {:ok, msg} <- Message.new(:method_call, fields),
+         {:ok, msg} <- as_received(msg) do
+      Connection.invoke(conn, msg, timeout)
+    end
+  end
+
+  # The encoder accepts some values in more than one shape, such as an
+  # integer for a double, while the decoder produces one. The serial is a
+  # placeholder the connection replaces.
+  defp as_received(%Message{} = msg) do
+    with {:ok, iodata} <- Message.encode(%{msg | serial: 1}) do
+      iodata |> IO.iodata_to_binary() |> Message.decode()
+    end
+  end
+
   defp validate_path(path) do
     if WireValue.valid_object_path?(path), do: :ok, else: {:error, :invalid_path}
   end

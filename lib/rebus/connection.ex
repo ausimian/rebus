@@ -148,6 +148,25 @@ defmodule Rebus.Connection do
     end
   end
 
+  # Makes a local call to an object this connection exports, built and
+  # checked by `Rebus.Service.invoke/7`. It is routed, bounded and recorded
+  # as a call from a peer would be, and answered with what `call/3` would
+  # return for the same reply, but nothing is written to the socket. A caller
+  # that stops waiting withdraws the call.
+  @doc false
+  @spec invoke(pid(), Message.t(), non_neg_integer()) ::
+          {:ok, Message.t()} | {:error, {:dbus_error, Message.t()} | term()}
+  def invoke(pid, %Message{type: :method_call} = msg, timeout)
+      when is_pid(pid) and is_integer(timeout) and timeout >= 0 do
+    if node(pid) == node() do
+      request_ref = make_ref()
+
+      SafeCall.call(pid, {:invoke, msg, request_ref}, timeout, cancel: {:cancel, request_ref})
+    else
+      {:error, :remote_connection_unsupported}
+    end
+  end
+
   # Exports an object, validated by `Rebus.Service`. The reference is made
   # here rather than by the connection so that a caller that stops waiting
   # can withdraw an export it never learned it had.
@@ -845,8 +864,31 @@ defmodule Rebus.Connection do
          {:ok, msg, state} <- Service.complete(state, ref, msg) do
       enqueue_send(:ok, state, from, msg, deadline, request_ref)
     else
+      {:answered, state} -> {:reply, :ok, state}
       {:error, _} = error -> {:reply, error, state}
     end
+  end
+
+  def handle_call(
+        {:invoke, %Message{}, _request_ref},
+        _from,
+        %__MODULE__{established?: false} = state
+      ) do
+    {:reply, {:error, :not_connected}, state}
+  end
+
+  # A local call is numbered from this connection's own serials, which no
+  # frame on the wire will reuse, and sent from its own name.
+  def handle_call({:invoke, %Message{} = msg, request_ref}, from, %__MODULE__{} = state) do
+    fields =
+      case state.name do
+        nil -> Map.delete(msg.header_fields, :sender)
+        name -> Map.put(msg.header_fields, :sender, name)
+      end
+
+    msg = %{msg | serial: Writer.serial(state.writer), header_fields: fields}
+    state = %{state | writer: Writer.consume_serial(state.writer)}
+    {:noreply, Service.invoke(msg, from, request_ref, state)}
   end
 
   def handle_call({:export, _spec}, _from, %__MODULE__{established?: false} = state) do
@@ -995,7 +1037,7 @@ defmodule Rebus.Connection do
   @impl true
   def handle_cast({:cancel, request_ref}, %__MODULE__{} = state) do
     case Pending.pop_by_request(state.pending, request_ref) do
-      {nil, _pending} -> cancel_claim_or_write(request_ref, state)
+      {nil, _pending} -> cancel_invoke_claim_or_write(request_ref, state)
       {_entry, pending} -> {:noreply, %{state | pending: pending}}
     end
   end
@@ -1016,6 +1058,15 @@ defmodule Rebus.Connection do
 
   def handle_cast({:attach_match_worker, worker}, %__MODULE__{} = state),
     do: {:noreply, %{state | match_worker: worker}}
+
+  # A request that is not waiting for a reply may be a local call still
+  # waiting for its handler.
+  defp cancel_invoke_claim_or_write(request_ref, %__MODULE__{} = state) do
+    case Service.cancel(state, request_ref) do
+      {:ok, state} -> {:noreply, state}
+      :error -> cancel_claim_or_write(request_ref, state)
+    end
+  end
 
   # A request that is not waiting for a reply is either an unacknowledged FD
   # claim or a frame still queued or being written.
