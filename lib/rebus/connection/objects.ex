@@ -152,7 +152,7 @@ defmodule Rebus.Connection.Objects do
 
     case path do
       ^prefix -> true
-      <<^prefix::binary-size(size), ?/, _rest::binary>> -> true
+      <<^prefix::binary-size(^size), ?/, _rest::binary>> -> true
       _other -> false
     end
   end
