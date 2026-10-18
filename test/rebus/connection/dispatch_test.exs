@@ -698,16 +698,25 @@ defmodule Rebus.Connection.DispatchTest do
       end
     end
 
-    test "refuses reading a write-only or writing a read-only property with PropertyReadOnly" do
+    test "refuses writing a read-only property with PropertyReadOnly" do
       {_export_ref, state} = exported(connection(), interfaces: [@settings])
 
-      for {member, signature, body} <- [
-            {"Get", "ss", ["org.example.Settings", "Secret"]},
-            {"Set", "ssv", ["org.example.Settings", "Version", {"s", "2.0"}]}
-          ] do
-        call = properties_call(member, signature: signature, body: body)
-        assert_refused(call, state, @property_read_only_error)
-      end
+      call =
+        properties_call("Set",
+          signature: "ssv",
+          body: ["org.example.Settings", "Version", {"s", "2.0"}]
+        )
+
+      assert_refused(call, state, @property_read_only_error)
+    end
+
+    test "refuses reading a write-only property with InvalidArgs" do
+      {_export_ref, state} = exported(connection(), interfaces: [@settings])
+      call = properties_call("Get", signature: "ss", body: ["org.example.Settings", "Secret"])
+
+      assert [%{msg: reply}] = queued_replies(call, state)
+      assert reply.header_fields.error_name == @invalid_args_error
+      assert reply.body == ["Property is not readable"]
     end
 
     test "refuses a Set whose value differs from the declared type with InvalidArgs" do
@@ -915,8 +924,10 @@ defmodule Rebus.Connection.DispatchTest do
       for {call, expected} <- [
             {app_call("Nope"), {:error, @unknown_method_error}},
             {app_call("Add", path: "/elsewhere"), {:error, @unknown_object_error}},
-            {properties_call("Get", signature: "ss", body: ["org.example.Settings", "Secret"]),
-             {:error, @property_read_only_error}},
+            {properties_call("Set",
+               signature: "ssv",
+               body: ["org.example.Settings", "Version", {"s", "2.0"}]
+             ), {:error, @property_read_only_error}},
             {properties_call("GetAll", signature: "s", body: ["org.example.Calculator"]),
              {:ok, [[]]}},
             {app_call("Ping", interface: "org.freedesktop.DBus.Peer"), {:ok, []}}

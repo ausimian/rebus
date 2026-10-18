@@ -72,11 +72,10 @@ defmodule Rebus.Connection.Service do
       {"org.freedesktop.DBus.Error.InvalidArgs", "Value does not match the property signature"},
     unknown_property:
       {"org.freedesktop.DBus.Error.UnknownProperty", "Property not declared by this interface"},
-    # The specification names no error for reading a write-only property, and
-    # this is the one it gives for the access mismatch the other way.
     property_read_only: {"org.freedesktop.DBus.Error.PropertyReadOnly", "Property is read-only"},
-    property_write_only:
-      {"org.freedesktop.DBus.Error.PropertyReadOnly", "Property is write-only"},
+    # The specification names no error for reading a write-only property;
+    # this is GDBus's answer.
+    property_not_readable: {"org.freedesktop.DBus.Error.InvalidArgs", "Property is not readable"},
     limits_exceeded:
       {"org.freedesktop.DBus.Error.LimitsExceeded", "Too many method calls are pending"},
     handler_exited: {"org.freedesktop.DBus.Error.Failed", "Handler exited"},
@@ -321,7 +320,7 @@ defmodule Rebus.Connection.Service do
 
   defp check_property("Get", %Interface{} = interface, [name]) do
     with {:ok, %Property{} = property} <- fetch_property(interface, name) do
-      check(property.access != :write, :property_write_only)
+      check(property.access != :write, :property_not_readable)
     end
   end
 

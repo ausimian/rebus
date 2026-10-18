@@ -57,7 +57,8 @@ defmodule Rebus.Service do
   | Method not declared, or, without an interface, declared by no exported interface or by more than one | `org.freedesktop.DBus.Error.UnknownMethod` |
   | Argument signature differs from the declaration | `org.freedesktop.DBus.Error.InvalidArgs` |
   | Property not declared by the interface a `Properties` call names | `org.freedesktop.DBus.Error.UnknownProperty` |
-  | `Get` of a write-only property, or `Set` of a read-only one | `org.freedesktop.DBus.Error.PropertyReadOnly` |
+  | `Set` of a read-only property | `org.freedesktop.DBus.Error.PropertyReadOnly` |
+  | `Get` of a write-only property | `org.freedesktop.DBus.Error.InvalidArgs` |
   | `Set` value of a type other than the declared one | `org.freedesktop.DBus.Error.InvalidArgs` |
   | `:max_pending_calls` calls already waiting | `org.freedesktop.DBus.Error.LimitsExceeded` |
   | Handler exited with the call pending | `org.freedesktop.DBus.Error.Failed` |

@@ -23,8 +23,9 @@
 - Exported objects answer `org.freedesktop.DBus.Properties`. The connection
   checks each `Get`, `Set` and `GetAll` against the declaration of the
   interface it names and answers `UnknownInterface`, `UnknownProperty`,
-  `PropertyReadOnly` or `InvalidArgs` for a call that does not fit, including
-  a `Set` value of the wrong type. Anything else goes to the handler that
+  `PropertyReadOnly` (for a `Set` of a read-only property) or `InvalidArgs`
+  for a call that does not fit, including a `Get` of a write-only property
+  and a `Set` value of the wrong type. Anything else goes to the handler that
   exported the interface, as a `Rebus.Service.Call` whose `out_signature` is
   `"v"`, `""` or `"a{sv}"`. `GetAll` for an interface with no readable
   property answers an empty dictionary.
