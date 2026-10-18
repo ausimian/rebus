@@ -8,8 +8,10 @@ defmodule Rebus.Connection do
   alias Rebus.Connection.Handshake
   alias Rebus.Connection.Inbound
   alias Rebus.Connection.InboundCalls
+  alias Rebus.Connection.Objects
   alias Rebus.Connection.Pending
   alias Rebus.Connection.Rights
+  alias Rebus.Connection.Service
   alias Rebus.Connection.Setup
   alias Rebus.Connection.SocketError
   alias Rebus.Connection.Writer
@@ -23,6 +25,7 @@ defmodule Rebus.Connection do
 
   @default_write_timeout 5_000
   @default_read_timeout 5_000
+  @default_max_pending_calls 1_024
 
   # The smallest accepted `:max_message_size`. A message-bus `Hello` reply and
   # the `NameAcquired` signal after it fit well inside this even with the
@@ -42,7 +45,8 @@ defmodule Rebus.Connection do
     :allow_anonymous?,
     :bus?,
     :connect_waiter,
-    :owner
+    :owner,
+    :max_pending_calls
   ]
 
   # The peer-supplied reasons a connection reports verbatim. Each list is
@@ -119,22 +123,62 @@ defmodule Rebus.Connection do
     )
   end
 
-  # Queues a `:method_return` or `:error` frame built by the handler of an
-  # inbound call. It takes the `:send` path with the handler as the waiting
-  # caller, so `:ok` means the frame was handed to the socket and the dispatch
-  # timeout gives the handler backpressure. `dispatch/3` keeps refusing these
-  # types, so callers cannot forge replies through `Rebus.send/2`.
+  # Answers the inbound call `ref` with a `:method_return` or `:error` frame
+  # its handler built. The call must still be pending, and the frame is
+  # addressed from what the connection retained for it, so a handler can only
+  # answer a call it was handed. It takes the `:send` path with the handler as
+  # the waiting caller, so `:ok` means the frame was handed to the socket and
+  # the dispatch timeout gives the handler backpressure. `dispatch/3` keeps
+  # refusing these types, so callers cannot forge replies through
+  # `Rebus.send/2`.
   @doc false
-  @spec send_reply(pid(), Message.t(), non_neg_integer()) :: :ok | {:error, term()}
-  def send_reply(pid, %Message{} = msg, dispatch_timeout \\ @default_write_timeout)
-      when is_pid(pid) and is_integer(dispatch_timeout) and dispatch_timeout >= 0 do
+  @spec reply_call(pid(), reference(), Message.t(), non_neg_integer()) :: :ok | {:error, term()}
+  def reply_call(pid, ref, %Message{} = msg, dispatch_timeout \\ @default_write_timeout)
+      when is_pid(pid) and is_reference(ref) and is_integer(dispatch_timeout) and
+             dispatch_timeout >= 0 do
     if node(pid) == node() do
       request_ref = make_ref()
       deadline = System.monotonic_time(:millisecond) + dispatch_timeout
 
-      SafeCall.call(pid, {:send_reply, msg, deadline, request_ref}, dispatch_timeout,
+      SafeCall.call(pid, {:reply_call, ref, msg, deadline, request_ref}, dispatch_timeout,
         cancel: {:cancel, request_ref}
       )
+    else
+      {:error, :remote_connection_unsupported}
+    end
+  end
+
+  # Exports an object, validated by `Rebus.Service`. The reference is made
+  # here rather than by the connection so that a caller that stops waiting
+  # can withdraw an export it never learned it had.
+  @doc false
+  @spec export(pid(), map(), non_neg_integer()) ::
+          {:ok, reference()}
+          | {:error,
+             :not_connected
+             | :timeout
+             | :disconnected
+             | :remote_connection_unsupported
+             | {:already_exported, binary(), binary()}}
+  def export(conn, spec, timeout)
+      when is_pid(conn) and is_map(spec) and is_integer(timeout) and timeout >= 0 do
+    if node(conn) == node() do
+      ref = make_ref()
+
+      safe_setup_call(conn, {:export, Map.put(spec, :ref, ref)}, {:unexport, ref}, timeout)
+    else
+      {:error, :remote_connection_unsupported}
+    end
+  end
+
+  @doc false
+  @spec unexport(pid(), reference(), non_neg_integer()) ::
+          :ok
+          | {:error, :not_connected | :timeout | :disconnected | :remote_connection_unsupported}
+  def unexport(conn, ref, timeout)
+      when is_pid(conn) and is_reference(ref) and is_integer(timeout) and timeout >= 0 do
+    if node(conn) == node() do
+      safe_setup_call(conn, {:unexport, ref}, nil, timeout)
     else
       {:error, :remote_connection_unsupported}
     end
@@ -325,8 +369,11 @@ defmodule Rebus.Connection do
     # acknowledged, and the terminal outcomes retained just after.
     field :fd_claims, FDClaims.t(), default: FDClaims.new()
     # Inbound method calls handed to a handler and not yet answered, with the
-    # descriptors they carried.
+    # descriptors they carried, and how many may wait at once.
     field :inbound_calls, InboundCalls.t(), default: InboundCalls.new()
+    field :max_pending_calls, pos_integer(), default: @default_max_pending_calls
+    # The objects this connection exports, and the monitors on their handlers.
+    field :objects, Objects.t(), default: Objects.new()
     # Signal handlers registered against this connection. Delivery and match
     # filtering happen in the connection process itself, so a signal arriving
     # here can never reach a handler installed on another connection.
@@ -378,6 +425,7 @@ defmodule Rebus.Connection do
       connect_waiter: Map.get(internal, :connect_waiter),
       owner: Keyword.get(opts, :owner),
       max_message_size: Keyword.get(opts, :max_message_size, Message.max_message_size()),
+      max_pending_calls: Keyword.get(opts, :max_pending_calls, @default_max_pending_calls),
       impl: Map.get_lazy(internal, :impl, &Rebus.Impl.default/0)
     }
   end
@@ -395,7 +443,8 @@ defmodule Rebus.Connection do
          :ok <- validate_flag(:invalid_allow_anonymous, settings.allow_anonymous?),
          :ok <- validate_flag(:invalid_bus_option, settings.bus?),
          :ok <- validate_owner(settings.owner),
-         :ok <- validate_max_message_size(settings.max_message_size) do
+         :ok <- validate_max_message_size(settings.max_message_size),
+         :ok <- validate_max_pending_calls(settings.max_pending_calls) do
       validate_registered_name(settings.name)
     end
   end
@@ -430,6 +479,9 @@ defmodule Rebus.Connection do
        do: :ok
 
   defp validate_max_message_size(_size), do: {:stop, :invalid_max_message_size}
+
+  defp validate_max_pending_calls(limit) when is_integer(limit) and limit > 0, do: :ok
+  defp validate_max_pending_calls(_limit), do: {:stop, :invalid_max_pending_calls}
 
   defp validate_registered_name(name) when is_nil(name) or is_atom(name), do: :ok
   defp validate_registered_name(_name), do: {:stop, :invalid_name}
@@ -564,9 +616,12 @@ defmodule Rebus.Connection do
          }}
 
       {nil, _handler_monitor_index} ->
-        handle_down_for_request(ref, state)
+        handle_down_for_export(ref, state)
     end
   end
+
+  def handle_info({:inbound_call_timeout, ref}, %__MODULE__{} = state),
+    do: {:noreply, Service.expire(state, ref)}
 
   def handle_info({:request_timeout, serial, request_ref}, %__MODULE__{} = state),
     do: serial |> Dispatch.request_timeout(request_ref, state) |> dispatch_result()
@@ -625,6 +680,14 @@ defmodule Rebus.Connection do
     do: {:stop, reason, state}
 
   def handle_info(_message, %__MODULE__{} = state), do: {:noreply, state}
+
+  # The handler of an export went down, which unexports it.
+  defp handle_down_for_export(ref, %__MODULE__{} = state) do
+    case Service.handler_down(state, ref) do
+      {:ok, state} -> {:noreply, state}
+      :error -> handle_down_for_request(ref, state)
+    end
+  end
 
   # A monitored caller can be waiting in exactly one place: the pending-reply
   # table, the write queue, or an unacknowledged FD claim. They are searched in
@@ -768,20 +831,40 @@ defmodule Rebus.Connection do
   def handle_call({:send, %Message{} = msg, deadline, request_ref}, from, %__MODULE__{} = state),
     do: enqueue_send(validate_send_message(msg), state, from, msg, deadline, request_ref)
 
+  # Nothing is routed to a handler before establishment, so a reply then
+  # answers nothing, as does one for a call already answered or expired. The
+  # frame is checked before the call is completed, so a handler whose reply
+  # is refused here can still answer the call another way.
   def handle_call(
-        {:send_reply, %Message{}, _deadline, _request_ref},
-        _from,
-        %__MODULE__{established?: false} = state
+        {:reply_call, ref, %Message{} = msg, deadline, request_ref},
+        from,
+        %__MODULE__{} = state
       ) do
+    with :ok <- validate_reply_message(msg),
+         :ok <- validate_outbound_fd_transport(msg, state),
+         {:ok, msg, state} <- Service.complete(state, ref, msg) do
+      enqueue_send(:ok, state, from, msg, deadline, request_ref)
+    else
+      {:error, _} = error -> {:reply, error, state}
+    end
+  end
+
+  def handle_call({:export, _spec}, _from, %__MODULE__{established?: false} = state) do
     {:reply, {:error, :not_connected}, state}
   end
 
-  def handle_call(
-        {:send_reply, %Message{} = msg, deadline, request_ref},
-        from,
-        %__MODULE__{} = state
-      ),
-      do: enqueue_send(validate_reply_message(msg), state, from, msg, deadline, request_ref)
+  def handle_call({:export, spec}, _from, %__MODULE__{} = state) do
+    {reply, state} = Service.export(state, spec)
+    {:reply, reply, state}
+  end
+
+  def handle_call({:unexport, _ref}, _from, %__MODULE__{established?: false} = state) do
+    {:reply, {:error, :not_connected}, state}
+  end
+
+  def handle_call({:unexport, ref}, _from, %__MODULE__{} = state) do
+    {:reply, :ok, Service.unexport(state, ref)}
+  end
 
   def handle_call(
         {:claim_fd_reply, claim_ref, delivery_ref, delivery_alias},
@@ -919,6 +1002,11 @@ defmodule Rebus.Connection do
 
   def handle_cast({:cancel_signal_handler, handler_ref}, %__MODULE__{} = state) do
     {:noreply, remove_signal_handler(state, handler_ref)}
+  end
+
+  # An export whose caller stopped waiting before it was answered.
+  def handle_cast({:unexport, ref}, %__MODULE__{} = state) do
+    {:noreply, Service.unexport(state, ref)}
   end
 
   def handle_cast({:notify_owner, message}, %__MODULE__{owner: owner} = state) do

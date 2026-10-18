@@ -1,5 +1,22 @@
 ### Added
 
+- `Rebus.Service` exports objects and answers the method calls made on them.
+  `Rebus.Service.export/4` binds `Rebus.Interface` declarations at an object
+  path, or a whole subtree, to a handler process, which receives each call as
+  `{export_ref, %Rebus.Service.Call{}}` and answers it with
+  `Rebus.Service.reply/3`, `Rebus.Service.reply_error/4` or
+  `Rebus.Service.reply_message/3`. The connection checks every call against
+  the declarations first, so a handler only sees declared methods with
+  arguments of the declared types, and callers get the standard D-Bus error
+  for anything else. A call without an interface resolves to the one exported
+  interface that declares its method. Pending calls are failed with
+  `org.freedesktop.DBus.Error.Failed` when their handler exits or their
+  object is unexported (`Rebus.Service.unexport/3`), and expire with
+  `org.freedesktop.DBus.Error.NoReply` after the export's `:call_timeout`,
+  60 seconds by default.
+- `Rebus.connect/2` takes a `:max_pending_calls` option, 1024 by default,
+  that bounds how many inbound calls may wait for a handler's answer at once.
+  Calls beyond it are answered with `org.freedesktop.DBus.Error.LimitsExceeded`.
 - `Rebus.Interface` declares a D-Bus interface's methods, signals, properties
   and annotations, validating every name and signature once. It provides the
   standard `Peer`, `Introspectable`, `Properties` and `ObjectManager`
@@ -26,6 +43,11 @@
 
 ### Changed
 
+- A method call to a path with nothing exported is now answered with
+  `org.freedesktop.DBus.Error.UnknownObject` rather than
+  `org.freedesktop.DBus.Error.UnknownMethod`, including on a connection that
+  exports nothing. `org.freedesktop.DBus.Peer` is still answered on every
+  path.
 - **Breaking:** `Rebus.call/3` now returns a D-Bus error reply from the peer as
   `{:error, {:dbus_error, %Rebus.Message{type: :error}}}` rather than
   `{:error, %Rebus.Message{type: :error}}`, so it no longer shares a shape

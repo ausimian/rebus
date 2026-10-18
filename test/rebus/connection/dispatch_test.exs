@@ -7,17 +7,38 @@ defmodule Rebus.Connection.DispatchTest do
   alias Rebus.Connection.Dispatch
   alias Rebus.Connection.FDClaims
   alias Rebus.Connection.Inbound
+  alias Rebus.Connection.InboundCalls
+  alias Rebus.Connection.Objects
   alias Rebus.Connection.Pending
   alias Rebus.Connection.Rights
+  alias Rebus.Connection.Service
   alias Rebus.Connection.Writer
+  alias Rebus.Interface
   alias Rebus.MatchRule
   alias Rebus.Message
   alias Rebus.ScriptedTransport
+  alias Rebus.Service.Call
   alias Rebus.TestFD
 
   @machine_id "0123456789abcdef0123456789abcdef"
+  @unknown_object_error "org.freedesktop.DBus.Error.UnknownObject"
+  @unknown_interface_error "org.freedesktop.DBus.Error.UnknownInterface"
   @unknown_method_error "org.freedesktop.DBus.Error.UnknownMethod"
+  @invalid_args_error "org.freedesktop.DBus.Error.InvalidArgs"
+  @limits_exceeded_error "org.freedesktop.DBus.Error.LimitsExceeded"
+  @no_reply_error "org.freedesktop.DBus.Error.NoReply"
   @failed_error "org.freedesktop.DBus.Error.Failed"
+
+  @path "/org/example/Calc"
+  @calculator Interface.new!("org.example.Calculator",
+                methods: [
+                  {"Add", in: [a: "i", b: "i"], out: [sum: "i"]},
+                  {"Reset", []}
+                ]
+              )
+  @display Interface.new!("org.example.Display",
+             methods: [{"Show", in: [text: "s"]}, {"Reset", []}]
+           )
 
   describe "reply correlation" do
     test "answers the caller of a correlated reply and clears its entry" do
@@ -191,7 +212,7 @@ defmodule Rebus.Connection.DispatchTest do
       assert reply.header_fields.error_name == @failed_error
     end
 
-    test "refuses any other method with UnknownMethod" do
+    test "refuses a call to a path with nothing exported with UnknownObject" do
       call =
         %{
           Message.new!(:method_call,
@@ -204,6 +225,16 @@ defmodule Rebus.Connection.DispatchTest do
         }
 
       assert [%{msg: reply}] = queued_replies(call)
+      assert %Message{type: :error, body: [detail]} = reply
+      assert reply.header_fields.error_name == @unknown_object_error
+      assert reply.header_fields.reply_serial == 5
+      # The reply body must never echo caller-supplied data.
+      refute detail =~ "Nope"
+      refute detail =~ "/test"
+    end
+
+    test "refuses an unknown Peer member with UnknownMethod" do
+      assert [%{msg: reply}] = queued_replies(peer_call("Nope"))
       assert %Message{type: :error, body: ["Method not handled by this connection"]} = reply
       assert reply.header_fields.error_name == @unknown_method_error
     end
@@ -232,6 +263,308 @@ defmodule Rebus.Connection.DispatchTest do
 
       assert queued_replies(call) == []
       refute_received :advance_writes
+    end
+  end
+
+  describe "routing to exported objects" do
+    test "hands a declared call to its handler and records it" do
+      {export_ref, state} = exported(connection())
+      call = app_call("Add", signature: "ii", body: [2, 3])
+
+      assert {:continue, :recv, %Connection{} = state} = dispatch(call, state)
+
+      assert_received {^export_ref, %Call{} = delivered}
+      assert delivered.conn == self()
+      assert delivered.export == export_ref
+      assert delivered.serial == 5
+      assert delivered.sender == ":1.7"
+      assert delivered.path == @path
+      assert delivered.interface == "org.example.Calculator"
+      assert delivered.member == "Add"
+      assert delivered.signature == "ii"
+      assert delivered.out_signature == "i"
+      assert delivered.body == [2, 3]
+      assert delivered.flags == []
+      refute delivered.no_reply?
+      assert delivered.unix_fds == []
+      assert delivered.message.header_fields.member == "Add"
+
+      assert {:ok, entry} = InboundCalls.fetch(state.inbound_calls, delivered.ref)
+      assert entry.serial == 5
+      assert entry.sender == ":1.7"
+      assert entry.export == export_ref
+      assert entry.deadline == delivered.deadline
+      assert is_integer(delivered.deadline)
+      assert :queue.is_empty(state.writer.queue)
+
+      InboundCalls.close_all(state.inbound_calls)
+    end
+
+    test "refuses an interface the object does not export with UnknownInterface" do
+      {_export_ref, state} = exported(connection())
+
+      for interface <- ["org.example.Missing", "org.freedesktop.DBus.Properties"] do
+        call = app_call("Add", interface: interface, signature: "ii", body: [2, 3])
+        assert_refused(call, state, @unknown_interface_error)
+      end
+    end
+
+    test "refuses an undeclared member with UnknownMethod" do
+      {_export_ref, state} = exported(connection())
+
+      assert_refused(
+        app_call("Subtract", signature: "ii", body: [2, 3]),
+        state,
+        @unknown_method_error
+      )
+    end
+
+    test "refuses arguments that differ from the declaration with InvalidArgs" do
+      {_export_ref, state} = exported(connection())
+
+      for {signature, body} <- [{"", []}, {"i", [2]}, {"iu", [2, 3]}, {"iii", [1, 2, 3]}] do
+        call = app_call("Add", signature: signature, body: body)
+        assert_refused(call, state, @invalid_args_error)
+      end
+    end
+
+    test "refuses everything on an intermediate node with UnknownInterface" do
+      {_export_ref, state} = exported(connection())
+
+      for {path, interface, member} <- [
+            {"/org/example", "org.example.Calculator", "Add"},
+            {"/", "org.freedesktop.DBus.Introspectable", "Introspect"},
+            {"/org", nil, "Anything"}
+          ] do
+        call = app_call(member, path: path, interface: interface)
+        assert_refused(call, state, @unknown_interface_error)
+      end
+    end
+
+    test "resolves a call without an interface to the one interface that declares it" do
+      {export_ref, state} = exported(connection(), interfaces: [@calculator, @display])
+
+      call = app_call("Show", interface: nil, signature: "s", body: ["hi"])
+      assert {:continue, :recv, %Connection{} = state} = dispatch(call, state)
+
+      assert_received {^export_ref, %Call{interface: "org.example.Display", member: "Show"}}
+      InboundCalls.close_all(state.inbound_calls)
+    end
+
+    test "refuses a call without an interface that no interface, or several, declare" do
+      {_export_ref, state} = exported(connection(), interfaces: [@calculator, @display])
+
+      assert_refused(app_call("Reset", interface: nil), state, @unknown_method_error)
+      assert_refused(app_call("Nope", interface: nil), state, @unknown_method_error)
+    end
+
+    test "refuses a call without an interface for a Peer member several interfaces declare" do
+      pinger = Interface.new!("org.example.Pinger", methods: [{"Ping", []}])
+      other = Interface.new!("org.example.OtherPinger", methods: [{"Ping", []}])
+      {_export_ref, state} = exported(connection(), interfaces: [pinger, other])
+
+      assert_refused(app_call("Ping", interface: nil), state, @unknown_method_error)
+    end
+
+    test "answers Peer members without an interface when nothing exported declares them" do
+      {_export_ref, state} = exported(connection())
+
+      for path <- [@path, "/org", "/elsewhere"] do
+        call = app_call("Ping", path: path, interface: nil)
+        assert [%{msg: %Message{type: :method_return}}] = queued_replies(call, state)
+      end
+    end
+
+    test "prefers an exported member to Peer for a call without an interface" do
+      pinger = Interface.new!("org.example.Pinger", methods: [{"Ping", []}])
+      {export_ref, state} = exported(connection(), interfaces: [pinger])
+
+      assert {:continue, :recv, %Connection{} = state} =
+               dispatch(app_call("Ping", interface: nil), state)
+
+      assert_received {^export_ref, %Call{interface: "org.example.Pinger"}}
+      assert :queue.is_empty(state.writer.queue)
+      InboundCalls.close_all(state.inbound_calls)
+    end
+
+    test "answers Peer on an exported path" do
+      {export_ref, state} = exported(connection())
+
+      assert [%{msg: %Message{type: :method_return}}] =
+               queued_replies(app_call("Ping", interface: "org.freedesktop.DBus.Peer"), state)
+
+      refute_received {^export_ref, _call}
+    end
+
+    test "routes calls below a subtree export with the path called" do
+      {export_ref, state} = exported(connection(), path: "/org/example", subtree?: true)
+      call = app_call("Add", path: "/org/example/a/b", signature: "ii", body: [2, 3])
+
+      assert {:continue, :recv, %Connection{} = state} = dispatch(call, state)
+
+      assert_received {^export_ref, %Call{path: "/org/example/a/b"}}
+      InboundCalls.close_all(state.inbound_calls)
+    end
+
+    test "refuses a call beyond max_pending_calls with LimitsExceeded" do
+      {export_ref, state} = exported(%{connection() | max_pending_calls: 1})
+      call = app_call("Add", signature: "ii", body: [2, 3])
+
+      assert {:continue, :recv, %Connection{} = state} = dispatch(call, state)
+      assert_received {^export_ref, %Call{}}
+
+      assert [%{msg: reply}] = queued_replies(%{call | serial: 6}, state)
+      assert reply.header_fields.error_name == @limits_exceeded_error
+      assert reply.header_fields.reply_serial == 6
+      refute_received {^export_ref, _call}
+
+      InboundCalls.close_all(state.inbound_calls)
+    end
+
+    test "never answers a call that asked for no reply, on any path" do
+      {export_ref, state} = exported(%{connection() | max_pending_calls: 1})
+      {:continue, :recv, state} = dispatch(app_call("Add", signature: "ii", body: [2, 3]), state)
+      assert_received {^export_ref, %Call{}}
+
+      for call <- [
+            app_call("Add", path: "/nowhere"),
+            app_call("Add", path: "/org"),
+            app_call("Add", interface: "org.example.Missing"),
+            app_call("Nope"),
+            app_call("Add", signature: "i", body: [2]),
+            # Over the limit, but untracked, so delivered below instead.
+            app_call("Ping", interface: "org.freedesktop.DBus.Peer")
+          ] do
+        call = %{call | flags: [:no_reply_expected]}
+        assert queued_replies(call, state) == []
+      end
+
+      refute_received :advance_writes
+      InboundCalls.close_all(state.inbound_calls)
+    end
+
+    test "delivers a call that asked for no reply without recording it, even at the limit" do
+      {export_ref, state} = exported(%{connection() | max_pending_calls: 1})
+      {:continue, :recv, state} = dispatch(app_call("Add", signature: "ii", body: [2, 3]), state)
+      assert_received {^export_ref, %Call{}}
+
+      call = %{app_call("Add", signature: "ii", body: [4, 5]) | flags: [:no_reply_expected]}
+      assert {:continue, :recv, %Connection{} = after_call} = dispatch(call, state)
+
+      assert_received {^export_ref,
+                       %Call{no_reply?: true, deadline: nil, flags: [:no_reply_expected]}}
+
+      assert after_call.inbound_calls == state.inbound_calls
+      assert :queue.is_empty(after_call.writer.queue)
+      InboundCalls.close_all(state.inbound_calls)
+    end
+
+    test "records no deadline for an export that never expires" do
+      {export_ref, state} = exported(connection(), call_timeout: :infinity)
+
+      {:continue, :recv, state} = dispatch(app_call("Add", signature: "ii", body: [2, 3]), state)
+
+      assert_received {^export_ref, %Call{deadline: nil, ref: ref}}
+      assert {:ok, %{timer_ref: nil}} = InboundCalls.fetch(state.inbound_calls, ref)
+    end
+  end
+
+  describe "completing inbound calls" do
+    test "addresses the reply from the recorded call, not from the handler" do
+      {_call, state} = routed()
+      [ref] = Map.keys(state.inbound_calls.entries)
+
+      forged =
+        Message.new!(:method_return,
+          reply_serial: 99,
+          destination: ":1.666",
+          signature: "i",
+          body: [5]
+        )
+
+      assert {:ok, reply, state} = Service.complete(state, ref, forged)
+      assert reply.header_fields.reply_serial == 5
+      assert reply.header_fields.destination == ":1.7"
+      assert state.inbound_calls == InboundCalls.new()
+    end
+
+    test "sends a peer-to-peer reply without a destination" do
+      {export_ref, state} = exported(connection())
+      call = app_call("Add", sender: nil, signature: "ii", body: [2, 3])
+      {:continue, :recv, state} = dispatch(call, state)
+      assert_received {^export_ref, %Call{ref: ref, sender: nil}}
+
+      forged = Message.new!(:method_return, reply_serial: 99, destination: ":1.666")
+
+      assert {:ok, reply, _state} = Service.complete(state, ref, forged)
+      refute Map.has_key?(reply.header_fields, :destination)
+    end
+
+    test "answers a second reply with unknown_call" do
+      {_call, state} = routed()
+      [ref] = Map.keys(state.inbound_calls.entries)
+      reply = Message.new!(:method_return, reply_serial: 5, signature: "i", body: [5])
+
+      {:ok, _reply, state} = Service.complete(state, ref, reply)
+
+      assert {:error, :unknown_call} = Service.complete(state, ref, reply)
+    end
+
+    test "answers an expired call with NoReply and forgets it" do
+      {%Call{ref: ref}, state} = routed(call_timeout: 10)
+      assert_receive {:inbound_call_timeout, ^ref}, 1_000
+
+      assert {:noreply, state} = Connection.handle_info({:inbound_call_timeout, ref}, state)
+
+      assert [%{kind: :reply, msg: reply}] = :queue.to_list(state.writer.queue)
+      assert reply.header_fields.error_name == @no_reply_error
+      assert reply.header_fields.reply_serial == 5
+      assert reply.header_fields.destination == ":1.7"
+      assert_received :advance_writes
+
+      reply = Message.new!(:method_return, signature: "i", body: [5], reply_serial: 5)
+      assert {:error, :unknown_call} = Service.complete(state, ref, reply)
+    end
+
+    test "ignores an expiry timer that fires after its call completed" do
+      {%Call{ref: ref}, state} = routed(call_timeout: 10)
+      reply = Message.new!(:method_return, signature: "i", body: [5], reply_serial: 5)
+      {:ok, _reply, state} = Service.complete(state, ref, reply)
+
+      assert {:noreply, ^state} = Connection.handle_info({:inbound_call_timeout, ref}, state)
+    end
+
+    test "fails pending calls with Failed and unexports when the handler exits" do
+      handler = spawn(fn -> Process.sleep(:infinity) end)
+      {export_ref, state} = exported(connection(), handler: handler)
+      {:continue, :recv, state} = dispatch(app_call("Add", signature: "ii", body: [2, 3]), state)
+
+      Process.exit(handler, :kill)
+      {:monitors, [{:process, ^handler}]} = Process.info(self(), :monitors)
+      monitor_ref = Map.fetch!(state.objects.exports, export_ref).monitor_ref
+
+      assert {:noreply, state} =
+               Connection.handle_info({:DOWN, monitor_ref, :process, handler, :killed}, state)
+
+      assert [%{msg: reply}] = :queue.to_list(state.writer.queue)
+      assert reply.header_fields.error_name == @failed_error
+      assert reply.body == ["Handler exited"]
+      assert reply.header_fields.reply_serial == 5
+      assert state.inbound_calls == InboundCalls.new()
+      assert state.objects == Objects.new()
+    end
+
+    test "fails pending calls with Failed when their object is unexported" do
+      {export_ref, state} = exported(connection())
+      {:continue, :recv, state} = dispatch(app_call("Add", signature: "ii", body: [2, 3]), state)
+
+      state = Service.unexport(state, export_ref)
+
+      assert [%{msg: reply}] = :queue.to_list(state.writer.queue)
+      assert reply.header_fields.error_name == @failed_error
+      assert reply.body == ["Object unexported"]
+      assert state.inbound_calls == InboundCalls.new()
+      assert {:monitors, []} = Process.info(self(), :monitors)
     end
   end
 
@@ -298,6 +631,54 @@ defmodule Rebus.Connection.DispatchTest do
       )
       | serial: 5
     }
+  end
+
+  # Exports `@calculator` at `@path` to this process, or what `opts` says.
+  defp exported(%Connection{} = state, opts \\ []) do
+    ref = make_ref()
+
+    {{:ok, ^ref}, state} =
+      Service.export(state, %{
+        ref: ref,
+        path: Keyword.get(opts, :path, @path),
+        subtree?: Keyword.get(opts, :subtree?, false),
+        interfaces: Keyword.get(opts, :interfaces, [@calculator]),
+        handler: Keyword.get(opts, :handler, self()),
+        call_timeout: Keyword.get(opts, :call_timeout, 60_000)
+      })
+
+    {ref, state}
+  end
+
+  # A call to `Add` routed to this process and recorded.
+  defp routed(opts \\ []) do
+    {export_ref, state} = exported(connection(), opts)
+    {:continue, :recv, state} = dispatch(app_call("Add", signature: "ii", body: [2, 3]), state)
+    assert_received {^export_ref, %Call{} = call}
+    {call, state}
+  end
+
+  defp app_call(member, opts \\ []) do
+    fields =
+      [
+        path: Keyword.get(opts, :path, @path),
+        interface: Keyword.get(opts, :interface, "org.example.Calculator"),
+        member: member,
+        sender: Keyword.get(opts, :sender, ":1.7"),
+        signature: Keyword.get(opts, :signature, ""),
+        body: Keyword.get(opts, :body, [])
+      ]
+      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+
+    %{Message.new!(:method_call, fields) | serial: 5}
+  end
+
+  defp assert_refused(%Message{} = call, %Connection{} = state, error_name) do
+    assert [%{kind: :reply, msg: reply}] = queued_replies(call, state)
+    assert %Message{type: :error, body: [_detail]} = reply
+    assert reply.header_fields.error_name == error_name
+    assert reply.header_fields.reply_serial == call.serial
+    refute_received {_export_ref, %Call{}}
   end
 
   # A pending-reply entry answered by this process: `GenServer.reply/2` on a

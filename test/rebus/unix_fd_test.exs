@@ -1259,7 +1259,7 @@ defmodule Rebus.UnixFDTest do
                       header_fields: %{
                         reply_serial: ^serial,
                         destination: ":1.99",
-                        error_name: "org.freedesktop.DBus.Error.UnknownMethod"
+                        error_name: "org.freedesktop.DBus.Error.UnknownObject"
                       }
                     }},
                    1_000
@@ -1990,7 +1990,14 @@ defmodule Rebus.UnixFDTest do
   defp hold_inbound_call_fd!(connection) do
     fd = TestFD.dup!()
 
-    call = %{ref: make_ref(), serial: 1, sender: ":1.99", handler: self(), unix_fds: [fd]}
+    call = %{
+      ref: make_ref(),
+      serial: 1,
+      sender: ":1.99",
+      export: make_ref(),
+      handler: self(),
+      unix_fds: [fd]
+    }
 
     :sys.replace_state(connection, fn state ->
       {_entry, calls} = InboundCalls.insert(state.inbound_calls, call, 60_000)

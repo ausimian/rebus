@@ -13,7 +13,8 @@ defmodule Rebus.Connection.InboundCalls do
   # therefore cancels that timer and closes those descriptors here rather than
   # at each call site, so every way out closes them exactly once.
   #
-  # Nothing routes calls into this table yet; export and routing add that.
+  # Every entry is bound to the export it was routed through, so unexporting
+  # an object, or losing its handler, fails exactly the calls made on it.
   # Expiry timers send `{:inbound_call_timeout, ref}` to the connection.
 
   use TypedStruct
@@ -26,14 +27,15 @@ defmodule Rebus.Connection.InboundCalls do
     use TypedStruct
 
     # One call awaiting its handler's answer: the serial and sender a reply is
-    # addressed to, the handler it was routed to, the descriptors it carried,
-    # and the timer that expires it. `timer_ref` and `deadline` are `nil` for
-    # a call that never expires.
+    # addressed to, the export and handler it was routed to, the descriptors
+    # it carried, and the timer that expires it. `timer_ref` and `deadline`
+    # are `nil` for a call that never expires.
 
     typedstruct enforce: true do
       field :ref, reference()
       field :serial, pos_integer()
       field :sender, binary() | nil
+      field :export, reference()
       field :handler, pid()
       field :unix_fds, [UnixFD.t()]
       field :timer_ref, reference() | nil
@@ -46,6 +48,7 @@ defmodule Rebus.Connection.InboundCalls do
           required(:ref) => reference(),
           required(:serial) => pos_integer(),
           required(:sender) => binary() | nil,
+          required(:export) => reference(),
           required(:handler) => pid(),
           required(:unix_fds) => [UnixFD.t()]
         }
@@ -59,6 +62,8 @@ defmodule Rebus.Connection.InboundCalls do
 
   # Records a call routed to a handler and starts its expiry timer, which
   # targets `self()`: the connection is the only process that calls in here.
+  # The sender is copied so a retained entry cannot pin the receive buffer it
+  # was parsed from.
   @spec insert(t(), call(), pos_integer() | :infinity) :: {Entry.t(), t()}
   def insert(%__MODULE__{} = calls, %{ref: ref} = call, call_timeout)
       when is_reference(ref) and
@@ -68,7 +73,8 @@ defmodule Rebus.Connection.InboundCalls do
     entry = %Entry{
       ref: ref,
       serial: call.serial,
-      sender: call.sender,
+      sender: copy(call.sender),
+      export: call.export,
       handler: call.handler,
       unix_fds: call.unix_fds,
       timer_ref: timer_ref,
@@ -81,6 +87,10 @@ defmodule Rebus.Connection.InboundCalls do
   @spec fetch(t(), reference()) :: {:ok, Entry.t()} | :error
   def fetch(%__MODULE__{entries: entries}, ref), do: Map.fetch(entries, ref)
 
+  # How many calls are waiting, which the connection bounds.
+  @spec size(t()) :: non_neg_integer()
+  def size(%__MODULE__{entries: entries}), do: map_size(entries)
+
   # The handler answered. The entry leaves the table with its timer cancelled
   # and its descriptors closed, so a second answer finds nothing.
   @spec complete(t(), reference()) :: {Entry.t() | nil, t()}
@@ -91,6 +101,17 @@ defmodule Rebus.Connection.InboundCalls do
   # error: cancelling a timer cannot recall a message it has already sent.
   @spec expire(t(), reference()) :: {Entry.t() | nil, t()}
   def expire(%__MODULE__{} = calls, ref), do: pop(calls, ref)
+
+  # The export the calls were routed through is gone, so every call made on
+  # it leaves the table, released, for the connection to fail. The scan is
+  # bounded by the connection's limit on pending calls.
+  @spec pop_export(t(), reference()) :: {[Entry.t()], t()}
+  def pop_export(%__MODULE__{entries: entries} = calls, export) do
+    {popped, kept} = Map.split_with(entries, fn {_ref, entry} -> entry.export == export end)
+    popped = popped |> Map.values() |> Enum.sort_by(& &1.serial)
+    Enum.each(popped, &release/1)
+    {popped, %{calls | entries: kept}}
+  end
 
   # Cancels every timer and closes every retained descriptor without
   # touching the rest of the table. Used from `terminate/2`, where nothing
@@ -123,6 +144,9 @@ defmodule Rebus.Connection.InboundCalls do
     cancel_timer(timer_ref)
     UnixFD.close_all(fds)
   end
+
+  defp copy(nil), do: nil
+  defp copy(sender) when is_binary(sender), do: :binary.copy(sender)
 
   defp start_timer(_ref, :infinity), do: {nil, nil}
 

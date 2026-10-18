@@ -9,6 +9,8 @@ defmodule RebusTest do
   alias Rebus.Connection.Inbound
   alias Rebus.Connection.Pending
   alias Rebus.Message
+  alias Rebus.Service
+  alias Rebus.Service.Call
   alias Rebus.TestImpl
   alias Rebus.TestServer
   alias Rebus.Transport.Socket
@@ -18,6 +20,11 @@ defmodule RebusTest do
   # below the 64–270KB source buffers used by the retention regressions.
   @max_copied_referenced_bytes 256
   @test_bus_guid "30313233343536373839414243444546"
+
+  @calc_path "/org/example/Calc"
+  @calculator Rebus.Interface.new!("org.example.Calculator",
+                methods: [{"Add", in: [a: "i", b: "i"], out: [sum: "i"]}]
+              )
 
   # This module runs synchronously, so the only connections alive when a test
   # starts belong to the previous test and are still tearing down after its
@@ -4544,69 +4551,350 @@ defmodule RebusTest do
     end
   end
 
-  describe "Handler replies" do
+  describe "Exported objects" do
     setup [:server_setup, :client_setup]
 
-    # Nothing routes inbound calls to a handler yet, and this path does not
-    # look calls up, so these replies answer serials no call used.
-    test "write a method return the handler built and answer the handler", %{
-      cli: cli,
-      svr: svr
-    } do
-      reply =
-        Message.new!(:method_return,
-          reply_serial: 41,
-          destination: ":1.99",
-          signature: "s",
-          body: ["done"]
-        )
+    test "receive their calls and answer each with a correlated reply", %{cli: cli, svr: svr} do
+      assert {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
+      {:ok, serial} = TestServer.push_call(svr, calc_call("Add", [2, 3]))
 
-      assert :ok = Connection.send_reply(cli, reply)
+      assert_receive {^ref, %Call{} = call}, 1_000
+      assert %Call{conn: ^cli, export: ^ref, serial: ^serial, sender: ":1.99"} = call
+      assert %Call{interface: "org.example.Calculator", member: "Add", body: [2, 3]} = call
 
-      assert_receive {^svr,
-                      %Message{type: :method_return, header_fields: fields, body: ["done"]}},
+      assert :ok = Service.reply(call, [5])
+
+      assert_receive {^svr, %Message{type: :method_return, header_fields: fields, body: [5]}},
                      1_000
 
-      assert fields.reply_serial == 41
+      assert fields.reply_serial == serial
       assert fields.destination == ":1.99"
+      assert fields.signature == "i"
       assert_method_call_round_trip(svr, cli)
     end
 
-    test "write an error the handler built", %{cli: cli, svr: svr} do
-      error =
-        Message.new!(:error,
-          reply_serial: 42,
-          destination: ":1.99",
-          error_name: "org.example.Error.Refused",
-          signature: "s",
-          body: ["refused"]
-        )
+    test "refuse a second answer to the same call", %{cli: cli, svr: svr} do
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
+      {:ok, _serial} = TestServer.push_call(svr, calc_call("Add", [2, 3]))
+      assert_receive {^ref, %Call{} = call}, 1_000
 
-      assert :ok = Connection.send_reply(cli, error)
+      assert :ok = Service.reply(call, [5])
+      assert_receive {^svr, %Message{type: :method_return}}, 1_000
 
-      assert_receive {^svr, %Message{type: :error, header_fields: fields, body: ["refused"]}},
-                     1_000
-
-      assert fields.reply_serial == 42
-      assert fields.error_name == "org.example.Error.Refused"
-    end
-
-    test "accept only replies", %{cli: cli, svr: svr} do
-      call = Message.new!(:method_call, path: "/org/example/Object", member: "NotAReply")
-
-      signal =
-        Message.new!(:signal,
-          path: "/org/example/Object",
-          interface: "org.example.Iface",
-          member: "NotAReply"
-        )
-
-      assert {:error, {:invalid_message_type, :method_call}} = Connection.send_reply(cli, call)
-      assert {:error, {:invalid_message_type, :signal}} = Connection.send_reply(cli, signal)
+      assert {:error, :unknown_call} = Service.reply(call, [5])
+      assert {:error, :unknown_call} = Service.reply_error(call, "org.example.Error.Late", "late")
       refute_receive {^svr, %Message{}}, 100
     end
 
-    test "cannot be forged through Rebus.send", %{cli: cli, svr: svr} do
+    test "can be answered from another process", %{cli: cli, svr: svr} do
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
+      {:ok, serial} = TestServer.push_call(svr, calc_call("Add", [2, 3]))
+      assert_receive {^ref, %Call{} = call}, 1_000
+
+      assert :ok = Task.await(Task.async(fn -> Service.reply(call, [5]) end))
+
+      assert_receive {^svr,
+                      %Message{type: :method_return, header_fields: %{reply_serial: ^serial}}},
+                     1_000
+    end
+
+    test "answer with an error the handler names", %{cli: cli, svr: svr} do
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
+      {:ok, serial} = TestServer.push_call(svr, calc_call("Add", [2, 3]))
+      assert_receive {^ref, %Call{} = call}, 1_000
+
+      assert :ok = Service.reply_error(call, "org.example.Error.Overflow", "too big")
+
+      assert_receive {^svr, %Message{type: :error, header_fields: fields, body: ["too big"]}},
+                     1_000
+
+      assert fields.error_name == "org.example.Error.Overflow"
+      assert fields.reply_serial == serial
+      assert fields.destination == ":1.99"
+    end
+
+    test "stay open when an answer cannot be built", %{cli: cli, svr: svr} do
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
+      {:ok, serial} = TestServer.push_call(svr, calc_call("Add", [2, 3]))
+      assert_receive {^ref, %Call{} = call}, 1_000
+
+      assert {:error, :signature_mismatch} = Service.reply(call, ["five"])
+      assert {:error, :signature_mismatch} = Service.reply(call, [5, 6])
+
+      assert {:error, {:invalid_header_field, :error_name}} =
+               Service.reply_error(call, "not an error name", "nope")
+
+      refute_receive {^svr, %Message{}}, 100
+
+      assert :ok = Service.reply(call, [5])
+
+      assert_receive {^svr,
+                      %Message{type: :method_return, header_fields: %{reply_serial: ^serial}}},
+                     1_000
+    end
+
+    test "answer with a reply built by hand, addressed from the call", %{cli: cli, svr: svr} do
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
+      {:ok, first} = TestServer.push_call(svr, calc_call("Add", [2, 3]))
+      {:ok, second} = TestServer.push_call(svr, calc_call("Add", [4, 5]))
+      assert_receive {^ref, %Call{serial: ^first} = return_call}, 1_000
+      assert_receive {^ref, %Call{serial: ^second} = error_call}, 1_000
+
+      forged =
+        Message.new!(:method_return,
+          reply_serial: 999,
+          destination: ":1.666",
+          signature: "i",
+          body: [5]
+        )
+
+      assert {:error, :signature_mismatch} =
+               Service.reply_message(
+                 return_call,
+                 Message.new!(:method_return, reply_serial: 1, signature: "s", body: ["5"])
+               )
+
+      assert {:error, {:invalid_message_type, :signal}} =
+               Service.reply_message(
+                 return_call,
+                 Message.new!(:signal, path: "/", interface: "org.example.I", member: "S")
+               )
+
+      assert :ok = Service.reply_message(return_call, forged)
+
+      assert_receive {^svr, %Message{type: :method_return, header_fields: fields, body: [5]}},
+                     1_000
+
+      assert fields.reply_serial == first
+      assert fields.destination == ":1.99"
+
+      structured =
+        Message.new!(:error,
+          reply_serial: 999,
+          error_name: "org.example.Error.Detailed",
+          signature: "su",
+          body: ["detail", 7]
+        )
+
+      assert :ok = Service.reply_message(error_call, structured)
+
+      assert_receive {^svr, %Message{type: :error, header_fields: fields, body: ["detail", 7]}},
+                     1_000
+
+      assert fields.reply_serial == second
+      assert fields.destination == ":1.99"
+    end
+
+    test "send nothing for a call that asked for no reply", %{cli: cli, svr: svr} do
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
+      :ok = TestServer.push(svr, calc_call("Add", [2, 3], flags: [:no_reply_expected]))
+      assert_receive {^ref, %Call{no_reply?: true} = call}, 1_000
+
+      assert :ok = Service.reply(call, [5])
+      assert :ok = Service.reply_error(call, "org.example.Error.Ignored", "ignored")
+      refute_receive {^svr, %Message{}}, 100
+
+      assert_method_call_round_trip(svr, cli)
+    end
+
+    test "fail their pending calls when unexported", %{cli: cli, svr: svr} do
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
+      {:ok, serial} = TestServer.push_call(svr, calc_call("Add", [2, 3]))
+      assert_receive {^ref, %Call{} = call}, 1_000
+
+      assert :ok = Service.unexport(cli, ref)
+
+      assert_receive {^svr, %Message{type: :error, header_fields: fields, body: [detail]}}, 1_000
+      assert fields.error_name == "org.freedesktop.DBus.Error.Failed"
+      assert fields.reply_serial == serial
+      assert detail == "Object unexported"
+
+      assert {:error, :unknown_call} = Service.reply(call, [5])
+      assert :ok = Service.unexport(cli, ref)
+
+      {:ok, serial} = TestServer.push_call(svr, calc_call("Add", [2, 3]))
+
+      assert_receive {^svr,
+                      %Message{
+                        type: :error,
+                        header_fields: %{
+                          reply_serial: ^serial,
+                          error_name: "org.freedesktop.DBus.Error.UnknownObject"
+                        }
+                      }},
+                     1_000
+    end
+
+    test "fail their pending calls and are unexported when the handler exits", %{
+      cli: cli,
+      svr: svr
+    } do
+      parent = self()
+
+      handler =
+        spawn(fn ->
+          receive do
+            {_ref, %Call{} = call} -> send(parent, {:handled, call})
+          end
+
+          Process.sleep(:infinity)
+        end)
+
+      {:ok, _ref} = Service.export(cli, @calc_path, [@calculator], handler: handler)
+      {:ok, serial} = TestServer.push_call(svr, calc_call("Add", [2, 3]))
+      assert_receive {:handled, %Call{} = call}, 1_000
+
+      Process.exit(handler, :kill)
+
+      assert_receive {^svr, %Message{type: :error, header_fields: fields, body: [detail]}}, 1_000
+      assert fields.error_name == "org.freedesktop.DBus.Error.Failed"
+      assert fields.reply_serial == serial
+      assert detail == "Handler exited"
+
+      assert {:error, :unknown_call} = Service.reply(call, [5])
+
+      # The export went with its handler, so the path is free again.
+      assert {:ok, _ref} = Service.export(cli, @calc_path, [@calculator])
+    end
+
+    test "expire unanswered calls with NoReply", %{cli: cli, svr: svr} do
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator], call_timeout: 50)
+      {:ok, serial} = TestServer.push_call(svr, calc_call("Add", [2, 3]))
+      assert_receive {^ref, %Call{deadline: deadline} = call}, 1_000
+      assert is_integer(deadline)
+
+      assert_receive {^svr, %Message{type: :error, header_fields: fields}}, 1_000
+      assert fields.error_name == "org.freedesktop.DBus.Error.NoReply"
+      assert fields.reply_serial == serial
+
+      assert {:error, :unknown_call} = Service.reply(call, [5])
+    end
+
+    test "refuse calls beyond max_pending_calls with LimitsExceeded" do
+      # A connection of its own, to a server of its own, with a limit of one.
+      {:ok, svr} = start_supervised({Rebus.TestServer, tap: self()}, id: :limited_server)
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      {:ok, cli} = Rebus.connect(addr, cached_identity(max_pending_calls: 1))
+      await_hello(svr)
+
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
+      {:ok, _first} = TestServer.push_call(svr, calc_call("Add", [2, 3]))
+      assert_receive {^ref, %Call{} = call}, 1_000
+
+      {:ok, second} = TestServer.push_call(svr, calc_call("Add", [4, 5]))
+
+      assert_receive {^svr, %Message{type: :error, header_fields: fields}}, 1_000
+      assert fields.error_name == "org.freedesktop.DBus.Error.LimitsExceeded"
+      assert fields.reply_serial == second
+      refute_received {^ref, %Call{}}
+
+      # Answering the first call frees its slot.
+      assert :ok = Service.reply(call, [5])
+      assert_receive {^svr, %Message{type: :method_return}}, 1_000
+      {:ok, _third} = TestServer.push_call(svr, calc_call("Add", [6, 7]))
+      assert_receive {^ref, %Call{body: [6, 7]}}, 1_000
+
+      assert :ok = Rebus.close(cli)
+    end
+
+    test "refuse an invalid max_pending_calls", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+
+      for limit <- [0, -1, 1.5, :infinity] do
+        assert {:error, :invalid_max_pending_calls} =
+                 Rebus.connect(addr, max_pending_calls: limit)
+      end
+    end
+
+    test "refuse an invalid max_pending_calls before trying a further bus address" do
+      parent = self()
+
+      connector = fn address, _args ->
+        send(parent, {:connect_candidate, address})
+        {:error, :invalid_max_pending_calls}
+      end
+
+      assert {:error, :invalid_max_pending_calls} =
+               connect_candidates(
+                 [{:local, "/tmp/one", nil}, {:local, "/tmp/two", nil}],
+                 [timeout: 50, max_pending_calls: 0],
+                 connector: TestImpl.connector(connect_candidate: connector),
+                 identity: TestImpl.identity(auth_id: fn _timeout -> {:ok, "501\n"} end)
+               )
+
+      assert_receive {:connect_candidate, %{path: "/tmp/one"}}
+      refute_receive {:connect_candidate, %{path: "/tmp/two"}}
+    end
+
+    test "refuse invalid exports", %{cli: cli} do
+      dead = spawn(fn -> :ok end)
+
+      for {path, interfaces, opts, reason} <- [
+            {"not/a/path", [@calculator], [], :invalid_path},
+            {"/trailing/", [@calculator], [], :invalid_path},
+            {@calc_path, [], [], {:invalid_interface, []}},
+            {@calc_path, :calc, [], {:invalid_interface, :calc}},
+            {@calc_path, ["org.example.Calculator"], [],
+             {:invalid_interface, "org.example.Calculator"}},
+            {@calc_path, [@calculator, @calculator], [],
+             {:invalid_interface, {:duplicate, "org.example.Calculator"}}},
+            {@calc_path, [Rebus.Interface.peer()], [],
+             {:invalid_interface, {:reserved, "org.freedesktop.DBus.Peer"}}},
+            {@calc_path, [Rebus.Interface.properties()], [],
+             {:invalid_interface, {:reserved, "org.freedesktop.DBus.Properties"}}},
+            {@calc_path, [Rebus.Interface.introspectable()], [],
+             {:invalid_interface, {:reserved, "org.freedesktop.DBus.Introspectable"}}},
+            {@calc_path, [@calculator], [handler: :me], :invalid_handler},
+            {@calc_path, [@calculator], [subtree: :yes], :invalid_subtree},
+            {@calc_path, [@calculator], [call_timeout: 0], :invalid_call_timeout},
+            {@calc_path, [@calculator], [call_timeout: nil], :invalid_call_timeout}
+          ] do
+        assert {:error, ^reason} = Service.export(cli, path, interfaces, opts)
+      end
+
+      # A handler that has already exited is accepted, and unexported at once.
+      assert {:ok, _ref} = Service.export(cli, "/dead", [@calculator], handler: dead)
+    end
+
+    test "refuse an interface already exported at the path", %{cli: cli, svr: svr} do
+      display = Rebus.Interface.new!("org.example.Display", methods: [{"Show", in: ["s"]}])
+
+      assert {:ok, _ref} = Service.export(cli, @calc_path, [@calculator])
+
+      assert {:error, {:already_exported, @calc_path, "org.example.Calculator"}} =
+               Service.export(cli, @calc_path, [display, @calculator])
+
+      # Another interface, another handler, the same path.
+      task =
+        Task.async(fn ->
+          {:ok, ref} = Service.export(cli, @calc_path, [display])
+
+          receive do
+            {^ref, %Call{} = call} -> Service.reply(call, [])
+          end
+        end)
+
+      assert wait_until(fn -> map_size(:sys.get_state(cli).objects.exports) == 2 end)
+
+      show =
+        Message.new!(:method_call,
+          path: @calc_path,
+          interface: "org.example.Display",
+          member: "Show",
+          sender: ":1.99",
+          signature: "s",
+          body: ["hi"]
+        )
+
+      {:ok, serial} = TestServer.push_call(svr, show)
+      assert :ok = Task.await(task, 1_000)
+
+      assert_receive {^svr,
+                      %Message{type: :method_return, header_fields: %{reply_serial: ^serial}}},
+                     1_000
+    end
+
+    test "cannot be answered through Rebus.send", %{cli: cli, svr: svr} do
       return = Message.new!(:method_return, reply_serial: 41)
 
       error =
@@ -4622,22 +4910,28 @@ defmodule RebusTest do
     end
 
     test "are refused before the connection is established" do
-      reply = Message.new!(:method_return, reply_serial: 1)
-
       {result, cli} =
-        while_connecting(:rebus_send_reply_while_connecting, &Connection.send_reply(&1, reply))
+        while_connecting(
+          :rebus_export_while_connecting,
+          &Service.export(&1, @calc_path, [@calculator])
+        )
 
       assert {:error, :not_connected} = result
       assert :ok = Rebus.close(cli)
     end
 
-    test "report a stopped connection as disconnected", %{cli: cli} do
-      ref = Process.monitor(cli)
-      assert :ok = Rebus.close(cli)
-      assert_receive {:DOWN, ^ref, :process, ^cli, _reason}, 1_000
+    test "report a stopped connection as disconnected", %{cli: cli, svr: svr} do
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
+      {:ok, _serial} = TestServer.push_call(svr, calc_call("Add", [2, 3]))
+      assert_receive {^ref, %Call{} = call}, 1_000
 
-      reply = Message.new!(:method_return, reply_serial: 1)
-      assert {:error, :disconnected} = Connection.send_reply(cli, reply)
+      monitor = Process.monitor(cli)
+      assert :ok = Rebus.close(cli)
+      assert_receive {:DOWN, ^monitor, :process, ^cli, _reason}, 1_000
+
+      assert {:error, :disconnected} = Service.reply(call, [5])
+      assert {:error, :disconnected} = Service.unexport(cli, ref)
+      assert {:error, :disconnected} = Service.export(cli, @calc_path, [@calculator])
     end
   end
 
@@ -4951,12 +5245,13 @@ defmodule RebusTest do
   describe "Inbound method calls" do
     setup [:server_setup, :client_setup]
 
-    test "are refused with UnknownMethod and leave the connection usable", %{svr: svr, cli: cli} do
+    test "to a path with nothing exported are refused with UnknownObject and leave the connection usable",
+         %{svr: svr, cli: cli} do
       {:ok, serial} = TestServer.push_call(svr, unhandled_call())
 
       assert_receive {^svr, %Message{type: :error, header_fields: fields, body: [detail]}}, 1_000
 
-      assert fields.error_name == "org.freedesktop.DBus.Error.UnknownMethod"
+      assert fields.error_name == "org.freedesktop.DBus.Error.UnknownObject"
       assert fields.reply_serial == serial
       assert fields.destination == ":1.99"
       assert fields.signature == "s"
@@ -5131,7 +5426,7 @@ defmodule RebusTest do
                         type: :error,
                         header_fields: %{
                           reply_serial: ^serial,
-                          error_name: "org.freedesktop.DBus.Error.UnknownMethod"
+                          error_name: "org.freedesktop.DBus.Error.UnknownObject"
                         }
                       }},
                      1_000
@@ -5168,7 +5463,7 @@ defmodule RebusTest do
 
       assert_receive {^svr, %Message{type: :error, header_fields: fields}}, 1_000
 
-      assert fields.error_name == "org.freedesktop.DBus.Error.UnknownMethod"
+      assert fields.error_name == "org.freedesktop.DBus.Error.UnknownObject"
       assert fields.reply_serial == serial
       refute Map.has_key?(fields, :destination)
 
@@ -5196,6 +5491,23 @@ defmodule RebusTest do
 
       assert :ok = Rebus.close(cli)
     end
+  end
+
+  defp calc_call(member, body, opts \\ []) do
+    Message.new!(
+      :method_call,
+      Keyword.merge(
+        [
+          path: @calc_path,
+          interface: "org.example.Calculator",
+          member: member,
+          sender: ":1.99",
+          signature: "ii",
+          body: body
+        ],
+        opts
+      )
+    )
   end
 
   defp unhandled_call(opts \\ []) do

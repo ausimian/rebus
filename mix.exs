@@ -108,6 +108,8 @@ defmodule Rebus.MixProject do
           Rebus.UnixFD
         ],
         Services: [
+          Rebus.Service,
+          Rebus.Service.Call,
           Rebus.Interface,
           Rebus.Interface.Arg,
           Rebus.Interface.Method,

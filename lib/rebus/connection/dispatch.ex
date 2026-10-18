@@ -5,8 +5,8 @@ defmodule Rebus.Connection.Dispatch do
   # feeding `Rebus.Connection.Inbound`, and deciding what each complete frame
   # means. Replies are correlated against the pending table and answered (or
   # turned into an FD claim), signals are matched against this connection's
-  # handlers, and method calls are handed to `Rebus.Connection.Peer`, which
-  # answers them because Rebus exposes no service-side API.
+  # handlers, and method calls are handed to `Rebus.Connection.Service`, which
+  # routes them to the handlers of exported objects or answers them itself.
   #
   # It works on the connection struct directly — reply correlation writes the
   # pending table — but it is not a `GenServer`. Every entry point answers with
@@ -17,9 +17,9 @@ defmodule Rebus.Connection.Dispatch do
   alias Rebus.Connection
   alias Rebus.Connection.FDClaims
   alias Rebus.Connection.Inbound
-  alias Rebus.Connection.Peer
   alias Rebus.Connection.Pending
   alias Rebus.Connection.Rights
+  alias Rebus.Connection.Service
   alias Rebus.Connection.Setup
   alias Rebus.MatchRule
   alias Rebus.Message
@@ -402,10 +402,10 @@ defmodule Rebus.Connection.Dispatch do
          %Connection{} = state,
          cursor
        ) do
-    # No method served by this connection takes a descriptor, so any received
-    # descriptor is closed before the call is answered.
+    # Inbound calls do not yet hand descriptors to their handler, so any
+    # received descriptor is closed before the call is routed.
     close_message_fds(msg)
-    parse_flat_messages(rest, Peer.answer(msg, state), cursor)
+    parse_flat_messages(rest, Service.answer(msg, state), cursor)
   end
 
   defp dispatch_inbound_message(%Message{} = msg, rest, state, cursor) do
