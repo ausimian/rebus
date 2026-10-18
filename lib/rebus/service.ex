@@ -479,10 +479,11 @@ defmodule Rebus.Service do
   # node, so local code such as an object manager can ask another object's
   # handler something through the same routing, checks and bounds a peer's
   # call meets. The call is encoded and decoded first, so its handler sees
-  # exactly what it would for the same call from a peer. Returns what
-  # `Rebus.call/3` would; a handler's reply that carries descriptors is
-  # refused with `{:error, :unix_fd_unsupported}`. The handler must not be
-  # the calling process, which would wait for itself until `timeout`.
+  # exactly what it would for the same call from a peer, and so is the
+  # reply, so this returns what `Rebus.call/3` would. A handler's reply that
+  # carries descriptors is refused with `{:error, :unix_fd_unsupported}`.
+  # The handler must not be the calling process, which would wait for itself
+  # until `timeout`.
   @doc false
   @spec invoke(pid(), binary(), binary() | nil, binary(), [term()], binary(), non_neg_integer()) ::
           {:ok, Message.t()}
@@ -495,15 +496,22 @@ defmodule Rebus.Service do
 
     with {:ok, msg} <- Message.new(:method_call, fields),
          {:ok, msg} <- as_received(msg) do
-      Connection.invoke(conn, msg, timeout)
+      conn |> Connection.invoke(msg, timeout) |> received_result()
     end
   end
 
+  defp received_result({:ok, %Message{} = reply}), do: as_received(reply)
+
+  defp received_result({:error, {:dbus_error, %Message{} = reply}}) do
+    with {:ok, reply} <- as_received(reply), do: {:error, {:dbus_error, reply}}
+  end
+
+  defp received_result({:error, _reason} = error), do: error
+
   # The encoder accepts some values in more than one shape, such as an
-  # integer for a double, while the decoder produces one. The serial is a
-  # placeholder the connection replaces.
+  # integer for a double, while the decoder produces one.
   defp as_received(%Message{} = msg) do
-    with {:ok, iodata} <- Message.encode(%{msg | serial: 1}) do
+    with {:ok, iodata} <- Message.encode(msg) do
       iodata |> IO.iodata_to_binary() |> Message.decode()
     end
   end

@@ -5004,9 +5004,10 @@ defmodule RebusTest do
           Service.invoke(cli, @calc_path, "org.example.Scaler", "Scale", [2], "d", 1_000)
         end)
 
-      # The handler sees the value as a peer's call would carry it, not as given.
+      # The handler sees the value as a peer's call would carry it, not as
+      # given, and so does the caller for the reply.
       assert_receive {^ref, %Call{body: [2.0], sender: ":1.100"} = call}, 1_000
-      assert :ok = Service.reply(call, [4.0])
+      assert :ok = Service.reply(call, [4])
 
       assert {:ok, %Message{type: :method_return, header_fields: fields, body: [4.0]}} =
                Task.await(task)
