@@ -109,6 +109,7 @@ defmodule Rebus.MixProject do
         ],
         Services: [
           Rebus.Service,
+          Rebus.Object,
           Rebus.Bus,
           Rebus.Service.Call,
           Rebus.Interface,

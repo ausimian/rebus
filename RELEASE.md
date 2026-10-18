@@ -1,5 +1,17 @@
 ### Added
 
+- `use Rebus.Object` runs an exported object as a GenServer.
+  `Rebus.Object.start_link/3` exports the object before calling its `init/1`,
+  so a supervisor restart exports it again, and maps each call to a
+  callback: `handle_method/3` for methods, and `handle_get_property/3` and
+  `handle_set_property/4` for `Get`, `GetAll` and `Set`. The callback's
+  return value answers the call, or `{:noreply, state}` leaves it for
+  `Rebus.Service.reply/3` to answer later from any process. A successful
+  `Set` emits `PropertiesChanged` as the property's `emits_changed` declares,
+  unless the callback returns `emit: false`. Exceptions are not rescued: the
+  object crashes and the caller receives `org.freedesktop.DBus.Error.Failed`.
+  The object stops with its connection. `Rebus.Object.dispatch/4` gives a
+  GenServer that keeps its own loop the same mapping.
 - `Rebus.Bus.request_name/4` and `Rebus.Bus.release_name/3` request and
   release well-known bus names, taking the `:allow_replacement`,
   `:replace_existing` and `:do_not_queue` flags as atoms and returning the
