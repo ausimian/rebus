@@ -11,6 +11,8 @@ defmodule Rebus.Integration.SessionBusTest do
 
   alias Rebus.MatchRule
   alias Rebus.Message
+  alias Rebus.Service
+  alias Rebus.Service.Call
 
   @moduletag :integration
 
@@ -31,6 +33,9 @@ defmodule Rebus.Integration.SessionBusTest do
   @well_known_name "org.example.RebusIntegration"
   @object_path "/org/example/RebusIntegration"
   @signal_interface "org.example.RebusIntegration.Events"
+  @calculator Rebus.Interface.new!("org.example.RebusIntegration.Calculator",
+                methods: [{"Add", in: [a: "i", b: "i"], out: [sum: "i"]}]
+              )
 
   # Every reply and signal crosses the daemon socket.
   @call_timeout 5_000
@@ -93,7 +98,7 @@ defmodule Rebus.Integration.SessionBusTest do
       assert :ok = Rebus.remove_match(observer, ref, @call_timeout)
     end
 
-    test "returns UnknownMethod for a method call routed to another connection" do
+    test "returns UnknownObject for a call to a path another connection has not exported" do
       caller = connect!()
       callee = connect!()
 
@@ -109,8 +114,83 @@ defmodule Rebus.Integration.SessionBusTest do
               {:dbus_error,
                %Message{
                  type: :error,
-                 header_fields: %{error_name: "org.freedesktop.DBus.Error.UnknownMethod"}
+                 header_fields: %{error_name: "org.freedesktop.DBus.Error.UnknownObject"}
                }}} = Rebus.call(caller, message, @call_timeout)
+    end
+
+    test "serves an exported object to another Rebus connection" do
+      caller = connect!()
+      exporter = connect!()
+      {:ok, ref} = Service.export(exporter, @object_path, [@calculator])
+      caller_name = unique_name!(caller)
+
+      add = fn opts ->
+        Message.new!(
+          :method_call,
+          Keyword.merge(
+            [
+              destination: unique_name!(exporter),
+              path: @object_path,
+              member: "Add",
+              signature: "ii",
+              body: [2, 3]
+            ],
+            opts
+          )
+        )
+      end
+
+      # With the interface, and without it: only one exported interface
+      # declares Add, so the exporter resolves it.
+      for message <- [add.(interface: "org.example.RebusIntegration.Calculator"), add.([])] do
+        task = Task.async(fn -> Rebus.call(caller, message, @call_timeout) end)
+
+        assert_receive {^ref, %Call{member: "Add", body: [2, 3], sender: ^caller_name} = call},
+                       @window
+
+        assert call.interface == "org.example.RebusIntegration.Calculator"
+        assert :ok = Service.reply(call, [5])
+        assert {:ok, %Message{type: :method_return, body: [5]}} = Task.await(task, @window)
+      end
+
+      assert {:error,
+              {:dbus_error,
+               %Message{header_fields: %{error_name: "org.freedesktop.DBus.Error.InvalidArgs"}}}} =
+               Rebus.call(caller, add.(signature: "s", body: ["2"]), @call_timeout)
+
+      task = Task.async(fn -> Rebus.call(caller, add.([]), @call_timeout) end)
+      assert_receive {^ref, %Call{} = call}, @window
+      assert :ok = Service.reply_error(call, "org.example.RebusIntegration.Error.Overflow", "no")
+
+      assert {:error,
+              {:dbus_error,
+               %Message{
+                 header_fields: %{error_name: "org.example.RebusIntegration.Error.Overflow"},
+                 body: ["no"]
+               }}} = Task.await(task, @window)
+    end
+
+    test "serves an exported object to dbus-send" do
+      exporter = connect!()
+      {:ok, ref} = Service.export(exporter, @object_path, [@calculator])
+
+      args = [
+        "--session",
+        "--print-reply",
+        "--dest=#{unique_name!(exporter)}",
+        @object_path,
+        "org.example.RebusIntegration.Calculator.Add",
+        "int32:2",
+        "int32:3"
+      ]
+
+      task = Task.async(fn -> System.cmd("dbus-send", args, stderr_to_stdout: true) end)
+
+      assert_receive {^ref, %Call{member: "Add", body: [2, 3]} = call}, @window
+      assert :ok = Service.reply(call, [5])
+
+      assert {output, 0} = Task.await(task, @window)
+      assert output =~ "int32 5"
     end
 
     test "answers org.freedesktop.DBus.Peer on a peer connection and on the daemon" do
@@ -179,12 +259,11 @@ defmodule Rebus.Integration.SessionBusTest do
     test "refuses an FD-bearing method call over the daemon socket without leaking it" do
       # The daemon does pass the descriptor: both connections negotiated
       # NEGOTIATE_UNIX_FD over the session socket. What cannot be exercised yet
-      # is a *successful* transfer, because Rebus has no service-side API - a
-      # connection answers every inbound method call with UnknownMethod, and
-      # FD-bearing signals are dropped by design. So this test pins the two
-      # halves that are observable today: the call is refused, and the
-      # descriptor the receiving connection was handed is closed rather than
-      # retained. Revisit once method calls can be served.
+      # is a *successful* transfer, because inbound calls do not yet hand their
+      # descriptors to a handler, and FD-bearing signals are dropped by design.
+      # So this test pins the two halves that are observable today: the call
+      # to a path with nothing exported is refused, and the descriptor the
+      # receiving connection was handed is closed rather than retained.
       caller = connect!()
       callee = connect!()
       fd = borrowed_fd!()
@@ -206,7 +285,7 @@ defmodule Rebus.Integration.SessionBusTest do
               {:dbus_error,
                %Message{
                  type: :error,
-                 header_fields: %{error_name: "org.freedesktop.DBus.Error.UnknownMethod"}
+                 header_fields: %{error_name: "org.freedesktop.DBus.Error.UnknownObject"}
                }}} = Rebus.call(caller, message, @call_timeout)
 
       # /proc is Linux-only; elsewhere the refusal above is all this asserts.

@@ -15,17 +15,31 @@ defmodule Rebus.Connection.InboundCallsTest do
       fd = TestFD.dup!()
       handler = self()
       ref = make_ref()
+      export = make_ref()
       before = System.monotonic_time(:millisecond)
 
       {entry, calls} =
         InboundCalls.insert(
           InboundCalls.new(),
-          %{ref: ref, serial: 7, sender: ":1.99", handler: handler, unix_fds: [fd]},
+          %{
+            ref: ref,
+            serial: 7,
+            sender: ":1.99",
+            export: export,
+            handler: handler,
+            unix_fds: [fd]
+          },
           60_000
         )
 
-      assert %Entry{ref: ^ref, serial: 7, sender: ":1.99", handler: ^handler, unix_fds: [^fd]} =
-               entry
+      assert %Entry{
+               ref: ^ref,
+               serial: 7,
+               sender: ":1.99",
+               export: ^export,
+               handler: ^handler,
+               unix_fds: [^fd]
+             } = entry
 
       assert is_reference(entry.timer_ref)
       assert is_integer(Process.read_timer(entry.timer_ref))
@@ -57,7 +71,14 @@ defmodule Rebus.Connection.InboundCallsTest do
     end
 
     test "refuses a call timeout that is not positive" do
-      call = %{ref: make_ref(), serial: 1, sender: nil, handler: self(), unix_fds: []}
+      call = %{
+        ref: make_ref(),
+        serial: 1,
+        sender: nil,
+        export: make_ref(),
+        handler: self(),
+        unix_fds: []
+      }
 
       assert_raise FunctionClauseError, fn -> InboundCalls.insert(InboundCalls.new(), call, 0) end
     end
@@ -66,6 +87,49 @@ defmodule Rebus.Connection.InboundCallsTest do
   describe "fetch/2" do
     test "misses a reference that was never inserted" do
       assert :error = InboundCalls.fetch(InboundCalls.new(), make_ref())
+    end
+  end
+
+  describe "size/1" do
+    test "counts the calls waiting for an answer" do
+      assert InboundCalls.size(InboundCalls.new()) == 0
+
+      {first, calls} = insert(InboundCalls.new())
+      {_second, calls} = insert(calls)
+      assert InboundCalls.size(calls) == 2
+
+      {_first, calls} = InboundCalls.complete(calls, first.ref)
+      assert InboundCalls.size(calls) == 1
+
+      InboundCalls.close_all(calls)
+    end
+  end
+
+  describe "pop_export/2" do
+    test "removes and releases every call made on the export, in serial order" do
+      export = make_ref()
+      fd = TestFD.dup!()
+      {second, calls} = insert(InboundCalls.new(), export: export, serial: 9, unix_fds: [fd])
+      {other, calls} = insert(calls, serial: 8)
+      {first, calls} = insert(calls, export: export, serial: 3)
+
+      assert {[^first, ^second], calls} = InboundCalls.pop_export(calls, export)
+
+      assert Process.read_timer(first.timer_ref) == false
+      assert Process.read_timer(second.timer_ref) == false
+      assert closed?(fd)
+      assert InboundCalls.size(calls) == 1
+      assert {:ok, ^other} = InboundCalls.fetch(calls, other.ref)
+
+      InboundCalls.close_all(calls)
+    end
+
+    test "finds nothing for an export with no calls" do
+      {_entry, calls} = insert(InboundCalls.new())
+
+      assert {[], ^calls} = InboundCalls.pop_export(calls, make_ref())
+
+      InboundCalls.close_all(calls)
     end
   end
 
@@ -185,6 +249,7 @@ defmodule Rebus.Connection.InboundCallsTest do
       ref: make_ref(),
       serial: Keyword.get(opts, :serial, 1),
       sender: Keyword.get(opts, :sender, ":1.99"),
+      export: Keyword.get_lazy(opts, :export, &make_ref/0),
       handler: self(),
       unix_fds: Keyword.get(opts, :unix_fds, [])
     }

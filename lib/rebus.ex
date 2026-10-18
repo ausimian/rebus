@@ -54,10 +54,11 @@ defmodule Rebus do
       config :rebus, :match_recovery_max_attempts, 30
 
   Connections implement
-  `org.freedesktop.DBus.Peer` (`Ping` and `GetMachineId`) and reply to every
-  other method call with an `org.freedesktop.DBus.Error.UnknownMethod` error,
-  unless the call is marked `:no_reply_expected`. There is no service-side API
-  for application methods.
+  `org.freedesktop.DBus.Peer` (`Ping` and `GetMachineId`) on every path.
+  `Rebus.Service` exports objects and answers the method calls made on them;
+  a call to a path with nothing exported gets an
+  `org.freedesktop.DBus.Error.UnknownObject` error, unless the call is marked
+  `:no_reply_expected`.
 
   See [Authentication](authentication.html),
   [Signal subscriptions and match rules](match_rules.html), and
@@ -175,6 +176,7 @@ defmodule Rebus do
   | `:bus` | `true` | Pass `false` for a peer-to-peer endpoint, which sends no `Hello` and has no unique name. |
   | `:owner` | `nil` | A local PID whose exit stops the connection. `nil` leaves the connection alive until `close/1`. |
   | `:max_message_size` | `134217728` | Largest complete inbound message, in bytes, from `4096` up to the protocol limit, `Rebus.Message.max_message_size/0`. Outbound messages are not affected. |
+  | `:max_pending_calls` | `1024` | Positive number of inbound method calls handed to `Rebus.Service` handlers that may wait for their answers at once. Calls beyond it are answered with `org.freedesktop.DBus.Error.LimitsExceeded`. |
 
   ## Notes
 
@@ -218,7 +220,7 @@ defmodule Rebus do
   - Invalid option: `:invalid_timeout`, `:invalid_read_timeout`,
     `:invalid_write_timeout`, `:invalid_allow_anonymous`,
     `:invalid_bus_option`, `:invalid_owner`, `:invalid_name`,
-    `:invalid_max_message_size`.
+    `:invalid_max_message_size`, `:invalid_max_pending_calls`.
   - Owner that exited before the connection was established: `:owner_down`.
   - Unusable address: `{:invalid_bus_address, reason}`,
     `:unsupported_bus_transport`, `{:tcp_resolution_failed, reason}`,
