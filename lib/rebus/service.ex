@@ -265,25 +265,31 @@ defmodule Rebus.Service do
   have the declared out-signature, `call.out_signature`, or this returns
   `{:error, :signature_mismatch}`; an error can carry any body. Whatever
   `reply_serial` and `destination` the message holds are replaced with the
-  call's own. Takes the same options and returns the same values as
-  `reply/3`, plus `{:error, {:invalid_message_type, type}}` for any other
-  message type.
+  call's own. The message is encoded in the calling process first, so one
+  that cannot be encoded returns the encoding error, as `Rebus.Message.encode/2`
+  reports it, and leaves the call open. Takes the same options and returns
+  the same values as `reply/3`, plus `{:error, {:invalid_message_type, type}}`
+  for any other message type.
   """
-  @spec reply_message(Call.t(), Message.t(), keyword()) :: :ok | {:error, reply_error()}
+  @spec reply_message(Call.t(), Message.t(), keyword()) ::
+          :ok | {:error, reply_error() | Message.encoding_error()}
   def reply_message(%Call{} = call, %Message{} = message, opts \\ []) when is_list(opts) do
-    case message do
-      %Message{type: :method_return} ->
-        if Message.signature(message) == call.out_signature,
-          do: send_reply(call, message, opts),
-          else: {:error, :signature_mismatch}
-
-      %Message{type: :error} ->
-        send_reply(call, message, opts)
-
-      %Message{type: type} ->
-        {:error, {:invalid_message_type, type}}
+    with :ok <- check_reply_message(call, message),
+         {:ok, _iodata} <- Message.encode(message) do
+      send_reply(call, message, opts)
     end
   end
+
+  defp check_reply_message(%Call{} = call, %Message{type: :method_return} = message) do
+    if Message.signature(message) == call.out_signature,
+      do: :ok,
+      else: {:error, :signature_mismatch}
+  end
+
+  defp check_reply_message(%Call{}, %Message{type: :error}), do: :ok
+
+  defp check_reply_message(%Call{}, %Message{type: type}),
+    do: {:error, {:invalid_message_type, type}}
 
   # A call that expects no reply is not tracked by the connection, so there
   # is nothing to complete there and nothing to send.

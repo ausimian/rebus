@@ -4685,6 +4685,24 @@ defmodule RebusTest do
       assert fields.destination == ":1.99"
     end
 
+    test "stay open when a reply built by hand cannot be encoded", %{cli: cli, svr: svr} do
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
+      {:ok, serial} = TestServer.push_call(svr, calc_call("Add", [2, 3]))
+      assert_receive {^ref, %Call{} = call}, 1_000
+
+      # The signature matches the declaration, but the body was replaced
+      # after the message was built and no longer fits it.
+      return = Message.new!(:method_return, reply_serial: 1, signature: "i", body: [5])
+      assert {:error, :invalid_body} = Service.reply_message(call, %{return | body: ["five"]})
+      refute_receive {^svr, %Message{}}, 100
+
+      assert :ok = Service.reply_message(call, return)
+
+      assert_receive {^svr,
+                      %Message{type: :method_return, header_fields: %{reply_serial: ^serial}}},
+                     1_000
+    end
+
     test "send nothing for a call that asked for no reply", %{cli: cli, svr: svr} do
       {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
       :ok = TestServer.push(svr, calc_call("Add", [2, 3], flags: [:no_reply_expected]))
