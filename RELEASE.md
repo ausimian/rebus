@@ -1,5 +1,13 @@
 ### Added
 
+- `Rebus.Bus.request_name/4` and `Rebus.Bus.release_name/3` request and
+  release well-known bus names, taking the `:allow_replacement`,
+  `:replace_existing` and `:do_not_queue` flags as atoms and returning the
+  bus's answer as `:primary_owner`, `:in_queue`, `:exists`, `:already_owner`,
+  `:released`, `:non_existent` or `:not_owner`. The process that requested a
+  name, or the `:owner` given instead, receives
+  `{:rebus_name, conn, :acquired | :lost, name}` each time the connection
+  gains or loses it, until the name is released or that process exits.
 - `Rebus.Service` exports objects and answers the method calls made on them.
   `Rebus.Service.export/4` binds `Rebus.Interface` declarations at an object
   path, or a whole subtree, to a handler process, which receives each call as

@@ -55,8 +55,9 @@ defmodule Rebus do
 
   Connections implement
   `org.freedesktop.DBus.Peer` (`Ping` and `GetMachineId`) on every path.
-  `Rebus.Service` exports objects and answers the method calls made on them;
-  a call to a path with nothing exported gets an
+  `Rebus.Service` exports objects and answers the method calls made on them,
+  and `Rebus.Bus` requests the well-known names clients find them by.
+  A call to a path with nothing exported gets an
   `org.freedesktop.DBus.Error.UnknownObject` error, unless the call is marked
   `:no_reply_expected`.
 

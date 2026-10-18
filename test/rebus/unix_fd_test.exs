@@ -1233,6 +1233,51 @@ defmodule Rebus.UnixFDTest do
     end
   end
 
+  test "Rebus.Bus closes descriptors sent with the driver's replies", %{
+    server: server,
+    connection: connection
+  } do
+    before_fds = fd_set!()
+    {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
+
+    replies = [
+      fn serial ->
+        Message.new!(:method_return, reply_serial: serial, signature: "u", body: [1], fds: [fd])
+      end,
+      fn serial ->
+        Message.new!(:error,
+          reply_serial: serial,
+          error_name: "org.freedesktop.DBus.Error.AccessDenied",
+          signature: "s",
+          body: ["denied"],
+          fds: [fd]
+        )
+      end
+    ]
+
+    results =
+      for reply <- replies do
+        task =
+          Task.async(fn ->
+            Rebus.Bus.request_name(connection, "org.example.Fd", [], owner: nil)
+          end)
+
+        assert_receive {^server,
+                        %Message{serial: serial, header_fields: %{member: "RequestName"}}},
+                       1_000
+
+        :ok = TestServer.push_with_fds(server, reply.(serial), [fd])
+        Task.await(task, 1_000)
+      end
+
+    assert [
+             {:ok, :primary_owner},
+             {:error, {:bus_error, "org.freedesktop.DBus.Error.AccessDenied"}}
+           ] = results
+
+    assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
+  end
+
   test "answers an FD-bearing inbound method call and closes its descriptor", %{
     server: server,
     connection: connection

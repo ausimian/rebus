@@ -301,6 +301,41 @@ defmodule Rebus.Connection do
     safe_setup_call(conn, {:delete_signal_handler, ref}, nil, timeout)
   end
 
+  # A handler that turns the bus driver's directed NameAcquired and NameLost
+  # signals for `name` into `{:rebus_name, conn, :acquired | :lost, name}` for
+  # `owner`. `Rebus.Bus` installs it before RequestName, since the driver
+  # sends NameAcquired ahead of the method return. One owner watches a name at
+  # most once, so a repeated request does not double its notices: `:existing`
+  # means the owner was already watching and `handler_ref` was not used.
+  @doc false
+  @spec watch_name(pid(), pid(), binary(), non_neg_integer()) ::
+          {:ok, :added | :existing}
+          | {:error, :not_a_bus | :timeout | :disconnected | :not_connected}
+  def watch_name(conn, owner, name, timeout)
+      when is_pid(conn) and is_pid(owner) and is_binary(name) and is_integer(timeout) and
+             timeout >= 0 do
+    handler_ref = make_ref()
+
+    safe_setup_call(
+      conn,
+      {:watch_name, owner, name, handler_ref},
+      {:cancel_signal_handler, handler_ref},
+      timeout
+    )
+  end
+
+  # Removes the watch `owner` holds on `name`, or every watch on `name` for
+  # `:all`, without waiting for the connection to answer: it cannot fail
+  # while the connection lives, and runs after a caller's budget may be
+  # spent. Being sent from the caller, it is handled after any `watch_name/4`
+  # that caller made before it. Removing a watch that is already gone is a
+  # no-op.
+  @doc false
+  @spec unwatch_name(pid(), binary(), pid() | :all) :: :ok
+  def unwatch_name(conn, name, owner)
+      when is_pid(conn) and is_binary(name) and (is_pid(owner) or owner == :all),
+      do: GenServer.cast(conn, {:unwatch_name, name, owner})
+
   # Removes a handler without waiting for the connection to answer, for a
   # match subscription that has stopped relying on its calls. Removing a
   # handler that is already gone is a no-op.
@@ -395,9 +430,17 @@ defmodule Rebus.Connection do
     field :objects, Objects.t(), default: Objects.new()
     # Signal handlers registered against this connection. Delivery and match
     # filtering happen in the connection process itself, so a signal arriving
-    # here can never reach a handler installed on another connection.
+    # here can never reach a handler installed on another connection. A
+    # handler with a `:name` is a name watch, which `watch_name/4` installs.
     field :handlers,
-          %{reference() => %{pid: pid(), monitor_ref: reference(), rule: MatchRule.t() | nil}},
+          %{
+            reference() => %{
+              required(:pid) => pid(),
+              required(:monitor_ref) => reference(),
+              required(:rule) => MatchRule.t() | nil,
+              optional(:name) => binary()
+            }
+          },
           default: %{}
 
     field :handler_monitor_index, %{reference() => reference()}, default: %{}
@@ -1018,20 +1061,65 @@ defmodule Rebus.Connection do
     {:reply, :ok, remove_signal_handler(state, ref)}
   end
 
+  def handle_call(
+        {:watch_name, _owner, _name, _ref},
+        _from,
+        %__MODULE__{established?: false} = state
+      ) do
+    {:reply, {:error, :not_connected}, state}
+  end
+
+  def handle_call({:watch_name, _owner, _name, _ref}, _from, %__MODULE__{name: nil} = state) do
+    {:reply, {:error, :not_a_bus}, state}
+  end
+
+  def handle_call({:watch_name, owner, name, handler_ref}, _from, %__MODULE__{} = state) do
+    if Enum.any?(state.handlers, &name_watch?(&1, name, owner)) do
+      {:reply, {:ok, :existing}, state}
+    else
+      rule = name_rule(name, state.name)
+      state = put_signal_handler(state, owner, handler_ref, %{rule: rule, name: name})
+      {:reply, {:ok, :added}, state}
+    end
+  end
+
   defp add_signal_handler(%__MODULE__{} = state, pid, handler_ref, rule) do
+    {:reply, {:ok, handler_ref}, put_signal_handler(state, pid, handler_ref, %{rule: rule})}
+  end
+
+  defp put_signal_handler(%__MODULE__{} = state, pid, handler_ref, fields) do
     monitor_ref = Process.monitor(pid)
 
-    {:reply, {:ok, handler_ref},
-     %{
-       state
-       | handlers:
-           Map.put(state.handlers, handler_ref, %{
-             pid: pid,
-             monitor_ref: monitor_ref,
-             rule: rule
-           }),
-         handler_monitor_index: Map.put(state.handler_monitor_index, monitor_ref, handler_ref)
-     }}
+    %{
+      state
+      | handlers:
+          Map.put(
+            state.handlers,
+            handler_ref,
+            Map.merge(%{pid: pid, monitor_ref: monitor_ref}, fields)
+          ),
+        handler_monitor_index: Map.put(state.handler_monitor_index, monitor_ref, handler_ref)
+    }
+  end
+
+  defp name_watch?({_handler_ref, %{name: name, pid: pid}}, name, owner),
+    do: owner == :all or pid == owner
+
+  defp name_watch?(_handler, _name, _owner), do: false
+
+  # Only the bus driver can send with its own name as the sender, and the
+  # sender of a directed signal is compared exactly, so naming this
+  # connection as the destination keeps a peer's broadcast lookalike out.
+  # Dispatch narrows the member to NameAcquired and NameLost, which one rule
+  # cannot express.
+  defp name_rule(name, unique_name) do
+    MatchRule.new!(
+      sender: "org.freedesktop.DBus",
+      path: "/org/freedesktop/DBus",
+      interface: "org.freedesktop.DBus",
+      destination: unique_name,
+      args: %{0 => name}
+    )
   end
 
   @impl true
@@ -1044,6 +1132,17 @@ defmodule Rebus.Connection do
 
   def handle_cast({:cancel_signal_handler, handler_ref}, %__MODULE__{} = state) do
     {:noreply, remove_signal_handler(state, handler_ref)}
+  end
+
+  def handle_cast({:unwatch_name, name, owner}, %__MODULE__{} = state) do
+    state =
+      state.handlers
+      |> Enum.filter(&name_watch?(&1, name, owner))
+      |> Enum.reduce(state, fn {handler_ref, _handler}, state ->
+        remove_signal_handler(state, handler_ref)
+      end)
+
+    {:noreply, state}
   end
 
   # An export whose caller stopped waiting before it was answered.

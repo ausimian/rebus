@@ -29,6 +29,10 @@ defmodule Rebus.Service do
           :ok = Rebus.Service.reply(call, [a + b])
       end
 
+  Clients usually find a service by a well-known name. Export its objects
+  first, then request the name with `Rebus.Bus.request_name/4`, so that no
+  client reaches the name before the objects are there to answer.
+
   ## Answering calls
 
   Answer every call exactly once, with `reply/3`, `reply_error/4` or
