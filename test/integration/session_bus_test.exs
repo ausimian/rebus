@@ -292,6 +292,43 @@ defmodule Rebus.Integration.SessionBusTest do
                }}} = Task.await(task, @window)
     end
 
+    test "delivers PropertiesChanged to a subscriber's match rule" do
+      subscriber = connect!()
+      exporter = connect!()
+      {:ok, _ref} = Service.export(exporter, @object_path, [@settings])
+
+      rule =
+        MatchRule.new!(
+          sender: unique_name!(exporter),
+          path: @object_path,
+          interface: "org.freedesktop.DBus.Properties",
+          member: "PropertiesChanged",
+          args: %{0 => "org.example.RebusIntegration.Settings"}
+        )
+
+      assert {:ok, match_ref} = Rebus.add_match(subscriber, rule, @call_timeout)
+
+      assert :ok =
+               Service.properties_changed(
+                 exporter,
+                 @object_path,
+                 @settings,
+                 %{"Precision" => 5},
+                 []
+               )
+
+      assert_receive {^match_ref, %Message{type: :signal} = signal}, @window
+      assert Message.signature(signal) == "sa{sv}as"
+
+      assert signal.body == [
+               "org.example.RebusIntegration.Settings",
+               [{"Precision", {"u", 5}}],
+               []
+             ]
+
+      assert :ok = Rebus.remove_match(subscriber, match_ref, @call_timeout)
+    end
+
     test "answers org.freedesktop.DBus.Peer on a peer connection and on the daemon" do
       caller = connect!()
       callee = connect!()

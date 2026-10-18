@@ -28,6 +28,13 @@
   exported the interface, as a `Rebus.Service.Call` whose `out_signature` is
   `"v"`, `""` or `"a{sv}"`. `GetAll` for an interface with no readable
   property answers an empty dictionary.
+- `Rebus.Service.emit/6` sends a signal from an exported object. Given a
+  `Rebus.Interface`, it encodes the body with the signal's declared
+  signature; given an interface name, it takes the signature as the
+  `:signature` option. `Rebus.Service.properties_changed/6` sends
+  `org.freedesktop.DBus.Properties.PropertiesChanged`, typing each value by
+  its declaration and refusing a property whose `emits_changed` does not
+  allow it where it appears.
 - `Rebus.connect/2` takes a `:max_pending_calls` option, 1024 by default,
   that bounds how many inbound calls may wait for a handler's answer at once.
   Calls beyond it are answered with `org.freedesktop.DBus.Error.LimitsExceeded`.

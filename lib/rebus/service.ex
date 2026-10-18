@@ -102,6 +102,19 @@ defmodule Rebus.Service do
   `GetAll` for an interface that declares no readable property is answered
   with an empty dictionary without reaching the handler.
 
+  ## Signals
+
+  `emit/6` sends a signal from an exported object, typed by the interface
+  declaration, and `properties_changed/6` sends
+  `org.freedesktop.DBus.Properties.PropertiesChanged` for properties that
+  changed, as each property's `emits_changed` allows:
+
+      :ok = Rebus.Service.emit(conn, "/org/example/Calculator", calculator, "Computed", [5])
+
+      :ok =
+        Rebus.Service.properties_changed(conn, "/org/example/Calculator", settings,
+          %{"Precision" => 3}, [])
+
   ## Introspection
 
   The connection answers `org.freedesktop.DBus.Introspectable.Introspect`
@@ -127,6 +140,7 @@ defmodule Rebus.Service do
 
   @default_timeout 5_000
   @default_call_timeout 60_000
+  @signal_options [:signature, :destination, :flags, :fds]
 
   @reserved_interfaces [
     "org.freedesktop.DBus.Peer",
@@ -345,6 +359,120 @@ defmodule Rebus.Service do
   defp send_reply(%Call{} = call, %Message{} = msg, opts) do
     timeout = Keyword.get(opts, :timeout, @default_timeout)
     Connection.reply_call(call.conn, call.ref, msg, timeout)
+  end
+
+  @doc """
+  Emits the signal `member` of `interface` from the object at `path`.
+
+  Given a `Rebus.Interface`, the signal must be one it declares, and `body`
+  is encoded with the declared signature. Given an interface name, the
+  signature must be passed as the `:signature` option. The signal is sent
+  as `Rebus.send/3` sends any message: the connection does not check that
+  anything is exported at `path`.
+
+  ## Options
+
+  - `:signature` - the body's signature. Required with an interface name,
+    and refused with a `Rebus.Interface`, which supplies its own.
+  - `:destination` - the unique name to send the signal to, rather than
+    broadcasting it.
+  - `:flags` and `:fds` - as for `Rebus.Message.new/2`.
+  - `:timeout` - milliseconds to wait for the connection to accept the
+    signal. Defaults to `5000`.
+
+  ## Return values
+
+  - `:ok` - the signal was handed to the socket.
+  - `{:error, :unknown_signal}` - the interface does not declare `member`.
+  - `{:error, :signature_required}` - an interface name without `:signature`.
+  - `{:error, {:invalid_option, opts}}` - an option not listed above.
+  - Any error of `Rebus.Message.new/2`, such as `{:error, :invalid_body}` for
+    a body that does not fit the signature, or of `Rebus.send/3`.
+  """
+  @spec emit(pid(), binary(), Interface.t() | binary(), binary(), [term()], keyword()) ::
+          :ok
+          | {:error,
+             :unknown_signal
+             | :signature_required
+             | {:invalid_option, term()}
+             | Message.construction_error()
+             | Rebus.error_reason()}
+  def emit(conn, path, interface, member, body, opts \\ [])
+      when is_pid(conn) and is_list(body) and is_list(opts) do
+    {timeout, opts} = Keyword.pop(opts, :timeout, @default_timeout)
+
+    with {:ok, signal} <- build_signal(interface, path, member, body, opts) do
+      Rebus.send(conn, signal, timeout)
+    end
+  end
+
+  defp build_signal(%Interface{} = interface, path, member, body, opts),
+    do: Interface.signal(interface, path, member, body, opts)
+
+  defp build_signal(interface, path, member, body, opts) when is_binary(interface) do
+    with :ok <- validate_signal_opts(opts),
+         {:ok, signature} <- fetch_signature(opts) do
+      Message.new(
+        :signal,
+        [path: path, interface: interface, member: member, signature: signature, body: body] ++
+          Keyword.delete(opts, :signature)
+      )
+    end
+  end
+
+  defp validate_signal_opts(opts) do
+    if Keyword.keyword?(opts) and
+         Enum.all?(opts, fn {key, _value} -> key in @signal_options end),
+       do: :ok,
+       else: {:error, {:invalid_option, opts}}
+  end
+
+  defp fetch_signature(opts) do
+    case Keyword.fetch(opts, :signature) do
+      {:ok, signature} -> {:ok, signature}
+      :error -> {:error, :signature_required}
+    end
+  end
+
+  @doc """
+  Emits `org.freedesktop.DBus.Properties.PropertiesChanged` for properties
+  of `interface` on the object at `path`.
+
+  `changed` maps property names to their new values, typed by the
+  declaration, and `invalidated` names properties that changed without
+  their values. Each property's `emits_changed` decides where it may appear,
+  as `Rebus.Interface.properties_changed/5` describes: one that emits `true`
+  only in `changed`, one that emits `:invalidates` only in `invalidated`,
+  and one that emits `false` or `:const` in neither.
+
+  Takes the options `emit/6` takes, except `:signature`, and returns what it
+  returns, plus `Rebus.Interface.properties_changed/5`'s errors for a
+  property the interface does not declare or does not allow where it
+  appears.
+  """
+  @spec properties_changed(
+          pid(),
+          binary(),
+          Interface.t(),
+          %{binary() => term()},
+          [binary()],
+          keyword()
+        ) ::
+          :ok
+          | {:error,
+             Interface.property_error()
+             | {:invalid_property_change, binary()}
+             | {:invalid_option, term()}
+             | Message.construction_error()
+             | Rebus.error_reason()}
+  def properties_changed(conn, path, %Interface{} = interface, changed, invalidated, opts \\ [])
+      when is_pid(conn) and is_map(changed) and is_list(invalidated) and is_list(opts) do
+    {timeout, opts} = Keyword.pop(opts, :timeout, @default_timeout)
+
+    with {:ok, signal} <-
+           Interface.properties_changed(interface, path, changed, invalidated, opts) do
+      Rebus.send(conn, signal, timeout)
+    end
   end
 
   defp validate_path(path) do

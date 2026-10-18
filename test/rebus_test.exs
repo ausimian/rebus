@@ -5006,6 +5006,82 @@ defmodule RebusTest do
     end
   end
 
+  describe "Emitting signals" do
+    setup [:server_setup, :client_setup]
+
+    @emitter Rebus.Interface.new!("org.example.Calculator",
+               signals: [{"Computed", args: [sum: "i"]}],
+               properties: [
+                 {"Precision", "u", :readwrite},
+                 {"Cache", "as", :read, emits_changed: :invalidates},
+                 {"Version", "s", :read, emits_changed: :const}
+               ]
+             )
+
+    test "types a declared signal by its declaration", %{cli: cli, svr: svr} do
+      assert :ok = Service.emit(cli, @calc_path, @emitter, "Computed", [5])
+
+      assert_receive {^svr, %Message{type: :signal, header_fields: fields, body: [5]}}, 1_000
+      assert fields.path == @calc_path
+      assert fields.interface == "org.example.Calculator"
+      assert fields.member == "Computed"
+      assert fields.signature == "i"
+
+      assert {:error, :unknown_signal} = Service.emit(cli, @calc_path, @emitter, "Nope", [5])
+      assert {:error, :invalid_body} = Service.emit(cli, @calc_path, @emitter, "Computed", ["5"])
+
+      assert {:error, {:invalid_option, _opts}} =
+               Service.emit(cli, @calc_path, @emitter, "Computed", [5], signature: "i")
+    end
+
+    test "requires a signature with an interface name", %{cli: cli, svr: svr} do
+      assert {:error, :signature_required} =
+               Service.emit(cli, @calc_path, "org.example.Calculator", "Computed", [5])
+
+      assert :ok =
+               Service.emit(cli, @calc_path, "org.example.Calculator", "Computed", [5],
+                 signature: "u",
+                 destination: ":1.99"
+               )
+
+      assert_receive {^svr, %Message{type: :signal, header_fields: fields, body: [5]}}, 1_000
+      assert fields.signature == "u"
+      assert fields.destination == ":1.99"
+
+      assert {:error, {:invalid_option, _opts}} =
+               Service.emit(cli, @calc_path, "org.example.Calculator", "Computed", [5],
+                 signature: "u",
+                 sender: ":1.1"
+               )
+    end
+
+    test "send PropertiesChanged as each property's declaration allows", %{cli: cli, svr: svr} do
+      assert :ok =
+               Service.properties_changed(cli, @calc_path, @emitter, %{"Precision" => 3}, [
+                 "Cache"
+               ])
+
+      assert_receive {^svr, %Message{type: :signal, header_fields: fields} = signal}, 1_000
+      assert fields.interface == "org.freedesktop.DBus.Properties"
+      assert fields.member == "PropertiesChanged"
+      assert fields.path == @calc_path
+      assert Message.signature(signal) == "sa{sv}as"
+      assert signal.body == ["org.example.Calculator", [{"Precision", {"u", 3}}], ["Cache"]]
+
+      for {changed, invalidated, reason} <- [
+            {%{"Version" => "2.0"}, [], {:invalid_property_change, "Version"}},
+            {%{"Cache" => ["a"]}, [], {:invalid_property_change, "Cache"}},
+            {%{}, ["Precision"], {:invalid_property_change, "Precision"}},
+            {%{"Missing" => 1}, [], {:unknown_property, "Missing"}}
+          ] do
+        assert {:error, ^reason} =
+                 Service.properties_changed(cli, @calc_path, @emitter, changed, invalidated)
+      end
+
+      refute_received {^svr, %Message{type: :signal}}
+    end
+  end
+
   describe "Signals" do
     setup [:server_setup, :client_setup]
 
