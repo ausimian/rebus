@@ -4938,6 +4938,145 @@ defmodule RebusTest do
       assert :ok = Rebus.close(cli)
     end
 
+    test "answer Properties Get, Set and GetAll from their handler", %{cli: cli, svr: svr} do
+      settings =
+        Rebus.Interface.new!("org.example.Settings",
+          properties: [{"Precision", "u", :readwrite}, {"Version", "s", :read}]
+        )
+
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator, settings])
+
+      {:ok, serial} = TestServer.push_call(svr, properties_call("Get", "ss", ["Version"]))
+      assert_receive {^ref, %Call{member: "Get", out_signature: "v"} = call}, 1_000
+      assert :ok = Service.reply(call, [{"s", "1.0"}])
+
+      assert_receive {^svr, %Message{type: :method_return, header_fields: fields} = reply},
+                     1_000
+
+      assert fields.reply_serial == serial
+      assert Message.signature(reply) == "v"
+      assert reply.body == [{"s", "1.0"}]
+
+      {:ok, serial} =
+        TestServer.push_call(svr, properties_call("Set", "ssv", ["Precision", {"u", 3}]))
+
+      assert_receive {^ref, %Call{member: "Set", out_signature: ""} = call}, 1_000
+      assert call.body == ["org.example.Settings", "Precision", {"u", 3}]
+      assert :ok = Service.reply(call, [])
+
+      assert_receive {^svr, %Message{type: :method_return, header_fields: fields, body: []}},
+                     1_000
+
+      assert fields.reply_serial == serial
+
+      {:ok, serial} = TestServer.push_call(svr, properties_call("GetAll", "s", []))
+      assert_receive {^ref, %Call{member: "GetAll", out_signature: "a{sv}"} = call}, 1_000
+
+      values = %{"Precision" => 3, "Version" => "1.0"}
+      assert :ok = Service.reply(call, [Rebus.Interface.wrap_properties!(settings, values)])
+
+      assert_receive {^svr, %Message{type: :method_return, header_fields: fields} = reply},
+                     1_000
+
+      assert fields.reply_serial == serial
+      assert reply.body == [[{"Precision", {"u", 3}}, {"Version", {"s", "1.0"}}]]
+
+      # A write to a read-only property never reaches the handler.
+      {:ok, serial} =
+        TestServer.push_call(svr, properties_call("Set", "ssv", ["Version", {"s", "2.0"}]))
+
+      assert_receive {^svr, %Message{type: :error, header_fields: fields}}, 1_000
+      assert fields.error_name == "org.freedesktop.DBus.Error.PropertyReadOnly"
+      assert fields.reply_serial == serial
+      refute_received {^ref, %Call{}}
+    end
+
+    test "answer local calls without writing to the socket", %{cli: cli, svr: svr} do
+      scaler =
+        Rebus.Interface.new!("org.example.Scaler",
+          methods: [{"Scale", in: [factor: "d"], out: [scaled: "d"]}]
+        )
+
+      {:ok, ref} = Service.export(cli, @calc_path, [scaler])
+
+      task =
+        Task.async(fn ->
+          Service.invoke(cli, @calc_path, "org.example.Scaler", "Scale", [2], "d", 1_000)
+        end)
+
+      # The handler sees the value as a peer's call would carry it, not as
+      # given, and so does the caller for the reply.
+      assert_receive {^ref, %Call{body: [2.0], sender: ":1.100"} = call}, 1_000
+      assert :ok = Service.reply(call, [4])
+
+      assert {:ok, %Message{type: :method_return, header_fields: fields, body: [4.0]}} =
+               Task.await(task)
+
+      assert fields.reply_serial == call.serial
+
+      task =
+        Task.async(fn -> Service.invoke(cli, @calc_path, nil, "Scale", [3.0], "d", 1_000) end)
+
+      assert_receive {^ref, %Call{interface: "org.example.Scaler", body: [3.0]} = call}, 1_000
+      assert :ok = Service.reply_error(call, "org.example.Error.Overflow", "too big")
+
+      assert {:error, {:dbus_error, %Message{header_fields: %{error_name: error_name}}}} =
+               Task.await(task)
+
+      assert error_name == "org.example.Error.Overflow"
+
+      assert {:error, {:dbus_error, %Message{header_fields: %{error_name: error_name}}}} =
+               Service.invoke(cli, "/elsewhere", "org.example.Scaler", "Scale", [1.0], "d", 1_000)
+
+      assert error_name == "org.freedesktop.DBus.Error.UnknownObject"
+
+      assert {:error, :invalid_body} =
+               Service.invoke(cli, @calc_path, nil, "Scale", ["x"], "d", 1_000)
+
+      refute_received {^svr, %Message{}}
+    end
+
+    test "fail a local call when the handler exits or does not answer in time", %{cli: cli} do
+      handler = spawn(fn -> Process.sleep(:infinity) end)
+      {:ok, _ref} = Service.export(cli, @calc_path, [@calculator], handler: handler)
+
+      task =
+        Task.async(fn -> Service.invoke(cli, @calc_path, nil, "Add", [2, 3], "ii", 1_000) end)
+
+      assert wait_until(fn ->
+               Process.info(handler, :message_queue_len) == {:message_queue_len, 1}
+             end)
+
+      Process.exit(handler, :kill)
+
+      assert {:error, {:dbus_error, %Message{header_fields: fields, body: ["Handler exited"]}}} =
+               Task.await(task)
+
+      assert fields.error_name == "org.freedesktop.DBus.Error.Failed"
+
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator], call_timeout: 50)
+
+      task =
+        Task.async(fn -> Service.invoke(cli, @calc_path, nil, "Add", [2, 3], "ii", 1_000) end)
+
+      assert_receive {^ref, %Call{} = call}, 1_000
+
+      assert {:error, {:dbus_error, %Message{header_fields: fields}}} = Task.await(task)
+      assert fields.error_name == "org.freedesktop.DBus.Error.NoReply"
+      assert {:error, :unknown_call} = Service.reply(call, [5])
+    end
+
+    test "withdraw a local call whose caller stopped waiting", %{cli: cli} do
+      {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
+
+      assert {:error, :timeout} = Service.invoke(cli, @calc_path, nil, "Add", [2, 3], "ii", 0)
+
+      # The cancellation was cast before this call, so it has been handled.
+      assert {:ok, _name} = Rebus.unique_name(cli)
+      assert_receive {^ref, %Call{} = call}, 1_000
+      assert {:error, :unknown_call} = Service.reply(call, [5])
+    end
+
     test "report a stopped connection as disconnected", %{cli: cli, svr: svr} do
       {:ok, ref} = Service.export(cli, @calc_path, [@calculator])
       {:ok, _serial} = TestServer.push_call(svr, calc_call("Add", [2, 3]))
@@ -4950,6 +5089,82 @@ defmodule RebusTest do
       assert {:error, :disconnected} = Service.reply(call, [5])
       assert {:error, :disconnected} = Service.unexport(cli, ref)
       assert {:error, :disconnected} = Service.export(cli, @calc_path, [@calculator])
+    end
+  end
+
+  describe "Emitting signals" do
+    setup [:server_setup, :client_setup]
+
+    @emitter Rebus.Interface.new!("org.example.Calculator",
+               signals: [{"Computed", args: [sum: "i"]}],
+               properties: [
+                 {"Precision", "u", :readwrite},
+                 {"Cache", "as", :read, emits_changed: :invalidates},
+                 {"Version", "s", :read, emits_changed: :const}
+               ]
+             )
+
+    test "types a declared signal by its declaration", %{cli: cli, svr: svr} do
+      assert :ok = Service.emit(cli, @calc_path, @emitter, "Computed", [5])
+
+      assert_receive {^svr, %Message{type: :signal, header_fields: fields, body: [5]}}, 1_000
+      assert fields.path == @calc_path
+      assert fields.interface == "org.example.Calculator"
+      assert fields.member == "Computed"
+      assert fields.signature == "i"
+
+      assert {:error, :unknown_signal} = Service.emit(cli, @calc_path, @emitter, "Nope", [5])
+      assert {:error, :invalid_body} = Service.emit(cli, @calc_path, @emitter, "Computed", ["5"])
+
+      assert {:error, {:invalid_option, _opts}} =
+               Service.emit(cli, @calc_path, @emitter, "Computed", [5], signature: "i")
+    end
+
+    test "requires a signature with an interface name", %{cli: cli, svr: svr} do
+      assert {:error, :signature_required} =
+               Service.emit(cli, @calc_path, "org.example.Calculator", "Computed", [5])
+
+      assert :ok =
+               Service.emit(cli, @calc_path, "org.example.Calculator", "Computed", [5],
+                 signature: "u",
+                 destination: ":1.99"
+               )
+
+      assert_receive {^svr, %Message{type: :signal, header_fields: fields, body: [5]}}, 1_000
+      assert fields.signature == "u"
+      assert fields.destination == ":1.99"
+
+      assert {:error, {:invalid_option, _opts}} =
+               Service.emit(cli, @calc_path, "org.example.Calculator", "Computed", [5],
+                 signature: "u",
+                 sender: ":1.1"
+               )
+    end
+
+    test "send PropertiesChanged as each property's declaration allows", %{cli: cli, svr: svr} do
+      assert :ok =
+               Service.properties_changed(cli, @calc_path, @emitter, %{"Precision" => 3}, [
+                 "Cache"
+               ])
+
+      assert_receive {^svr, %Message{type: :signal, header_fields: fields} = signal}, 1_000
+      assert fields.interface == "org.freedesktop.DBus.Properties"
+      assert fields.member == "PropertiesChanged"
+      assert fields.path == @calc_path
+      assert Message.signature(signal) == "sa{sv}as"
+      assert signal.body == ["org.example.Calculator", [{"Precision", {"u", 3}}], ["Cache"]]
+
+      for {changed, invalidated, reason} <- [
+            {%{"Version" => "2.0"}, [], {:invalid_property_change, "Version"}},
+            {%{"Cache" => ["a"]}, [], {:invalid_property_change, "Cache"}},
+            {%{}, ["Precision"], {:invalid_property_change, "Precision"}},
+            {%{"Missing" => 1}, [], {:unknown_property, "Missing"}}
+          ] do
+        assert {:error, ^reason} =
+                 Service.properties_changed(cli, @calc_path, @emitter, changed, invalidated)
+      end
+
+      refute_received {^svr, %Message{type: :signal}}
     end
   end
 
@@ -5525,6 +5740,18 @@ defmodule RebusTest do
         ],
         opts
       )
+    )
+  end
+
+  # A Properties call on `org.example.Settings` at `@calc_path`.
+  defp properties_call(member, signature, args) do
+    Message.new!(:method_call,
+      path: @calc_path,
+      interface: "org.freedesktop.DBus.Properties",
+      member: member,
+      sender: ":1.99",
+      signature: signature,
+      body: ["org.example.Settings" | args]
     )
   end
 

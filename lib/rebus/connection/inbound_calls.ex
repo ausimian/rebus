@@ -29,7 +29,9 @@ defmodule Rebus.Connection.InboundCalls do
     # One call awaiting its handler's answer: the serial and sender a reply is
     # addressed to, the export and handler it was routed to, the descriptors
     # it carried, and the timer that expires it. `timer_ref` and `deadline`
-    # are `nil` for a call that never expires.
+    # are `nil` for a call that never expires. `from` is the local process
+    # waiting for the answer to a call made with `Rebus.Service.invoke/7`,
+    # and `nil` for a call from a peer, whose answer goes to the socket.
 
     typedstruct enforce: true do
       field :ref, reference()
@@ -40,6 +42,7 @@ defmodule Rebus.Connection.InboundCalls do
       field :unix_fds, [UnixFD.t()]
       field :timer_ref, reference() | nil
       field :deadline, integer() | nil
+      field :from, GenServer.from() | nil, default: nil
     end
   end
 
@@ -50,7 +53,8 @@ defmodule Rebus.Connection.InboundCalls do
           required(:sender) => binary() | nil,
           required(:export) => reference(),
           required(:handler) => pid(),
-          required(:unix_fds) => [UnixFD.t()]
+          required(:unix_fds) => [UnixFD.t()],
+          optional(:from) => GenServer.from()
         }
 
   typedstruct enforce: true do
@@ -78,7 +82,8 @@ defmodule Rebus.Connection.InboundCalls do
       handler: call.handler,
       unix_fds: call.unix_fds,
       timer_ref: timer_ref,
-      deadline: deadline
+      deadline: deadline,
+      from: Map.get(call, :from)
     }
 
     {entry, %{calls | entries: Map.put(calls.entries, ref, entry)}}

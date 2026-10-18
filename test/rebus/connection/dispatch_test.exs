@@ -38,7 +38,10 @@ defmodule Rebus.Connection.DispatchTest do
   @limits_exceeded_error "org.freedesktop.DBus.Error.LimitsExceeded"
   @no_reply_error "org.freedesktop.DBus.Error.NoReply"
   @failed_error "org.freedesktop.DBus.Error.Failed"
+  @unknown_property_error "org.freedesktop.DBus.Error.UnknownProperty"
+  @property_read_only_error "org.freedesktop.DBus.Error.PropertyReadOnly"
   @introspectable "org.freedesktop.DBus.Introspectable"
+  @properties "org.freedesktop.DBus.Properties"
 
   @path "/org/example/Calc"
   @calculator Interface.new!("org.example.Calculator",
@@ -50,6 +53,13 @@ defmodule Rebus.Connection.DispatchTest do
   @display Interface.new!("org.example.Display",
              methods: [{"Show", in: [text: "s"]}, {"Reset", []}]
            )
+  @settings Interface.new!("org.example.Settings",
+              properties: [
+                {"Precision", "u", :readwrite},
+                {"Version", "s", :read},
+                {"Secret", "s", :write}
+              ]
+            )
 
   describe "reply correlation" do
     test "answers the caller of a correlated reply and clears its entry" do
@@ -314,10 +324,8 @@ defmodule Rebus.Connection.DispatchTest do
     test "refuses an interface the object does not export with UnknownInterface" do
       {_export_ref, state} = exported(connection())
 
-      for interface <- ["org.example.Missing", "org.freedesktop.DBus.Properties"] do
-        call = app_call("Add", interface: interface, signature: "ii", body: [2, 3])
-        assert_refused(call, state, @unknown_interface_error)
-      end
+      call = app_call("Add", interface: "org.example.Missing", signature: "ii", body: [2, 3])
+      assert_refused(call, state, @unknown_interface_error)
     end
 
     test "refuses an undeclared member with UnknownMethod" do
@@ -591,6 +599,180 @@ defmodule Rebus.Connection.DispatchTest do
     end
   end
 
+  describe "Properties" do
+    test "routes each call to the handler that exported the target interface" do
+      {_calc_ref, state} = exported(connection())
+      handler = forwarder()
+      {settings_ref, state} = exported(state, interfaces: [@settings], handler: handler)
+
+      for {member, signature, body, out_signature} <- [
+            {"Get", "ss", ["org.example.Settings", "Version"], "v"},
+            {"Set", "ssv", ["org.example.Settings", "Precision", {"u", 3}], ""},
+            {"GetAll", "s", ["org.example.Settings"], "a{sv}"}
+          ] do
+        call = properties_call(member, signature: signature, body: body)
+        assert {:continue, :recv, %Connection{} = routed} = dispatch(call, state)
+
+        assert_receive {:forwarded, {^settings_ref, %Call{} = delivered}}, 1_000
+        assert delivered.export == settings_ref
+        assert delivered.interface == @properties
+        assert delivered.member == member
+        assert delivered.signature == signature
+        assert delivered.out_signature == out_signature
+        assert delivered.body == body
+
+        assert {:ok, entry} = InboundCalls.fetch(routed.inbound_calls, delivered.ref)
+        assert entry.handler == handler
+        assert :queue.is_empty(routed.writer.queue)
+        InboundCalls.close_all(routed.inbound_calls)
+      end
+
+      refute_received {_export_ref, %Call{}}
+    end
+
+    test "answers GetAll itself with an empty dictionary when nothing is readable" do
+      write_only = Interface.new!("org.example.Sink", properties: [{"Level", "u", :write}])
+      {export_ref, state} = exported(connection(), interfaces: [@calculator, write_only])
+
+      for target <- ["org.example.Calculator", "org.example.Sink"] do
+        call = properties_call("GetAll", signature: "s", body: [target])
+
+        assert [%{kind: :reply, msg: reply}] = queued_replies(call, state)
+        assert %Message{type: :method_return, body: [[]]} = reply
+        assert Message.signature(reply) == "a{sv}"
+        assert reply.header_fields.reply_serial == 5
+        assert reply.header_fields.destination == ":1.7"
+      end
+
+      refute_received {^export_ref, _call}
+    end
+
+    test "refuses a member Properties does not declare with UnknownMethod" do
+      {_export_ref, state} = exported(connection(), interfaces: [@settings])
+
+      call = properties_call("Nope", signature: "s", body: ["org.example.Settings"])
+      assert_refused(call, state, @unknown_method_error)
+    end
+
+    test "refuses arguments that differ from the Properties signatures with InvalidArgs" do
+      {_export_ref, state} = exported(connection(), interfaces: [@settings])
+
+      for {member, signature, body} <- [
+            {"Get", "s", ["org.example.Settings"]},
+            {"Get", "ssv", ["org.example.Settings", "Version", {"s", "x"}]},
+            {"Set", "ss", ["org.example.Settings", "Precision"]},
+            {"Set", "ssu", ["org.example.Settings", "Precision", 3]},
+            {"GetAll", "", []},
+            {"GetAll", "ss", ["org.example.Settings", "Version"]}
+          ] do
+        call = properties_call(member, signature: signature, body: body)
+        assert_refused(call, state, @invalid_args_error)
+      end
+    end
+
+    test "refuses an interface the object does not export with UnknownInterface" do
+      {_export_ref, state} = exported(connection(), interfaces: [@settings])
+
+      for target <- ["org.example.Missing", "", @properties, @introspectable] do
+        for {member, signature, body} <- [
+              {"Get", "ss", [target, "Version"]},
+              {"Set", "ssv", [target, "Precision", {"u", 3}]},
+              {"GetAll", "s", [target]}
+            ] do
+          call = properties_call(member, signature: signature, body: body)
+          assert_refused(call, state, @unknown_interface_error)
+        end
+      end
+    end
+
+    test "refuses a property the interface does not declare with UnknownProperty" do
+      {_export_ref, state} = exported(connection(), interfaces: [@settings, @calculator])
+
+      for {member, signature, body} <- [
+            {"Get", "ss", ["org.example.Settings", "Missing"]},
+            {"Set", "ssv", ["org.example.Settings", "Missing", {"u", 3}]},
+            {"Get", "ss", ["org.example.Calculator", "Precision"]}
+          ] do
+        call = properties_call(member, signature: signature, body: body)
+        assert_refused(call, state, @unknown_property_error)
+      end
+    end
+
+    test "refuses writing a read-only property with PropertyReadOnly" do
+      {_export_ref, state} = exported(connection(), interfaces: [@settings])
+
+      call =
+        properties_call("Set",
+          signature: "ssv",
+          body: ["org.example.Settings", "Version", {"s", "2.0"}]
+        )
+
+      assert_refused(call, state, @property_read_only_error)
+    end
+
+    test "refuses reading a write-only property with InvalidArgs" do
+      {_export_ref, state} = exported(connection(), interfaces: [@settings])
+      call = properties_call("Get", signature: "ss", body: ["org.example.Settings", "Secret"])
+
+      assert [%{msg: reply}] = queued_replies(call, state)
+      assert reply.header_fields.error_name == @invalid_args_error
+      assert reply.body == ["Property is not readable"]
+    end
+
+    test "refuses a Set whose value differs from the declared type with InvalidArgs" do
+      {_export_ref, state} = exported(connection(), interfaces: [@settings])
+
+      for value <- [{"i", 3}, {"s", "3"}, {"au", [3]}, {"v", {"u", 3}}] do
+        call =
+          properties_call("Set",
+            signature: "ssv",
+            body: ["org.example.Settings", "Precision", value]
+          )
+
+        assert [%{msg: reply}] = queued_replies(call, state)
+        assert reply.header_fields.error_name == @invalid_args_error
+        assert reply.body == ["Value does not match the property signature"]
+      end
+    end
+
+    test "refuses Properties on an intermediate node and on a path with nothing exported" do
+      {_export_ref, state} = exported(connection(), interfaces: [@settings])
+      body = ["org.example.Settings"]
+
+      assert_refused(
+        properties_call("GetAll", path: "/org", signature: "s", body: body),
+        state,
+        @unknown_interface_error
+      )
+
+      assert_refused(
+        properties_call("GetAll", path: "/elsewhere", signature: "s", body: body),
+        state,
+        @unknown_object_error
+      )
+    end
+
+    test "never answers a Properties call that asked for no reply" do
+      {_export_ref, state} = exported(connection(), interfaces: [@settings, @calculator])
+
+      for {member, signature, body} <- [
+            {"GetAll", "s", ["org.example.Calculator"]},
+            {"Get", "ss", ["org.example.Settings", "Secret"]},
+            {"Get", "ss", ["org.example.Missing", "Version"]},
+            {"Set", "ssv", ["org.example.Settings", "Precision", {"s", "3"}]}
+          ] do
+        call = %{
+          properties_call(member, signature: signature, body: body)
+          | flags: [:no_reply_expected]
+        }
+
+        assert queued_replies(call, state) == []
+      end
+
+      refute_received :advance_writes
+    end
+  end
+
   describe "completing inbound calls" do
     test "addresses the reply from the recorded call, not from the handler" do
       {_call, state} = routed()
@@ -687,6 +869,129 @@ defmodule Rebus.Connection.DispatchTest do
       assert reply.body == ["Object unexported"]
       assert state.inbound_calls == InboundCalls.new()
       assert {:monitors, []} = Process.info(self(), :monitors)
+    end
+  end
+
+  describe "local calls" do
+    test "are recorded under the caller's request reference and delivered" do
+      {export_ref, state} = exported(connection())
+      {from, _tag} = local_caller()
+      request_ref = make_ref()
+
+      state =
+        Service.invoke(app_call("Add", signature: "ii", body: [2, 3]), from, request_ref, state)
+
+      assert_received {^export_ref, %Call{ref: ^request_ref, body: [2, 3]}}
+
+      assert {:ok, %{from: ^from, serial: 5}} =
+               InboundCalls.fetch(state.inbound_calls, request_ref)
+
+      assert :queue.is_empty(state.writer.queue)
+      InboundCalls.close_all(state.inbound_calls)
+    end
+
+    test "deliver the handler's reply to the caller instead of the socket" do
+      {state, request_ref, tag} = invoked()
+      reply = Message.new!(:method_return, reply_serial: 99, signature: "i", body: [5])
+
+      assert {:answered, state} = Service.complete(state, request_ref, reply)
+      assert_received {^tag, {:ok, %Message{type: :method_return, body: [5]} = answered}}
+      assert answered.header_fields.reply_serial == 5
+      assert state.inbound_calls == InboundCalls.new()
+      assert :queue.is_empty(state.writer.queue)
+
+      error = Message.new!(:error, reply_serial: 5, error_name: "org.example.Error.No")
+      {state, request_ref, tag} = invoked()
+      assert {:answered, _state} = Service.complete(state, request_ref, error)
+      assert_received {^tag, {:error, {:dbus_error, %Message{type: :error}}}}
+    end
+
+    test "refuse a reply carrying descriptors and keep the call open" do
+      {state, request_ref, tag} = invoked()
+      reply = Message.new!(:method_return, reply_serial: 5, signature: "i", body: [5])
+
+      assert {:error, :unix_fd_unsupported} =
+               Service.complete(state, request_ref, %{reply | unix_fds: [:not_a_descriptor]})
+
+      refute_received {^tag, _result}
+      assert {:answered, _state} = Service.complete(state, request_ref, reply)
+      assert_received {^tag, {:ok, %Message{}}}
+    end
+
+    test "are answered directly when the connection refuses or answers them itself" do
+      {_export_ref, state} = exported(connection(), interfaces: [@calculator, @settings])
+
+      for {call, expected} <- [
+            {app_call("Nope"), {:error, @unknown_method_error}},
+            {app_call("Add", path: "/elsewhere"), {:error, @unknown_object_error}},
+            {properties_call("Set",
+               signature: "ssv",
+               body: ["org.example.Settings", "Version", {"s", "2.0"}]
+             ), {:error, @property_read_only_error}},
+            {properties_call("GetAll", signature: "s", body: ["org.example.Calculator"]),
+             {:ok, [[]]}},
+            {app_call("Ping", interface: "org.freedesktop.DBus.Peer"), {:ok, []}}
+          ] do
+        {from, tag} = local_caller()
+        after_call = Service.invoke(call, from, make_ref(), state)
+
+        assert :queue.is_empty(after_call.writer.queue)
+        refute_received :advance_writes
+
+        case expected do
+          {:ok, body} ->
+            assert_received {^tag, {:ok, %Message{type: :method_return, body: ^body}}}
+
+          {:error, name} ->
+            assert_received {^tag, {:error, {:dbus_error, %Message{} = reply}}}
+            assert reply.header_fields.error_name == name
+            assert reply.header_fields.reply_serial == 5
+        end
+      end
+    end
+
+    test "are refused with LimitsExceeded beyond max_pending_calls" do
+      {state, _request_ref, _tag} = invoked(%{connection() | max_pending_calls: 1})
+      {from, tag} = local_caller()
+
+      after_call =
+        Service.invoke(app_call("Add", signature: "ii", body: [2, 3]), from, make_ref(), state)
+
+      assert_received {^tag, {:error, {:dbus_error, reply}}}
+      assert reply.header_fields.error_name == @limits_exceeded_error
+      assert after_call.inbound_calls == state.inbound_calls
+      InboundCalls.close_all(state.inbound_calls)
+    end
+
+    test "are failed to the caller when their object is unexported" do
+      {state, _request_ref, tag} = invoked()
+      [export_ref] = Map.keys(state.objects.exports)
+
+      state = Service.unexport(state, export_ref)
+
+      assert_received {^tag, {:error, {:dbus_error, reply}}}
+      assert reply.header_fields.error_name == @failed_error
+      assert reply.body == ["Object unexported"]
+      assert :queue.is_empty(state.writer.queue)
+    end
+
+    test "are withdrawn when their caller stops waiting" do
+      {state, request_ref, tag} = invoked()
+
+      assert {:ok, state} = Service.cancel(state, request_ref)
+      assert state.inbound_calls == InboundCalls.new()
+
+      reply = Message.new!(:method_return, reply_serial: 5, signature: "i", body: [5])
+      assert {:error, :unknown_call} = Service.complete(state, request_ref, reply)
+      refute_received {^tag, _result}
+    end
+
+    test "leave calls from peers alone on cancellation" do
+      {%Call{ref: ref}, state} = routed()
+
+      assert :error = Service.cancel(state, ref)
+      assert :error = Service.cancel(state, make_ref())
+      InboundCalls.close_all(state.inbound_calls)
     end
   end
 
@@ -796,6 +1101,42 @@ defmodule Rebus.Connection.DispatchTest do
   end
 
   defp introspect_call(path), do: app_call("Introspect", path: path, interface: @introspectable)
+
+  defp properties_call(member, opts), do: app_call(member, [interface: @properties] ++ opts)
+
+  # A local caller's `from`: `GenServer.reply/2` sends `{tag, result}` here.
+  defp local_caller do
+    tag = make_ref()
+    {{self(), tag}, tag}
+  end
+
+  # A local call to `Add` routed to this process and recorded.
+  defp invoked(state \\ connection()) do
+    {export_ref, state} = exported(state)
+    {from, tag} = local_caller()
+    request_ref = make_ref()
+
+    state =
+      Service.invoke(app_call("Add", signature: "ii", body: [2, 3]), from, request_ref, state)
+
+    assert_received {^export_ref, %Call{ref: ^request_ref}}
+    {state, request_ref, tag}
+  end
+
+  # A handler other than this process, which hands every message it receives
+  # back here, so a test can tell which handler a call was routed to.
+  defp forwarder do
+    test = self()
+    spawn_link(fn -> forward(test) end)
+  end
+
+  defp forward(test) do
+    receive do
+      message -> send(test, {:forwarded, message})
+    end
+
+    forward(test)
+  end
 
   # The interface names and children of the document `Introspect` answers on
   # `path`, after checking that it parses.

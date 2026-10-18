@@ -56,6 +56,10 @@ defmodule Rebus.Service do
   | Interface not exported on the object | `org.freedesktop.DBus.Error.UnknownInterface` |
   | Method not declared, or, without an interface, declared by no exported interface or by more than one | `org.freedesktop.DBus.Error.UnknownMethod` |
   | Argument signature differs from the declaration | `org.freedesktop.DBus.Error.InvalidArgs` |
+  | Property not declared by the interface a `Properties` call names | `org.freedesktop.DBus.Error.UnknownProperty` |
+  | `Set` of a read-only property | `org.freedesktop.DBus.Error.PropertyReadOnly` |
+  | `Get` of a write-only property | `org.freedesktop.DBus.Error.InvalidArgs` |
+  | `Set` value of a type other than the declared one | `org.freedesktop.DBus.Error.InvalidArgs` |
   | `:max_pending_calls` calls already waiting | `org.freedesktop.DBus.Error.LimitsExceeded` |
   | Handler exited with the call pending | `org.freedesktop.DBus.Error.Failed` |
   | Object unexported with the call pending | `org.freedesktop.DBus.Error.Failed` |
@@ -67,6 +71,50 @@ defmodule Rebus.Service do
   it cannot be exported, and neither can
   `org.freedesktop.DBus.Introspectable` or `org.freedesktop.DBus.Properties`,
   which the connection reserves for itself.
+
+  ## Properties
+
+  The connection checks every `org.freedesktop.DBus.Properties` call against
+  the declaration of the interface it names, and sends it to the handler that
+  exported that interface. The call arrives with
+  `interface: "org.freedesktop.DBus.Properties"`, `member` `"Get"`, `"Set"`
+  or `"GetAll"`, and the body as sent, whose first element names the
+  interface. By then the interface is exported on the object, a `Get` or
+  `Set` names a declared property that can be read or written, and a `Set`
+  value has the declared type, so the handler only reads or writes values:
+
+      alias Rebus.Service.Call
+
+      receive do
+        {^ref, %Call{member: "Get", body: [_iface, "Precision"]} = call} ->
+          Rebus.Service.reply(call, [{"u", precision}])
+
+        {^ref, %Call{member: "Set", body: [_iface, "Precision", {"u", value}]} = call} ->
+          Rebus.Service.reply(call, [])
+
+        {^ref, %Call{member: "GetAll"} = call} ->
+          values = Rebus.Interface.wrap_properties!(settings, %{"Precision" => precision})
+          Rebus.Service.reply(call, [values])
+      end
+
+  `call.out_signature` is `"v"` for `Get`, so the value is a
+  `{signature, value}` variant; `""` for `Set`; and `"a{sv}"` for `GetAll`,
+  which `Rebus.Interface.wrap_properties/2` builds from the declaration. A
+  `GetAll` for an interface that declares no readable property is answered
+  with an empty dictionary without reaching the handler.
+
+  ## Signals
+
+  `emit/6` sends a signal from an exported object, typed by the interface
+  declaration, and `properties_changed/6` sends
+  `org.freedesktop.DBus.Properties.PropertiesChanged` for properties that
+  changed, as each property's `emits_changed` allows:
+
+      :ok = Rebus.Service.emit(conn, "/org/example/Calculator", calculator, "Computed", [5])
+
+      :ok =
+        Rebus.Service.properties_changed(conn, "/org/example/Calculator", settings,
+          %{"Precision" => 3}, [])
 
   ## Introspection
 
@@ -93,6 +141,7 @@ defmodule Rebus.Service do
 
   @default_timeout 5_000
   @default_call_timeout 60_000
+  @signal_options [:signature, :destination, :flags, :fds]
 
   @reserved_interfaces [
     "org.freedesktop.DBus.Peer",
@@ -311,6 +360,161 @@ defmodule Rebus.Service do
   defp send_reply(%Call{} = call, %Message{} = msg, opts) do
     timeout = Keyword.get(opts, :timeout, @default_timeout)
     Connection.reply_call(call.conn, call.ref, msg, timeout)
+  end
+
+  @doc """
+  Emits the signal `member` of `interface` from the object at `path`.
+
+  Given a `Rebus.Interface`, the signal must be one it declares, and `body`
+  is encoded with the declared signature. Given an interface name, the
+  signature must be passed as the `:signature` option. The signal is sent
+  as `Rebus.send/3` sends any message: the connection does not check that
+  anything is exported at `path`.
+
+  ## Options
+
+  - `:signature` - the body's signature. Required with an interface name,
+    and refused with a `Rebus.Interface`, which supplies its own.
+  - `:destination` - the unique name to send the signal to, rather than
+    broadcasting it.
+  - `:flags` and `:fds` - as for `Rebus.Message.new/2`.
+  - `:timeout` - milliseconds to wait for the connection to accept the
+    signal. Defaults to `5000`.
+
+  ## Return values
+
+  - `:ok` - the signal was handed to the socket.
+  - `{:error, :unknown_signal}` - the interface does not declare `member`.
+  - `{:error, :signature_required}` - an interface name without `:signature`.
+  - `{:error, {:invalid_option, opts}}` - an option not listed above.
+  - Any error of `Rebus.Message.new/2`, such as `{:error, :invalid_body}` for
+    a body that does not fit the signature, or of `Rebus.send/3`.
+  """
+  @spec emit(pid(), binary(), Interface.t() | binary(), binary(), [term()], keyword()) ::
+          :ok
+          | {:error,
+             :unknown_signal
+             | :signature_required
+             | {:invalid_option, term()}
+             | Message.construction_error()
+             | Rebus.error_reason()}
+  def emit(conn, path, interface, member, body, opts \\ [])
+      when is_pid(conn) and is_list(body) and is_list(opts) do
+    {timeout, opts} = Keyword.pop(opts, :timeout, @default_timeout)
+
+    with {:ok, signal} <- build_signal(interface, path, member, body, opts) do
+      Rebus.send(conn, signal, timeout)
+    end
+  end
+
+  defp build_signal(%Interface{} = interface, path, member, body, opts),
+    do: Interface.signal(interface, path, member, body, opts)
+
+  defp build_signal(interface, path, member, body, opts) when is_binary(interface) do
+    with :ok <- validate_signal_opts(opts),
+         {:ok, signature} <- fetch_signature(opts) do
+      Message.new(
+        :signal,
+        [path: path, interface: interface, member: member, signature: signature, body: body] ++
+          Keyword.delete(opts, :signature)
+      )
+    end
+  end
+
+  defp validate_signal_opts(opts) do
+    if Keyword.keyword?(opts) and
+         Enum.all?(opts, fn {key, _value} -> key in @signal_options end),
+       do: :ok,
+       else: {:error, {:invalid_option, opts}}
+  end
+
+  defp fetch_signature(opts) do
+    case Keyword.fetch(opts, :signature) do
+      {:ok, signature} -> {:ok, signature}
+      :error -> {:error, :signature_required}
+    end
+  end
+
+  @doc """
+  Emits `org.freedesktop.DBus.Properties.PropertiesChanged` for properties
+  of `interface` on the object at `path`.
+
+  `changed` maps property names to their new values, typed by the
+  declaration, and `invalidated` names properties that changed without
+  their values. Each property's `emits_changed` decides where it may appear,
+  as `Rebus.Interface.properties_changed/5` describes: one that emits `true`
+  only in `changed`, one that emits `:invalidates` only in `invalidated`,
+  and one that emits `false` or `:const` in neither.
+
+  Takes the options `emit/6` takes, except `:signature`, and returns what it
+  returns, plus `Rebus.Interface.properties_changed/5`'s errors for a
+  property the interface does not declare or does not allow where it
+  appears.
+  """
+  @spec properties_changed(
+          pid(),
+          binary(),
+          Interface.t(),
+          %{binary() => term()},
+          [binary()],
+          keyword()
+        ) ::
+          :ok
+          | {:error,
+             Interface.property_error()
+             | {:invalid_property_change, binary()}
+             | {:invalid_option, term()}
+             | Message.construction_error()
+             | Rebus.error_reason()}
+  def properties_changed(conn, path, %Interface{} = interface, changed, invalidated, opts \\ [])
+      when is_pid(conn) and is_map(changed) and is_list(invalidated) and is_list(opts) do
+    {timeout, opts} = Keyword.pop(opts, :timeout, @default_timeout)
+
+    with {:ok, signal} <-
+           Interface.properties_changed(interface, path, changed, invalidated, opts) do
+      Rebus.send(conn, signal, timeout)
+    end
+  end
+
+  # Makes a method call to an object exported on `conn` without leaving the
+  # node, so local code such as an object manager can ask another object's
+  # handler something through the same routing, checks and bounds a peer's
+  # call meets. The call is encoded and decoded first, so its handler sees
+  # exactly what it would for the same call from a peer, and so is the
+  # reply, so this returns what `Rebus.call/3` would. A handler's reply that
+  # carries descriptors is refused with `{:error, :unix_fd_unsupported}`.
+  # The handler must not be the calling process, which would wait for itself
+  # until `timeout`.
+  @doc false
+  @spec invoke(pid(), binary(), binary() | nil, binary(), [term()], binary(), non_neg_integer()) ::
+          {:ok, Message.t()}
+          | {:error, {:dbus_error, Message.t()} | Message.encoding_error() | Rebus.error_reason()}
+  def invoke(conn, path, interface, member, body, signature, timeout)
+      when is_pid(conn) and is_list(body) and is_integer(timeout) and timeout >= 0 do
+    fields =
+      [path: path, interface: interface, member: member, signature: signature, body: body]
+      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+
+    with {:ok, msg} <- Message.new(:method_call, fields),
+         {:ok, msg} <- as_received(msg) do
+      conn |> Connection.invoke(msg, timeout) |> received_result()
+    end
+  end
+
+  defp received_result({:ok, %Message{} = reply}), do: as_received(reply)
+
+  defp received_result({:error, {:dbus_error, %Message{} = reply}}) do
+    with {:ok, reply} <- as_received(reply), do: {:error, {:dbus_error, reply}}
+  end
+
+  defp received_result({:error, _reason} = error), do: error
+
+  # The encoder accepts some values in more than one shape, such as an
+  # integer for a double, while the decoder produces one.
+  defp as_received(%Message{} = msg) do
+    with {:ok, iodata} <- Message.encode(msg) do
+      iodata |> IO.iodata_to_binary() |> Message.decode()
+    end
   end
 
   defp validate_path(path) do
