@@ -93,6 +93,7 @@ defmodule Rebus.MixProject do
       extras: [
         "README.md",
         "CONTRIBUTING.md",
+        "guides/services.md",
         "guides/unix_fds.md",
         "guides/authentication.md",
         "guides/match_rules.md",
