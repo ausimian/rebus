@@ -1,10 +1,11 @@
 defmodule Rebus do
   @moduledoc """
-  A D-Bus client for Elixir.
+  A D-Bus library for Elixir.
 
   Rebus connects to system and session buses, Unix sockets, and TCP endpoints.
-  Use it to call methods, send messages, subscribe to signals, and pass Unix
-  file descriptors on supported local connections.
+  Use it to call methods, send messages, subscribe to signals, export objects
+  that answer method calls, and pass Unix file descriptors on supported local
+  connections.
 
   ## Example
 
@@ -56,12 +57,13 @@ defmodule Rebus do
   Connections implement
   `org.freedesktop.DBus.Peer` (`Ping` and `GetMachineId`) on every path.
   `Rebus.Service` exports objects and answers the method calls made on them,
-  and `Rebus.Bus` requests the well-known names clients find them by.
+  `Rebus.Object` runs an exported object as a GenServer, and `Rebus.Bus`
+  requests the well-known names clients find them by.
   A call to a path with nothing exported gets an
   `org.freedesktop.DBus.Error.UnknownObject` error, unless the call is marked
   `:no_reply_expected`.
 
-  See [Authentication](authentication.html),
+  See [Exporting objects](services.html), [Authentication](authentication.html),
   [Signal subscriptions and match rules](match_rules.html), and
   [Unix file descriptor passing](unix_fds.html) for practical guidance.
   """
