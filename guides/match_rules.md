@@ -1,16 +1,9 @@
 # Signal subscriptions and match rules
 
-A message bus forwards a broadcast signal only to connections that asked for
-it. Rebus gives you two ways to receive signals.
-
-## At a glance
-
-- `Rebus.add_signal_handler/1` delivers every signal that arrives on the
-  connection.
-- `Rebus.add_match/3` asks the bus to route matching broadcast signals to you.
-- Both deliver `{ref, %Rebus.Message{}}` to the process that registered.
-- Build rules with `Rebus.MatchRule.new!/1`. Raw rule strings are not accepted.
-- Handlers are per connection, and never see signals from another connection.
+A message bus forwards a broadcast signal only to connections that have
+asked for it. Rebus gives you two ways to receive signals. Both deliver
+`{ref, %Rebus.Message{}}` to the process that registered, and both belong to
+one connection: a handler never sees signals from another connection.
 
 ## Every signal on the connection
 
@@ -20,12 +13,14 @@ it. Rebus gives you two ways to receive signals.
 :ok = Rebus.delete_signal_handler(conn, ref)
 ```
 
-This asks the bus for nothing. It gives you the signals the connection already
-receives, such as signals directed at your unique name.
+`Rebus.add_signal_handler/1` asks the bus for nothing. It hands you the
+signals the connection already receives, such as signals directed at your
+unique name.
 
-## Routed subscriptions
+## Subscribing with a match rule
 
-`Rebus.add_match/3` registers a rule with the bus and returns a reference:
+`Rebus.add_match/3` registers a rule with the bus, which then routes the
+matching broadcast signals to the connection:
 
 ```elixir
 rule =
@@ -46,68 +41,67 @@ end
 :ok = Rebus.remove_match(conn, ref)
 ```
 
-A connection opened with `bus: false` has no bus driver to ask, so
-`add_match/3` returns `{:error, :not_a_bus}`.
-
-## Building a rule
-
-`Rebus.MatchRule.new!/1` accepts `:sender`, `:interface`, `:member`, `:path`,
-`:path_namespace`, `:destination`, `:args`, `:arg_paths` and `:arg0namespace`.
-`:path` and `:path_namespace` cannot be combined. Rules always match signals.
-
-The encoded rule is limited to 1024 bytes, which is the D-Bus limit.
-`eavesdrop` is deliberately not accepted; use a dedicated monitoring
+Rules are built with `Rebus.MatchRule.new!/1`. Raw rule strings are not
+accepted. It takes `:sender`, `:interface`, `:member`, `:path`,
+`:path_namespace`, `:destination`, `:args`, `:arg_paths` and
+`:arg0namespace`. `:path` and `:path_namespace` cannot be combined, rules
+always match signals, and the encoded rule is limited to the D-Bus maximum of
+1024 bytes. `eavesdrop` is not accepted; use a dedicated monitoring
 connection for that.
 
 Two equivalent rules share one registration with the bus. Each `add_match/3`
 call still returns its own reference, and the bus rule is removed once the
 last reference is removed or its owning process exits.
 
+A connection opened with `bus: false` has no bus driver to ask, so
+`add_match/3` returns `{:error, :not_a_bus}`.
+
 ## Sender matching
 
-Rebus checks a unique `:sender` name itself, on top of whatever the bus
-routed.
+The bus routes broadcast signals, but Rebus checks the `:sender` of each
+delivered signal itself.
 
-A well-known `:sender` is left to the bus for broadcast signals, because the
-bus forwards them under the sender's current unique name. A directed signal
-bypasses bus routing, so Rebus decides that one itself. It tracks who owns the
-name, with `GetNameOwner` and the bus driver's `NameOwnerChanged` signal, and
-delivers a directed signal whose sender is that owner, or the well-known name
-itself, which only the bus driver can send. A directed signal from anyone else
-is rejected. Both facts come from the bus driver, whose sender header a peer
-cannot forge.
+For a unique-name sender that is a plain comparison. A well-known name needs
+more care. The bus forwards broadcast signals under the sender's current
+unique name, and a directed signal, one with a destination, bypasses bus
+routing altogether. Rebus therefore tracks who owns the well-known name,
+using `GetNameOwner` and the bus driver's `NameOwnerChanged` signal, and
+accepts a directed signal only from that owner, or from the well-known name
+itself, which only the bus driver can send. Both facts come from the bus
+driver, whose sender header a peer cannot forge. A directed signal from
+anyone else is dropped.
 
-Tracking is best effort. If it fails, Rebus logs a warning and retries with
-backoff. Directed delivery for the name stays off until ownership is known;
-broadcast delivery is unaffected. If the retry budget is exhausted, Rebus
-logs an error and keeps rejecting directed signals from that service for the
-life of the connection. A directed signal can also be missed briefly while a
-new subscription obtains its first ownership answer.
+Ownership tracking is best effort. If a lookup fails, Rebus logs a warning
+and retries with backoff. Directed delivery for that name stays off until
+ownership is known; broadcast delivery is unaffected. If the retries run
+out, Rebus logs an error and keeps rejecting directed signals from that
+service for the life of the connection. A directed signal can also be missed
+briefly while a new subscription obtains its first ownership answer.
 
-D-Bus does not say which rule admitted a signal. Rebus therefore rejects a
-rule that overlaps an existing one with a different sender, returning
-`{:error, :sender_routing_ambiguous}`, rather than delivering a signal to the
-wrong subscription.
+D-Bus does not say which rule admitted a signal. Rather than risk delivering
+a signal to the wrong subscription, Rebus rejects a rule that overlaps an
+existing one with a different sender, returning
+`{:error, :sender_routing_ambiguous}`.
 
 ## When a subscription fails
 
-`{:error, :timeout}` from `add_match/3` is ambiguous. You get no reference,
-but the bus may already hold the rule. Rebus cleans up in the background while
-the connection lives. A later `add_match/3` for the same rule waits behind
-that cleanup under its own timeout, and returns
+`{:error, :timeout}` from `add_match/3` is ambiguous: you have no reference,
+but the bus may already hold the rule. Rebus cleans up in the background
+while the connection lives. A later `add_match/3` for the same rule waits
+behind that cleanup, under its own timeout, and returns
 `{:error, :match_rule_cleanup_pending}` if the cleanup outlasts it.
 
-A reply that exceeds Rebus's local decoding limit before its header fields can
-be trusted also appears as `{:error, :timeout}`: the connection cannot recover
-the reply serial needed to correlate it. This is the same conservative
-fallback described by the fuller `Rebus.call/3` contract.
+A bus reply too large for the local decoding limit also surfaces as
+`{:error, :timeout}`, because the connection cannot recover the serial it
+would need to correlate the reply. `Rebus.call/3` describes that fallback.
 
-Sometimes Rebus cannot prove what the bus holds for a rule. It then leaves
-the rule uncertain and keeps the connection up. A rule becomes uncertain when
-its cleanup exhausts its retry budget, when too many other cleanups are
-already running, or when the task running one of its operations is lost.
+### Uncertain rules
 
-Rebus sends a notice to each process holding a reference on the rule:
+Sometimes Rebus cannot establish what the bus holds for a rule: the cleanup
+exhausts its retries, too many other cleanups are already running, or the
+task running an operation on the rule is lost. Rebus then marks the rule
+uncertain, keeps the connection up, and notifies each process holding a
+reference on it:
 
 ```elixir
 receive do
@@ -117,40 +111,42 @@ receive do
 end
 ```
 
-The connection's `:owner`, if it has one, receives the same notice with `nil`
-in place of the reference, once per rule. A process that is both gets both.
-The notice is a four-element tuple, so a receive pattern written for
-`{ref, %Rebus.Message{}}` never matches it.
+The connection's `:owner`, if it has one, receives the same notice with
+`nil` in place of the reference, once per rule. A process that is both gets
+both. The notice is a four-element tuple, so a receive pattern written for
+`{ref, %Rebus.Message{}}` never matches it by accident.
 
-An uncertain rule stays that way for the life of the connection:
+An uncertain rule stays uncertain for the life of the connection:
 
-- Rebus does no more bus work for it. The bus may keep routing its signals to
-  the connection, and the last reference's removal does not send
+- Rebus does no more bus work for it. The bus may keep routing its signals
+  to the connection, and removing the last reference does not send
   `RemoveMatch`.
-- References on it keep receiving signals until they are removed or their
+- Existing references keep receiving signals until they are removed or their
   owners exit. `Rebus.remove_match/3` still stops delivery to a reference.
 - `Rebus.add_match/3` for the same rule returns
   `{:error, :match_rule_uncertain}`.
 
-Closing the connection is the only way to make the bus forget an uncertain
-rule. Whether that is worth the disruption is for your application to decide.
+Closing the connection is the only way to make the bus forget the rule.
+Whether that is worth the disruption is your application's call.
 
-Two application environment settings bound the cleanup.
-`:match_recovery_max_rules` (default `64`) is how many rules are cleaned up
-at once; a rule that needs cleanup beyond that is left uncertain. It also
-bounds admission: while the rules being cleaned up and the uncertain rules
-together reach it, `add_match/3` returns
-`{:error, :match_recovery_capacity_exhausted}` for a rule the connection does
-not already hold. An equivalent rule already held is still served, because it
-adds nothing on the bus. `:match_recovery_max_attempts` (default `30`) is how
-many cleanup attempts one rule receives before it is left uncertain. Recovery
-continues across transient local failures because those failures do not prove
-that the bus resolved the rule.
+### Tuning recovery
 
-Rebus closes the connection itself in one case. Each connection's match
-rules are managed by a process linked to it, and that process is the only
-record of which rules and handlers the connection holds. If it fails, which
-would be a bug in Rebus, the connection stops with
+Two application environment settings bound the cleanup work:
+
+- `:match_recovery_max_rules`, 64 by default, is how many rules may be in
+  cleanup at once. A rule that needs cleanup beyond that is left uncertain.
+  While the rules in cleanup and the uncertain rules together reach this
+  limit, `add_match/3` returns `{:error, :match_recovery_capacity_exhausted}`
+  for any rule the connection does not already hold. An equivalent rule
+  already held is still served, since it adds nothing on the bus.
+- `:match_recovery_max_attempts`, 30 by default, is how many cleanup
+  attempts a rule gets before it is left uncertain. A transient local
+  failure is not proof that the bus resolved the rule, so recovery continues
+  through those.
+
+Each connection's match rules are managed by a process linked to it, and
+that process is the only record of the rules and handlers the connection
+holds. If it fails, which would be a bug in Rebus, the connection stops with
 `{:shutdown, {:match_subscription_exited, reason}}`. Stopping removes the
 connection's handlers and makes the bus discard every rule it held.
 
@@ -164,7 +160,7 @@ connection's handlers and makes the bus discard every rule it held.
 | `:sender_routing_ambiguous` | The rule overlaps an existing one with a different sender. |
 | `:timeout` | The operation did not finish in time, or the reply header exceeded a local decoding limit. The bus may still hold the rule; see `Rebus.call/3` for the header-limit fallback. |
 | `:match_rule_cleanup_pending` | An earlier ambiguous operation on the same rule is still being cleaned up. |
-| `:match_rule_uncertain` | Rebus has left the rule uncertain, or the operation's task was lost and left it so. See [When a subscription fails](#when-a-subscription-fails). |
+| `:match_rule_uncertain` | Rebus has left the rule uncertain, or the operation's task was lost and left it so. See [Uncertain rules](#uncertain-rules). |
 | `:match_recovery_capacity_exhausted` | Too many rules on the connection are unresolved to accept a new one. Nothing was sent. |
 | `{:bus_error, error_name}` | The bus returned a D-Bus error reply. |
 | `:invalid_bus_reply` | The bus reply did not have the expected shape. |
