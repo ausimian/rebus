@@ -35,20 +35,20 @@ defmodule Rebus.Bus do
 
       {:rebus_name, conn, :acquired | :lost, name}
 
-  A name can change hands at any time after it is requested: a connection
+  A name can change hands at any time after it is requested. A connection
   that asks with `:replace_existing` takes it from an owner that allowed
   replacement, and a connection waiting in the queue gets it when the owner
   releases it or disconnects. Each change arrives as a notice, so an owner
-  learns that it lost a name, and a queued connection that it gained one.
+  learns that it lost the name and a queued connection that it gained it.
 
-  The notices for a name continue until `release_name/3` releases it, the
-  owner exits, or the connection closes. A first request answered `:exists`
-  leaves none behind, and requesting a name again for the same owner does not
-  repeat its notices.
+  Notices for a name continue until `release_name/3` releases it, the owner
+  exits, or the connection closes. A first request answered `:exists` sets
+  up no notices, and requesting a name again for the same owner does not
+  duplicate them.
 
-  Make one request or release of a name at a time on a connection. When they
-  overlap, an earlier one's cleanup can stop the notices a later request set
-  up.
+  Make one request or release of a given name at a time on a connection.
+  When two overlap, the earlier one's cleanup can stop the notices the later
+  one set up.
   """
 
   alias Rebus.Connection

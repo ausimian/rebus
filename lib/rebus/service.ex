@@ -124,26 +124,24 @@ defmodule Rebus.Service do
   ## Introspection
 
   The connection answers `org.freedesktop.DBus.Introspectable.Introspect`
-  itself, with XML generated from the exported declarations, so tools such as
-  `busctl` and `d-feet` can find and describe the objects. An exported object
-  lists its own interfaces, then `Peer`, `Introspectable` and `Properties`,
-  then the next path element of every export below it. A path with exports
-  only below it, such as `/` or `/org` for `/org/example/Calculator`, lists
-  `Introspectable` and those child elements, so a tool can walk the tree from
-  `/`. A path served by a subtree export lists the subtree's interfaces and
-  no children, since nothing tells the connection which paths the handler
-  serves.
+  itself, with XML generated from the exported declarations, so tools such
+  as `busctl` and `d-feet` can find and describe the objects. An exported
+  object lists its own interfaces, then `Peer`, `Introspectable` and
+  `Properties`, then the next path element of every export below it. A path
+  with exports only below it, such as `/` or `/org` for
+  `/org/example/Calculator`, lists `Introspectable` and those child elements,
+  so a tool can walk the tree from `/`. A path served by a subtree export
+  lists the subtree's interfaces and no children, since the connection
+  cannot know which paths the handler serves.
 
   ## Unix file descriptors
 
   Descriptors sent with a call arrive in `call.unix_fds`, indexed by the
-  call's `h` arguments, and the handler borrows them until the call
-  completes. It may read them, or pass them to a port or another D-Bus call,
-  while the call is pending, but the connection closes them, exactly once,
-  when the call completes, however it does: when it is answered, expires,
-  or is failed because its handler exited or its object was unexported. A
-  handler that ignores them therefore leaks nothing. To keep them,
-  `take_fds/2` transfers their ownership before the call completes:
+  call's `h` arguments. The handler borrows them while the call is pending
+  and may read them or pass them on, but the connection owns them and closes
+  each one exactly once when the call completes, however it completes. A
+  handler that ignores them leaks nothing. To keep them, take ownership with
+  `take_fds/2` before the call completes:
 
       receive do
         {^ref, %Rebus.Service.Call{member: "TakeLog"} = call} ->
@@ -152,16 +150,15 @@ defmodule Rebus.Service do
           # fd is now the handler's to close with Rebus.UnixFD.close/1
       end
 
-  A reply carries descriptors with `reply/3`'s `:fds` option, or the
+  A reply sends descriptors through `reply/3`'s `:fds` option, or the
   `unix_fds` of a message answered with `reply_message/3`. Rebus borrows
-  these, as it does every outbound descriptor: the handler still owns them
+  them, as it does every outbound descriptor, so the handler still owns them
   and closes them once the answer returns. A reply cannot send a descriptor
   the connection still owns, such as one of the call's own borrowed
-  descriptors, which the answer closes as it completes the call; take them
-  with `take_fds/2` first.
+  descriptors; take it with `take_fds/2` first.
 
-  See [Unix file descriptor passing](unix_fds.html) for the rest of the
-  ownership rules.
+  See [Unix file descriptor passing](unix_fds.html) for the full ownership
+  rules.
   """
 
   alias Rebus.Connection
@@ -183,9 +180,9 @@ defmodule Rebus.Service do
   @typedoc """
   A reason why `export/4` refused an export.
 
-  `{:invalid_interface, reason}` carries the offending value, `{:duplicate,
-  name}` for an interface listed twice, or `{:reserved, name}` for an
-  interface the connection implements itself.
+  `{:invalid_interface, reason}` carries the offending value, or
+  `{:duplicate, name}` for an interface listed twice, or `{:reserved, name}`
+  for an interface the connection implements itself.
   """
   @type export_error ::
           :not_connected
@@ -372,16 +369,17 @@ defmodule Rebus.Service do
   @doc """
   Answers a call with a reply built by hand.
 
-  `message` must be a `:method_return` or an `:error`. A method return must
+  `message` must be a `:method_return` or an `:error`; any other type
+  returns `{:error, {:invalid_message_type, type}}`. A method return must
   have the declared out-signature, `call.out_signature`, or this returns
-  `{:error, :signature_mismatch}`; an error can carry any body. Whatever
-  `reply_serial` and `destination` the message holds are replaced with the
-  call's own. The message is encoded in the calling process first, so one
-  that cannot be encoded returns the encoding error, as `Rebus.Message.encode/2`
-  reports it, and leaves the call open. Takes the same options as `reply/3`
-  but `:fds`, since the message carries its own descriptors in `unix_fds`,
-  and returns the same values, plus `{:error, {:invalid_message_type, type}}`
-  for any other message type.
+  `{:error, :signature_mismatch}`. An error can carry any body. The message's
+  `reply_serial` and `destination` are replaced with the call's own.
+
+  The message is encoded in the calling process first, so one that cannot be
+  encoded returns the error `Rebus.Message.encode/2` would report and leaves
+  the call open. Otherwise this takes the options and returns the values of
+  `reply/3`, except that there is no `:fds` option: the message carries its
+  own descriptors in `unix_fds`.
   """
   @spec reply_message(Call.t(), Message.t(), keyword()) ::
           :ok | {:error, reply_error() | Message.encoding_error()}

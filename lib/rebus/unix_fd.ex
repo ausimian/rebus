@@ -1,28 +1,25 @@
 defmodule Rebus.UnixFD do
   @moduledoc """
-  Closes Unix file descriptors received in D-Bus replies.
+  Closes Unix file descriptors received from a peer.
 
-  A descriptor is represented as the non-negative integer returned by the
-  operating system.  `Rebus` borrows descriptors supplied for an outbound
-  message: it never closes or duplicates them.  A descriptor in
-  `Rebus.Message.unix_fds` was received from a peer and is owned by the process
-  that successfully receives that message.  The owner must close it exactly
-  once, or adopt it with its own OS/OTP API.
+  A descriptor is the non-negative integer the operating system returned for
+  it. Rebus borrows the descriptors given to it for an outbound message and
+  never closes or duplicates them. A descriptor received in a reply to
+  `Rebus.call/3` belongs to the process that received the message, which
+  must close it exactly once, with `close/1` or an OS or OTP API of its own.
 
-  The exception is an inbound method call delivered to a `Rebus.Service`
-  handler: the descriptors in its `Rebus.Service.Call`, and in the message it
-  carries, are borrowed from the connection, which closes them when the call
-  completes. Close one only after taking it with `Rebus.Service.take_fds/2`.
+  Descriptors on an inbound method call are the exception. The handler of a
+  `Rebus.Service.Call` borrows them from the connection, which closes them
+  when the call completes. Close one only after taking it with
+  `Rebus.Service.take_fds/2`.
 
-  `close/1` consumes an owned descriptor exactly once. Do not call it again:
-  operating systems may reuse descriptor numbers, so a second close could close
-  an unrelated resource. It is suitable for `after` blocks and does not log
-  descriptor values.
+  Never close a descriptor twice. Operating systems reuse descriptor
+  numbers, so a second close can close an unrelated resource. `close/1` is
+  safe in an `after` block and does not log descriptor values.
 
-  The helpers are available only on Unix systems with OTP's raw-file support.
-  They return `{:error, :unsupported}` elsewhere.
-
-  See [Unix file descriptor passing](unix_fds.html).
+  These functions need a Unix system with OTP's raw-file support, and return
+  `{:error, :unsupported}` elsewhere. See
+  [Unix file descriptor passing](unix_fds.html).
   """
 
   alias Rebus.UnixFD.Raw
@@ -33,15 +30,20 @@ defmodule Rebus.UnixFD do
   @doc """
   Closes an owned raw Unix file descriptor.
 
-  Returns `:ok` on success or `{:error, reason}` on failure.
+  The descriptor is spent whether this returns `:ok` or a POSIX error, so
+  treat the number as unusable afterwards and never retry: the operating
+  system may already have given it to another resource.
 
-  This consumes an adopted descriptor whether it returns `:ok` or a POSIX
-  error. Treat the number as unusable and never retry: the operating system may
-  already have assigned it to another resource. `:invalid_descriptor` rejects
-  a value that is not a non-negative integer, `:close_failed` reports an
-  unexpected close failure, and `:unsupported` means the platform cannot
-  perform this operation. After `:unsupported`, the caller still owns the
-  descriptor and must close it with another API.
+  ## Return values
+
+  - `:ok` - the descriptor was closed.
+  - `{:error, :invalid_descriptor}` - `fd` is not a non-negative integer.
+  - `{:error, :close_failed}` - the close failed unexpectedly. The descriptor
+    is still spent.
+  - `{:error, :unsupported}` - the platform cannot do this. The caller still
+    owns the descriptor and must close it with another API.
+  - `{:error, reason}` - a POSIX error from the close. The descriptor is
+    spent.
   """
   @spec close(t()) :: :ok | {:error, :close_failed | :invalid_descriptor | :unsupported | term()}
   def close(fd) when is_integer(fd) and fd >= 0 do

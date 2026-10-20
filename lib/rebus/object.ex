@@ -83,9 +83,9 @@ defmodule Rebus.Object do
 
   A reply that cannot be sent while the call is still open, such as a body
   that does not fit the method's out-signature, is a bug in the object, which
-  stops with `{:invalid_reply, reason}`. A call that has already been
-  answered or has expired, or a reply whose delivery timed out, is not, and
-  the object carries on.
+  stops with `{:invalid_reply, reason}`. Replying to a call that was already
+  answered or has expired, or a reply whose delivery timed out, is not a bug,
+  and the object carries on.
 
   ## Properties
 
@@ -97,12 +97,13 @@ defmodule Rebus.Object do
 
   After a successful `Set`, the object emits
   `org.freedesktop.DBus.Properties.PropertiesChanged` as the property's
-  `emits_changed` asks: with the value set when it is `true`, with the
+  `emits_changed` asks: with the new value when it is `true`, with the
   property's name only when it is `:invalidates`, and not at all when it is
   `false` or `:const`. A write-only property is never announced, since that
-  would broadcast a value no one may read. A callback returns `{:ok, state, emit: false}` to
-  suppress that, for example when it stores a value other than the one it was
-  given, and can then emit its own with `Rebus.Service.properties_changed/6`.
+  would broadcast a value no one may read. A callback that returns
+  `{:ok, state, emit: false}` suppresses the signal, for example when it
+  stores a value other than the one it was given, and can emit its own with
+  `Rebus.Service.properties_changed/6`.
 
   The callbacks cannot carry Unix file descriptors, so an object whose
   properties have a type containing `h` serves them through
