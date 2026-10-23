@@ -777,7 +777,9 @@ defmodule Rebus.Connection.WriterTest do
       from: Keyword.get(opts, :from, default_from(kind)),
       msg: msg,
       deadline: Keyword.get(opts, :deadline, System.monotonic_time(:millisecond) + 5_000),
-      request_ref: Keyword.get(opts, :request_ref, make_ref())
+      request_ref: Keyword.get(opts, :request_ref, make_ref()),
+      unix_fds: Keyword.get(opts, :unix_fds, msg.unix_fds),
+      pins: Keyword.get(opts, :pins, [])
     }
   end
 

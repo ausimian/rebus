@@ -1,3 +1,14 @@
+Rebus 0.4 adds services, so an application can export objects that answer
+method calls, and makes Unix file descriptors safe to hold. Every descriptor
+Rebus receives now arrives as an opaque `Rebus.UnixFD` handle that closes
+itself exactly once, when it is closed, when its owning process exits, or
+when nothing refers to it any more, and a stale handle can never touch a
+descriptor number the operating system has reused. Code that received raw
+numbers must treat them as handles: close them with `Rebus.UnixFD.close/1`,
+and use the number inside `Rebus.UnixFD.with_fd/2`. Outbound `fds:` take
+handles and raw numbers alike. On Unix, building Rebus now compiles a small
+native library, which needs `make` and a C++17 compiler.
+
 ### Added
 
 - `Rebus.UnixFD` handles. A handle owns one Unix file descriptor and closes
@@ -12,6 +23,14 @@
   manage and inspect ownership, and a handle that has crossed to another node
   answers `{:error, :not_local}`. Inspecting a handle shows its state and
   owner but never the descriptor number.
+- Outbound messages take `Rebus.UnixFD` handles as well as raw descriptor
+  numbers, in any mix, in `Rebus.Message.new/2`'s `:fds`, the replies of
+  `Rebus.Service` and a `Rebus.Object`'s `{:reply, body, state, fds: fds}`.
+  Any process holding a handle may send it, and sending neither closes nor
+  transfers it. The connection keeps each handle's descriptor open until the
+  kernel has taken it, even if the handle is closed or its owner exits
+  meanwhile. A handle that is already closed when the connection accepts the
+  message fails it with `{:error, :unix_fd_closed}`, and nothing is written.
 
 - Services. `Rebus.Service` exports objects on a connection and answers the
   method calls made on them. `Rebus.Service.export/4` binds `Rebus.Interface`
@@ -66,8 +85,7 @@
   still owns, however the call completes. `Rebus.Service.take_fds/2` makes
   the handler their owner instead. `Rebus.Service.reply/3` and
   `Rebus.Service.reply_error/4` take an `:fds` option to send descriptors
-  with a reply; sending the number of one the connection still owns returns
-  `{:error, :unix_fd_borrowed}`.
+  with a reply, which may include the call's own borrowed handles.
 - `Rebus.connect/2` takes `:max_pending_calls`, 1024 by default, which bounds
   how many inbound calls may wait for a handler's answer at once. Calls
   beyond it are answered with `org.freedesktop.DBus.Error.LimitsExceeded`.
@@ -98,8 +116,7 @@
   reply included, in `Rebus.Service.Call.unix_fds` and its message, and from
   `Rebus.Service.take_fds/2`. The process that called `Rebus.call/3` owns
   its reply's handles, so they close when it exits if it has not closed them
-  first. Outbound messages still take raw numbers in `fds:`; use
-  `Rebus.UnixFD.with_fd/2` to send the number behind a handle you own.
+  first. Send a received handle on by passing the handle itself in `fds:`.
 
   ```elixir
   # Before
@@ -108,7 +125,7 @@
 
   # After: the same code works, and `fd` is a handle
   {:ok, %Rebus.Message{unix_fds: [handle]}} = Rebus.call(conn, message)
-  {:ok, stat} = Rebus.UnixFD.with_fd(handle, &File.stat("/dev/fd/#{&1}"))
+  {:ok, {:ok, stat}} = Rebus.UnixFD.with_fd(handle, &File.stat("/dev/fd/#{&1}"))
   :ok = Rebus.UnixFD.close(handle)
   ```
 
@@ -126,8 +143,10 @@
   building it needs `make` and a C++17 compiler. Nothing is compiled on other
   platforms, where `Rebus.UnixFD` returns `{:error, :unsupported}`.
 
-- Clarified the guides and public API documentation, including descriptor
-  ownership and the experimental status of Unix file descriptor support.
+- Rewrote the [Unix file descriptor passing](unix_fds.html) guide for
+  handles, with recipes for adopting a received descriptor into an OTP
+  `:socket` or file, and clarified the other guides and the public API
+  documentation.
 
 - **Breaking:** `Rebus.call/3` returns a D-Bus error reply from the peer as
   `{:error, {:dbus_error, %Rebus.Message{type: :error}}}` rather than
@@ -181,6 +200,9 @@
 
 ### Fixed
 
+- A raw descriptor number in `fds:` too large to be a descriptor, above
+  `0x7FFFFFFF`, is refused with `{:error, :invalid_unix_fds}` rather than
+  sent truncated to 32 bits, which could pass a different descriptor.
 - `EXTERNAL` authentication now completes when the peer answers with an
   empty `DATA` challenge, which the specification permits. A peer `ERROR`
   now cancels `EXTERNAL` and moves on to the next mechanism rather than

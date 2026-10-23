@@ -198,17 +198,17 @@ defmodule Rebus.Connection.Dispatch do
     }
   end
 
-  # Each received descriptor becomes a handle this process owns. One that
-  # cannot be wrapped is closed here if it is still open, and the decoder
-  # treats its batch as malformed.
+  # Each received descriptor becomes a handle this process owns, and the
+  # decoder treats the batch of one that cannot be wrapped as malformed. A
+  # refused number needs no closing here. `wrap/2` closes it on every
+  # refusal but three: after `:ebadf` and `:invalid_descriptor` nothing is
+  # open under it, so closing it could only close a descriptor another
+  # thread has just been given, and `:unsupported` comes only from a
+  # platform that never receives descriptors.
   defp wrap_received(fd) do
     case UnixFD.wrap(fd, self()) do
-      {:ok, handle} ->
-        {:ok, handle}
-
-      {:error, reason} ->
-        UnixFD.close_unwrapped(fd, reason)
-        :error
+      {:ok, handle} -> {:ok, handle}
+      {:error, _reason} -> :error
     end
   end
 

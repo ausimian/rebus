@@ -4,7 +4,7 @@ defmodule Rebus.TestServer do
   use TypedStruct
 
   alias Rebus.Message
-  alias Rebus.UnixFD.Raw
+  alias Rebus.UnixFD
 
   def get_listen_addr(svr) when is_pid(svr) do
     GenServer.call(svr, :get_listen_addr)
@@ -56,7 +56,7 @@ defmodule Rebus.TestServer do
     field :cli_sock, :socket.socket() | nil, default: nil
     field :handle, reference() | nil, default: nil
     field :prev, binary(), default: <<>>
-    field :received_fds, [non_neg_integer()], default: []
+    field :received_fds, [UnixFD.t()], default: []
     field :tap, pid()
     field :serial, non_neg_integer(), default: 1
     field :family, :inet | :inet6 | :local, default: :inet
@@ -439,7 +439,7 @@ defmodule Rebus.TestServer do
             deliver_frame(msg, rest, %{state | received_fds: []})
 
           {:error, _reason} ->
-            Enum.each(state.received_fds, &Raw.close/1)
+            Enum.each(state.received_fds, &UnixFD.close/1)
             {:stop, :parse_error, state}
         end
 
@@ -571,12 +571,27 @@ defmodule Rebus.TestServer do
     ArgumentError -> :error
   end
 
+  # Received descriptors become handles the server owns, as they do in a
+  # connection, so they close when a test closes them or the server stops.
   defp rights_fds(ctrl) do
     fds =
       for %{level: :socket, type: :rights, data: data} <- ctrl,
           <<fd::native-signed-32 <- data>>,
           do: fd
 
-    if Enum.all?(fds, &(&1 >= 0)), do: {:ok, fds}, else: :error
+    if Enum.all?(fds, &(&1 >= 0)), do: wrap_fds(fds), else: :error
+  end
+
+  defp wrap_fds(fds) do
+    Enum.reduce_while(fds, {:ok, []}, fn fd, {:ok, handles} ->
+      case UnixFD.wrap(fd, self()) do
+        {:ok, handle} ->
+          {:cont, {:ok, handles ++ [handle]}}
+
+        {:error, _reason} ->
+          Enum.each(handles, &UnixFD.close/1)
+          {:halt, :error}
+      end
+    end)
   end
 end

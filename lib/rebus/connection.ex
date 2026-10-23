@@ -884,18 +884,20 @@ defmodule Rebus.Connection do
   end
 
   def handle_call({:call, %Message{} = msg, deadline, request_ref}, from, %__MODULE__{} = state) do
-    case validate_call_message(msg) do
-      :ok ->
-        enqueue_write(state, %{
-          kind: :call,
-          from: from,
-          msg: msg,
-          deadline: deadline,
-          request_ref: request_ref
-        })
-
-      {:error, _} = error ->
-        {:reply, error, state}
+    with :ok <- validate_call_message(msg),
+         :ok <- validate_outbound_fd_transport(msg, state),
+         {:ok, fds, pins} <- Writer.pin(msg) do
+      enqueue_write(state, %{
+        kind: :call,
+        from: from,
+        msg: msg,
+        deadline: deadline,
+        request_ref: request_ref,
+        unix_fds: fds,
+        pins: pins
+      })
+    else
+      {:error, _} = error -> {:reply, error, state}
     end
   end
 
@@ -907,13 +909,23 @@ defmodule Rebus.Connection do
     {:reply, {:error, :not_connected}, state}
   end
 
-  def handle_call({:send, %Message{} = msg, deadline, request_ref}, from, %__MODULE__{} = state),
-    do: enqueue_send(validate_send_message(msg), state, from, msg, deadline, request_ref)
+  def handle_call({:send, %Message{} = msg, deadline, request_ref}, from, %__MODULE__{} = state) do
+    with :ok <- validate_send_message(msg),
+         :ok <- validate_outbound_fd_transport(msg, state),
+         {:ok, fds, pins} <- Writer.pin(msg) do
+      enqueue_send(state, from, msg, {fds, pins}, deadline, request_ref)
+    else
+      {:error, _} = error -> {:reply, error, state}
+    end
+  end
 
   # Nothing is routed to a handler before establishment, so a reply then
   # answers nothing, as does one for a call already answered or expired. The
-  # frame is checked before the call is completed, so a handler whose reply
-  # is refused here can still answer the call another way.
+  # frame is checked, and its handles pinned, before the call is completed,
+  # so a handler whose reply is refused here can still answer the call
+  # another way. Pinning first is also what lets a reply carry the call's own
+  # borrowed handles: completing the call closes them, but their descriptors
+  # stay open until the frame has passed them on.
   def handle_call(
         {:reply_call, ref, %Message{} = msg, deadline, request_ref},
         from,
@@ -921,10 +933,20 @@ defmodule Rebus.Connection do
       ) do
     with :ok <- validate_reply_message(msg),
          :ok <- validate_outbound_fd_transport(msg, state),
-         {:ok, msg, state} <- Service.complete(state, ref, msg) do
-      enqueue_send(:ok, state, from, msg, deadline, request_ref)
+         {:ok, fds, pins} <- Writer.pin(msg) do
+      case Service.complete(state, ref, msg) do
+        {:ok, msg, state} ->
+          enqueue_send(state, from, msg, {fds, pins}, deadline, request_ref)
+
+        {:answered, state} ->
+          Writer.release_pins(pins)
+          {:reply, :ok, state}
+
+        {:error, _} = error ->
+          Writer.release_pins(pins)
+          {:reply, error, state}
+      end
     else
-      {:answered, state} -> {:reply, :ok, state}
       {:error, _} = error -> {:reply, error, state}
     end
   end
@@ -1291,18 +1313,17 @@ defmodule Rebus.Connection do
 
   # Both `Rebus.send/2` frames and handler replies are written on the `:send`
   # path; they differ only in which message types they accept.
-  defp enqueue_send(:ok, %__MODULE__{} = state, from, msg, deadline, request_ref) do
+  defp enqueue_send(%__MODULE__{} = state, from, msg, {fds, pins}, deadline, request_ref) do
     enqueue_write(state, %{
       kind: :send,
       from: from,
       msg: msg,
       deadline: deadline,
-      request_ref: request_ref
+      request_ref: request_ref,
+      unix_fds: fds,
+      pins: pins
     })
   end
-
-  defp enqueue_send({:error, _} = error, %__MODULE__{} = state, _from, _msg, _deadline, _ref),
-    do: {:reply, error, state}
 
   defp validate_outbound_fd_transport(%Message{unix_fds: []}, _state), do: :ok
 

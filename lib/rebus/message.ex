@@ -13,12 +13,16 @@ defmodule Rebus.Message do
 
   The `unix_fds` struct field holds the descriptors themselves and is
   separate from the `:unix_fds` header field, which is only their count.
-  Build an outbound message with `fds: [fd, ...]`, where each `fd` is a raw
-  descriptor number; each `h` value in the body is a zero-based index into
-  that list. A received message holds `Rebus.UnixFD` handles instead. On a
-  `Rebus.call/3` reply, the calling process owns them. On the message of an
-  inbound call delivered to a `Rebus.Service` handler, the connection owns
-  them and the handler borrows them until the call completes. See
+  Build an outbound message with `fds: [fd, ...]`, where each `fd` is a
+  `Rebus.UnixFD` handle or a raw descriptor number, in any mix; each `h`
+  value in the body is a zero-based index into that list. Sending neither
+  closes nor transfers a handle, and a raw number stays the caller's to keep
+  open until the send returns and to close afterwards.
+
+  A received message holds `Rebus.UnixFD` handles. On a `Rebus.call/3`
+  reply, the calling process owns them. On the message of an inbound call
+  delivered to a `Rebus.Service` handler, the connection owns them and the
+  handler borrows them until the call completes. See
   [Unix file descriptor passing](unix_fds.html).
 
   ## Examples
@@ -78,8 +82,9 @@ defmodule Rebus.Message do
   @type flag :: :no_reply_expected | :no_auto_start | :allow_interactive_authorization
 
   @typedoc """
-  A descriptor in `unix_fds`: a `Rebus.UnixFD` handle on a received message,
-  or a raw descriptor number on one built to be sent.
+  A descriptor in `unix_fds`. A received message holds `Rebus.UnixFD`
+  handles; one built to be sent may hold handles, raw descriptor numbers, or
+  both.
   """
   @type unix_fd :: Rebus.UnixFD.t() | Rebus.UnixFD.raw()
 
@@ -280,8 +285,10 @@ defmodule Rebus.Message do
   - `:body` - the body, as a list of values. Defaults to `[]`.
   - `:signature` - the body's signature. Defaults to one inferred from the
     body, where `:infinity`, `:negative_infinity` and `:nan` infer `d`.
-  - `:fds` - borrowed Unix file descriptors, which `h` values in the body
-    index. Rebus never closes outbound descriptors.
+  - `:fds` - Unix file descriptors to send, which `h` values in the body
+    index: `Rebus.UnixFD` handles, raw descriptor numbers, or both. Rebus
+    never closes or transfers them. Whether a handle is open is checked only
+    when a connection accepts the message for sending.
   - `:flags` - a list of `:no_reply_expected`, `:no_auto_start` and
     `:allow_interactive_authorization`. Defaults to `[]`.
   - `:version` - the protocol version. Defaults to `1`.
@@ -428,7 +435,7 @@ defmodule Rebus.Message do
          {:ok, header_fields_encoded} <- encode_header_fields(message.header_fields, endianness),
          {:ok, body_data} <-
            body_iodata(message, Map.get(message.header_fields, :signature, ""), endianness),
-         :ok <- UnixFDs.validate_outbound_unix_fds(message),
+         :ok <- UnixFDs.validate_unix_fds(message),
          :ok <-
            validate_encoded_size(
              IO.iodata_length(header_fields_encoded),

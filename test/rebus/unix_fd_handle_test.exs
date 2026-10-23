@@ -233,6 +233,37 @@ defmodule Rebus.UnixFDHandleTest do
     end
   end
 
+  # The recipes in guides/unix_fds.md.
+  describe "with_fd/2 recipes" do
+    test "adopts a socket into an OTP :socket, which keeps its own duplicate" do
+      {peer, local} = socket_pair()
+      handle = wrap_received(local)
+      :ok = :socket.close(local)
+
+      assert {:ok, {:ok, sock}} =
+               UnixFD.with_fd(handle, fn fd ->
+                 :socket.open(fd, %{domain: :local, type: :stream})
+               end)
+
+      :ok = UnixFD.close(handle)
+
+      # The socket outlives the handle, because :socket.open/2 dup()ed it.
+      assert :ok = :socket.send(sock, "ping")
+      assert {:ok, "ping"} = :socket.recv(peer, 4, 1_000)
+      Enum.each([sock, peer], &:socket.close/1)
+    end
+
+    test "reads what a descriptor refers to through /dev/fd" do
+      {:ok, read, write} = UnixFD.__pipe__()
+
+      assert {:ok, :ok} = UnixFD.with_fd(write, &File.write("/dev/fd/#{&1}", "hello"))
+      :ok = UnixFD.close(write)
+
+      assert {:ok, {:ok, "hello"}} = UnixFD.with_fd(read, &File.read("/dev/fd/#{&1}"))
+      :ok = UnixFD.close(read)
+    end
+  end
+
   describe "controlling_process/2" do
     test "moves ownership, after which the old owner's exit leaves it open" do
       {owner, handle} = owned_elsewhere()
@@ -429,6 +460,38 @@ defmodule Rebus.UnixFDHandleTest do
 
       assert_closed_once(read, [pid])
       assert :ok = UnixFD.close(write)
+    end
+
+    test "pin_all/1 pins every handle and passes raw numbers through, in order" do
+      {:ok, read, write} = UnixFD.__pipe__()
+      {:ok, read_fd} = UnixFD.with_fd(read, & &1)
+
+      assert {:ok, [^read_fd, 7, write_fd], [_, _] = pins} = UnixFD.pin_all([read, 7, write])
+      assert {:ok, ^write_fd} = UnixFD.with_fd(write, & &1)
+
+      Enum.each([read, write], &UnixFD.close/1)
+      assert {:ok, 0} = UnixFD.__close_count__(read)
+      assert :ok = UnixFD.unpin_all(pins)
+      assert {:ok, 1} = UnixFD.__close_count__(read)
+      assert {:ok, 1} = UnixFD.__close_count__(write)
+      assert {:ok, [], []} = UnixFD.pin_all([])
+    end
+
+    test "pin_all/1 releases what it pinned when a handle cannot be pinned" do
+      {:ok, read, write} = UnixFD.__pipe__()
+      {:ok, closed, closed_write} = UnixFD.__pipe__()
+      :ok = UnixFD.close(closed)
+
+      for refused <- [closed, %UnixFD{ref: make_ref()}, %UnixFD{ref: :forged}] do
+        assert {:error, :closed} = UnixFD.pin_all([read, 3, refused, write])
+      end
+
+      assert {:error, :invalid} = UnixFD.pin_all([read, write | :improper])
+
+      # Nothing stayed pinned, so closing now runs close(2) at once.
+      Enum.each([read, write, closed_write], &UnixFD.close/1)
+      assert {:ok, 1} = UnixFD.__close_count__(read)
+      assert {:ok, 1} = UnixFD.__close_count__(write)
     end
   end
 
@@ -631,6 +694,34 @@ defmodule Rebus.UnixFDHandleTest do
 
   # A pid and a reference from another node, as distribution would decode
   # them: NEW_PID_EXT and NEWER_REFERENCE_EXT in the external term format.
+  # Both ends of a connected local stream socket pair.
+  defp socket_pair do
+    path = Rebus.TestTmp.path("pair")
+    {:ok, listener} = :socket.open(:local, :stream, :default)
+    :ok = :socket.bind(listener, %{family: :local, path: path})
+    :ok = :socket.listen(listener, 1)
+    {:ok, peer} = :socket.open(:local, :stream, :default)
+    :ok = :socket.connect(peer, %{family: :local, path: path})
+    {:ok, local} = :socket.accept(listener, 1_000)
+    :ok = :socket.close(listener)
+    File.rm(path)
+    {peer, local}
+  end
+
+  # A handle for a copy of `sock`'s descriptor received over SCM_RIGHTS, as
+  # a connection would wrap it.
+  defp wrap_received(sock) do
+    {sender, receiver} = socket_pair()
+    {:ok, fd} = :socket.getopt(sock, {:otp, :fd})
+    rights = [%{level: :socket, type: :rights, data: <<fd::native-signed-32>>}]
+    :ok = :socket.sendmsg(sender, %{iov: ["x"], ctrl: rights}, [], 1_000)
+    {:ok, %{ctrl: ctrl}} = :socket.recvmsg(receiver, 0, 256, [], 1_000)
+    [%{data: <<received::native-signed-32>>}] = Enum.filter(ctrl, &match?(%{type: :rights}, &1))
+    Enum.each([sender, receiver], &:socket.close/1)
+    {:ok, handle} = UnixFD.wrap(received, self())
+    handle
+  end
+
   defp remote_pid do
     :erlang.binary_to_term(
       <<131, 88, 119, byte_size(@remote_node), @remote_node::binary, 1::32, 0::32, 1::32>>

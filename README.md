@@ -20,6 +20,10 @@ def deps do
 end
 ```
 
+On Linux and macOS, Rebus compiles a small native library when it is built,
+for Unix file descriptor passing, so the build needs `make` and a C++17
+compiler such as GCC or Clang.
+
 ## Examples
 
 Call a method:

@@ -88,6 +88,7 @@ defmodule Rebus do
           | :remote_connection_unsupported
           | :unix_fd_not_negotiated
           | :unix_fd_unsupported
+          | :unix_fd_closed
           | :unix_fd_send_failed
           | {:invalid_message_type, Rebus.Message.message_type()}
 
@@ -420,9 +421,11 @@ defmodule Rebus do
   Sends a method call and waits for its reply.
 
   Only a method call that expects a reply is accepted, and `timeout` is in
-  milliseconds. Each result carries the complete message, including a
-  `Rebus.UnixFD` handle in `:unix_fds` for each descriptor received with it,
-  which the calling process owns. A D-Bus error reply from the peer is
+  milliseconds. The call may carry descriptors, as `Rebus.UnixFD` handles,
+  raw descriptor numbers or both; see `Rebus.Message.new/2`. Each result
+  carries the complete message, including a `Rebus.UnixFD` handle in
+  `:unix_fds` for each descriptor received with it, which the calling process
+  owns. A D-Bus error reply from the peer is
   returned as `{:error, {:dbus_error, %Rebus.Message{type: :error}}}`, so it
   never shares a shape with a local or transport failure.
 
@@ -446,8 +449,10 @@ defmodule Rebus do
   - `{:error, :disconnected}` - the connection stopped before the reply.
   - Nothing was written for `:encode_failed`, `:no_reply_expected`,
     `:not_connected`, `:serial_exhausted`, `:unix_fd_unsupported`,
-    `:unix_fd_not_negotiated`, `:unix_fd_send_failed`,
+    `:unix_fd_not_negotiated`, `:unix_fd_closed`, `:unix_fd_send_failed`,
     `{:invalid_message_type, type}` and `:remote_connection_unsupported`.
+    `:unix_fd_closed` means a handle in `unix_fds` was already closed, or
+    belongs to another node, when the connection accepted the call.
 
   A reply that exceeds a decoding cap inside its own header fields is a
   special case: Rebus recovers no trusted `reply_serial`, so the frame is
@@ -484,7 +489,8 @@ defmodule Rebus do
 
   Use this for signals and for method calls flagged `:no_reply_expected`.
   `send/2` allows five seconds for the connection to accept the message;
-  `send/3` takes that timeout as an argument.
+  `send/3` takes that timeout as an argument. Descriptors are sent as for
+  `call/3`.
 
   ## Return values
 
@@ -495,8 +501,8 @@ defmodule Rebus do
   - `{:error, :disconnected}` - the connection stopped.
   - Nothing was written for `:encode_failed`, `:reply_expected`,
     `{:invalid_message_type, type}`, `:not_connected`, `:serial_exhausted`,
-    `:unix_fd_unsupported`, `:unix_fd_not_negotiated`, `:unix_fd_send_failed`
-    and `:remote_connection_unsupported`.
+    `:unix_fd_unsupported`, `:unix_fd_not_negotiated`, `:unix_fd_closed`,
+    `:unix_fd_send_failed` and `:remote_connection_unsupported`.
   """
   @spec send(pid(), Rebus.Message.t()) :: :ok | {:error, error_reason()}
   def send(conn, %Rebus.Message{} = message) when is_pid(conn),

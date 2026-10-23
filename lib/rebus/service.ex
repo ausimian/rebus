@@ -152,12 +152,17 @@ defmodule Rebus.Service do
           # or with Rebus.UnixFD.close/1
       end
 
-  A reply sends raw descriptor numbers through `reply/3`'s `:fds` option, or
-  the `unix_fds` of a message answered with `reply_message/3`. Rebus borrows
-  them, as it does every outbound descriptor, so the handler still owns them
-  and closes them once the answer returns. A reply cannot send the number of
-  a descriptor the connection still owns, such as one of the call's own
-  borrowed handles; take it with `take_fds/2` first.
+  A reply sends descriptors through `reply/3`'s `:fds` option, or the
+  `unix_fds` of a message answered with `reply_message/3`: handles, raw
+  descriptor numbers, or both, as for `Rebus.Message.new/2`. A reply may
+  carry the call's own borrowed handles. Answering the call closes them, but
+  the connection keeps their descriptors open until the reply has passed
+  them on:
+
+      receive do
+        {^ref, %Rebus.Service.Call{member: "Echo", unix_fds: [handle]} = call} ->
+          :ok = Rebus.Service.reply(call, [0], fds: [handle])
+      end
 
   See [Unix file descriptor passing](unix_fds.html) for the full ownership
   rules.
@@ -202,7 +207,6 @@ defmodule Rebus.Service do
   @type reply_error ::
           :unknown_call
           | :signature_mismatch
-          | :unix_fd_borrowed
           | Message.construction_error()
           | Rebus.error_reason()
 
@@ -303,28 +307,38 @@ defmodule Rebus.Service do
 
   ## Options
 
-  - `:fds` - borrowed Unix file descriptors to send with the reply, which
-    `h` values in `body` index, as for `Rebus.Message.new/2`. The handler
-    keeps ownership and closes them once this returns. Defaults to `[]`.
+  - `:fds` - Unix file descriptors to send with the reply, which `h` values
+    in `body` index: `Rebus.UnixFD` handles, raw descriptor numbers, or
+    both, as for `Rebus.Message.new/2`. They may include the call's own
+    borrowed handles, whose descriptors stay open until the reply is
+    written. A handle the handler owns stays open and its own, and a raw
+    number stays the handler's to close once this returns. Defaults to `[]`.
   - `:timeout` - milliseconds to wait for the connection to accept the
     reply. Defaults to `5000`.
 
   ## Return values
+
+  Once the connection accepts a reply, the call is complete and the handles
+  it borrowed are closed, even if writing the reply then fails. Their
+  descriptors stay open only until the frame is written or abandoned, and
+  the call cannot be answered again.
 
   - `:ok` - the reply was handed to the socket, or the caller asked for no
     reply and nothing was sent.
   - `{:error, :signature_mismatch}` - `body` does not fit `call.out_signature`.
   - `{:error, :unknown_call}` - the call was already answered, expired, or
     its export is gone.
-  - `{:error, :unix_fd_borrowed}` - `:fds` names the number of a descriptor
-    the connection still owns, such as one this call or another pending call
-    borrowed, which it may close before the reply is written; take it with
-    `take_fds/2` first. The call stays open.
+  - `{:error, :unix_fd_closed}` - a handle in `:fds` was already closed,
+    or belongs to another node, when the connection accepted the reply.
+    Nothing was sent, and the call stays open.
   - `{:error, :unix_fd_unsupported}` and `{:error, :unix_fd_not_negotiated}`
     - the reply carries descriptors this connection cannot send, as for
     `Rebus.send/3`. The call stays open.
+  - `{:error, :unix_fd_send_failed}` - the kernel refused a descriptor, so
+    nothing was written and the caller gets no reply. The call is complete
+    all the same and cannot be answered again.
   - `{:error, :timeout}` - delivery is ambiguous, as for `Rebus.send/3`. The
-    call is complete either way.
+    call is complete either way and cannot be answered again.
   - `{:error, :disconnected}` - the connection stopped.
   - Any other reason is a failure to build or write the frame, as for
     `Rebus.send/3`. The call is complete unless the frame could not be built.

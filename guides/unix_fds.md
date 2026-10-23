@@ -5,53 +5,61 @@
 > Unix file descriptor support is experimental and likely to change in a
 > subsequent release.
 
-D-Bus can carry raw Unix file descriptors alongside a message body. Rebus
+D-Bus can carry Unix file descriptors alongside a message body. Rebus
 supports this on Linux and macOS, over local Unix sockets, when the peer
 agrees to it during authentication. If the transport cannot carry descriptors
 or the peer did not agree to receive them, Rebus rejects the message without
 sending any bytes.
 
-Rebus sends raw descriptor numbers, and hands every descriptor it receives
-to your code as a `Rebus.UnixFD` handle. A raw number is only a number:
-copying it does not duplicate the descriptor, and garbage collection does
-not close it, so each one you send must be closed exactly once by whoever
-owns it. A handle closes its descriptor exactly once by itself: when any
-holder calls `Rebus.UnixFD.close/1`, when its owning process exits, or when
-the last reference to it is garbage collected. Use the descriptor behind a
-handle with `Rebus.UnixFD.with_fd/2`.
+Every descriptor Rebus receives reaches your code as a `Rebus.UnixFD`
+handle, never as a raw number. A handle owns one open descriptor and closes
+it exactly once, whichever comes first of:
 
-The ownership rules are:
+- any holder calling `Rebus.UnixFD.close/1`,
+- its owning process exiting, for any reason including `:kill`,
+- the last reference to it being garbage collected.
 
-- Rebus does not duplicate or close the raw descriptors you send. You keep
-  ownership and close them yourself.
-- Handles in a reply to `Rebus.call/3` are owned by the process that called
-  it.
-- Handles on an inbound method call are owned by the connection and lent to
-  the handler for the life of the call. Take them with
-  `Rebus.Service.take_fds/2` to keep them.
-- Signals never hand a descriptor to your code.
-
-## Sending descriptors
-
-Pass the raw descriptors as `fds:` when you build the message. Each `h` value
-in the body is a zero-based index into that list:
+A closed handle forgets its descriptor number, so a stale handle can never
+close or use an unrelated descriptor that the operating system has since
+given the same number. Inspecting a handle shows its state and owner, never
+the number:
 
 ```elixir
-message = Rebus.Message.new!(:method_call,
-  path: "/com/example/Object",
-  interface: "com.example.Interface",
-  destination: "com.example.Service",
-  member: "TakeFile",
-  signature: "h",
-  body: [0],
-  fds: [fd]
-)
-
-{:ok, reply} = Rebus.call(conn, message)
+iex> handle
+#Rebus.UnixFD<open, owner: #PID<0.215.0>>
 ```
 
-Rebus never duplicates or closes these descriptors. The sender stays
-responsible for closing them once the call returns.
+## Ownership and aliases
+
+Each handle has exactly one owning process, in the controlling-process model
+of ports and sockets. A handle is an ordinary term, so any number of
+processes can hold it; those copies are aliases of the same handle, not
+duplicates of the descriptor. The rules are:
+
+- Any holder may use a handle, send it, duplicate it with
+  `Rebus.UnixFD.dup/1`, or close it. Closing is idempotent: a second
+  `Rebus.UnixFD.close/1` returns `{:error, :closed}`.
+- Only the owner can transfer ownership, with
+  `Rebus.UnixFD.controlling_process/2`. Anyone else gets
+  `{:error, :not_owner}`, and a closed handle answers `{:error, :closed}`
+  before ownership is even checked.
+- When the owner exits, the descriptor is closed at once, and every alias
+  reads closed from then on. Transferring a handle to a process that is not
+  alive closes it and returns `{:error, :noproc}`.
+- `Rebus.UnixFD.dup/1` makes a new handle, owned by the process that calls
+  it, for the same open file. The two close independently, so `dup/1` is how
+  a process that does not own a handle gets a descriptor of its own.
+- `Rebus.UnixFD.owner/1` and `Rebus.UnixFD.open?/1` tell who owns a handle
+  and whether it is open.
+
+Where handles come from:
+
+- The handles in a reply to `Rebus.call/3` are owned by the process that
+  called it.
+- The handles on an inbound method call are owned by the connection and lent
+  to the handler for the life of the call. `Rebus.Service.take_fds/2` makes
+  the handler their owner instead.
+- Signals never hand a descriptor to your code.
 
 ## Receiving descriptors in a reply
 
@@ -72,11 +80,11 @@ case Rebus.call(conn, message) do
     handle_call_failure(reason)
 end
 
-defp handle_and_close(%Rebus.Message{unix_fds: fds} = message, handler) do
+defp handle_and_close(%Rebus.Message{unix_fds: handles} = message, handler) do
   try do
     handler.(message)
   after
-    Enum.each(fds, &Rebus.UnixFD.close/1)
+    Enum.each(handles, &Rebus.UnixFD.close/1)
   end
 end
 ```
@@ -84,23 +92,111 @@ end
 Closing a handle you no longer need releases the descriptor at once. A
 handle you leave open is closed when your process exits or when nothing
 refers to it any more, so it never leaks for good, but it holds the
-descriptor until then. Closing a handle twice is harmless: the second
-`Rebus.UnixFD.close/1` returns `{:error, :closed}`. Never close the raw
-number you get inside `Rebus.UnixFD.with_fd/2` yourself.
+descriptor until then.
 
-An FD-bearing `Rebus.call/3` honours its timeout like any other call. A
-reply that arrives after the call has returned `{:error, :timeout}` is
-dropped, and its descriptors are closed as soon as the connection learns
-that the call timed out, which the calling process tells it as it gives up.
-Only if that news takes more than a second past the call's deadline to
-arrive, on a badly overloaded system, do they stay open until the calling
-process exits or garbage-collects the dropped reply.
+## Using a descriptor with `with_fd/2`
 
-## Signals
+`Rebus.UnixFD.with_fd/2` calls a function with the raw descriptor number and
+returns `{:ok, result}`, or `{:error, :closed}` without calling it. The
+descriptor stays open until the function returns, even if the handle is
+closed or its owner exits meanwhile. The number is valid only inside the
+function: hand it to something that takes its own copy, and never close it
+yourself.
 
-Rebus closes the descriptors on an inbound signal and drops the signal. A
-handle has one owner, so it cannot be handed to several subscribers. The
-connection stays up and later signals arrive normally.
+Adopt a received socket into an OTP `:socket`. `:socket.open/2` duplicates
+the descriptor by default, so the socket outlives the handle:
+
+```elixir
+{:ok, {:ok, sock}} =
+  Rebus.UnixFD.with_fd(h, fn fd ->
+    :socket.open(fd, %{domain: :local, type: :stream})
+  end)
+
+:ok = Rebus.UnixFD.close(h)
+```
+
+Read a file that a portal handed you, through an independent OTP file opened
+on `/dev/fd`:
+
+```elixir
+{:ok, {:ok, contents}} =
+  Rebus.UnixFD.with_fd(h, fn fd -> File.read("/dev/fd/#{fd}") end)
+```
+
+What opening `/dev/fd/N` gives you depends on the platform. On Linux it
+reopens the file the descriptor refers to, so the new file has its own
+offset, starting at the beginning, and it does not work for sockets. On
+macOS it duplicates the descriptor, so the new file shares the original's
+offset.
+
+Many descriptors need no `with_fd/2` at all. A systemd-logind inhibitor lock,
+for instance, holds for as long as its descriptor is open, so the handle is
+all you need:
+
+```elixir
+{:ok, %Rebus.Message{unix_fds: [lock]}} = Rebus.call(conn, inhibit_msg)
+# ... work ...
+Rebus.UnixFD.close(lock)   # or let the owning process exit
+```
+
+Do not take the number out of the function:
+
+```elixir
+# Wrong
+{:ok, fd} = Rebus.UnixFD.with_fd(h, & &1)
+```
+
+Once `with_fd/2` returns, nothing keeps that descriptor open. Any holder can
+close the handle, or its owner can exit, and the number may then be closed,
+or given to an unrelated file, socket or pipe by the time you use it. To
+keep a descriptor of your own, use `Rebus.UnixFD.dup/1`, or have something
+like `:socket.open/2` take its own copy inside the function.
+
+## Sending descriptors
+
+Pass descriptors as `fds:` when you build the message: `Rebus.UnixFD`
+handles, raw descriptor numbers, or both. Each `h` value in the body is a
+zero-based index into that list:
+
+```elixir
+message = Rebus.Message.new!(:method_call,
+  path: "/com/example/Object",
+  interface: "com.example.Interface",
+  destination: "com.example.Service",
+  member: "TakeFiles",
+  signature: "hh",
+  body: [0, 1],
+  fds: [handle, raw_fd]
+)
+
+{:ok, reply} = Rebus.call(conn, message)
+```
+
+`Rebus.send/2,3`, `Rebus.Service.emit/6`, the replies of `Rebus.Service`
+and a `Rebus.Object`'s `{:reply, body, state, fds: fds}` all take
+descriptors the same way.
+
+A handle can be sent by any process that holds it, not only its owner.
+Sending it neither closes it nor transfers it. When the connection accepts
+the message for writing, it pins each handle, which keeps the descriptor
+open until the kernel has taken it, or until the write is abandoned: it
+fails, its caller gives up waiting, or the connection stops. So you may
+close a handle, or its owner may exit, while it is being sent: the handle
+reads closed for everyone at once, and the descriptor itself is closed once
+it has been passed on. A handle that is already closed when the connection
+accepts the message, or that belongs to another node, fails the message
+with `{:error, :unix_fd_closed}`, and nothing is written. Building the
+message does not check this, so a message built from an open handle can
+still be refused if the handle is closed before you send it.
+
+A raw number is borrowed. Rebus never duplicates or closes it, and keeping
+it open until the send returns, and closing it afterwards, is up to you. A
+number from inside `with_fd/2` qualifies, as long as the send happens inside
+the function:
+
+```elixir
+{:ok, :ok} = Rebus.UnixFD.with_fd(handle, &Rebus.send(conn, signal_with_fd(&1)))
+```
 
 ## Inbound method calls
 
@@ -146,30 +242,91 @@ the connection closes its descriptors as it answers it.
 
 `Rebus.Service.reply/3` and `Rebus.Service.reply_error/4` take the same
 `fds:` option as `Rebus.Message.new/2`, and `Rebus.Service.reply_message/3`
-sends whatever raw descriptors its message carries. Rebus borrows them, as
-it does for every outbound message, so the handler still owns them and
-closes them once the answer returns.
+sends whatever descriptors its message carries. A reply may carry the call's
+own borrowed handles, with no need to take them first. Answering the call
+closes them, but the connection pins them before it does, so their
+descriptors stay open until the reply has passed them on:
 
-A reply cannot carry the number of a descriptor the connection still owns.
-That includes the call's own borrowed handles, which answering the call
-closes before the reply is written, and handles borrowed by another pending
-call. Such a reply returns `{:error, :unix_fd_borrowed}` and leaves the call
-open. Take the handle with `take_fds/2` first, then send its number from
-inside `Rebus.UnixFD.with_fd/2`.
+```elixir
+receive do
+  {^ref, %Rebus.Service.Call{member: "Echo", unix_fds: [handle]} = call} ->
+    :ok = Rebus.Service.reply(call, [0], fds: [handle])
+end
+```
+
+A reply that carries a closed handle returns `{:error, :unix_fd_closed}`,
+sends nothing, and leaves the call open for another answer. Once the
+connection has accepted a reply, though, the call is complete and its
+borrowed handles are closed, even if writing the reply then fails with
+`{:error, :unix_fd_send_failed}` or the handler stops waiting with
+`{:error, :timeout}`. The call cannot be answered again after either.
+
+## Signals
+
+Rebus closes the descriptors on an inbound signal and drops the signal. A
+handle has one owner, so it cannot be handed to several subscribers. The
+connection stays up and later signals arrive normally.
+
+## Timeouts and late replies
+
+An FD-bearing `Rebus.call/3` honours its timeout like any other call. A
+reply that arrives after the call has returned `{:error, :timeout}` is
+dropped, and its descriptors are closed. If it arrives before the
+connection learns of the timeout, the connection has already made the
+calling process the owner of its handles. The calling process tells the
+connection as it gives up, and the connection then closes them. It
+remembers such handles for one second past the call's deadline. If that
+news takes longer to arrive, on a badly overloaded system, the handles stay
+open until the calling process exits or garbage-collects the dropped reply.
 
 ## Cleanup
 
 `Rebus.close/1` closes every handle the connection still owns, including
 those lent to the handlers of pending calls. So does any other way the
 connection stops, even an untrappable `:kill`, because a handle closes when
-its owner exits.
+its owner exits. The pins of writes still in progress go with the
+connection too, so a handle closed while it was being sent has its
+descriptor closed when the connection stops.
+
+## Distribution and other details
+
+- A handle is local to the node that created it. Sent to another node, it
+  answers `{:error, :not_local}` to every operation there, and a connection
+  there refuses to send it with `{:error, :unix_fd_closed}`. Once it is back
+  on its own node, whether sent back or decoded with `:erlang.binary_to_term/1`,
+  it works again.
+- Handles are built on a small native library, which cannot be upgraded in
+  place. Reloading the module that loads it in a running node, for example
+  by recompiling Rebus from `iex` after changing it, fails; restart the node
+  instead. This only affects development.
+
+## Building
+
+On Unix, Rebus compiles that native library when it is built, from C++17
+source shipped in the package. Building it needs `make` and a C++17
+compiler, such as GCC or Clang, which most Linux distributions and the
+Xcode command line tools on macOS provide. Nothing is compiled on other
+platforms, where every `Rebus.UnixFD` function returns
+`{:error, :unsupported}` and no connection can pass descriptors.
 
 ## Errors
+
+These are returned when sending or answering:
 
 | Reason | Meaning |
 | --- | --- |
 | `:unix_fd_unsupported` | This connection cannot pass descriptors at all. It is a TCP connection, or the platform lacks support. |
 | `:unix_fd_not_negotiated` | The peer did not agree to descriptor passing. |
-| `:unix_fd_send_failed` | An outbound descriptor could not be passed. No byte of the frame was written, the connection remains usable, and the sender still owns the descriptor. |
-| `:unix_fd_borrowed` | A reply named the number of a descriptor the connection still owns, such as one a pending call borrowed. Take it with `Rebus.Service.take_fds/2` first. |
+| `:unix_fd_closed` | A handle in the message was already closed, or belongs to another node, when the connection accepted it. Nothing was written. |
+| `:unix_fd_send_failed` | The kernel refused an outbound descriptor. No byte of the frame was written and the connection remains usable. A handle you sent is as it was, but a reply has still completed its call, closing the call's borrowed handles, and the caller gets no answer. |
 | `:disconnected` | The connection stopped, closing the handles it owned. |
+
+`Rebus.UnixFD` functions return these:
+
+| Reason | Meaning |
+| --- | --- |
+| `:closed` | The handle is closed. |
+| `:not_owner` | Only the owner can transfer the handle. |
+| `:noproc` | The process it was transferred to is not alive, so the descriptor was closed. |
+| `:not_local` | The handle, or the process given, belongs to another node. |
+| `:unsupported` | This platform has no handle support. |

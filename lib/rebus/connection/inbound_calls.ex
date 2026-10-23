@@ -103,11 +103,6 @@ defmodule Rebus.Connection.InboundCalls do
   @spec fetch(t(), reference()) :: {:ok, Entry.t()} | :error
   def fetch(%__MODULE__{entries: entries}, ref), do: Map.fetch(entries, ref)
 
-  # Every handle the table still holds for its calls.
-  @spec fds(t()) :: [UnixFD.t()]
-  def fds(%__MODULE__{entries: entries}),
-    do: Enum.flat_map(entries, fn {_ref, %Entry{unix_fds: fds}} -> fds end)
-
   # How many calls are waiting, which the connection bounds.
   @spec size(t()) :: non_neg_integer()
   def size(%__MODULE__{entries: entries}), do: map_size(entries)

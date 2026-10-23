@@ -5,7 +5,6 @@ defmodule Rebus.UnixFDTest do
   alias Rebus.Connection.Rights
   alias Rebus.{Message, Service, TestImpl, TestServer, UnixFD}
   alias Rebus.Service.Call
-  alias Rebus.UnixFD.Raw
 
   @connection_name :rebus_unix_fd_test_connection
   @files_path "/org/example/Files"
@@ -69,21 +68,6 @@ defmodule Rebus.UnixFDTest do
     assert message.header_fields.unix_fds == 1
     assert message.unix_fds == [0]
     assert {:error, :invalid_unix_fds} = Message.attach_unix_fds(message, [])
-  end
-
-  test "reports invalid raw descriptors without closing an unrelated descriptor" do
-    assert {:error, :invalid_descriptor} = Raw.close(-1)
-    assert {:error, :invalid_descriptor} = Raw.close(:not_a_descriptor)
-    assert {:error, :ebadf} = Raw.close(1_000_000)
-  end
-
-  test "the private OTP close primitive is still exported" do
-    Code.ensure_loaded(:prim_file)
-
-    assert function_exported?(:prim_file, :file_desc_to_ref, 2),
-           "Rebus.UnixFD.Raw closes owned descriptors with the private OTP function " <>
-             ":prim_file.file_desc_to_ref/2, and this OTP release no longer exports it. " <>
-             "The migration plan in lib/rebus/unix_fd/raw.ex now applies."
   end
 
   test "closes a received socket descriptor without disturbing the original", %{
@@ -166,8 +150,8 @@ defmodule Rebus.UnixFDTest do
     assert_receive {^server, %Message{header_fields: %{member: "FD"}, unix_fds: [received]}},
                    1_000
 
-    assert received != fd
-    assert :ok = Raw.close(received)
+    assert raw!(received) != fd
+    assert :ok = UnixFD.close(received)
   end
 
   test "sends rights once and switches a partial sendmsg tail to send", %{connection: connection} do
@@ -1250,7 +1234,7 @@ defmodule Rebus.UnixFDTest do
     assert_closed_once(borrowed)
   end
 
-  test "sends descriptors with a reply, but not the call's borrowed ones", %{
+  test "echoes a call's borrowed handle in its reply and closes it once written", %{
     server: server,
     connection: connection
   } do
@@ -1259,13 +1243,11 @@ defmodule Rebus.UnixFDTest do
     {_ref, %Call{serial: serial, unix_fds: [borrowed]} = call} =
       fd_call!(server, connection, "Echo")
 
-    # Outbound descriptors are raw numbers. A handler can read one out of a
-    # borrowed handle, but not send it.
-    assert {:error, :unix_fd_borrowed} = Service.reply(call, [0], fds: [raw!(borrowed)])
-    refute_receive {^server, %Message{header_fields: %{reply_serial: _}}}, 100
+    identity = identity!(borrowed)
 
-    {:ok, [taken]} = Service.take_fds(call)
-    assert {:ok, :ok} = UnixFD.with_fd(taken, &Service.reply(call, [0], fds: [&1]))
+    # Completing the call closes its borrowed handle, but the connection
+    # pinned it first, so the reply still passes on the live descriptor.
+    assert :ok = Service.reply(call, [0], fds: [borrowed])
 
     assert_receive {^server,
                     %Message{
@@ -1276,25 +1258,25 @@ defmodule Rebus.UnixFDTest do
                     }},
                    1_000
 
-    # The reply borrowed the descriptor, so it is still the handler's to close,
-    # as the server's received duplicate is the server's.
-    assert :ok = Raw.close(received)
+    assert identity!(received) == identity
+    assert_closed_once(borrowed)
+    assert :ok = UnixFD.close(received)
+    assert no_new_fds?(before_fds)
+  end
 
-    # An error reply carries them the same way.
-    {:ok, ref} = Service.export(connection, @files_path <> "/Errors", [@files])
-    serial = push_fd_call!(server, "Echo", path: @files_path <> "/Errors")
+  test "sends handles with error replies and hand-built replies", %{
+    server: server,
+    connection: connection
+  } do
+    before_fds = fd_set!()
+    {:ok, ref} = Service.export(connection, @files_path, [@files])
+
+    # An error reply carries the call's own handle the same way.
+    serial = push_fd_call!(server, "Echo")
     assert_receive {^ref, %Call{serial: ^serial, unix_fds: [borrowed]} = call}, 1_000
+    identity = identity!(borrowed)
 
-    assert {:error, :unix_fd_borrowed} =
-             Service.reply_error(call, "org.example.Error.Refused", "no", fds: [raw!(borrowed)])
-
-    assert {:ok, [error_taken]} = Service.take_fds(call)
-
-    assert {:ok, :ok} =
-             UnixFD.with_fd(
-               taken,
-               &Service.reply_error(call, "org.example.Error.Refused", "no", fds: [&1])
-             )
+    assert :ok = Service.reply_error(call, "org.example.Error.Refused", "no", fds: [borrowed])
 
     assert_receive {^server,
                     %Message{
@@ -1304,10 +1286,335 @@ defmodule Rebus.UnixFDTest do
                     }},
                    1_000
 
-    assert :ok = Raw.close(received)
-    assert :ok = UnixFD.close(error_taken)
+    assert identity!(received) == identity
+    assert_closed_once(borrowed)
+    assert :ok = UnixFD.close(received)
+
+    # A taken handle is the handler's own, and sending it leaves it open.
+    serial = push_fd_call!(server, "Echo")
+    assert_receive {^ref, %Call{serial: ^serial} = call}, 1_000
+    {:ok, [taken]} = Service.take_fds(call)
+
+    reply =
+      Message.new!(:method_return, reply_serial: 1, signature: "h", body: [0], fds: [taken])
+
+    assert :ok = Service.reply_message(call, reply)
+
+    assert_receive {^server,
+                    %Message{
+                      type: :method_return,
+                      header_fields: %{reply_serial: ^serial},
+                      unix_fds: [received]
+                    }},
+                   1_000
+
+    assert identity!(received) == identity!(taken)
+    assert {:ok, self()} == UnixFD.owner(taken)
+    assert :ok = UnixFD.close(received)
     assert :ok = UnixFD.close(taken)
+    assert_closed_once(taken)
     assert no_new_fds?(before_fds)
+  end
+
+  test "refuses a reply carrying a closed handle and leaves the call open", %{
+    server: server,
+    connection: connection
+  } do
+    {_ref, %Call{serial: serial, unix_fds: [borrowed]} = call} =
+      fd_call!(server, connection, "Echo")
+
+    assert :ok = UnixFD.close(borrowed)
+    assert {:error, :unix_fd_closed} = Service.reply(call, [0], fds: [borrowed])
+
+    # `reply_message/3` encodes in the handler, while the handle is still
+    # open; the connection checks it again when it accepts the reply.
+    {:ok, read, write} = UnixFD.__pipe__()
+
+    reply =
+      Message.new!(:method_return, reply_serial: 1, signature: "h", body: [0], fds: [read])
+
+    assert {:ok, _iodata} = Message.encode(reply)
+    assert :ok = UnixFD.close(read)
+    assert {:error, :unix_fd_closed} = Service.reply_message(call, reply)
+    refute_receive {^server, %Message{header_fields: %{reply_serial: ^serial}}}, 100
+
+    assert :ok = Service.reply_error(call, "org.example.Error.Refused", "closed")
+
+    assert_receive {^server, %Message{type: :error, header_fields: %{reply_serial: ^serial}}},
+                   1_000
+
+    assert_closed_once(read)
+    assert :ok = UnixFD.close(write)
+  end
+
+  test "sends handles and borrowed raw numbers in any mix", %{
+    server: server,
+    connection: connection
+  } do
+    before_fds = fd_set!()
+    {:ok, first, first_write} = UnixFD.__pipe__()
+    {:ok, second, second_write} = UnixFD.__pipe__()
+    expected = [identity!(first), identity!(second)]
+
+    # Two handles, a raw number with a handle, and two raw numbers. A raw
+    # number is borrowed: here it is valid only inside `with_fd/2`.
+    assert :ok = Rebus.send(connection, fd_signal("Mixed", [first, second]))
+
+    assert {:ok, :ok} =
+             UnixFD.with_fd(first, &Rebus.send(connection, fd_signal("Mixed", [&1, second])))
+
+    assert {:ok, {:ok, :ok}} =
+             UnixFD.with_fd(first, fn first_fd ->
+               UnixFD.with_fd(second, &Rebus.send(connection, fd_signal("Mixed", [first_fd, &1])))
+             end)
+
+    for _sent <- 1..3 do
+      assert_receive {^server, %Message{header_fields: %{member: "Mixed"}, unix_fds: received}},
+                     1_000
+
+      assert Enum.map(received, &identity!/1) == expected
+      Enum.each(received, &UnixFD.close/1)
+    end
+
+    # A method call carries them the same way.
+    method =
+      Message.new!(:method_call,
+        path: "/test",
+        interface: "test.interface",
+        member: "TakesFDs",
+        signature: "hh",
+        body: [0, 1],
+        fds: [second, first]
+      )
+
+    task = Task.async(fn -> Rebus.call(connection, method, 1_000) end)
+
+    assert_receive {^server,
+                    %Message{
+                      serial: serial,
+                      header_fields: %{member: "TakesFDs"},
+                      unix_fds: received
+                    }},
+                   1_000
+
+    assert Enum.map(received, &identity!/1) == Enum.reverse(expected)
+    Enum.each(received, &UnixFD.close/1)
+    TestServer.push(server, Message.new!(:method_return, reply_serial: serial))
+    assert {:ok, %Message{type: :method_return}} = Task.await(task, 1_000)
+
+    # Sending a handle neither closes it nor moves it, and leaves no pin on
+    # it: closing it now runs close(2) at once.
+    assert {:ok, self()} == UnixFD.owner(first)
+
+    for handle <- [first, second] do
+      assert :ok = UnixFD.close(handle)
+      assert_closed_once(handle)
+    end
+
+    Enum.each([first_write, second_write], &UnixFD.close/1)
+    assert no_new_fds?(before_fds)
+  end
+
+  test "refuses a closed or foreign handle when it accepts a message, writing nothing", %{
+    server: server,
+    connection: connection
+  } do
+    {:ok, read, write} = UnixFD.__pipe__()
+    :ok = UnixFD.close(read)
+
+    {owner, orphaned} = pipe_end_owned_elsewhere()
+    send(owner, :exit)
+    assert eventually(fn -> not UnixFD.open?(orphaned) end)
+
+    method =
+      Message.new!(:method_call,
+        path: "/test",
+        interface: "test.interface",
+        member: "Refused",
+        signature: "h",
+        body: [0],
+        fds: [read]
+      )
+
+    # The open handle ahead of the closed one is pinned, then released.
+    assert {:error, :unix_fd_closed} = Rebus.send(connection, fd_signal("Refused", [write, read]))
+    assert {:error, :unix_fd_closed} = Rebus.send(connection, fd_signal("Refused", [orphaned]))
+
+    # A handle from another node, as a plain reference reads.
+    foreign = %UnixFD{ref: make_ref()}
+    assert {:error, :unix_fd_closed} = Rebus.send(connection, fd_signal("Refused", [foreign]))
+    assert {:error, :unix_fd_closed} = Rebus.call(connection, method, 1_000)
+    refute_receive {^server, %Message{header_fields: %{member: "Refused"}}}, 100
+
+    assert Process.alive?(connection)
+    assert :ok = UnixFD.close(write)
+    assert_closed_once(write)
+  end
+
+  test "keeps a pinned descriptor open while its send is in flight, closing it once after", %{
+    server: server,
+    connection: connection
+  } do
+    for release <- [:close, :owner_exit] do
+      {owner, handle} = pipe_end_owned_elsewhere()
+      identity = identity!(handle)
+      {task, fd, resume} = park_fd_send!(connection, handle, "InFlight")
+
+      case release do
+        :close -> assert :ok = UnixFD.close(handle)
+        :owner_exit -> send(owner, :exit)
+      end
+
+      # The handle reads closed for everyone at once, but the pin keeps the
+      # descriptor itself open, under the same number, until it is written.
+      assert eventually(fn -> not UnixFD.open?(handle) end)
+      assert {:ok, 0} = UnixFD.__close_count__(handle)
+      assert UnixFD.__fd_identity__(fd) == identity
+
+      resume.()
+      assert :ok = Task.await(task, 1_000)
+
+      assert_receive {^server,
+                      %Message{header_fields: %{member: "InFlight"}, unix_fds: [received]}},
+                     1_000
+
+      assert identity!(received) == identity
+      assert_closed_once(handle)
+      assert :ok = UnixFD.close(received)
+      send(owner, :exit)
+    end
+  end
+
+  test "releases the pins once the kernel has accepted the descriptors", %{
+    connection: connection
+  } do
+    parent = self()
+    continuation = {:select_info, :sendmsg, make_ref()}
+    tail_select = {:select_info, :send, make_ref()}
+
+    # The rights go out with the first byte, and the rest of the frame waits.
+    :ok =
+      TestImpl.install(connection,
+        sendmsg: fn _sock, %{iov: [rest]}, [], :nowait ->
+          {:select, {continuation, [binary_part(rest, 1, byte_size(rest) - 1)]}}
+        end,
+        send: fn _sock, _rest, [], :nowait ->
+          send(parent, :tail_waiting)
+          {:select, tail_select}
+        end,
+        cancel: fn _sock, ^continuation -> :ok end
+      )
+
+    {:ok, read, write} = UnixFD.__pipe__()
+    task = Task.async(fn -> Rebus.send(connection, fd_signal("Accepted", [read])) end)
+    assert_receive :tail_waiting, 1_000
+
+    assert :ok = UnixFD.close(read)
+    assert_closed_once(read)
+
+    ref = Process.monitor(connection)
+    Rebus.close(connection)
+    assert_receive {:DOWN, ^ref, :process, ^connection, _reason}, 1_000
+    assert {:error, :disconnected} = Task.await(task, 1_000)
+    assert :ok = UnixFD.close(write)
+  end
+
+  test "releases the pins of a write that fails, is cancelled or is dropped from the queue", %{
+    connection: connection
+  } do
+    parent = self()
+
+    # A descriptor the kernel refuses: the caller is told, and the pin goes.
+    :ok =
+      TestImpl.install(connection, sendmsg: fn _sock, _msg, [], :nowait -> {:error, :ebadf} end)
+
+    {:ok, failed, failed_write} = UnixFD.__pipe__()
+    assert {:error, :unix_fd_send_failed} = Rebus.send(connection, fd_signal("Failed", [failed]))
+    assert :ok = UnixFD.close(failed)
+    assert_closed_once(failed)
+
+    # A frame that cannot be encoded, because it lists more descriptors
+    # than its header counts. Both were pinned when it was accepted.
+    {:ok, read, write} = UnixFD.__pipe__()
+    unencodable = %{fd_signal("Unencodable", [read]) | unix_fds: [read, write]}
+
+    ExUnit.CaptureLog.capture_log(fn ->
+      assert {:error, :encode_failed} = Rebus.send(connection, unencodable)
+    end)
+
+    for handle <- [read, write] do
+      assert :ok = UnixFD.close(handle)
+      assert_closed_once(handle)
+    end
+
+    # A parked write whose caller gives up, and another queued behind it
+    # whose caller gives up first.
+    continuation = {:select_info, :sendmsg, make_ref()}
+
+    :ok =
+      TestImpl.install(connection,
+        sendmsg: fn _sock, _msg, [], :nowait ->
+          send(parent, :parked)
+          {:select, continuation}
+        end,
+        cancel: fn _sock, ^continuation ->
+          send(parent, :cancelled)
+          :ok
+        end
+      )
+
+    {:ok, active, queued} = UnixFD.__pipe__()
+    first = Task.async(fn -> Rebus.send(connection, fd_signal("Cancelled", [active]), 1_000) end)
+    assert_receive :parked, 1_000
+    second = Task.async(fn -> Rebus.send(connection, fd_signal("Dropped", [queued]), 100) end)
+
+    # The queued frame's pin goes as soon as it is cancelled, while the
+    # write ahead of it still holds the queue.
+    assert {:error, :timeout} = Task.await(second, 1_000)
+    assert :ok = UnixFD.close(queued)
+    assert_closed_once(queued)
+    refute_received :cancelled
+
+    assert {:error, :timeout} = Task.await(first, 2_000)
+    assert_receive :cancelled, 1_000
+    assert :ok = UnixFD.close(active)
+    assert_closed_once(active)
+
+    assert :ok = UnixFD.close(failed_write)
+  end
+
+  test "Rebus.close releases the pins of a write in flight", %{connection: connection} do
+    assert_stop_releases_pins(connection, &Rebus.close/1)
+  end
+
+  test "a killed connection releases the pins of a write in flight", %{connection: connection} do
+    assert_stop_releases_pins(connection, &Process.exit(&1, :kill))
+  end
+
+  test "leaves no pin or handle behind once sent handles are let go", %{
+    server: server,
+    connection: connection
+  } do
+    baseline = UnixFD.__live_count__()
+
+    # The sender's handles live only in a process that has exited, and in
+    # the connection while it writes them.
+    elsewhere(fn ->
+      {:ok, read, write} = UnixFD.__pipe__()
+      :ok = Rebus.send(connection, fd_signal("Live", [read, write]))
+    end)
+
+    assert_receive {^server, %Message{header_fields: %{member: "Live"}, unix_fds: received}},
+                   1_000
+
+    # What remains is the server's own handles for what it received. A pin
+    # the connection kept would keep a sent handle allocated.
+    assert eventually(fn ->
+             :erlang.garbage_collect(connection)
+             UnixFD.__live_count__() == baseline + length(received)
+           end)
+
+    Enum.each(received, &UnixFD.close/1)
   end
 
   test "leaves taken handles closed exactly once after take_fds times out", %{
@@ -1784,7 +2091,7 @@ defmodule Rebus.UnixFDTest do
 
     # The malformed first cmsg must not prevent the later, kernel-created
     # descriptor from being found and closed on the fail-closed path.
-    assert {:error, :ebadf} = Raw.close(received)
+    assert {:error, :ebadf} = UnixFD.__fd_identity__(received)
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
   end
 
@@ -1812,7 +2119,7 @@ defmodule Rebus.UnixFDTest do
                :sys.get_state(connection)
              )
 
-    assert {:error, :ebadf} = Raw.close(invalid_iov_fd)
+    assert {:error, :ebadf} = UnixFD.__fd_identity__(invalid_iov_fd)
 
     assert {:ok,
             %{
@@ -1825,7 +2132,7 @@ defmodule Rebus.UnixFDTest do
                :sys.get_state(connection)
              )
 
-    assert {:error, :ebadf} = Raw.close(missing_iov_fd)
+    assert {:error, :ebadf} = UnixFD.__fd_identity__(missing_iov_fd)
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
   end
 
@@ -2109,6 +2416,82 @@ defmodule Rebus.UnixFDTest do
 
     {:ok, serial} = TestServer.push_call_with_fds(server, call, [fd])
     serial
+  end
+
+  # A signal whose body indexes each of `fds`, handles or raw numbers.
+  defp fd_signal(member, fds) do
+    Message.new!(:signal,
+      path: "/test",
+      interface: "test.interface",
+      member: member,
+      signature: String.duplicate("h", length(fds)),
+      body: Enum.to_list(0..(length(fds) - 1)//1),
+      fds: fds
+    )
+  end
+
+  # The read end of a new pipe, owned by a process that exits on `:exit`.
+  defp pipe_end_owned_elsewhere do
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        {:ok, read, write} = UnixFD.__pipe__()
+        :ok = UnixFD.close(write)
+        send(parent, {:pipe_end, self(), read})
+
+        receive do
+          :exit -> :ok
+        end
+      end)
+
+    assert_receive {:pipe_end, ^owner, handle}, 1_000
+    {owner, handle}
+  end
+
+  # Sends a signal carrying `handle` from a task, through a transport whose
+  # sendmsg parks on a select without writing anything. Returns the task, the
+  # raw number the parked frame carries, and a function that resumes the
+  # write, which then passes the frame to the server for real.
+  defp park_fd_send!(connection, handle, member) do
+    parent = self()
+    continuation = {:select_info, :sendmsg, make_ref()}
+    {:select_info, :sendmsg, select_handle} = continuation
+    sock = :sys.get_state(connection).sock
+
+    :ok =
+      TestImpl.install(connection,
+        sendmsg: fn
+          _sock, %{ctrl: [%{data: <<fd::native-signed-32>>}]} = msg, [], :nowait ->
+            Process.put({__MODULE__, :parked}, msg)
+            send(parent, {:parked, fd})
+            {:select, continuation}
+
+          sock, [_rest], ^continuation, :nowait ->
+            :socket.sendmsg(sock, Process.get({__MODULE__, :parked}), [], 1_000)
+        end,
+        cancel: fn _sock, ^continuation -> :ok end
+      )
+
+    task = Task.async(fn -> Rebus.send(connection, fd_signal(member, [handle])) end)
+    assert_receive {:parked, fd}, 1_000
+    {task, fd, fn -> send(connection, {:"$socket", sock, :select, select_handle}) end}
+  end
+
+  # Stops `connection` with `stop` while a write holds a pin on a handle that
+  # is already closed, and checks that the descriptor is closed then.
+  defp assert_stop_releases_pins(connection, stop) do
+    {:ok, read, write} = UnixFD.__pipe__()
+    {task, _fd, _resume} = park_fd_send!(connection, read, "Stopped")
+    assert :ok = UnixFD.close(read)
+    assert {:ok, 0} = UnixFD.__close_count__(read)
+
+    ref = Process.monitor(connection)
+    stop.(connection)
+    assert_receive {:DOWN, ^ref, :process, ^connection, _reason}, 1_000
+    assert {:error, :disconnected} = Task.await(task, 1_000)
+    assert_closed_once(read)
+    assert :ok = UnixFD.close(write)
   end
 
   # Calls `method` from a task that checks it owns every handle in the reply,
