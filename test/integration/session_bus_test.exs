@@ -13,7 +13,7 @@ defmodule Rebus.Integration.SessionBusTest do
   alias Rebus.Message
   alias Rebus.Service
   alias Rebus.Service.Call
-  alias Rebus.UnixFD.Raw
+  alias Rebus.UnixFD
 
   @moduletag :integration
 
@@ -38,7 +38,7 @@ defmodule Rebus.Integration.SessionBusTest do
                 methods: [{"Add", in: [a: "i", b: "i"], out: [sum: "i"]}]
               )
   @files Rebus.Interface.new!("org.example.RebusIntegration.Files",
-           methods: [{"TakeDescriptor", in: [fd: "h"]}]
+           methods: [{"TakeDescriptor", in: [fd: "h"]}, {"OpenDescriptor", out: [fd: "h"]}]
          )
   @settings Rebus.Interface.new!("org.example.RebusIntegration.Settings",
               properties: [{"Precision", "u", :readwrite}, {"Version", "s", :read}]
@@ -426,9 +426,10 @@ defmodule Rebus.Integration.SessionBusTest do
 
     test "hands an FD-bearing method call's descriptor to the exporter's handler" do
       # Both connections negotiated NEGOTIATE_UNIX_FD over the session socket,
-      # so the daemon passes the descriptor through. The handler takes it and
-      # closes it itself, and the count check confirms the exporter kept
-      # nothing else open.
+      # so the daemon passes the descriptor through, and it arrives in a handle
+      # the exporting connection owns. The handler takes it and closes it
+      # itself, and the count check confirms the exporter kept nothing else
+      # open.
       caller = connect!()
       callee = connect!()
       {:ok, ref} = Service.export(callee, @object_path, [@files])
@@ -453,17 +454,58 @@ defmodule Rebus.Integration.SessionBusTest do
                       %Call{member: "TakeDescriptor", body: [0], unix_fds: [borrowed]} = call},
                      @window
 
-      assert borrowed != fd
+      assert {:ok, ^callee} = UnixFD.owner(borrowed)
+      assert {:ok, received} = UnixFD.with_fd(borrowed, & &1)
+      assert received != fd
       assert {:ok, [^borrowed]} = Service.take_fds(call)
+      assert {:ok, owner} = UnixFD.owner(borrowed)
+      assert owner == self()
       assert :ok = Service.reply(call, [])
       assert {:ok, %Message{type: :method_return}} = Task.await(task, @window)
-      assert :ok = Raw.close(borrowed)
+      assert UnixFD.open?(borrowed)
+      assert :ok = UnixFD.close(borrowed)
+      assert {:ok, 1} = UnixFD.__close_count__(borrowed)
 
       # /proc is Linux-only; elsewhere the transfer above is all this asserts.
       if before do
         assert eventually(fn -> open_fd_count() <= before end),
                "the received descriptor was not closed: #{open_fd_count()} open, #{before} before"
       end
+    end
+
+    test "returns a reply's descriptor in a handle the caller owns" do
+      caller = connect!()
+      callee = connect!()
+      fd = borrowed_fd!()
+      parent = self()
+
+      handler =
+        spawn_link(fn ->
+          receive do
+            {_ref, %Call{member: "OpenDescriptor"} = call} ->
+              send(parent, {:replied, Service.reply(call, [0], fds: [fd])})
+          end
+        end)
+
+      {:ok, _ref} = Service.export(callee, @object_path, [@files], handler: handler)
+
+      message =
+        Message.new!(:method_call,
+          destination: unique_name!(callee),
+          path: @object_path,
+          interface: "org.example.RebusIntegration.Files",
+          member: "OpenDescriptor"
+        )
+
+      assert {:ok, %Message{type: :method_return, body: [0], unix_fds: [received]}} =
+               Rebus.call(caller, message, @call_timeout)
+
+      assert_receive {:replied, :ok}, @window
+      assert {:ok, owner} = UnixFD.owner(received)
+      assert owner == self()
+      assert {:ok, identity} = UnixFD.with_fd(received, &UnixFD.__fd_identity__/1)
+      assert identity == UnixFD.__fd_identity__(fd)
+      assert :ok = UnixFD.close(received)
     end
 
     test "connects to a non-bus peer endpoint with bus: false and completes a Ping" do

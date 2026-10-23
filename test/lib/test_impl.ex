@@ -51,12 +51,7 @@ defmodule Rebus.TestImpl do
     ArgumentError -> :ok
   end
 
-  @hook_callbacks [
-    :fd_claim_ack,
-    :fd_claim_delivery,
-    :fd_claim_handoff,
-    :request_timeout_slack
-  ]
+  @hook_callbacks [:request_timeout_slack]
 
   @doc """
   Installs the doubles serving `overrides` on a running connection.
@@ -281,18 +276,6 @@ defmodule Rebus.TestImpl.Hooks do
   @behaviour Rebus.Connection.Hooks
 
   alias Rebus.Connection.Hooks.Default
-
-  @impl Rebus.Connection.Hooks
-  def fd_claim_handoff,
-    do: Rebus.TestImpl.dispatch(:fd_claim_handoff, Default, :fd_claim_handoff, [])
-
-  @impl Rebus.Connection.Hooks
-  def fd_claim_delivery,
-    do: Rebus.TestImpl.dispatch(:fd_claim_delivery, Default, :fd_claim_delivery, [])
-
-  @impl Rebus.Connection.Hooks
-  def fd_claim_ack(claim),
-    do: Rebus.TestImpl.dispatch(:fd_claim_ack, Default, :fd_claim_ack, [claim])
 
   @impl Rebus.Connection.Hooks
   def request_timeout_slack,

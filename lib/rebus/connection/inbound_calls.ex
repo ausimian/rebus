@@ -8,12 +8,14 @@ defmodule Rebus.Connection.InboundCalls do
   # for a local handler to answer one of the peer's.
   #
   # Like `Rebus.Connection.Pending` this is not a pure structure: an entry owns
-  # its expiry timer and the descriptors that arrived with the call, which the
+  # its expiry timer and the handles that arrived with the call, which the
   # connection keeps until the call completes. Taking an entry out of the table
-  # therefore cancels that timer and closes those descriptors here rather than
-  # at each call site, so every way out closes them exactly once. The one
-  # exception is `take_fds/2`, which moves the descriptors out of the entry
-  # for an FD claim to hand over, and leaves the entry itself in place.
+  # therefore cancels that timer and closes those handles here rather than at
+  # each call site, so every way out closes them. Only handles the connection
+  # still owns are closed, and closing is idempotent, so one a handler has
+  # already closed is harmless. The one exception is `take_fds/2`, which moves
+  # the handles out of the entry for the connection to hand over, and leaves
+  # the entry itself in place.
   #
   # Every entry is bound to the export it was routed through, so unexporting
   # an object, or losing its handler, fails exactly the calls made on it.
@@ -44,7 +46,7 @@ defmodule Rebus.Connection.InboundCalls do
       field :sender, binary() | nil
       field :export, reference()
       field :handler, pid()
-      field :unix_fds, [UnixFD.raw()]
+      field :unix_fds, [UnixFD.t()]
       field :timer_ref, reference() | nil
       field :deadline, integer() | nil
       field :from, GenServer.from() | nil, default: nil
@@ -60,7 +62,7 @@ defmodule Rebus.Connection.InboundCalls do
           required(:sender) => binary() | nil,
           required(:export) => reference(),
           required(:handler) => pid(),
-          required(:unix_fds) => [UnixFD.raw()],
+          required(:unix_fds) => [UnixFD.t()],
           optional(:from) => GenServer.from(),
           optional(:no_reply?) => boolean()
         }
@@ -101,8 +103,8 @@ defmodule Rebus.Connection.InboundCalls do
   @spec fetch(t(), reference()) :: {:ok, Entry.t()} | :error
   def fetch(%__MODULE__{entries: entries}, ref), do: Map.fetch(entries, ref)
 
-  # Every descriptor the table still holds for its calls.
-  @spec fds(t()) :: [UnixFD.raw()]
+  # Every handle the table still holds for its calls.
+  @spec fds(t()) :: [UnixFD.t()]
   def fds(%__MODULE__{entries: entries}),
     do: Enum.flat_map(entries, fn {_ref, %Entry{unix_fds: fds}} -> fds end)
 
@@ -111,14 +113,14 @@ defmodule Rebus.Connection.InboundCalls do
   def size(%__MODULE__{entries: entries}), do: map_size(entries)
 
   # The handler answered. The entry leaves the table with its timer cancelled
-  # and its descriptors closed, so a second answer finds nothing.
+  # and its handles closed, so a second answer finds nothing.
   @spec complete(t(), reference()) :: {Entry.t() | nil, t()}
   def complete(%__MODULE__{} = calls, ref), do: pop(calls, ref)
 
-  # Moves a call's descriptors out for the connection to hand over, leaving
-  # the call pending with nothing of its own to close. The entry is returned
-  # as it was, holding them. Descriptors can be taken only once, so a second
-  # take, like a take of a call that is gone, finds nothing.
+  # Moves a call's handles out for the connection to hand over, leaving the
+  # call pending with nothing of its own to close. The entry is returned as
+  # it was, holding them. Handles can be taken only once, so a second take,
+  # like a take of a call that is gone, finds nothing.
   @spec take_fds(t(), reference()) :: {:ok, Entry.t(), t()} | :error
   def take_fds(%__MODULE__{entries: entries} = calls, ref) do
     case Map.fetch(entries, ref) do
@@ -148,8 +150,8 @@ defmodule Rebus.Connection.InboundCalls do
     {popped, %{calls | entries: kept}}
   end
 
-  # Cancels every timer and closes every retained descriptor without
-  # touching the rest of the table. Used from `terminate/2`, where nothing
+  # Cancels every timer and closes every retained handle without touching the
+  # rest of the table. Used from `terminate/2`, where nothing
   # survives the return.
   @spec close_all(t()) :: :ok
   def close_all(%__MODULE__{entries: entries}) do
@@ -177,7 +179,7 @@ defmodule Rebus.Connection.InboundCalls do
 
   defp release(%Entry{timer_ref: timer_ref, unix_fds: fds}) do
     cancel_timer(timer_ref)
-    UnixFD.close_all(fds)
+    UnixFD.close_owned(fds)
   end
 
   defp copy(nil), do: nil

@@ -5,13 +5,11 @@ defmodule Rebus.Connection.Pending do
   # indexes that find one by the caller's request reference or by the monitor
   # held on that caller.
   #
-  # Like `Rebus.Connection.Writer` and `Rebus.Connection.FDClaims` this is not
-  # a pure structure: an entry owns the request-timeout timer and a monitor on
-  # its caller, so taking one out of the table cancels that timer here rather
-  # than at each call site. Releasing the monitor is deliberately not part of
-  # every removal: a caller that has already gone down has nothing left to
-  # release, and a reply carrying descriptors hands its monitor on to the
-  # FD-claim table.
+  # Like `Rebus.Connection.Writer` this is not a pure structure: an entry owns
+  # the request-timeout timer and a monitor on its caller, so taking one out
+  # of the table cancels that timer here rather than at each call site.
+  # Releasing the monitor is deliberately not part of every removal: a caller
+  # that has already gone down has nothing left to release.
 
   use TypedStruct
 

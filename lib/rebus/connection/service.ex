@@ -28,12 +28,11 @@ defmodule Rebus.Connection.Service do
   # carries none is not recorded, and `Rebus.Service` answers it as a no-op
   # in the handler process.
   #
-  # The descriptors that arrive with a call are the connection's until the
-  # call completes: a handler borrows them, and the table closes them when
-  # the call leaves it. A call that reaches no handler has them closed as it
-  # is answered. `take_fds/5` hands them over through the FD-claim protocol
-  # of `Rebus.Connection.FDClaims`, which then owns them until the taker
-  # acknowledges.
+  # The handles that arrive with a call are the connection's until the call
+  # completes: a handler borrows them, and the table closes those the
+  # connection still owns when the call leaves it. A call that reaches no
+  # handler has them closed as it is answered. `take_fds/3` makes the taker
+  # their owner instead, and from then on they are the taker's to close.
   #
   # A local call made with `Rebus.Service.invoke/7` takes the same route and
   # is recorded the same way, but every answer to it, the handler's or the
@@ -45,7 +44,6 @@ defmodule Rebus.Connection.Service do
   # connection.
 
   alias Rebus.Connection
-  alias Rebus.Connection.FDClaims
   alias Rebus.Connection.InboundCalls
   alias Rebus.Connection.InboundCalls.Entry
   alias Rebus.Connection.Objects
@@ -100,8 +98,8 @@ defmodule Rebus.Connection.Service do
   # or a local process, answered directly.
   @typep caller :: :remote | {:local, GenServer.from(), reference()}
 
-  # Routes one inbound method call, which brings the descriptors that
-  # arrived with it: a handler borrows them, and anything else closes them.
+  # Routes one inbound method call, which brings the handles that arrived
+  # with it: a handler borrows them, and anything else closes them.
   @doc false
   @spec answer(Message.t(), Connection.t()) :: Connection.t()
   def answer(%Message{} = msg, %Connection{} = state), do: route_call(msg, :remote, state)
@@ -213,12 +211,12 @@ defmodule Rebus.Connection.Service do
   #
   # A reply is written after the call completes, so it cannot carry a
   # descriptor the connection still owns: one lent to a pending call, this
-  # one or another, held by an FD claim that has not settled, or received
-  # for a frame not yet complete. Completing
-  # a call, or a claim failing, closes it before the frame is written, and
-  # the reply would carry a closed descriptor or whatever reused its number.
-  # Such a reply is refused, and the call stays open for the handler to take
-  # them first.
+  # one or another, or received for a frame not yet complete. Outbound
+  # descriptors are still raw numbers, which a handler can read out of a
+  # borrowed handle with `Rebus.UnixFD.with_fd/2`. Completing a call closes
+  # its handles before the frame is written, and the reply would carry a
+  # closed descriptor or whatever reused its number. Such a reply is refused,
+  # and the call stays open for the handler to take them first.
   @doc false
   @spec complete(Connection.t(), reference(), Message.t()) ::
           {:ok, Message.t(), Connection.t()}
@@ -242,17 +240,18 @@ defmodule Rebus.Connection.Service do
     end
   end
 
-  # The scan is bounded by `max_pending_calls`, each call's descriptor limit,
-  # the open claims and the receive buffer's own bound, and only a reply that
-  # carries descriptors pays it.
+  # The scan is bounded by `max_pending_calls`, each call's descriptor limit
+  # and the receive buffer's own bound, and only a reply that carries
+  # descriptors pays it. A taken call holds no handles, so those the handler
+  # now owns may be sent. A handle already closed has no number to match.
   defp lent?(%Connection{}, []), do: false
 
   defp lent?(%Connection{} = state, fds) do
     owned =
-      MapSet.new(
-        InboundCalls.fds(state.inbound_calls) ++
-          FDClaims.fds(state.fd_claims) ++ Rights.fds(state.inbound_fds)
-      )
+      for handle <- InboundCalls.fds(state.inbound_calls) ++ Rights.fds(state.inbound_fds),
+          {:ok, fd} <- [UnixFD.with_fd(handle, & &1)],
+          into: MapSet.new(),
+          do: fd
 
     Enum.any?(fds, &MapSet.member?(owned, &1))
   end
@@ -287,39 +286,33 @@ defmodule Rebus.Connection.Service do
     end
   end
 
-  # Hands a pending call's descriptors to `from` through an FD claim, which
-  # owns them from here on: it closes them on every way out but the taker's
-  # acknowledgement. The call stays pending, with nothing left for its
-  # completion to close, and the claim monitors the taker rather than the
-  # handler, since any process holding the call may take them.
+  # Makes `pid`, the process taking a pending call's handles, their owner.
+  # The call stays pending, with nothing left for its completion to close.
+  # Any process holding the call may take them, not only its handler. One
+  # that has died meanwhile has them closed by the transfer, and one that
+  # stopped waiting owns them without having seen the answer: either way
+  # each handle closes exactly once, and is no longer the connection's.
   @doc false
-  @spec take_fds(Connection.t(), reference(), GenServer.from(), integer(), reference()) ::
-          {:ok, Connection.t()} | {:error, :unknown_call}
-  def take_fds(%Connection{} = state, ref, {pid, _tag} = from, deadline, request_ref)
-      when is_reference(request_ref) do
+  @spec take_fds(Connection.t(), reference(), pid()) ::
+          {:ok, [UnixFD.t()], Connection.t()} | {:error, :unknown_call}
+  def take_fds(%Connection{} = state, ref, pid) when is_pid(pid) do
     case InboundCalls.take_fds(state.inbound_calls, ref) do
-      {:ok, %Entry{serial: serial, unix_fds: fds}, calls} ->
-        # The claim delivers a message, so the descriptors travel in one
-        # that is never sent anywhere.
-        carrier = %{Message.new!(:method_return, reply_serial: serial) | unix_fds: fds}
-
-        claims =
-          FDClaims.open(
-            state.fd_claims,
-            %{
-              msg: carrier,
-              from: from,
-              request_ref: request_ref,
-              monitor_ref: Process.monitor(pid),
-              deadline: deadline
-            },
-            Connection.fd_claims_context(state)
-          )
-
-        {:ok, %{state | inbound_calls: calls, fd_claims: claims}}
+      {:ok, %Entry{unix_fds: handles}, calls} ->
+        Enum.each(handles, &transfer(&1, pid))
+        {:ok, handles, %{state | inbound_calls: calls}}
 
       :error ->
         {:error, :unknown_call}
+    end
+  end
+
+  # The connection owns every handle a pending call holds, so the transfer
+  # cannot be refused. A handle the handler has already closed stays closed,
+  # and one offered to a taker that has died is closed by the transfer.
+  defp transfer(handle, pid) do
+    case UnixFD.controlling_process(handle, pid) do
+      :ok -> :ok
+      {:error, reason} when reason in [:closed, :noproc] -> :ok
     end
   end
 
@@ -490,7 +483,7 @@ defmodule Rebus.Connection.Service do
     end
   end
 
-  # The call and the message it carries both list the borrowed descriptors.
+  # The call and the message it carries both list the borrowed handles.
   defp send_call(%Message{} = msg, %Export{} = export, interface, method, ref, deadline) do
     fields = msg.header_fields
     no_reply? = no_reply?(msg)
@@ -544,10 +537,10 @@ defmodule Rebus.Connection.Service do
     end
   end
 
-  # A call answered here reaches no handler, so nothing borrows its
-  # descriptors and they are closed first, whether or not an answer is sent.
+  # A call answered here reaches no handler, so nothing borrows its handles
+  # and they are closed first, whether or not an answer is sent.
   defp answer_internally(%Message{unix_fds: fds} = msg, caller, %Connection{} = state, build) do
-    _ = UnixFD.close_all(fds)
+    _ = UnixFD.close_owned(fds)
     respond(msg, caller, state, build)
   end
 

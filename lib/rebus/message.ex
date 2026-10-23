@@ -13,11 +13,12 @@ defmodule Rebus.Message do
 
   The `unix_fds` struct field holds the descriptors themselves and is
   separate from the `:unix_fds` header field, which is only their count.
-  Build an outbound message with `fds: [fd, ...]`; each `h` value in the body
-  is a zero-based index into that list. On a `Rebus.call/3` reply, the
-  descriptors in `message.unix_fds` belong to the calling process. On the
-  message of an inbound call delivered to a `Rebus.Service` handler, they are
-  borrowed from the connection until the call completes. See
+  Build an outbound message with `fds: [fd, ...]`, where each `fd` is a raw
+  descriptor number; each `h` value in the body is a zero-based index into
+  that list. A received message holds `Rebus.UnixFD` handles instead. On a
+  `Rebus.call/3` reply, the calling process owns them. On the message of an
+  inbound call delivered to a `Rebus.Service` handler, the connection owns
+  them and the handler borrows them until the call completes. See
   [Unix file descriptor passing](unix_fds.html).
 
   ## Examples
@@ -76,6 +77,12 @@ defmodule Rebus.Message do
   @typedoc "Message flags"
   @type flag :: :no_reply_expected | :no_auto_start | :allow_interactive_authorization
 
+  @typedoc """
+  A descriptor in `unix_fds`: a `Rebus.UnixFD` handle on a received message,
+  or a raw descriptor number on one built to be sent.
+  """
+  @type unix_fd :: Rebus.UnixFD.t() | Rebus.UnixFD.raw()
+
   @typedoc "Header field keys"
   @type header_field ::
           :path
@@ -123,7 +130,7 @@ defmodule Rebus.Message do
     field :serial, non_neg_integer()
     field :header_fields, %{optional(header_field()) => term()}
     field :body, [term()]
-    field :unix_fds, [Rebus.UnixFD.raw()], default: []
+    field :unix_fds, [unix_fd()], default: []
 
     # Internal little-endian encoding cache populated by `new/2`, holding the
     # `{body, signature, binary}` the encoded bytes were produced from. Callers
@@ -421,7 +428,7 @@ defmodule Rebus.Message do
          {:ok, header_fields_encoded} <- encode_header_fields(message.header_fields, endianness),
          {:ok, body_data} <-
            body_iodata(message, Map.get(message.header_fields, :signature, ""), endianness),
-         :ok <- UnixFDs.validate_unix_fds(message),
+         :ok <- UnixFDs.validate_outbound_unix_fds(message),
          :ok <-
            validate_encoded_size(
              IO.iodata_length(header_fields_encoded),
@@ -753,7 +760,7 @@ defmodule Rebus.Message do
   end
 
   @doc false
-  @spec attach_unix_fds(t(), [Rebus.UnixFD.raw()]) ::
+  @spec attach_unix_fds(t(), [unix_fd()]) ::
           {:ok, t()} | {:error, :invalid_unix_fds | :unix_fd_limit}
   def attach_unix_fds(%__MODULE__{} = message, fds) when is_list(fds) do
     message = %{message | unix_fds: fds}

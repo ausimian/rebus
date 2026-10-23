@@ -276,11 +276,11 @@ defmodule Rebus.Bus do
     Rebus.call(conn, message, remaining(deadline))
   end
 
-  # The reply itself is not returned, so any descriptors it carried are
-  # closed here, and an error name is copied out of the frame rather than
-  # left pinning it.
+  # The reply itself is not returned, so any handles it carried, which this
+  # process owns, are closed here, and an error name is copied out of the
+  # frame rather than left pinning it.
   defp decode_reply({:ok, %Message{} = reply}, results) do
-    _ = UnixFD.close_all(reply.unix_fds)
+    _ = UnixFD.close_owned(reply.unix_fds)
 
     with "u" <- Message.signature(reply),
          [code] <- reply.body,
@@ -292,7 +292,7 @@ defmodule Rebus.Bus do
   end
 
   defp decode_reply({:error, {:dbus_error, %Message{} = error}}, _results) do
-    _ = UnixFD.close_all(error.unix_fds)
+    _ = UnixFD.close_owned(error.unix_fds)
     {:error, {:bus_error, :binary.copy(error.header_fields.error_name)}}
   end
 
@@ -320,7 +320,6 @@ defmodule Rebus.Bus do
   defp ambiguous?(:timeout), do: true
   defp ambiguous?(:disconnected), do: true
   defp ambiguous?(:invalid_bus_reply), do: true
-  defp ambiguous?(:fd_claim_expired), do: true
   defp ambiguous?({:reply_dropped, :method_return}), do: true
   defp ambiguous?(_reason), do: false
 end

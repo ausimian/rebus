@@ -60,12 +60,13 @@
   path above them, so `busctl tree`, `gdbus introspect` and `d-feet` can
   find and describe a Rebus service. `Rebus.Introspection.to_xml/1` renders a
   `Rebus.Introspection.Node` without an XML library.
-- Descriptors sent with a method call arrive in `call.unix_fds`. The handler
-  borrows them until the call completes and the connection closes them
-  exactly once, however the call completes. `Rebus.Service.take_fds/2`
-  transfers ownership to the handler instead. `Rebus.Service.reply/3` and
+- Descriptors sent with a method call arrive in `call.unix_fds` as
+  `Rebus.UnixFD` handles. The connection owns them and the handler borrows
+  them until the call completes, when the connection closes each one it
+  still owns, however the call completes. `Rebus.Service.take_fds/2` makes
+  the handler their owner instead. `Rebus.Service.reply/3` and
   `Rebus.Service.reply_error/4` take an `:fds` option to send descriptors
-  with a reply; sending one the connection still owns returns
+  with a reply; sending the number of one the connection still owns returns
   `{:error, :unix_fd_borrowed}`.
 - `Rebus.connect/2` takes `:max_pending_calls`, 1024 by default, which bounds
   how many inbound calls may wait for a handler's answer at once. Calls
@@ -91,6 +92,35 @@
   `Rebus.UnixFD.close/1` closes a handle rather than a raw descriptor number,
   returning `{:error, :closed}` for a handle that is already closed. A raw
   number is typed `Rebus.UnixFD.raw()`.
+
+- **Breaking:** received descriptors arrive as `Rebus.UnixFD` handles rather
+  than raw numbers: in the `unix_fds` of a `Rebus.call/3` reply, D-Bus error
+  reply included, in `Rebus.Service.Call.unix_fds` and its message, and from
+  `Rebus.Service.take_fds/2`. The process that called `Rebus.call/3` owns
+  its reply's handles, so they close when it exits if it has not closed them
+  first. Outbound messages still take raw numbers in `fds:`; use
+  `Rebus.UnixFD.with_fd/2` to send the number behind a handle you own.
+
+  ```elixir
+  # Before
+  {:ok, %Rebus.Message{unix_fds: [fd]}} = Rebus.call(conn, message)
+  :ok = Rebus.UnixFD.close(fd)
+
+  # After: the same code works, and `fd` is a handle
+  {:ok, %Rebus.Message{unix_fds: [handle]}} = Rebus.call(conn, message)
+  {:ok, stat} = Rebus.UnixFD.with_fd(handle, &File.stat("/dev/fd/#{&1}"))
+  :ok = Rebus.UnixFD.close(handle)
+  ```
+
+- A `Rebus.call/3` whose reply carries descriptors now honours its timeout
+  like any other call, and so does `Rebus.Service.take_fds/2`; neither can
+  return later than its timeout any more. When a reply arrives too late for
+  a call that has already timed out, Rebus closes its descriptors as soon as
+  the connection learns of the timeout.
+
+- A connection that is killed, or stops in any other way, closes every
+  descriptor it received and still owns, including those lent to the
+  handlers of pending calls. A `:kill` used to leave them open.
 
 - On Unix, Rebus now compiles a small native library when it is built, so
   building it needs `make` and a C++17 compiler. Nothing is compiled on other
@@ -140,6 +170,14 @@
   `/proc/self/status` rather than by running `id -u`. Where `id` is still
   run, Rebus uses `/usr/bin/id` or `/bin/id` and searches `PATH` only when
   neither exists, ignoring a relative match.
+
+### Removed
+
+- **Breaking:** `{:error, :fd_claim_expired}` is gone from `Rebus.call/3`,
+  `Rebus.add_match/3`, `Rebus.remove_match/3` and
+  `Rebus.Service.take_fds/2`. Rebus no longer hands received descriptors
+  over through a separate acknowledgement, so it has no such failure to
+  report.
 
 ### Fixed
 
