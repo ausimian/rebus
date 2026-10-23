@@ -74,6 +74,9 @@
 
 ### Changed
 
+- Clarified the guides and public API documentation, including descriptor
+  ownership and the experimental status of Unix file descriptor support.
+
 - **Breaking:** `Rebus.call/3` returns a D-Bus error reply from the peer as
   `{:error, {:dbus_error, %Rebus.Message{type: :error}}}` rather than
   `{:error, %Rebus.Message{type: :error}}`, so it no longer shares a shape

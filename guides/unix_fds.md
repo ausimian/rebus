@@ -1,16 +1,26 @@
 # Unix file descriptor passing
 
+> #### Experimental support {: .warning}
+>
+> Unix file descriptor support is experimental and likely to change in a
+> subsequent release.
+
 D-Bus can carry raw Unix file descriptors alongside a message body. Rebus
 supports this on Linux and macOS, over local Unix sockets, when the peer
-agrees to it during authentication. An FD-bearing message is rejected before
-any byte is written if the transport cannot carry descriptors or the peer
-declined.
+agrees to it during authentication. If the transport cannot carry descriptors
+or the peer did not agree to receive them, Rebus rejects the message without
+sending any bytes.
 
-Who owns a descriptor, and therefore who closes it, is the whole subject of
-this guide. The rules in short:
+Rebus represents descriptors as non-negative integers. Copying a descriptor
+number does not duplicate the descriptor, and garbage collection does not
+close it. Each descriptor must be closed exactly once: leaving it open leaks
+resources, while closing it twice can close an unrelated resource if the
+operating system has reused the number.
 
-- Rebus borrows the descriptors you send. You keep ownership and close them
-  yourself.
+The ownership rules are:
+
+- Rebus does not duplicate or close the descriptors you send. You keep
+  ownership and close them yourself.
 - Descriptors in a reply to `Rebus.call/3` become yours. Close each one
   exactly once.
 - Descriptors on an inbound method call are lent to the handler for the life
