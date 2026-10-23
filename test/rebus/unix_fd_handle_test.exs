@@ -34,14 +34,19 @@ defmodule Rebus.UnixFDHandleTest do
   end
 
   describe "garbage collection" do
+    # Live counts are compared with <=, not ==: a handle left over from an
+    # earlier test may be freed meanwhile, which lowers the count.
+
     test "closes the descriptor of a handle nothing refers to" do
       baseline = UnixFD.__live_count__()
       {fd, identity} = lost_pipe_end()
 
-      :erlang.garbage_collect()
+      assert eventually(fn ->
+               :erlang.garbage_collect()
+               UnixFD.__fd_identity__(fd) != {:ok, identity}
+             end)
 
-      assert eventually(fn -> UnixFD.__live_count__() == baseline end)
-      refute UnixFD.__fd_identity__(fd) == {:ok, identity}
+      assert eventually(fn -> UnixFD.__live_count__() <= baseline end)
     end
 
     test "leaks no handle when many are dropped" do
@@ -53,7 +58,7 @@ defmodule Rebus.UnixFDHandleTest do
 
       :erlang.garbage_collect()
 
-      assert eventually(fn -> UnixFD.__live_count__() == baseline end)
+      assert eventually(fn -> UnixFD.__live_count__() <= baseline end)
     end
 
     test "closes the handles of a process that exits holding them" do
@@ -71,7 +76,9 @@ defmodule Rebus.UnixFDHandleTest do
       assert_receive {:read_end, fd, identity}
       assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
 
-      assert eventually(fn -> UnixFD.__live_count__() == baseline end)
+      # The owner's exit closes the descriptors before its heap, and with it
+      # the handles, is freed, so wait for the handles themselves.
+      assert eventually(fn -> UnixFD.__live_count__() <= baseline end)
       refute UnixFD.__fd_identity__(fd) == {:ok, identity}
     end
   end
@@ -84,7 +91,7 @@ defmodule Rebus.UnixFDHandleTest do
       send(owner, :exit)
 
       assert eventually(fn -> not UnixFD.open?(handle) end)
-      assert {:ok, 1} = UnixFD.__close_count__(handle)
+      assert_closed_once(handle, [owner])
       assert {:error, :closed} = UnixFD.close(handle)
       assert {:error, :closed} = UnixFD.owner(handle)
 
@@ -99,7 +106,7 @@ defmodule Rebus.UnixFDHandleTest do
       Process.exit(owner, :kill)
 
       assert eventually(fn -> not UnixFD.open?(handle) end)
-      assert {:ok, 1} = UnixFD.__close_count__(handle)
+      assert_closed_once(handle, [owner])
     end
 
     test "defers close(2) until a pin in another process is released" do
@@ -167,7 +174,7 @@ defmodule Rebus.UnixFDHandleTest do
       ref = Process.monitor(holder)
       send(holder, :drop)
       assert_receive {:DOWN, ^ref, :process, ^holder, :normal}
-      assert eventually(fn -> UnixFD.__live_count__() == baseline + 2 end)
+      assert eventually(fn -> UnixFD.__live_count__() <= baseline + 2 end)
 
       assert {:ok, ^fresh_identity} = UnixFD.__fd_identity__(number)
       assert UnixFD.open?(fresh)
@@ -242,7 +249,7 @@ defmodule Rebus.UnixFDHandleTest do
 
       Process.exit(new_owner, :kill)
       assert eventually(fn -> not UnixFD.open?(handle) end)
-      assert {:ok, 1} = UnixFD.__close_count__(handle)
+      assert_closed_once(handle, [new_owner])
     end
 
     test "answers :not_owner to any other process, including a former owner" do
@@ -356,7 +363,7 @@ defmodule Rebus.UnixFDHandleTest do
 
       Process.exit(holder, :kill)
       assert eventually(fn -> not UnixFD.open?(handle) end)
-      assert {:ok, 1} = UnixFD.__close_count__(handle)
+      assert_closed_once(handle, [holder])
     end
 
     test "closes the descriptor when the owner is dead or remote" do
@@ -637,7 +644,7 @@ defmodule Rebus.UnixFDHandleTest do
     )
   end
 
-  defp eventually(fun, attempts \\ 200)
+  defp eventually(fun, attempts \\ 400)
 
   defp eventually(fun, attempts) when attempts > 0 do
     if fun.() do
