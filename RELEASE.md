@@ -1,3 +1,14 @@
+Rebus 0.4 adds services, so an application can export objects that answer
+method calls, and makes Unix file descriptors safe to hold. Every descriptor
+Rebus receives now arrives as an opaque `Rebus.UnixFD` handle that closes
+itself exactly once, when it is closed, when its owning process exits, or
+when nothing refers to it any more, and a stale handle can never touch a
+descriptor number the operating system has reused. Code that received raw
+numbers must treat them as handles: close them with `Rebus.UnixFD.close/1`,
+and use the number inside `Rebus.UnixFD.with_fd/2`. Outbound `fds:` take
+handles and raw numbers alike. On Unix, building Rebus now compiles a small
+native library, which needs `make` and a C++17 compiler.
+
 ### Added
 
 - `Rebus.UnixFD` handles. A handle owns one Unix file descriptor and closes
@@ -132,8 +143,10 @@
   building it needs `make` and a C++17 compiler. Nothing is compiled on other
   platforms, where `Rebus.UnixFD` returns `{:error, :unsupported}`.
 
-- Clarified the guides and public API documentation, including descriptor
-  ownership and the experimental status of Unix file descriptor support.
+- Rewrote the [Unix file descriptor passing](unix_fds.html) guide for
+  handles, with recipes for adopting a received descriptor into an OTP
+  `:socket` or file, and clarified the other guides and the public API
+  documentation.
 
 - **Breaking:** `Rebus.call/3` returns a D-Bus error reply from the peer as
   `{:error, {:dbus_error, %Rebus.Message{type: :error}}}` rather than
