@@ -17,7 +17,13 @@ defmodule Rebus.Connection.Rights do
   # into a frame that began after its read, and descriptors no frame in range
   # claims are closed rather than queued for a later one.
   #
-  # Nothing here closes a descriptor. Every decision names the descriptors the
+  # Each received descriptor is wrapped in a `Rebus.UnixFD` handle as soon as
+  # the control data is decoded, through the `wrap` function the connection
+  # supplies, so no raw number outlives the read that delivered it. A number
+  # that cannot be wrapped is the wrapper's to dispose of, and the batch it
+  # arrived with is treated as malformed control data.
+  #
+  # Nothing here closes a handle. Every decision names the handles the
   # caller must close, so the single close-or-deliver ownership path stays in
   # one place — the connection — and can be read without following the
   # attribution rules. What the module does own is quarantine: control data
@@ -25,9 +31,9 @@ defmodule Rebus.Connection.Rights do
   # beginning there that declares descriptors is dropped, and rights arriving
   # where no frame begins taint the frame being assembled.
   #
-  # Like `Rebus.Connection.Inbound` this is pure: no timers, no logging, no
-  # socket. Everything it needs from the connection arrives per call in a
-  # `t:context/0`.
+  # Like `Rebus.Connection.Inbound` this is otherwise pure: no timers, no
+  # logging, no socket. Everything it needs from the connection, the wrapper
+  # included, arrives per call in a `t:context/0`.
 
   use TypedStruct
 
@@ -49,9 +55,9 @@ defmodule Rebus.Connection.Rights do
         }
 
   typedstruct enforce: true do
-    # Received descriptors not yet claimed by a frame, in arrival order. The
+    # Received handles not yet claimed by a frame, in arrival order. The
     # batches partition this list.
-    field :fds, [UnixFD.raw()], default: []
+    field :fds, [UnixFD.t()], default: []
     # Oldest first. A batch outlives its read only while the frame being
     # assembled began inside it, so there is at most one between receives.
     field :batches, [batch()], default: []
@@ -66,11 +72,14 @@ defmodule Rebus.Connection.Rights do
   @typedoc """
   Everything a decode borrows from the connection for one `recvmsg` result.
   `inbound` is the receive buffer before the result's bytes are appended.
+  `wrap` turns one received raw descriptor into a handle, or answers `:error`
+  having disposed of the number itself.
   """
   @type context :: %{
           required(:negotiated?) => boolean(),
           required(:inbound) => Inbound.t(),
-          required(:max_bytes) => pos_integer()
+          required(:max_bytes) => pos_integer(),
+          required(:wrap) => (UnixFD.raw() -> {:ok, UnixFD.t()} | :error)
         }
 
   @typedoc """
@@ -80,19 +89,19 @@ defmodule Rebus.Connection.Rights do
   each names descriptors the connection must close, exactly once.
   """
   @type decision ::
-          {:frame, binary(), [UnixFD.raw()]}
-          | {:quarantine, binary(), [UnixFD.raw()], atom()}
-          | {:taint, binary(), [UnixFD.raw()]}
-          | {:stop, atom(), [UnixFD.raw()]}
+          {:frame, binary(), [UnixFD.t()]}
+          | {:quarantine, binary(), [UnixFD.t()], atom()}
+          | {:taint, binary(), [UnixFD.t()]}
+          | {:stop, atom(), [UnixFD.t()]}
 
   @typedoc false
-  @type fds_result :: {:ok, [UnixFD.raw()]} | {:error, atom(), [UnixFD.raw()]}
+  @type fds_result(fd) :: {:ok, [fd]} | {:error, atom(), [fd]}
 
   @spec new() :: t()
   def new, do: %__MODULE__{}
 
   @doc false
-  @spec fds(t()) :: [UnixFD.raw()]
+  @spec fds(t()) :: [UnixFD.t()]
   def fds(%__MODULE__{fds: fds}), do: fds
 
   @doc false
@@ -111,7 +120,7 @@ defmodule Rebus.Connection.Rights do
   # Hold descriptors for the frame at the head of the inbound buffer alone.
   # Received batches are added by `decode/3`, which knows their byte range.
   @doc false
-  @spec retain(t(), [UnixFD.raw()]) :: t()
+  @spec retain(t(), [UnixFD.t()]) :: t()
   def retain(%__MODULE__{} = rights, []), do: rights
 
   def retain(%__MODULE__{offset: offset} = rights, fds),
@@ -122,7 +131,7 @@ defmodule Rebus.Connection.Rights do
   # with any descriptors rejected on receipt, which the caller must close.
   @doc false
   @spec decode(term(), t(), context()) ::
-          {:ok, binary(), t(), [UnixFD.raw()]} | {:stop, atom(), [UnixFD.raw()]}
+          {:ok, binary(), t(), [UnixFD.t()]} | {:stop, atom(), [UnixFD.t()]}
   def decode(message, %__MODULE__{} = rights, context) do
     case decode_message(message, context) do
       {:frame, data, fds} ->
@@ -141,7 +150,7 @@ defmodule Rebus.Connection.Rights do
 
   defp decode_message(%{iov: iov, ctrl: ctrl, flags: flags}, context)
        when is_list(ctrl) and is_list(flags) do
-    fds = recvmsg_fds(ctrl, flags)
+    fds = ctrl |> recvmsg_fds(flags) |> wrap_fds(context.wrap)
 
     case recvmsg_data(iov, context.max_bytes) do
       {:ok, data} ->
@@ -154,12 +163,12 @@ defmodule Rebus.Connection.Rights do
     end
   end
 
-  defp decode_message(%{ctrl: ctrl, flags: flags}, _context)
+  defp decode_message(%{ctrl: ctrl, flags: flags}, context)
        when is_list(ctrl) and is_list(flags),
-       do: {:stop, :invalid_unix_fds, received_fds(recvmsg_fds(ctrl, flags))}
+       do: {:stop, :invalid_unix_fds, received_fds(ctrl, flags, context.wrap)}
 
-  defp decode_message(%{ctrl: ctrl}, _context) when is_list(ctrl),
-    do: {:stop, :invalid_unix_fds, received_fds(recvmsg_fds(ctrl, []))}
+  defp decode_message(%{ctrl: ctrl}, context) when is_list(ctrl),
+    do: {:stop, :invalid_unix_fds, received_fds(ctrl, [], context.wrap)}
 
   defp decode_message(_message, _context), do: {:stop, :invalid_unix_fds, []}
 
@@ -169,7 +178,7 @@ defmodule Rebus.Connection.Rights do
   defp starts_frame?(_fds, %{inbound: inbound}, data), do: Inbound.starts_frame?(inbound, data)
 
   @doc false
-  @spec decide(fds_result(), binary(), map()) :: decision()
+  @spec decide(fds_result(UnixFD.t()), binary(), map()) :: decision()
   def decide({:ok, []}, data, _context), do: {:frame, data, []}
 
   def decide({:ok, fds}, data, context) do
@@ -228,7 +237,7 @@ defmodule Rebus.Connection.Rights do
   # at or before the head frame. Their unclaimed descriptors are named for the
   # caller to close, never carried into a later frame.
   @doc false
-  @spec expire(t()) :: {[UnixFD.raw()], t()}
+  @spec expire(t()) :: {[UnixFD.t()], t()}
   def expire(%__MODULE__{batches: [%{stop: stop} = batch | batches], offset: offset} = rights)
       when stop <= offset do
     {unclaimed, fds} = Enum.split(rights.fds, batch.count)
@@ -245,7 +254,7 @@ defmodule Rebus.Connection.Rights do
   # closed with it, never carried into a later frame.
   @doc false
   @spec attach(t(), Message.t(), pos_integer(), boolean()) ::
-          {:ok, Message.t(), t()} | {:error, atom(), [UnixFD.raw()], t()}
+          {:ok, Message.t(), t()} | {:error, atom(), [UnixFD.t()], t()}
   def attach(%__MODULE__{} = rights, %Message{} = msg, size, negotiated?) do
     {fds, rejected, advanced} = claim(rights, declared_unix_fds(msg), size)
 
@@ -264,7 +273,7 @@ defmodule Rebus.Connection.Rights do
   # attributed safely: those descriptors are named for closing and the batch
   # is poisoned for any later frame in its range.
   @doc false
-  @spec skip(t(), pos_integer()) :: {[UnixFD.raw()], t()}
+  @spec skip(t(), pos_integer()) :: {[UnixFD.t()], t()}
   def skip(%__MODULE__{} = rights, size) do
     case in_scope(rights) do
       {%{reason: nil, count: count} = batch, batches} ->
@@ -351,7 +360,7 @@ defmodule Rebus.Connection.Rights do
   end
 
   @doc false
-  @spec recvmsg_fds([map()], [atom()]) :: fds_result()
+  @spec recvmsg_fds([map()], [atom()]) :: fds_result(UnixFD.raw())
   def recvmsg_fds(ctrl, flags) do
     case {extract_rights_fds(ctrl), :ctrunc in flags} do
       {{:ok, fds}, true} ->
@@ -370,7 +379,7 @@ defmodule Rebus.Connection.Rights do
   end
 
   @doc false
-  @spec extract_rights_fds([map()]) :: fds_result()
+  @spec extract_rights_fds([map()]) :: fds_result(UnixFD.raw())
   def extract_rights_fds(ctrl) do
     {fds, reason} =
       Enum.reduce(ctrl, {[], nil}, fn
@@ -425,6 +434,37 @@ defmodule Rebus.Connection.Rights do
     {fds, reason}
   end
 
+  defp received_fds(ctrl, flags, wrap),
+    do: ctrl |> recvmsg_fds(flags) |> wrap_fds(wrap) |> received_fds()
+
   defp received_fds({:ok, fds}), do: fds
   defp received_fds({:error, _reason, fds}), do: fds
+
+  # Wraps every received descriptor in a handle, before anything else looks
+  # at them. One the wrapper refuses is gone, so the result carries only the
+  # handles, and a clean result becomes malformed control data: its batch
+  # cannot be attributed with a descriptor missing.
+  defp wrap_fds({:ok, fds}, wrap) do
+    case wrap_each(fds, wrap) do
+      {handles, true} -> {:ok, handles}
+      {handles, false} -> {:error, :invalid_unix_fds, handles}
+    end
+  end
+
+  defp wrap_fds({:error, reason, fds}, wrap) do
+    {handles, _all?} = wrap_each(fds, wrap)
+    {:error, reason, handles}
+  end
+
+  defp wrap_each(fds, wrap) do
+    {handles, all?} =
+      Enum.reduce(fds, {[], true}, fn fd, {handles, all?} ->
+        case wrap.(fd) do
+          {:ok, handle} -> {[handle | handles], all?}
+          :error -> {handles, false}
+        end
+      end)
+
+    {Enum.reverse(handles), all?}
+  end
 end

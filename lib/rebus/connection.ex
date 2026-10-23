@@ -4,7 +4,7 @@ defmodule Rebus.Connection do
   use TypedStruct
 
   alias Rebus.Connection.Dispatch
-  alias Rebus.Connection.FDClaims
+  alias Rebus.Connection.HandedOver
   alias Rebus.Connection.Handshake
   alias Rebus.Connection.Inbound
   alias Rebus.Connection.InboundCalls
@@ -94,10 +94,11 @@ defmodule Rebus.Connection do
     end
   end
 
+  # The reply, and any handles it carries, comes straight back to the calling
+  # process: the connection makes it their owner before it answers.
   defp call_for_reply(pid, msg, deadline, request_ref, timeout) do
     SafeCall.call(pid, {:call, msg, deadline, request_ref}, timeout,
-      cancel: {:cancel, request_ref},
-      then: &FDClaims.Client.receive_claim(&1, pid, deadline)
+      cancel: {:cancel, request_ref}
     )
   end
 
@@ -162,23 +163,18 @@ defmodule Rebus.Connection do
     end
   end
 
-  # Takes ownership of the descriptors the inbound call `ref` borrowed. The
-  # connection hands them over as it hands over a reply's to `call/3`,
-  # through an FD claim, so they move only when the claim is acknowledged
-  # and are closed by the connection on any other outcome.
+  # Takes ownership of the handles the inbound call `ref` borrowed. The
+  # connection makes the calling process their owner before it answers, as
+  # it does for a reply to `call/3`. A caller that times out may still have
+  # become their owner, and nothing cancels that: the transfer is queued
+  # ahead of anything the caller could send after it.
   @doc false
   @spec take_call_fds(pid(), reference(), non_neg_integer()) ::
-          {:ok, Message.t()} | {:error, term()}
+          {:ok, [UnixFD.t()]} | {:error, term()}
   def take_call_fds(pid, ref, timeout)
       when is_pid(pid) and is_reference(ref) and is_integer(timeout) and timeout >= 0 do
     if node(pid) == node() do
-      request_ref = make_ref()
-      deadline = System.monotonic_time(:millisecond) + timeout
-
-      SafeCall.call(pid, {:take_call_fds, ref, deadline, request_ref}, timeout,
-        cancel: {:cancel, request_ref},
-        then: &FDClaims.Client.receive_claim(&1, pid, deadline)
-      )
+      SafeCall.call(pid, {:take_call_fds, ref}, timeout)
     else
       {:error, :remote_connection_unsupported}
     end
@@ -420,9 +416,9 @@ defmodule Rebus.Connection do
     # The pending receive select handle, or nil when no receive is outstanding.
     field :rref, :socket.select_handle() | nil, default: nil
     field :inbound, Inbound.t(), default: Inbound.new()
-    # SCM_RIGHTS descriptors received with the frame currently being assembled,
-    # and the taint bit recording ancillary data rejected before that frame's
-    # boundary was known.
+    # Handles for the SCM_RIGHTS descriptors received with the frame currently
+    # being assembled, and the taint bit recording ancillary data rejected
+    # before that frame's boundary was known.
     field :inbound_fds, Rights.t(), default: Rights.new()
     field :name, binary() | nil, default: nil
     field :hello_serial, non_neg_integer() | nil, default: nil
@@ -455,11 +451,11 @@ defmodule Rebus.Connection do
     # The method calls waiting for a reply, and the indexes that find one by
     # request reference or by the monitor on its caller.
     field :pending, Pending.t(), default: Pending.new()
-    # Replies whose descriptors have been handed to a caller but not yet
-    # acknowledged, and the terminal outcomes retained just after.
-    field :fd_claims, FDClaims.t(), default: FDClaims.new()
+    # Replies whose handles have moved to their caller, until that caller can
+    # no longer cancel the call and so prove it never received them.
+    field :handed_over, HandedOver.t(), default: HandedOver.new()
     # Inbound method calls handed to a handler and not yet answered, with the
-    # descriptors they carried, and how many may wait at once.
+    # handles they carried, and how many may wait at once.
     field :inbound_calls, InboundCalls.t(), default: InboundCalls.new()
     field :max_pending_calls, pos_integer(), default: @default_max_pending_calls
     # The objects this connection exports, and the monitors on their handlers.
@@ -632,13 +628,13 @@ defmodule Rebus.Connection do
           impl: impl,
           partial_frame_timer: timer_ref,
           inbound_fds: inbound_fds,
-          fd_claims: fd_claims,
           inbound_calls: inbound_calls
         }
       ) do
+    # The handles of replies already handed over are their callers' now, so
+    # `handed_over` is dropped with the rest of the state.
     Dispatch.cancel_partial_frame_timer(timer_ref)
-    _ = UnixFD.close_all(Rights.fds(inbound_fds))
-    FDClaims.close_all(fd_claims)
+    _ = UnixFD.close_owned(Rights.fds(inbound_fds))
     InboundCalls.close_all(inbound_calls)
     _ = impl.transport.close(sock)
     :ok
@@ -664,7 +660,7 @@ defmodule Rebus.Connection do
   end
 
   # An owned connection follows its owner out. The stop is ordinary, so
-  # terminate/2 runs and closes the socket and every retained descriptor.
+  # terminate/2 runs and closes the socket and every handle it still owns.
   # Whether the peer then reads a FIN or a reset is the kernel's decision, and
   # depends on bytes this side may not have read yet. This clause precedes the
   # general monitor handling below: the owner's reference indexes no request
@@ -724,13 +720,8 @@ defmodule Rebus.Connection do
   def handle_info({:request_timeout, serial, request_ref}, %__MODULE__{} = state),
     do: serial |> Dispatch.request_timeout(request_ref, state) |> dispatch_result()
 
-  def handle_info({:fd_claim_timeout, claim_ref}, %__MODULE__{} = state) do
-    {:noreply, %{state | fd_claims: FDClaims.expire(state.fd_claims, claim_ref)}}
-  end
-
-  def handle_info({:fd_claim_outcome_timeout, claim_ref}, %__MODULE__{} = state) do
-    {:noreply, %{state | fd_claims: FDClaims.expire_outcome(state.fd_claims, claim_ref)}}
-  end
+  def handle_info({:handed_over_expired, request_ref}, %__MODULE__{} = state),
+    do: {:noreply, %{state | handed_over: HandedOver.expire(state.handed_over, request_ref)}}
 
   def handle_info(
         {:partial_frame_timeout, token},
@@ -770,8 +761,9 @@ defmodule Rebus.Connection do
 
   # With :trap_exit enabled, preserve the process-link behavior that would
   # otherwise terminate this GenServer. In particular, supervisor shutdown
-  # reaches terminate/2 instead of bypassing descriptor cleanup. :kill remains
-  # untrappable by the BEAM and is documented as outside that guarantee.
+  # reaches terminate/2, which closes the socket at once. :kill remains
+  # untrappable and skips terminate/2, but every handle this process owns
+  # closes as it dies.
   def handle_info({:EXIT, _pid, :normal}, %__MODULE__{} = state), do: {:noreply, state}
 
   def handle_info({:EXIT, _pid, reason}, %__MODULE__{} = state),
@@ -788,9 +780,8 @@ defmodule Rebus.Connection do
   end
 
   # A monitored caller can be waiting in exactly one place: the pending-reply
-  # table, the write queue, or an unacknowledged FD claim. They are searched in
-  # that order, and a reference found nowhere is a monitor this connection no
-  # longer cares about.
+  # table or the write queue. They are searched in that order, and a reference
+  # found nowhere is a monitor this connection no longer cares about.
   defp handle_down_for_request(ref, %__MODULE__{} = state) do
     case Pending.pop_by_monitor(state.pending, ref) do
       {nil, _pending} -> down_for_queued_write(ref, state)
@@ -801,7 +792,7 @@ defmodule Rebus.Connection do
   defp down_for_queued_write(ref, %__MODULE__{} = state) do
     case Writer.pop_monitor(state.writer, ref) do
       :error ->
-        down_for_fd_claim(ref, state)
+        {:noreply, state}
 
       {request_ref, writer} ->
         state = %{state | writer: writer}
@@ -809,16 +800,6 @@ defmodule Rebus.Connection do
         writer
         |> Writer.cancel_monitored(request_ref, writer_context(state))
         |> writer_result(state)
-    end
-  end
-
-  defp down_for_fd_claim(ref, %__MODULE__{} = state) do
-    case FDClaims.fetch_by_monitor(state.fd_claims, ref) do
-      {:ok, claim_ref} ->
-        {:noreply, drop_fd_claim(state, claim_ref, close?: true, monitor_down?: true)}
-
-      :error ->
-        {:noreply, state}
     end
   end
 
@@ -834,11 +815,11 @@ defmodule Rebus.Connection do
   # with plain recv, which never hands this process a descriptor.
   #
   # The Hello reply and every read after it can carry SCM_RIGHTS
-  # descriptors, which only terminate/2 closes, so exits are trapped from
-  # here on. The GenServer loop then returns :stop on a supervisor shutdown
-  # and runs terminate/2, which closes raw descriptors retained in partial
-  # frames or reply claims. The EXIT clauses above preserve normal link
-  # semantics.
+  # descriptors, so exits are trapped from here on. The GenServer loop then
+  # returns :stop on a supervisor shutdown and runs terminate/2, which closes
+  # the handles held for partial frames and pending calls at once rather than
+  # when this process's exit reaches them. The EXIT clauses above preserve
+  # normal link semantics.
   def handle_continue({:setup, addr}, %__MODULE__{} = state) do
     result = Setup.setup(state, addr)
     Process.flag(:trap_exit, true)
@@ -955,10 +936,9 @@ defmodule Rebus.Connection do
     end
   end
 
-  # The claim answers the taker itself, as a reply's claim answers `call/3`.
-  def handle_call({:take_call_fds, ref, deadline, request_ref}, from, %__MODULE__{} = state) do
-    case Service.take_fds(state, ref, from, deadline, request_ref) do
-      {:ok, state} -> {:noreply, state}
+  def handle_call({:take_call_fds, ref}, {pid, _tag}, %__MODULE__{} = state) do
+    case Service.take_fds(state, ref, pid) do
+      {:ok, handles, state} -> {:reply, {:ok, handles}, state}
       {:error, _} = error -> {:reply, error, state}
     end
   end
@@ -1000,40 +980,6 @@ defmodule Rebus.Connection do
 
   def handle_call({:unexport, ref}, _from, %__MODULE__{} = state) do
     {:reply, :ok, Service.unexport(state, ref)}
-  end
-
-  def handle_call(
-        {:claim_fd_reply, claim_ref, delivery_ref, delivery_alias},
-        {pid, _tag},
-        %__MODULE__{} = state
-      ) do
-    {reply, claims} =
-      FDClaims.claim(
-        state.fd_claims,
-        claim_ref,
-        delivery_ref,
-        delivery_alias,
-        pid,
-        fd_claims_context(state)
-      )
-
-    {:reply, reply, %{state | fd_claims: claims}}
-  end
-
-  def handle_call({:ack_fd_reply, claim_ref, delivery_ref}, {pid, _tag}, %__MODULE__{} = state) do
-    {reply, claims} =
-      FDClaims.ack(state.fd_claims, claim_ref, delivery_ref, pid, fd_claims_context(state))
-
-    {:reply, reply, %{state | fd_claims: claims}}
-  end
-
-  def handle_call({:resolve_fd_claim, claim_ref, delivery_ref}, _from, %__MODULE__{} = state) do
-    {reply, claims} = FDClaims.resolve(state.fd_claims, claim_ref, delivery_ref)
-    {:reply, reply, %{state | fd_claims: claims}}
-  end
-
-  def handle_call({:discard_fd_claim, claim_ref}, {pid, _tag}, %__MODULE__{} = state) do
-    {:reply, :ok, %{state | fd_claims: FDClaims.discard(state.fd_claims, claim_ref, pid)}}
   end
 
   def handle_call(:bus?, _from, %__MODULE__{} = state) do
@@ -1176,7 +1122,7 @@ defmodule Rebus.Connection do
   @impl true
   def handle_cast({:cancel, request_ref}, %__MODULE__{} = state) do
     case Pending.pop_by_request(state.pending, request_ref) do
-      {nil, _pending} -> cancel_invoke_claim_or_write(request_ref, state)
+      {nil, _pending} -> cancel_invoke_or_write(request_ref, state)
       {_entry, pending} -> {:noreply, %{state | pending: pending}}
     end
   end
@@ -1209,26 +1155,18 @@ defmodule Rebus.Connection do
   def handle_cast({:attach_match_worker, worker}, %__MODULE__{} = state),
     do: {:noreply, %{state | match_worker: worker}}
 
-  # A request that is not waiting for a reply may be a local call still
-  # waiting for its handler.
-  defp cancel_invoke_claim_or_write(request_ref, %__MODULE__{} = state) do
-    case Service.cancel(state, request_ref) do
-      {:ok, state} -> {:noreply, state}
-      :error -> cancel_claim_or_write(request_ref, state)
-    end
-  end
-
-  # A request that is not waiting for a reply is either an unacknowledged FD
-  # claim or a frame still queued or being written.
-  defp cancel_claim_or_write(request_ref, %__MODULE__{} = state) do
-    case FDClaims.fetch_by_request(state.fd_claims, request_ref) do
-      {:ok, claim_ref} ->
-        {:noreply, drop_fd_claim(state, claim_ref, close?: true)}
-
-      :error ->
-        state.writer
-        |> Writer.cancel(request_ref, writer_context(state))
-        |> writer_result(state)
+  # A request that is not waiting for a reply is a local call still waiting
+  # for its handler, a call whose reply was handed over too late for its
+  # caller to see, or a frame still queued or being written.
+  defp cancel_invoke_or_write(request_ref, %__MODULE__{} = state) do
+    with :error <- Service.cancel(state, request_ref),
+         :error <- HandedOver.cancel(state.handed_over, request_ref) do
+      state.writer
+      |> Writer.cancel(request_ref, writer_context(state))
+      |> writer_result(state)
+    else
+      {:ok, %__MODULE__{} = state} -> {:noreply, state}
+      {:ok, %HandedOver{} = handed_over} -> {:noreply, %{state | handed_over: handed_over}}
     end
   end
 
@@ -1376,15 +1314,6 @@ defmodule Rebus.Connection do
 
   defp validate_outbound_fd_transport(%Message{}, %__MODULE__{}), do: :ok
 
-  # Everything a claim operation borrows from the connection for one call.
-  # `Rebus.Connection.Dispatch` opens claims of its own and asks for it here.
-  @doc false
-  @spec fd_claims_context(t()) :: FDClaims.context()
-  def fd_claims_context(%__MODULE__{impl: %{hooks: hooks}}), do: %{hooks: hooks}
-
-  defp drop_fd_claim(%__MODULE__{} = state, claim_ref, opts),
-    do: %{state | fd_claims: FDClaims.drop(state.fd_claims, claim_ref, opts)}
-
   # Everything the writer borrows from the connection for one call. Building it
   # per call keeps the writer free of connection state, and means substituting
   # an implementation module on a running connection needs no writer update.
@@ -1433,7 +1362,6 @@ defmodule Rebus.Connection do
     %{
       state
       | pending: Pending.fail_all(state.pending),
-        fd_claims: FDClaims.fail_all(state.fd_claims),
         inbound_calls: InboundCalls.fail_all(state.inbound_calls),
         writer: writer
     }

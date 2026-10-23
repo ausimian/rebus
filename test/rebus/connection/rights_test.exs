@@ -9,6 +9,8 @@ defmodule Rebus.Connection.RightsTest do
 
   # Every descriptor here is a plain integer: nothing in this module opens,
   # closes or dereferences one, which is exactly the property under test.
+  # `decode/3` wraps each received number through the context, which here
+  # passes it through unchanged unless a test supplies a wrapper of its own.
 
   describe "decode_rights_data/1" do
     test "decodes a well-formed payload in wire order" do
@@ -232,6 +234,42 @@ defmodule Rebus.Connection.RightsTest do
     test "fails closed on an unrecognised recvmsg result" do
       assert {:stop, :invalid_unix_fds, []} = Rights.decode(:garbage, Rights.new(), context())
     end
+
+    test "wraps every received descriptor before holding it" do
+      message = %{iov: ["abc"], ctrl: [rights_cmsg([3, 4])], flags: []}
+
+      assert {:ok, "abc", rights, []} =
+               Rights.decode(message, Rights.new(), context(wrap: &{:ok, {:handle, &1}}))
+
+      assert Rights.fds(rights) == [{:handle, 3}, {:handle, 4}]
+    end
+
+    test "quarantines a batch holding a descriptor that cannot be wrapped" do
+      wrap = fn
+        4 -> :error
+        fd -> {:ok, {:handle, fd}}
+      end
+
+      message = %{iov: ["abc"], ctrl: [rights_cmsg([3, 4, 5])], flags: []}
+
+      assert {:ok, "abc", rights, [{:handle, 3}, {:handle, 5}]} =
+               Rights.decode(message, Rights.new(), context(wrap: wrap))
+
+      refute Rights.holding?(rights)
+      assert rights.batches == [%{start: 0, stop: 3, count: 0, reason: :invalid_unix_fds}]
+    end
+
+    test "names only the wrapped descriptors when it fails closed" do
+      wrap = fn
+        3 -> :error
+        fd -> {:ok, {:handle, fd}}
+      end
+
+      message = %{ctrl: [rights_cmsg([3, 4])], flags: []}
+
+      assert {:stop, :invalid_unix_fds, [{:handle, 4}]} =
+               Rights.decode(message, Rights.new(), context(wrap: wrap))
+    end
   end
 
   describe "attach/4" do
@@ -393,7 +431,13 @@ defmodule Rebus.Connection.RightsTest do
   end
 
   defp context(overrides \\ []) do
-    %{negotiated?: true, starts_frame?: true, inbound: Inbound.new(), max_bytes: @max_read_chunk}
+    %{
+      negotiated?: true,
+      starts_frame?: true,
+      inbound: Inbound.new(),
+      max_bytes: @max_read_chunk,
+      wrap: &{:ok, &1}
+    }
     |> Map.merge(Map.new(overrides))
   end
 

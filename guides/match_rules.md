@@ -169,6 +169,5 @@ connection's handlers and makes the bus discard every rule it held.
 | `:not_started` | Rebus could not start the local task for the operation. Nothing was sent to the bus and the rule and its references are unchanged, so retrying is safe. |
 | `:encode_failed` | The request could not be encoded. |
 | `:serial_exhausted` | Every D-Bus serial is in use. |
-| `:fd_claim_expired` | Descriptors arrived with the bus reply and were closed. |
 | `{:reply_dropped, outcome}` | The bus replied, but the reply exceeded a local decoding cap. |
 | `:remote_connection_unsupported` | The connection PID belongs to another node. |

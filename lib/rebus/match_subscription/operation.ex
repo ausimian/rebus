@@ -285,7 +285,7 @@ defmodule Rebus.MatchSubscription.Operation do
   # A name nobody owns is a definite answer, not a failure. Every other error
   # leaves the name unseeded, so directed signals for it stay rejected.
   defp name_owner_result(%Message{} = reply) do
-    _ = UnixFD.close_all(reply.unix_fds)
+    _ = UnixFD.close_owned(reply.unix_fds)
 
     case reply do
       %Message{type: :method_return, body: [owner]} when is_binary(owner) ->
@@ -318,11 +318,11 @@ defmodule Rebus.MatchSubscription.Operation do
   end
 
   # These internal method calls never expose a D-Bus reply to application
-  # code. Retain neither its body nor any received descriptors; in particular,
-  # a malicious AddMatch/RemoveMatch reply must not leak Unix FD ownership into
-  # the worker process.
+  # code. Retain neither its body nor any received handles; in particular, a
+  # malicious AddMatch/RemoveMatch reply must not leave descriptors open for
+  # the life of the worker process.
   defp bus_reply_result(%Message{} = reply) do
-    _ = UnixFD.close_all(reply.unix_fds)
+    _ = UnixFD.close_owned(reply.unix_fds)
 
     case reply do
       %Message{type: :method_return} ->

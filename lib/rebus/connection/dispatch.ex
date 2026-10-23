@@ -3,10 +3,15 @@ defmodule Rebus.Connection.Dispatch do
 
   # The inbound half of an established D-Bus connection: reading the socket,
   # feeding `Rebus.Connection.Inbound`, and deciding what each complete frame
-  # means. Replies are correlated against the pending table and answered (or
-  # turned into an FD claim), signals are matched against this connection's
-  # handlers, and method calls are handed to `Rebus.Connection.Service`, which
-  # routes them to the handlers of exported objects or answers them itself.
+  # means. Replies are correlated against the pending table and handed to
+  # their caller, signals are matched against this connection's handlers, and
+  # method calls are handed to `Rebus.Connection.Service`, which routes them
+  # to the handlers of exported objects or answers them itself.
+  #
+  # Every received descriptor is a `Rebus.UnixFD` handle that this process
+  # owns from the moment it is read, so if the connection dies, even by
+  # `:kill`, they all close with it. A reply's handles move to its caller as
+  # it is answered; everything else is closed here once nothing claims it.
   #
   # It works on the connection struct directly — reply correlation writes the
   # pending table — but it is not a `GenServer`. Every entry point answers with
@@ -15,7 +20,7 @@ defmodule Rebus.Connection.Dispatch do
   # was entered from.
 
   alias Rebus.Connection
-  alias Rebus.Connection.FDClaims
+  alias Rebus.Connection.HandedOver
   alias Rebus.Connection.Inbound
   alias Rebus.Connection.Pending
   alias Rebus.Connection.Rights
@@ -128,11 +133,11 @@ defmodule Rebus.Connection.Dispatch do
     # rejected on receipt is closed here, exactly once.
     case Rights.decode(message, state.inbound_fds, rights_context(state)) do
       {:ok, data, inbound_fds, rejected} ->
-        _ = UnixFD.close_all(rejected)
+        _ = UnixFD.close_owned(rejected)
         append_inbound(data, %{state | inbound_fds: inbound_fds}, continuation)
 
       {:stop, reason, fds} ->
-        _ = UnixFD.close_all(fds)
+        _ = UnixFD.close_owned(fds)
         {:protocol_error, reason, state}
     end
   end
@@ -169,7 +174,7 @@ defmodule Rebus.Connection.Dispatch do
   @doc false
   @spec discard_inbound_unix_fds(Connection.t()) :: Connection.t()
   def discard_inbound_unix_fds(%Connection{inbound_fds: inbound_fds} = state) do
-    _ = UnixFD.close_all(Rights.fds(inbound_fds))
+    _ = UnixFD.close_owned(Rights.fds(inbound_fds))
     %{state | inbound_fds: Rights.new()}
   end
 
@@ -188,8 +193,23 @@ defmodule Rebus.Connection.Dispatch do
     %{
       negotiated?: state.unix_fd_negotiated?,
       inbound: state.inbound,
-      max_bytes: @max_read_chunk
+      max_bytes: @max_read_chunk,
+      wrap: &wrap_received/1
     }
+  end
+
+  # Each received descriptor becomes a handle this process owns. One that
+  # cannot be wrapped is closed here if it is still open, and the decoder
+  # treats its batch as malformed.
+  defp wrap_received(fd) do
+    case UnixFD.wrap(fd, self()) do
+      {:ok, handle} ->
+        {:ok, handle}
+
+      {:error, reason} ->
+        UnixFD.close_unwrapped(fd, reason)
+        :error
+    end
   end
 
   # Descriptors that arrived with bytes in which no further frame can begin,
@@ -201,7 +221,7 @@ defmodule Rebus.Connection.Dispatch do
         %{state | inbound_fds: inbound_fds}
 
       {unclaimed, inbound_fds} ->
-        _ = UnixFD.close_all(unclaimed)
+        _ = UnixFD.close_owned(unclaimed)
         Logger.warning("D-Bus descriptors dropped: :unclaimed", reason: :unclaimed)
         %{state | inbound_fds: inbound_fds}
     end
@@ -328,7 +348,7 @@ defmodule Rebus.Connection.Dispatch do
         {:ok, msg, %{state | inbound_fds: inbound_fds}}
 
       {:error, reason, fds, inbound_fds} ->
-        _ = UnixFD.close_all(fds)
+        _ = UnixFD.close_owned(fds)
         {:error, reason, %{state | inbound_fds: inbound_fds}}
     end
   end
@@ -338,7 +358,7 @@ defmodule Rebus.Connection.Dispatch do
   defp skip_inbound_frame(size, %Connection{} = state) do
     state = expire_inbound_fds(state)
     {fds, inbound_fds} = Rights.skip(state.inbound_fds, size)
-    _ = UnixFD.close_all(fds)
+    _ = UnixFD.close_owned(fds)
     %{state | inbound_fds: inbound_fds}
   end
 
@@ -384,9 +404,8 @@ defmodule Rebus.Connection.Dispatch do
          %Connection{} = state,
          cursor
        ) do
-    # Signals may have multiple subscribers. Without a per-subscriber dup(2)
-    # primitive, one raw descriptor cannot be transferred safely to all of
-    # them, so FD-bearing signals are rejected and closed.
+    # Signals may have multiple subscribers, and a handle has one owner, so
+    # FD-bearing signals are rejected and their handles closed.
     if msg.unix_fds == [] do
       parse_flat_messages(rest, notify(msg, apply_name_owner_change(msg, state)), cursor)
     else
@@ -433,7 +452,7 @@ defmodule Rebus.Connection.Dispatch do
     {:protocol_error, reason, state}
   end
 
-  defp close_message_fds(%Message{unix_fds: fds}), do: UnixFD.close_all(fds)
+  defp close_message_fds(%Message{unix_fds: fds}), do: UnixFD.close_owned(fds)
 
   # The owner table follows the bus driver's own NameOwnerChanged signals, and
   # only for the names a subscription asked to track. On a message bus the
@@ -552,44 +571,55 @@ defmodule Rebus.Connection.Dispatch do
     end
   end
 
-  defp deliver_reply(
-         %Message{unix_fds: []} = msg,
-         %Pending.Entry{} = entry,
-         %Connection{} = state
-       ) do
+  # The reply's handles move to the caller before it is answered, so they
+  # are the caller's the moment it can see them. `from` is the process that
+  # called `Rebus.call/3` itself: the call reaches this connection straight
+  # from it, with no process in between. A caller that has died meanwhile
+  # gets no reply, and its handles closed as the transfer finds it gone. One
+  # that is alive but stopped waiting never receives the reply, and its
+  # timeout cancel closes the handles; see `Rebus.Connection.HandedOver`.
+  defp deliver_reply(%Message{} = msg, %Pending.Entry{from: from} = entry, state) do
     Pending.release_monitor(entry)
 
-    if live_from?(entry.from) do
-      GenServer.reply(entry.from, msg)
+    if hand_over(msg.unix_fds, from) do
+      GenServer.reply(from, reply_result(msg))
+      remember_handed_over(state, entry, msg.unix_fds)
     else
-      close_message_fds(msg)
+      state
     end
-
-    state
   end
 
-  # The claim keeps the monitor this entry took on its caller, so the reply is
-  # handed over without releasing it.
-  defp deliver_reply(%Message{} = msg, %Pending.Entry{} = entry, %Connection{} = state) do
-    claims =
-      FDClaims.open(
-        state.fd_claims,
-        %{
-          msg: msg,
-          from: entry.from,
-          request_ref: entry.request_ref,
-          monitor_ref: entry.monitor_ref,
-          deadline: entry.deadline
-        },
-        Connection.fd_claims_context(state)
-      )
+  defp remember_handed_over(%Connection{} = state, _entry, []), do: state
 
-    %{state | fd_claims: claims}
+  defp remember_handed_over(%Connection{} = state, %Pending.Entry{} = entry, handles) do
+    handed_over = HandedOver.put(state.handed_over, entry.request_ref, handles, entry.deadline)
+    %{state | handed_over: handed_over}
   end
 
   # A pending entry is only ever registered for a call that arrived through
-  # `handle_call/3`, so its `from` is always a `t:GenServer.from/0`.
-  defp live_from?({pid, _tag}) when is_pid(pid), do: Process.alive?(pid)
+  # `handle_call/3`, so its `from` is always a `t:GenServer.from/0`. Every
+  # handle is offered to the caller even after one finds it dead, since that
+  # transfer is what closes each of them.
+  defp hand_over([], {pid, _tag}) when is_pid(pid), do: Process.alive?(pid)
+
+  defp hand_over(handles, {pid, _tag}) when is_pid(pid) do
+    handed? =
+      handles
+      |> Enum.map(&UnixFD.controlling_process(&1, pid))
+      |> Enum.all?(&(&1 == :ok))
+
+    # Whatever did not move is still this process's, and nobody will see it.
+    unless handed?, do: UnixFD.close_owned(handles)
+    handed?
+  end
+
+  # A D-Bus error reply is a definitive peer answer, not a transport failure,
+  # but callers should not have to test the type to branch on it. The
+  # `:dbus_error` tag keeps it apart from local failure reasons under the same
+  # `:error`. The complete message is retained in either shape so its error
+  # name, body and any handles it carries stay available to the caller.
+  defp reply_result(%Message{type: :error} = msg), do: {:error, {:dbus_error, msg}}
+  defp reply_result(%Message{} = msg), do: {:ok, msg}
 
   defp drop_resource_limited_reply(
          %{type: :method_return, reply_serial: reply_serial},

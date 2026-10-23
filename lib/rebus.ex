@@ -89,7 +89,6 @@ defmodule Rebus do
           | :unix_fd_not_negotiated
           | :unix_fd_unsupported
           | :unix_fd_send_failed
-          | :fd_claim_expired
           | {:invalid_message_type, Rebus.Message.message_type()}
 
   @typedoc """
@@ -115,7 +114,6 @@ defmodule Rebus do
           | :remote_connection_unsupported
           | :encode_failed
           | :serial_exhausted
-          | :fd_claim_expired
           | :invalid_bus_reply
           | :match_rule_cleanup_pending
           | :match_rule_uncertain
@@ -183,8 +181,8 @@ defmodule Rebus do
   `:owner`, until that process exits. An `:owner` is monitored, not linked,
   and need not be the process calling `connect/2`. When it exits for any
   reason, including `:normal`, the connection stops with
-  `{:shutdown, :owner_down}`: its socket and any retained descriptors are
-  closed, the bus releases the state it held, and inflight callers receive
+  `{:shutdown, :owner_down}`: its socket and any descriptors it still owns
+  are closed, the bus releases the state it held, and inflight callers receive
   `{:error, :disconnected}`. Only a local PID is accepted; a remote one is
   `:invalid_owner`.
 
@@ -422,8 +420,9 @@ defmodule Rebus do
   Sends a method call and waits for its reply.
 
   Only a method call that expects a reply is accepted, and `timeout` is in
-  milliseconds. Each result carries the complete message, including any
-  received descriptors in `:unix_fds`. A D-Bus error reply from the peer is
+  milliseconds. Each result carries the complete message, including a
+  `Rebus.UnixFD` handle in `:unix_fds` for each descriptor received with it,
+  which the calling process owns. A D-Bus error reply from the peer is
   returned as `{:error, {:dbus_error, %Rebus.Message{type: :error}}}`, so it
   never shares a shape with a local or transport failure.
 
@@ -432,21 +431,19 @@ defmodule Rebus do
   - `{:ok, %Rebus.Message{type: :method_return}}` - the peer replied.
   - `{:error, {:dbus_error, %Rebus.Message{type: :error}}}` - the peer
     returned a D-Bus error. Its name is in `header_fields.error_name`, and
-    any descriptors it carried are in `:unix_fds` and owned by the caller.
+    handles for any descriptors it carried are in `:unix_fds`, owned by the
+    caller.
   - `{:error, :timeout}` - no reply arrived in time. The request may already
     have reached the peer, except when it was sent to a named PID whose
     `connect/2` has not yet returned: that request was never written and is
-    safe to retry.
+    safe to retry. A reply that arrives later is dropped, and any
+    descriptors it carried are closed when the notice of the timeout, which
+    the calling process sends the connection as it gives up, reaches it.
   - `{:error, {:reply_dropped, :method_return}}` or
     `{:error, {:reply_dropped, {:error, error_name}}}` - the peer replied,
     but the reply exceeded a local decoding cap and was discarded. Delivery
     is not in doubt, so decide whether to retry from what the operation does.
-  - `{:error, :fd_claim_expired}` - Rebus closed the reply's descriptors
-    instead of handing them over.
-  - `{:error, :disconnected}` - the connection stopped before the reply, or
-    before its descriptors transferred. A call carrying descriptors can
-    return after `timeout`; see
-    [Unix file descriptor passing](unix_fds.html).
+  - `{:error, :disconnected}` - the connection stopped before the reply.
   - Nothing was written for `:encode_failed`, `:no_reply_expected`,
     `:not_connected`, `:serial_exhausted`, `:unix_fd_unsupported`,
     `:unix_fd_not_negotiated`, `:unix_fd_send_failed`,
@@ -543,9 +540,8 @@ defmodule Rebus do
   `:match_rule_cleanup_pending`, `:match_rule_uncertain`,
   `:match_recovery_capacity_exhausted`, `{:bus_error, error_name}`,
   `:invalid_bus_reply`, `:not_connected`, `:disconnected`, `:encode_failed`,
-  `:serial_exhausted`, `:fd_claim_expired`, `:not_started`,
-  `{:reply_dropped, outcome}` or `:remote_connection_unsupported`. The guide
-  lists what each one means.
+  `:serial_exhausted`, `:not_started`, `{:reply_dropped, outcome}` or
+  `:remote_connection_unsupported`. The guide lists what each one means.
 
   ## Example
 

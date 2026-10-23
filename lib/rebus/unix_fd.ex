@@ -136,16 +136,39 @@ defmodule Rebus.UnixFD do
     end
   end
 
-  # The connection uses these until it carries handles itself.
+  # Internal API for the connection.
 
   @doc false
-  @spec close_all([raw()]) :: :ok
-  def close_all(fds) when is_list(fds) do
-    Enum.each(fds, &Raw.close/1)
-    :ok
+  # Closes each handle the calling process owns, and leaves the rest alone:
+  # one whose ownership has moved on is no longer the caller's to close, and
+  # one already closed needs nothing.
+  @spec close_owned([t()]) :: :ok
+  def close_owned(handles) when is_list(handles) do
+    me = self()
+
+    Enum.each(handles, fn handle ->
+      # Only the owner can transfer a handle, so one the caller owns stays
+      # its own between these two calls; a concurrent close by another
+      # holder makes the second answer `{:error, :closed}`.
+      with {:ok, ^me} <- owner(handle), do: close(handle)
+    end)
   end
 
-  # Internal API for the connection.
+  @doc false
+  # Closes a received raw descriptor that `wrap/2` refused, when it is still
+  # open and the caller's. `wrap/2` has already closed it after `:noproc`,
+  # `:not_local` and `:enomem`, and after `:ebadf` or `:invalid_descriptor`
+  # there is nothing open under the number: closing it then could only close
+  # a descriptor another thread has just been given.
+  @spec close_unwrapped(raw(), atom()) :: :ok
+  def close_unwrapped(_fd, reason)
+      when reason in [:noproc, :not_local, :enomem, :ebadf, :invalid_descriptor],
+      do: :ok
+
+  def close_unwrapped(fd, _reason) do
+    _ = Raw.close(fd)
+    :ok
+  end
 
   @doc false
   # Wraps a raw descriptor in a handle owned by `owner`, a local process.

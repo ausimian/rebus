@@ -136,26 +136,28 @@ defmodule Rebus.Service do
 
   ## Unix file descriptors
 
-  Descriptors sent with a call arrive in `call.unix_fds`, indexed by the
-  call's `h` arguments. The handler borrows them while the call is pending
-  and may read them or pass them on, but the connection owns them and closes
-  each one exactly once when the call completes, however it completes. A
+  Descriptors sent with a call arrive in `call.unix_fds` as `Rebus.UnixFD`
+  handles, indexed by the call's `h` arguments. The connection owns them and
+  the handler borrows them while the call is pending: it may use them, with
+  `Rebus.UnixFD.with_fd/2`, or close them early. When the call completes,
+  however it completes, the connection closes each one it still owns, so a
   handler that ignores them leaks nothing. To keep them, take ownership with
   `take_fds/2` before the call completes:
 
       receive do
         {^ref, %Rebus.Service.Call{member: "TakeLog"} = call} ->
-          {:ok, [fd]} = Rebus.Service.take_fds(call)
+          {:ok, [handle]} = Rebus.Service.take_fds(call)
           :ok = Rebus.Service.reply(call, [])
-          # fd is now the handler's to close with Rebus.UnixFD.close/1
+          # handle is now the handler's, closed when the handler exits
+          # or with Rebus.UnixFD.close/1
       end
 
-  A reply sends descriptors through `reply/3`'s `:fds` option, or the
-  `unix_fds` of a message answered with `reply_message/3`. Rebus borrows
+  A reply sends raw descriptor numbers through `reply/3`'s `:fds` option, or
+  the `unix_fds` of a message answered with `reply_message/3`. Rebus borrows
   them, as it does every outbound descriptor, so the handler still owns them
-  and closes them once the answer returns. A reply cannot send a descriptor
-  the connection still owns, such as one of the call's own borrowed
-  descriptors; take it with `take_fds/2` first.
+  and closes them once the answer returns. A reply cannot send the number of
+  a descriptor the connection still owns, such as one of the call's own
+  borrowed handles; take it with `take_fds/2` first.
 
   See [Unix file descriptor passing](unix_fds.html) for the full ownership
   rules.
@@ -204,8 +206,8 @@ defmodule Rebus.Service do
           | Message.construction_error()
           | Rebus.error_reason()
 
-  @typedoc "A reason why `take_fds/2` did not transfer a call's descriptors."
-  @type take_fds_error :: :unknown_call | :fd_claim_expired | :timeout | :disconnected
+  @typedoc "A reason why `take_fds/2` did not return a call's handles."
+  @type take_fds_error :: :unknown_call | :timeout | :disconnected
 
   @doc """
   Exports `interfaces` at `path` on `conn`.
@@ -314,8 +316,8 @@ defmodule Rebus.Service do
   - `{:error, :signature_mismatch}` - `body` does not fit `call.out_signature`.
   - `{:error, :unknown_call}` - the call was already answered, expired, or
     its export is gone.
-  - `{:error, :unix_fd_borrowed}` - `:fds` names a descriptor the
-    connection still owns, such as one this call or another pending call
+  - `{:error, :unix_fd_borrowed}` - `:fds` names the number of a descriptor
+    the connection still owns, such as one this call or another pending call
     borrowed, which it may close before the reply is written; take it with
     `take_fds/2` first. The call stays open.
   - `{:error, :unix_fd_unsupported}` and `{:error, :unix_fd_not_negotiated}`
@@ -418,44 +420,42 @@ defmodule Rebus.Service do
   end
 
   @doc """
-  Takes ownership of the descriptors that arrived with a call.
+  Takes ownership of the handles that arrived with a call.
 
-  Until a call completes, its descriptors are borrowed from the connection,
-  which closes them when the call is answered, expires or fails. This
-  transfers them to the calling process instead, which then owns them and
-  must close each one exactly once, with `Rebus.UnixFD.close/1` or an API
-  of its own. The call stays pending, and still has to be answered.
-
-  Ownership moves only once the connection has handed the descriptors over
-  and the calling process has acknowledged them. On every other outcome the
-  connection closes them, and there is nothing left for the caller to
-  close. As for an FD-bearing `Rebus.call/3`, this can return later than
-  `timeout`, while that is settled.
+  Until a call completes, its handles are borrowed from the connection,
+  which closes them when the call is answered, expires or fails. This makes
+  the calling process their owner instead, so they outlive the call and
+  close when this process closes them or exits. The call stays pending, and
+  still has to be answered.
 
   ## Return values
 
-  - `{:ok, fds}` - the descriptors, in the order of `call.unix_fds`. A call
-    that carried none returns `{:ok, []}` without reaching the connection.
-  - `{:error, :unknown_call}` - the descriptors were already taken, or the
-    call was answered, expired, or its export is gone.
-  - `{:error, :fd_claim_expired}` - the connection closed the descriptors
-    rather than hand them over.
-  - `{:error, :timeout}` - the hand-over did not complete within `timeout`,
-    and the connection closed the descriptors.
-  - `{:error, :disconnected}` - the connection stopped, closing them.
+  - `{:ok, handles}` - the handles, the same ones as `call.unix_fds` and in
+    the same order, now owned by the calling process. A call that carried
+    none returns `{:ok, []}` without reaching the connection. A handle the
+    handler had already closed stays closed.
+  - `{:error, :unknown_call}` - the handles were already taken, or the call
+    was answered, expired, or its export is gone.
+  - `{:error, :timeout}` - the connection did not answer within `timeout`.
+    It may still make this process their owner afterwards, or it may not:
+    either way each handle closes exactly once, when this process or the
+    connection is done with it. `Rebus.UnixFD.owner/1` on `call.unix_fds`
+    tells which once the connection has caught up, and a second `take_fds/2`
+    answers `{:error, :unknown_call}` if the first one went through.
+  - `{:error, :disconnected}` - the connection stopped, closing the handles
+    it still owned. Only if it was killed as it handed them over can this
+    process have become their owner, which `Rebus.UnixFD.owner/1` on
+    `call.unix_fds` tells.
   """
   @spec take_fds(Call.t(), non_neg_integer()) ::
-          {:ok, [Rebus.UnixFD.raw()]} | {:error, take_fds_error()}
+          {:ok, [Rebus.UnixFD.t()]} | {:error, take_fds_error()}
   def take_fds(call, timeout \\ @default_timeout)
 
   def take_fds(%Call{unix_fds: []}, timeout) when is_integer(timeout) and timeout >= 0,
     do: {:ok, []}
 
   def take_fds(%Call{} = call, timeout) when is_integer(timeout) and timeout >= 0 do
-    case Connection.take_call_fds(call.conn, call.ref, timeout) do
-      {:ok, %Message{unix_fds: fds}} -> {:ok, fds}
-      {:error, _reason} = error -> error
-    end
+    Connection.take_call_fds(call.conn, call.ref, timeout)
   end
 
   @doc """

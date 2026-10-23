@@ -1,7 +1,6 @@
 defmodule Rebus.UnixFDTest do
   use ExUnit.Case, async: false
 
-  alias Rebus.Connection.FDClaims
   alias Rebus.Connection.Inbound
   alias Rebus.Connection.Rights
   alias Rebus.{Message, Service, TestImpl, TestServer, UnixFD}
@@ -76,8 +75,6 @@ defmodule Rebus.UnixFDTest do
     assert {:error, :invalid_descriptor} = Raw.close(-1)
     assert {:error, :invalid_descriptor} = Raw.close(:not_a_descriptor)
     assert {:error, :ebadf} = Raw.close(1_000_000)
-    assert :ok = UnixFD.close_all([1_000_000, -1])
-    assert {:error, :ebadf} = Raw.close(1_000_000)
   end
 
   test "the private OTP close primitive is still exported" do
@@ -104,7 +101,7 @@ defmodule Rebus.UnixFDTest do
         member: "ReceiveSocketFD"
       )
 
-    task = Task.async(fn -> Rebus.call(connection, method, 1_000) end)
+    task = call_task(connection, method)
 
     assert_receive {^server,
                     %Message{serial: serial, header_fields: %{member: "ReceiveSocketFD"}}},
@@ -123,23 +120,27 @@ defmodule Rebus.UnixFDTest do
     assert {:ok, %Message{type: :method_return, unix_fds: [first, second]}} =
              Task.await(task, 1_000)
 
-    # SCM_RIGHTS hands the receiver an independent duplicate per right, so
-    # closing them leaves this process's own socket open.
-    assert first != fd
-    assert second != fd
-    assert first != second
-    assert :ok = Raw.close(first)
-    assert :ok = Raw.close(second)
+    # SCM_RIGHTS hands the receiver an independent duplicate per right, each
+    # in its own handle, so closing them leaves this process's own socket
+    # open.
+    first_fd = raw!(first)
+    second_fd = raw!(second)
+    assert first_fd != fd
+    assert second_fd != fd
+    assert first_fd != second_fd
+    assert identity!(first) == UnixFD.__fd_identity__(fd)
+    assert :ok = UnixFD.close(first)
+    assert :ok = UnixFD.close(second)
 
     # Read-only: /dev/fd is /proc/self/fd on Linux and the fdesc filesystem on
     # macOS, and exists?/1 is a stat, not an open, so this cannot adopt or
-    # disturb a reused number.  Pins that Raw.close/1 closed the number it was
-    # given rather than a duplicate.  It sits directly after the closes, before
-    # any other syscall in this test frees a number, because it holds only
-    # while nothing in the VM has reused either number; the module is
-    # async: false for that reason.
-    refute File.exists?("/dev/fd/#{first}")
-    refute File.exists?("/dev/fd/#{second}")
+    # disturb a reused number.  Pins that closing the handles closed the
+    # numbers they held rather than a duplicate.  It sits directly after the
+    # closes, before any other syscall in this test frees a number, because
+    # it holds only while nothing in the VM has reused either number; the
+    # module is async: false for that reason.
+    refute File.exists?("/dev/fd/#{first_fd}")
+    refute File.exists?("/dev/fd/#{second_fd}")
 
     assert {:ok, %{family: :local}} = :socket.sockname(sock)
     # Part of the survival check, not cleanup: a socket whose descriptor was
@@ -303,7 +304,7 @@ defmodule Rebus.UnixFDTest do
     assert :ok = Task.await(task, 1_000)
   end
 
-  test "delivers a received descriptor only with a live method reply", %{
+  test "delivers a received descriptor in a handle the caller owns", %{
     server: server,
     connection: connection
   } do
@@ -314,7 +315,7 @@ defmodule Rebus.UnixFDTest do
         member: "ReceiveFD"
       )
 
-    task = Task.async(fn -> Rebus.call(connection, method, 1_000) end)
+    task = call_task(connection, method)
 
     assert_receive {^server, %Message{serial: serial, header_fields: %{member: "ReceiveFD"}}},
                    1_000
@@ -330,9 +331,13 @@ defmodule Rebus.UnixFDTest do
       )
 
     :ok = TestServer.push_with_fds(server, reply, [fd])
+
+    # `call_task/2` checks that the caller owned the handle on arrival.
     assert {:ok, %Message{type: :method_return, unix_fds: [received]}} = Task.await(task, 1_000)
-    assert received != fd
-    assert :ok = Raw.close(received)
+    assert raw!(received) != fd
+    assert identity!(received) == UnixFD.__fd_identity__(fd)
+    assert :ok = UnixFD.close(received)
+    assert {:ok, 1} = UnixFD.__close_count__(received)
   end
 
   test "delivers a received descriptor with an FD-bearing D-Bus error reply", %{
@@ -346,7 +351,7 @@ defmodule Rebus.UnixFDTest do
         member: "ReceiveErrorFD"
       )
 
-    task = Task.async(fn -> Rebus.call(connection, method, 1_000) end)
+    task = call_task(connection, method)
 
     assert_receive {^server,
                     %Message{serial: serial, header_fields: %{member: "ReceiveErrorFD"}}},
@@ -373,11 +378,11 @@ defmodule Rebus.UnixFDTest do
                unix_fds: [received]
              }}} = Task.await(task, 1_000)
 
-    assert received != fd
-    assert :ok = Raw.close(received)
+    assert identity!(received) == UnixFD.__fd_identity__(fd)
+    assert :ok = UnixFD.close(received)
   end
 
-  test "closes an FD reply whose public call alias timed out while its PID lived", %{
+  test "closes an FD reply handed to a caller that timed out but lives, on its cancel", %{
     server: server,
     connection: connection
   } do
@@ -385,15 +390,19 @@ defmodule Rebus.UnixFDTest do
     before_fds = fd_set!()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 
+    # The connection keeps the request open well past its caller's deadline,
+    # so only the caller gives up on it, and reports each descriptor it reads.
     TestImpl.install(connection,
-      fd_claim_handoff: fn ->
-        send(parent, :fd_claim_handoff_waiting)
+      request_timeout_slack: fn -> 5_000 end,
+      recvmsg: fn sock, length, control_size, flags, timeout ->
+        result = :socket.recvmsg(sock, length, control_size, flags, timeout)
 
-        receive do
-          :continue_fd_claim_handoff -> :ok
+        with {:ok, %{ctrl: [%{type: :rights, data: <<received::native-signed-32>>}]}} <- result do
+          send(parent, {:received_fd, received})
         end
-      end,
-      request_timeout_slack: fn -> 1_000 end
+
+        result
+      end
     )
 
     method =
@@ -405,11 +414,12 @@ defmodule Rebus.UnixFDTest do
 
     caller =
       spawn(fn ->
-        result = Rebus.call(connection, method, 500)
+        result = Rebus.call(connection, method, 1_000)
         send(parent, {:timed_out_alias_result, result})
 
         receive do
           :stop_timed_out_alias_caller -> :ok
+          message -> send(parent, {:unexpected_message, message})
         end
       end)
 
@@ -425,193 +435,133 @@ defmodule Rebus.UnixFDTest do
         fds: [fd]
       )
 
+    # Hold the connection while the reply reaches its socket and the caller
+    # times out, so it reads the reply, and hands it to a call alias that no
+    # longer accepts anything, before the cancel the caller sends as it gives
+    # up.
+    :ok = :sys.suspend(connection)
     :ok = TestServer.push_with_fds(server, reply, [fd])
-    assert_receive :fd_claim_handoff_waiting, 1_000
-    assert_receive {:timed_out_alias_result, {:error, :timeout}}, 1_000
+
+    assert eventually(fn ->
+             Process.info(connection, :message_queue_len) != {:message_queue_len, 0}
+           end)
+
+    assert_receive {:timed_out_alias_result, {:error, :timeout}}, 2_000
     assert Process.alive?(caller)
 
-    # The task PID is still alive, but its timed-out GenServer.call alias is
-    # gone. Releasing this hook exercises the exact late-reply race.
-    send(connection, :continue_fd_claim_handoff)
-    assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        :ok = :sys.resume(connection)
+        assert_receive {:received_fd, received}, 1_000
+
+        # The cancel closes it at once: nothing collects any garbage here.
+        assert eventually(fn -> not File.exists?("/dev/fd/#{received}") end)
+        assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
+        elsewhere(fn -> :sys.get_state(connection) end)
+      end)
+
+    # Handed over rather than dropped as an orphan.
+    refute log =~ "orphaned"
+    refute_received {:unexpected_message, _message}
     assert Process.alive?(connection)
     send(caller, :stop_timed_out_alias_caller)
   end
 
-  test "unaliases a delayed FD delivery before it can reach the caller mailbox", %{
-    server: server,
-    connection: connection
-  } do
+  test "leaves a reply's handles with a caller that received them once its cancel window ends",
+       %{server: server, connection: connection} do
     parent = self()
-    before_fds = fd_set!()
     {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
 
-    TestImpl.install(connection,
-      fd_claim_delivery: fn ->
-        send(parent, :fd_delivery_waiting)
-
-        receive do
-          :continue_fd_delivery -> :ok
-        end
-      end,
-      # The caller's alias must time out while the connection still holds the
-      # request, so the reply has to survive the socket round trip on a loaded
-      # runner. Keep the connection-side reaper well behind the caller
-      # deadline, as the timed-out alias test above does.
-      request_timeout_slack: fn -> 1_000 end
-    )
-
     method =
-      Message.new!(:method_call,
-        path: "/test",
-        interface: "test.interface",
-        member: "DelayedFDDelivery"
-      )
+      Message.new!(:method_call, path: "/test", interface: "test.interface", member: "KeptFD")
 
     caller =
       spawn(fn ->
-        result = Rebus.call(connection, method, 500)
-        send(parent, {:delayed_fd_result, result})
-
-        receive do
-          :stop_delayed_fd_caller -> :ok
-          message -> send(parent, {:unexpected_delayed_fd_message, message})
-        end
+        send(parent, {:kept_result, Rebus.call(connection, method, 1_000)})
+        Process.sleep(:infinity)
       end)
 
-    assert_receive {^server,
-                    %Message{serial: serial, header_fields: %{member: "DelayedFDDelivery"}}},
+    assert_receive {^server, %Message{serial: serial, header_fields: %{member: "KeptFD"}}},
                    1_000
 
     reply =
-      Message.new!(:method_return,
-        reply_serial: serial,
-        signature: "h",
-        body: [0],
-        fds: [fd]
-      )
+      Message.new!(:method_return, reply_serial: serial, signature: "h", body: [0], fds: [fd])
 
     :ok = TestServer.push_with_fds(server, reply, [fd])
-    assert_receive :fd_delivery_waiting, 1_000
-    assert_receive {:delayed_fd_result, {:error, :timeout}}, 2_000
+    assert_receive {:kept_result, {:ok, %Message{unix_fds: [received]}}}, 1_000
 
-    send(connection, :continue_fd_delivery)
-    assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
-    refute_receive {:unexpected_delayed_fd_message, {:rebus_fd_reply, _, _, _}}, 100
-    assert Process.alive?(connection)
-    send(caller, :stop_delayed_fd_caller)
-  end
+    # Past the deadline and the connection's grace for a cancel, the caller
+    # still owns an open handle and nothing has closed it.
+    assert eventually(
+             fn -> elsewhere(fn -> :sys.get_state(connection).handed_over.entries == %{} end) end,
+             400
+           )
 
-  test "closes a stalled FD acknowledgement after its claim deadline", %{
-    server: server,
-    connection: connection
-  } do
-    parent = self()
-    before_fds = fd_set!()
-    {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
+    assert {:ok, ^caller} = UnixFD.owner(received)
+    assert {:ok, 0} = UnixFD.__close_count__(received)
+    assert identity!(received) == UnixFD.__fd_identity__(fd)
 
-    TestImpl.install(connection,
-      fd_claim_ack: fn _claim ->
-        send(parent, :fd_ack_waiting)
-
-        receive do
-          :continue_fd_ack -> :ok
-        end
-      end
-    )
-
-    method =
-      Message.new!(:method_call,
-        path: "/test",
-        interface: "test.interface",
-        member: "DelayedFDAck"
-      )
-
-    # The reply has to reach the connection inside the caller deadline, so the
-    # budget must cover a socket round trip on a loaded runner. Every deadline
-    # below scales with it; only the wall-clock margin changes.
-    task = Task.async(fn -> Rebus.call(connection, method, 200) end)
-
-    assert_receive {^server, %Message{serial: serial, header_fields: %{member: "DelayedFDAck"}}},
-                   1_000
-
-    reply =
-      Message.new!(:method_return,
-        reply_serial: serial,
-        signature: "h",
-        body: [0],
-        fds: [fd]
-      )
-
-    :ok = TestServer.push_with_fds(server, reply, [fd])
-    assert_receive :fd_ack_waiting, 1_000
-
-    # The first acknowledgement call expires at 300ms. Keep the handler
-    # blocked beyond the 450ms claim cleanup deadline: the FIFO resolver must
-    # still wait for a definitive close rather than return while this queued
-    # acknowledgement could later transfer ownership.
-    Process.sleep(550)
-    send(connection, :continue_fd_ack)
-
-    assert {:error, :fd_claim_expired} = Task.await(task, 1_000)
-    assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
-    assert Process.alive?(connection)
-  end
-
-  test "closes a claimed FD when its caller dies before acknowledgement", %{
-    server: server,
-    connection: connection
-  } do
-    parent = self()
-    before_fds = fd_set!()
-    {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
-
-    TestImpl.install(connection,
-      fd_claim_delivery: fn ->
-        send(parent, :claimed_fd_delivery_waiting)
-
-        receive do
-          :continue_claimed_fd_delivery -> :ok
-        end
-      end
-    )
-
-    caller =
-      spawn(fn ->
-        message =
-          Message.new!(:method_call,
-            path: "/test",
-            interface: "test.interface",
-            member: "ClaimedCallerDown"
-          )
-
-        send(parent, {:claimed_caller_result, Rebus.call(connection, message, 1_000)})
-      end)
-
-    assert_receive {^server,
-                    %Message{serial: serial, header_fields: %{member: "ClaimedCallerDown"}}},
-                   1_000
-
-    reply =
-      Message.new!(:method_return,
-        reply_serial: serial,
-        signature: "h",
-        body: [0],
-        fds: [fd]
-      )
-
-    :ok = TestServer.push_with_fds(server, reply, [fd])
-    assert_receive :claimed_fd_delivery_waiting, 1_000
-
-    caller_ref = Process.monitor(caller)
     Process.exit(caller, :kill)
-    assert_receive {:DOWN, ^caller_ref, :process, ^caller, :killed}, 1_000
+    assert_closed_once(received)
+  end
 
-    send(connection, :continue_claimed_fd_delivery)
-    refute_receive {:claimed_caller_result, _result}, 50
-    assert eventually(fn -> :sys.get_state(connection).fd_claims.claims == %{} end)
+  test "closes a reply whose caller cancelled before it arrived", %{
+    server: server,
+    connection: connection
+  } do
+    parent = self()
+    before_fds = fd_set!()
+    {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
+
+    TestImpl.install(connection,
+      request_timeout_slack: fn -> 5_000 end,
+      recvmsg: fn sock, length, control_size, flags, timeout ->
+        result = :socket.recvmsg(sock, length, control_size, flags, timeout)
+
+        with {:ok, %{ctrl: [%{type: :rights, data: <<received::native-signed-32>>}]}} <- result do
+          send(parent, {:received_fd, received})
+        end
+
+        result
+      end
+    )
+
+    method =
+      Message.new!(:method_call, path: "/test", interface: "test.interface", member: "LateFD")
+
+    caller =
+      spawn(fn ->
+        send(parent, {:late_result, Rebus.call(connection, method, 200)})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {^server, %Message{serial: serial, header_fields: %{member: "LateFD"}}},
+                   1_000
+
+    assert_receive {:late_result, {:error, :timeout}}, 1_000
+
+    # The cancel has withdrawn the call, so the reply correlates to nothing.
+    assert eventually(fn ->
+             elsewhere(fn -> :sys.get_state(connection).pending.entries == %{} end)
+           end)
+
+    reply =
+      Message.new!(:method_return, reply_serial: serial, signature: "h", body: [0], fds: [fd])
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        :ok = TestServer.push_with_fds(server, reply, [fd])
+        assert_receive {:received_fd, received}, 1_000
+        assert eventually(fn -> not File.exists?("/dev/fd/#{received}") end)
+
+        # The connection logs as it finishes with the frame.
+        elsewhere(fn -> :sys.get_state(connection) end)
+      end)
+
+    assert log =~ "orphaned"
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
     assert Process.alive?(connection)
+    Process.exit(caller, :kill)
   end
 
   test "Rebus.close closes partial inbound descriptors and unregisters its child", %{
@@ -652,10 +602,7 @@ defmodule Rebus.UnixFDTest do
     ref = Process.monitor(connection)
     assert :ok = Rebus.close(connection)
     assert_receive {:DOWN, ^ref, :process, ^connection, :shutdown}, 1_000
-    # Check the exact received descriptor before any other operation can cause
-    # the OS to reuse its integer value. This is stronger than a process-wide
-    # table comparison, which changes by one OTP fixture descriptor on close.
-    assert {:error, :ebadf} = Raw.close(received)
+    assert_closed_once(received)
     assert Process.whereis(connection_name) == nil
 
     refute Enum.any?(DynamicSupervisor.which_children(Rebus.ConnectionSupervisor), fn
@@ -673,7 +620,39 @@ defmodule Rebus.UnixFDTest do
     ref = Process.monitor(connection)
     assert :ok = Rebus.close(connection)
     assert_receive {:DOWN, ^ref, :process, ^connection, :shutdown}, 1_000
-    assert {:error, :ebadf} = Raw.close(fd)
+    assert_closed_once(fd)
+  end
+
+  test "a killed connection closes every handle it owns", %{
+    server: server,
+    connection: connection
+  } do
+    before_fds = fd_set!()
+    borrowed = hold_inbound_call_fd!(server, connection)
+    {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
+
+    # A descriptor held for a frame still being read, as well as the one an
+    # unanswered call lent this process.
+    :ok =
+      :socket.sendmsg(
+        :sys.get_state(server).cli_sock,
+        %{iov: ["l"], ctrl: [%{level: :socket, type: :rights, data: <<fd::native-signed-32>>}]},
+        [],
+        1_000
+      )
+
+    assert eventually(fn -> :sys.get_state(connection).inbound_fds.fds != [] end)
+    [partial] = :sys.get_state(connection).inbound_fds.fds
+
+    # :kill skips terminate/2, so only the handles' owner monitor can close
+    # them.
+    ref = Process.monitor(connection)
+    Process.exit(connection, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^connection, :killed}, 1_000
+
+    assert_closed_once(borrowed)
+    assert_closed_once(partial)
+    assert no_new_fds?(before_fds)
   end
 
   test "a transport stop closes descriptors held by unanswered inbound calls", %{
@@ -685,277 +664,7 @@ defmodule Rebus.UnixFDTest do
     ref = Process.monitor(connection)
     :ok = :socket.shutdown(:sys.get_state(server).cli_sock, :write)
     assert_receive {:DOWN, ^ref, :process, ^connection, {:shutdown, :closed}}, 1_000
-    assert {:error, :ebadf} = Raw.close(fd)
-  end
-
-  test "Rebus.close resolves an unacknowledged claim as disconnected", %{
-    server: server,
-    connection: connection,
-    connection_name: connection_name
-  } do
-    parent = self()
-    {:ok, fd} = :socket.getopt(:sys.get_state(server).cli_sock, {:otp, :fd})
-
-    TestImpl.install(connection,
-      fd_claim_ack: fn %{msg: %Message{unix_fds: [received]}} ->
-        send(parent, {:close_claim_ack_waiting, received})
-
-        receive do
-          :continue_close_claim_ack -> :ok
-        end
-      end
-    )
-
-    method =
-      Message.new!(:method_call,
-        path: "/test",
-        interface: "test.interface",
-        member: "CloseClaimFD"
-      )
-
-    # The reply has to reach the connection inside the caller deadline, so the
-    # budget must cover a socket round trip on a loaded runner. The release
-    # sleep below scales with it; only the wall-clock margin changes.
-    call_task = Task.async(fn -> Rebus.call(connection, method, 200) end)
-
-    assert_receive {^server, %Message{serial: serial, header_fields: %{member: "CloseClaimFD"}}},
-                   1_000
-
-    reply =
-      Message.new!(:method_return,
-        reply_serial: serial,
-        signature: "h",
-        body: [0],
-        fds: [fd]
-      )
-
-    :ok = TestServer.push_with_fds(server, reply, [fd])
-    assert_receive {:close_claim_ack_waiting, received}, 1_000
-
-    ref = Process.monitor(connection)
-    close_task = Task.async(fn -> Rebus.close(connection) end)
-    assert nil == Task.yield(close_task, 20)
-
-    # The shutdown signal enters the connection mailbox before the client can
-    # enqueue an acknowledgement. Release after the 450ms claim deadline so an
-    # ack cannot transfer ownership if scheduling changes at the boundary.
-    Process.sleep(550)
-    send(connection, :continue_close_claim_ack)
-
-    assert :ok = Task.await(close_task, 1_000)
-    assert_receive {:DOWN, ^ref, :process, ^connection, :shutdown}, 1_000
-    assert {:error, :disconnected} = Task.await(call_task, 1_000)
-    assert {:error, :ebadf} = Raw.close(received)
-    assert Process.whereis(connection_name) == nil
-
-    refute Enum.any?(DynamicSupervisor.which_children(Rebus.ConnectionSupervisor), fn
-             {_id, ^connection, _type, _modules} -> true
-             _child -> false
-           end)
-  end
-
-  test "drops claimed reply ownership on expiry, caller DOWN, and cancellation", %{
-    connection: connection
-  } do
-    state = :sys.get_state(connection)
-
-    expired_ref = make_ref()
-    expired = claimed_state(state, expired_ref, make_ref(), Process.monitor(self()))
-
-    assert {:noreply, expired_state} =
-             Rebus.Connection.handle_info({:fd_claim_timeout, expired_ref}, expired)
-
-    assert expired_state.fd_claims.claims == %{}
-
-    assert {:noreply, ^expired_state} =
-             Rebus.Connection.handle_info({:fd_claim_timeout, make_ref()}, expired_state)
-
-    down_ref = make_ref()
-    down_monitor = Process.monitor(self())
-    down_state = claimed_state(state, down_ref, make_ref(), down_monitor)
-
-    assert {:noreply, down_state} =
-             Rebus.Connection.handle_info(
-               {:DOWN, down_monitor, :process, self(), :normal},
-               down_state
-             )
-
-    assert down_state.fd_claims.claims == %{}
-
-    cancel_ref = make_ref()
-    cancel_monitor = Process.monitor(self())
-
-    :sys.replace_state(connection, fn current ->
-      claimed_state(current, make_ref(), cancel_ref, cancel_monitor)
-    end)
-
-    GenServer.cast(connection, {:cancel, cancel_ref})
-    assert eventually(fn -> :sys.get_state(connection).fd_claims.claims == %{} end)
-  end
-
-  test "rejects stale claim and acknowledgement tokens without changing connection state", %{
-    connection: connection
-  } do
-    delivery_alias = :erlang.alias([:reply])
-
-    assert {:error, :fd_claim_expired} =
-             GenServer.call(connection, {:claim_fd_reply, make_ref(), make_ref(), delivery_alias})
-
-    assert {:error, :fd_claim_expired} =
-             GenServer.call(connection, {:ack_fd_reply, make_ref(), make_ref()})
-
-    :erlang.unalias(delivery_alias)
-    assert Process.alive?(connection)
-  end
-
-  test "resolves FD claims as acknowledged, closed, or expired", %{connection: connection} do
-    acknowledged_ref = make_ref()
-    acknowledged_request = make_ref()
-    acknowledged_monitor = Process.monitor(self())
-
-    acknowledged_state =
-      claimed_state(
-        :sys.get_state(connection),
-        acknowledged_ref,
-        acknowledged_request,
-        acknowledged_monitor
-      )
-
-    :sys.replace_state(connection, fn _state -> acknowledged_state end)
-
-    delivery_ref = make_ref()
-    delivery_alias = :erlang.alias([:reply])
-
-    assert :ok =
-             GenServer.call(
-               connection,
-               {:claim_fd_reply, acknowledged_ref, delivery_ref, delivery_alias}
-             )
-
-    assert_receive {:rebus_fd_reply, ^acknowledged_ref, ^delivery_ref, %Message{}}, 1_000
-    assert :ok = GenServer.call(connection, {:ack_fd_reply, acknowledged_ref, delivery_ref})
-
-    assert :acknowledged =
-             GenServer.call(connection, {:resolve_fd_claim, acknowledged_ref, delivery_ref})
-
-    assert :fd_claim_expired =
-             GenServer.call(connection, {:resolve_fd_claim, acknowledged_ref, delivery_ref})
-
-    :erlang.unalias(delivery_alias)
-
-    closed_ref = make_ref()
-    closed_request = make_ref()
-    closed_monitor = Process.monitor(self())
-
-    closed_state =
-      claimed_state(:sys.get_state(connection), closed_ref, closed_request, closed_monitor)
-
-    :sys.replace_state(connection, fn _state -> closed_state end)
-
-    closed_delivery_ref = make_ref()
-    closed_alias = :erlang.alias([:reply])
-
-    assert :ok =
-             GenServer.call(
-               connection,
-               {:claim_fd_reply, closed_ref, closed_delivery_ref, closed_alias}
-             )
-
-    assert_receive {:rebus_fd_reply, ^closed_ref, ^closed_delivery_ref, %Message{}}, 1_000
-
-    assert :closed =
-             GenServer.call(connection, {:resolve_fd_claim, closed_ref, closed_delivery_ref})
-
-    discard_ref = make_ref()
-    discard_request = make_ref()
-    discard_monitor = Process.monitor(self())
-
-    :sys.replace_state(connection, fn state ->
-      claimed_state(state, discard_ref, discard_request, discard_monitor)
-    end)
-
-    # A caller which abandons the delivery leg closes the retained claim. A
-    # duplicate discard is harmless and must not revive ownership.
-    assert :ok = GenServer.call(connection, {:discard_fd_claim, discard_ref})
-    assert :ok = GenServer.call(connection, {:discard_fd_claim, discard_ref})
-
-    outcome_ref = make_ref()
-    outcome_timer = Process.send_after(self(), {:fd_claim_outcome_timeout, outcome_ref}, 60_000)
-
-    :sys.replace_state(connection, fn state ->
-      %{
-        state
-        | fd_claims: %{state.fd_claims | outcomes: %{outcome_ref => {:closed, outcome_timer}}}
-      }
-    end)
-
-    send(connection, {:fd_claim_outcome_timeout, outcome_ref})
-    assert eventually(fn -> :sys.get_state(connection).fd_claims.outcomes == %{} end)
-
-    state = :sys.get_state(connection)
-
-    assert {:noreply, ^state} =
-             Rebus.Connection.handle_info({:fd_claim_outcome_timeout, make_ref()}, state)
-
-    assert {:noreply, ^state} =
-             Rebus.Connection.handle_info({:request_timeout, make_ref(), make_ref()}, state)
-
-    :erlang.unalias(closed_alias)
-  end
-
-  test "acknowledges only before the absolute claim deadline", %{connection: connection} do
-    delivery_ref = make_ref()
-    live_ref = make_ref()
-    live_request = make_ref()
-    live_monitor = Process.monitor(self())
-
-    live_state =
-      claimed_state(
-        :sys.get_state(connection),
-        live_ref,
-        live_request,
-        live_monitor,
-        delivery_ref: delivery_ref,
-        deadline: System.monotonic_time(:millisecond) + 100
-      )
-
-    :sys.replace_state(connection, fn _state -> live_state end)
-
-    assert :ok = GenServer.call(connection, {:ack_fd_reply, live_ref, delivery_ref})
-
-    assert :acknowledged =
-             GenServer.call(connection, {:resolve_fd_claim, live_ref, delivery_ref})
-
-    expired_ref = make_ref()
-    expired_request = make_ref()
-    expired_monitor = Process.monitor(self())
-
-    expired_state =
-      claimed_state(
-        :sys.get_state(connection),
-        expired_ref,
-        expired_request,
-        expired_monitor,
-        delivery_ref: make_ref(),
-        deadline: System.monotonic_time(:millisecond) - 1
-      )
-
-    expired_delivery_ref = expired_state.fd_claims.claims[expired_ref].delivery_ref
-    :sys.replace_state(connection, fn _state -> expired_state end)
-
-    assert {:error, :fd_claim_expired} =
-             GenServer.call(connection, {:ack_fd_reply, expired_ref, expired_delivery_ref})
-
-    assert :closed =
-             GenServer.call(connection, {:resolve_fd_claim, expired_ref, expired_delivery_ref})
-  end
-
-  test "connection termination closes retained claim state", %{connection: connection} do
-    {:ok, sock} = :socket.open(:local, :stream, :default)
-    monitor_ref = Process.monitor(self())
-    state = claimed_state(:sys.get_state(connection), make_ref(), make_ref(), monitor_ref)
-
-    assert :ok = Rebus.Connection.terminate(:shutdown, %{state | sock: sock})
+    assert_closed_once(fd)
   end
 
   test "closes received duplicates of inherited pipe descriptors on Linux", %{
@@ -977,7 +686,7 @@ defmodule Rebus.UnixFDTest do
             member: member
           )
 
-        task = Task.async(fn -> Rebus.call(connection, method, 1_000) end)
+        task = call_task(connection, method)
 
         assert_receive {^server, %Message{serial: serial, header_fields: %{member: ^member}}},
                        1_000
@@ -992,8 +701,8 @@ defmodule Rebus.UnixFDTest do
 
         :ok = TestServer.push_with_fds(server, reply, [fd])
         assert {:ok, %Message{unix_fds: [received]}} = Task.await(task, 1_000)
-        assert received != fd
-        assert :ok = Raw.close(received)
+        assert raw!(received) != fd
+        assert :ok = UnixFD.close(received)
       end
     end
   end
@@ -1098,9 +807,7 @@ defmodule Rebus.UnixFDTest do
       end)
 
     assert log =~ "D-Bus connection protocol stopped: :message_too_large"
-    # Check the exact received descriptor before anything else can reuse its
-    # integer value.
-    assert {:error, :ebadf} = Raw.close(received)
+    assert_closed_once(received)
   end
 
   test "reads coalesced frames in one recvmsg once descriptors are negotiated", %{
@@ -1170,7 +877,7 @@ defmodule Rebus.UnixFDTest do
         member: "CoalescedFD"
       )
 
-    task = Task.async(fn -> Rebus.call(connection, method, 1_000) end)
+    task = call_task(connection, method)
 
     assert_receive {^server, %Message{serial: serial, header_fields: %{member: "CoalescedFD"}}},
                    1_000
@@ -1210,8 +917,8 @@ defmodule Rebus.UnixFDTest do
 
     assert_receive {^handler_ref, %Message{header_fields: %{member: "BeforeFDReply"}}}, 1_000
     assert {:ok, %Message{type: :method_return, unix_fds: [received]}} = Task.await(task, 1_000)
-    assert received != fd
-    assert :ok = Raw.close(received)
+    assert identity!(received) == UnixFD.__fd_identity__(fd)
+    assert :ok = UnixFD.close(received)
   end
 
   test "delivers descriptors with consecutive replies in separate reads", %{
@@ -1224,7 +931,7 @@ defmodule Rebus.UnixFDTest do
       method =
         Message.new!(:method_call, path: "/test", interface: "test.interface", member: member)
 
-      task = Task.async(fn -> Rebus.call(connection, method, 1_000) end)
+      task = call_task(connection, method)
 
       assert_receive {^server, %Message{serial: serial, header_fields: %{member: ^member}}},
                      1_000
@@ -1234,7 +941,7 @@ defmodule Rebus.UnixFDTest do
 
       :ok = TestServer.push_with_fds(server, reply, [fd])
       assert {:ok, %Message{unix_fds: [received]}} = Task.await(task, 1_000)
-      assert :ok = Raw.close(received)
+      assert :ok = UnixFD.close(received)
     end
   end
 
@@ -1334,12 +1041,36 @@ defmodule Rebus.UnixFDTest do
 
       assert_receive {^ref, %Call{serial: ^serial, unix_fds: [borrowed]} = call}, 1_000
       assert call.message.unix_fds == [borrowed]
-      assert open_fd?(borrowed)
+      assert {:ok, ^connection} = UnixFD.owner(borrowed)
+
+      # The handler may use it while the call is pending.
+      assert {:ok, {:ok, _identity}} = UnixFD.with_fd(borrowed, &UnixFD.__fd_identity__/1)
 
       assert :ok = answer.(call)
       assert_receive {^server, %Message{header_fields: %{reply_serial: ^serial}}}, 1_000
+
+      # Completing the call closed it, and the handler's alias reads closed.
+      assert_closed_once(borrowed)
       assert no_new_fds?(before_fds)
     end
+  end
+
+  test "lets a handler close a borrowed handle without a second close", %{
+    server: server,
+    connection: connection
+  } do
+    before_fds = fd_set!()
+
+    {_ref, %Call{serial: serial, unix_fds: [borrowed]} = call} =
+      fd_call!(server, connection, "Take")
+
+    assert :ok = UnixFD.close(borrowed)
+    assert :ok = Service.reply(call, [])
+    assert_receive {^server, %Message{header_fields: %{reply_serial: ^serial}}}, 1_000
+
+    assert {:error, :closed} = UnixFD.close(borrowed)
+    assert {:ok, 1} = UnixFD.__close_count__(borrowed)
+    assert no_new_fds?(before_fds)
   end
 
   test "closes the descriptor of a call that asked for no reply once it is answered", %{
@@ -1353,8 +1084,9 @@ defmodule Rebus.UnixFDTest do
     assert_receive {^ref, %Call{serial: ^serial, no_reply?: true, unix_fds: [borrowed]} = call},
                    1_000
 
-    assert open_fd?(borrowed)
+    assert UnixFD.open?(borrowed)
     assert :ok = Service.reply(call, [])
+    assert_closed_once(borrowed)
     assert no_new_fds?(before_fds)
     assert {:error, :unknown_call} = Service.reply(call, [])
     refute_receive {^server, %Message{header_fields: %{reply_serial: _}}}, 100
@@ -1405,7 +1137,7 @@ defmodule Rebus.UnixFDTest do
 
     {_ref, serial} = fd_call!(server, connection, "Take", handler: handler)
     assert_receive {:handled, %Call{unix_fds: [borrowed]}}, 1_000
-    assert open_fd?(borrowed)
+    assert UnixFD.open?(borrowed)
 
     Process.exit(handler, :kill)
 
@@ -1419,6 +1151,7 @@ defmodule Rebus.UnixFDTest do
                     }},
                    1_000
 
+    assert_closed_once(borrowed)
     assert no_new_fds?(before_fds)
   end
 
@@ -1479,17 +1212,42 @@ defmodule Rebus.UnixFDTest do
     {_ref, %Call{unix_fds: [borrowed]} = call} = fd_call!(server, connection, "Take")
 
     assert {:ok, [^borrowed]} = Service.take_fds(call)
+    assert {:ok, owner} = UnixFD.owner(borrowed)
+    assert owner == self()
     assert {:error, :unknown_call} = Service.take_fds(call)
-    assert :sys.get_state(connection).fd_claims.claims == %{}
 
     assert :ok = Service.reply(call, [])
     assert_receive {^server, %Message{type: :method_return}}, 1_000
     assert {:error, :unknown_call} = Service.take_fds(call)
 
-    # Completing the call closed nothing: the descriptor is this process's.
-    assert open_fd?(borrowed)
-    assert :ok = Raw.close(borrowed)
+    # Completing the call closed nothing: the handle is this process's.
+    assert UnixFD.open?(borrowed)
+    assert :ok = UnixFD.close(borrowed)
+    assert {:ok, 1} = UnixFD.__close_count__(borrowed)
     assert no_new_fds?(before_fds)
+  end
+
+  test "transfers taken handles to whichever process takes them", %{
+    server: server,
+    connection: connection
+  } do
+    parent = self()
+    {_ref, %Call{unix_fds: [borrowed]} = call} = fd_call!(server, connection, "Take")
+
+    taker =
+      spawn(fn ->
+        send(parent, {:taken, Service.take_fds(call)})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:taken, {:ok, [^borrowed]}}, 1_000
+    assert {:ok, ^taker} = UnixFD.owner(borrowed)
+    assert :ok = Service.reply(call, [])
+
+    # The taker owns it past the call, and its exit closes it.
+    assert UnixFD.open?(borrowed)
+    Process.exit(taker, :kill)
+    assert_closed_once(borrowed)
   end
 
   test "sends descriptors with a reply, but not the call's borrowed ones", %{
@@ -1501,11 +1259,13 @@ defmodule Rebus.UnixFDTest do
     {_ref, %Call{serial: serial, unix_fds: [borrowed]} = call} =
       fd_call!(server, connection, "Echo")
 
-    assert {:error, :unix_fd_borrowed} = Service.reply(call, [0], fds: [borrowed])
+    # Outbound descriptors are raw numbers. A handler can read one out of a
+    # borrowed handle, but not send it.
+    assert {:error, :unix_fd_borrowed} = Service.reply(call, [0], fds: [raw!(borrowed)])
     refute_receive {^server, %Message{header_fields: %{reply_serial: _}}}, 100
 
     {:ok, [taken]} = Service.take_fds(call)
-    assert :ok = Service.reply(call, [0], fds: [taken])
+    assert {:ok, :ok} = UnixFD.with_fd(taken, &Service.reply(call, [0], fds: [&1]))
 
     assert_receive {^server,
                     %Message{
@@ -1526,12 +1286,15 @@ defmodule Rebus.UnixFDTest do
     assert_receive {^ref, %Call{serial: ^serial, unix_fds: [borrowed]} = call}, 1_000
 
     assert {:error, :unix_fd_borrowed} =
-             Service.reply_error(call, "org.example.Error.Refused", "no", fds: [borrowed])
+             Service.reply_error(call, "org.example.Error.Refused", "no", fds: [raw!(borrowed)])
 
     assert {:ok, [error_taken]} = Service.take_fds(call)
 
-    assert :ok =
-             Service.reply_error(call, "org.example.Error.Refused", "no", fds: [taken])
+    assert {:ok, :ok} =
+             UnixFD.with_fd(
+               taken,
+               &Service.reply_error(call, "org.example.Error.Refused", "no", fds: [&1])
+             )
 
     assert_receive {^server,
                     %Message{
@@ -1542,111 +1305,64 @@ defmodule Rebus.UnixFDTest do
                    1_000
 
     assert :ok = Raw.close(received)
-    assert :ok = Raw.close(error_taken)
-    assert :ok = Raw.close(taken)
+    assert :ok = UnixFD.close(error_taken)
+    assert :ok = UnixFD.close(taken)
     assert no_new_fds?(before_fds)
   end
 
-  test "closes call descriptors whose taker timed out during the hand-over while it lived", %{
+  test "leaves taken handles closed exactly once after take_fds times out", %{
     server: server,
     connection: connection
   } do
     parent = self()
-    before_fds = fd_set!()
-    {_ref, call} = fd_call!(server, connection, "Take")
+    {_ref, %Call{unix_fds: [borrowed]} = call} = fd_call!(server, connection, "Take")
 
-    TestImpl.install(connection,
-      fd_claim_handoff: fn ->
-        send(parent, :take_handoff_waiting)
-
-        receive do
-          :continue_take_handoff -> :ok
-        end
-      end
-    )
+    # The connection reads the take only after the taker has given up on it,
+    # and still makes the live taker the owner.
+    :ok = :sys.suspend(connection)
 
     taker =
       spawn(fn ->
         send(parent, {:take_result, Service.take_fds(call, 100)})
 
         receive do
-          :stop_taker -> :ok
+          message -> send(parent, {:unexpected_message, message})
         end
       end)
 
-    assert_receive :take_handoff_waiting, 1_000
     assert_receive {:take_result, {:error, :timeout}}, 1_000
-    assert Process.alive?(taker)
+    :ok = :sys.resume(connection)
 
-    # The taker is alive, but its call alias is gone. Releasing the hook sends
-    # the claim token into it, and the cancellation queued behind closes it.
-    send(connection, :continue_take_handoff)
+    assert eventually(fn -> UnixFD.owner(borrowed) == {:ok, taker} end)
     assert {:error, :unknown_call} = Service.take_fds(call)
-    assert no_new_fds?(before_fds)
     assert :ok = Service.reply(call, [])
-    send(taker, :stop_taker)
+    assert UnixFD.open?(borrowed)
+    refute_received {:unexpected_message, _message}
+
+    Process.exit(taker, :kill)
+    assert_closed_once(borrowed)
   end
 
-  test "closes call descriptors whose taker exits before acknowledging", %{
+  test "closes call descriptors whose taker exits before the connection reads the take", %{
     server: server,
     connection: connection
   } do
-    parent = self()
-    before_fds = fd_set!()
-    {_ref, call} = fd_call!(server, connection, "Take")
+    {_ref, %Call{unix_fds: [borrowed]} = call} = fd_call!(server, connection, "Take")
 
-    TestImpl.install(connection,
-      fd_claim_delivery: fn ->
-        send(parent, :take_delivery_waiting)
+    :ok = :sys.suspend(connection)
+    taker = spawn(fn -> Service.take_fds(call, 1_000) end)
 
-        receive do
-          :continue_take_delivery -> :ok
-        end
-      end
-    )
-
-    taker = spawn(fn -> send(parent, {:take_result, Service.take_fds(call, 1_000)}) end)
-    assert_receive :take_delivery_waiting, 1_000
+    assert eventually(fn ->
+             Process.info(connection, :message_queue_len) != {:message_queue_len, 0}
+           end)
 
     taker_ref = Process.monitor(taker)
     Process.exit(taker, :kill)
     assert_receive {:DOWN, ^taker_ref, :process, ^taker, :killed}, 1_000
+    :ok = :sys.resume(connection)
 
-    send(connection, :continue_take_delivery)
-    refute_receive {:take_result, _result}, 50
-    assert eventually(fn -> :sys.get_state(connection).fd_claims.claims == %{} end)
-    assert no_new_fds?(before_fds)
-    assert :ok = Service.reply(call, [])
-  end
-
-  test "closes call descriptors whose acknowledgement stalls past the claim deadline", %{
-    server: server,
-    connection: connection
-  } do
-    parent = self()
-    before_fds = fd_set!()
-    {_ref, call} = fd_call!(server, connection, "Take")
-
-    TestImpl.install(connection,
-      fd_claim_ack: fn _claim ->
-        send(parent, :take_ack_waiting)
-
-        receive do
-          :continue_take_ack -> :ok
-        end
-      end
-    )
-
-    task = Task.async(fn -> Service.take_fds(call, 200) end)
-    assert_receive :take_ack_waiting, 1_000
-
-    # As for a reply's claim: hold the acknowledgement beyond the 450ms claim
-    # deadline, so the connection must close rather than transfer.
-    Process.sleep(550)
-    send(connection, :continue_take_ack)
-
-    assert {:error, :fd_claim_expired} = Task.await(task, 1_000)
-    assert no_new_fds?(before_fds)
+    # The transfer found the taker gone and closed the handle.
+    assert_closed_once(borrowed)
     assert {:error, :unknown_call} = Service.take_fds(call)
     assert :ok = Service.reply(call, [])
   end
@@ -2343,30 +2059,6 @@ defmodule Rebus.UnixFDTest do
     end
   end
 
-  defp claimed_state(state, claim_ref, request_ref, monitor_ref, opts \\ []) do
-    timer_ref = Process.send_after(self(), {:fd_claim_timeout, claim_ref}, 60_000)
-
-    claim = %{
-      pid: self(),
-      msg: Message.new!(:method_return, reply_serial: 1),
-      request_ref: request_ref,
-      monitor_ref: monitor_ref,
-      timer_ref: timer_ref,
-      delivery_ref: Keyword.get(opts, :delivery_ref),
-      delivery_alias: Keyword.get(opts, :delivery_alias),
-      deadline: Keyword.get(opts, :deadline, System.monotonic_time(:millisecond) + 60_000)
-    }
-
-    %{
-      state
-      | fd_claims: %FDClaims{
-          claims: %{claim_ref => claim},
-          request_index: %{request_ref => claim_ref},
-          monitor_index: %{monitor_ref => claim_ref}
-        }
-    }
-  end
-
   # A descriptor an exported object's handler is holding: a call routed to
   # this process and left unanswered, so the connection still owns what it
   # carried.
@@ -2419,12 +2111,61 @@ defmodule Rebus.UnixFDTest do
     serial
   end
 
-  defp open_fd?(fd), do: MapSet.member?(fd_set!(), Integer.to_string(fd))
+  # Calls `method` from a task that checks it owns every handle in the reply,
+  # then hands them to the test process, so they outlive the task.
+  defp call_task(connection, method) do
+    parent = self()
+
+    Task.async(fn ->
+      result = Rebus.call(connection, method, 1_000)
+
+      case result do
+        {:ok, %Message{unix_fds: handles}} -> hand_back(handles, parent)
+        {:error, {:dbus_error, %Message{unix_fds: handles}}} -> hand_back(handles, parent)
+        _other -> :ok
+      end
+
+      result
+    end)
+  end
+
+  defp hand_back(handles, parent) do
+    me = self()
+
+    for handle <- handles do
+      {:ok, ^me} = UnixFD.owner(handle)
+      :ok = UnixFD.controlling_process(handle, parent)
+    end
+  end
+
+  # Runs `fun` in a short-lived process, so nothing it copies into its heap,
+  # such as a handle in a connection's state, outlives the call.
+  defp elsewhere(fun), do: fun |> Task.async() |> Task.await()
+
+  # The raw number behind an open handle, for comparison only.
+  defp raw!(handle) do
+    {:ok, fd} = UnixFD.with_fd(handle, & &1)
+    fd
+  end
+
+  defp identity!(handle) do
+    {:ok, identity} = UnixFD.with_fd(handle, &UnixFD.__fd_identity__/1)
+    identity
+  end
+
+  # close(2) on owner exit runs just after the handle reads closed, so the
+  # count is polled.
+  defp assert_closed_once(handle) do
+    assert eventually(fn ->
+             not UnixFD.open?(handle) and UnixFD.__close_count__(handle) == {:ok, 1}
+           end)
+  end
 
   defp no_new_fds?(before_fds),
     do: eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
 
-  defp eventually(fun, attempts \\ 20)
+  # Polls for up to a second, as loaded macOS runners need.
+  defp eventually(fun, attempts \\ 100)
 
   defp eventually(fun, attempts) when attempts > 0 do
     if fun.() do

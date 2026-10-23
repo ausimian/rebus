@@ -10,6 +10,7 @@ defmodule Rebus.Connection.SetupTest do
   alias Rebus.ScriptedTransport
   alias Rebus.TestFD
   alias Rebus.TestImpl
+  alias Rebus.UnixFD
 
   @guid "30313233343536373839616263646566"
   @other_guid "46454443424139383736353433323130"
@@ -273,12 +274,14 @@ defmodule Rebus.Connection.SetupTest do
     test "refuses a Hello reply that carries descriptors" do
       fd = descriptor()
 
+      # The frame only declares a descriptor; the connection attributes the
+      # handle it is holding.
       reply =
         Message.new!(:method_return,
           reply_serial: @hello_serial,
           signature: "h",
           body: [0],
-          fds: [fd]
+          fds: [0]
         )
 
       state = %{
@@ -287,10 +290,12 @@ defmodule Rebus.Connection.SetupTest do
           inbound_fds: Rights.retain(Rights.new(), [fd])
       }
 
-      # The connection closes the descriptor before stopping, which is why this
-      # test hands it one it owns rather than an arbitrary number.
+      # The connection closes the handle before stopping.
       assert {:protocol_error, :invalid_unix_fds, %Connection{}} =
                Setup.hello_reply_buffer(state)
+
+      refute UnixFD.open?(fd)
+      assert {:ok, 1} = UnixFD.__close_count__(fd)
     end
   end
 
@@ -433,10 +438,13 @@ defmodule Rebus.Connection.SetupTest do
     iodata(encoded)
   end
 
-  # A descriptor this test owns outright, so the close-or-deliver path under
-  # test closes a number no other socket still holds. `{:otp, :fd}` on a socket
-  # the test keeps would do exactly that; see `Rebus.TestFD`.
-  defp descriptor, do: TestFD.dup!()
+  # A handle this process owns, as the connection owns every descriptor it
+  # receives: one end of a new pipe.
+  defp descriptor do
+    {:ok, read, write} = UnixFD.__pipe__()
+    :ok = UnixFD.close(write)
+    read
+  end
 
   defp dead_process do
     pid = spawn(fn -> :ok end)

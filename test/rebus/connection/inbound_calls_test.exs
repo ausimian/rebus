@@ -1,18 +1,16 @@
 defmodule Rebus.Connection.InboundCallsTest do
-  # Not async: assertions turn on whether a specific descriptor number is still
-  # open, and a concurrently opened descriptor could reuse a closed number.
-  use ExUnit.Case, async: false
+  use ExUnit.Case, async: true
 
   alias Rebus.Connection.InboundCalls
   alias Rebus.Connection.InboundCalls.Entry
   alias Rebus.TestFD
-  alias Rebus.UnixFD.Raw
+  alias Rebus.UnixFD
 
   @moduletag skip: TestFD.skip_reason()
 
   describe "insert/3" do
     test "records the call under its reference and starts its expiry timer" do
-      fd = TestFD.dup!()
+      fd = handle!()
       handler = self()
       ref = make_ref()
       export = make_ref()
@@ -47,9 +45,9 @@ defmodule Rebus.Connection.InboundCallsTest do
       assert entry.deadline <= System.monotonic_time(:millisecond) + 60_000
       assert {:ok, ^entry} = InboundCalls.fetch(calls, ref)
 
-      # Inserting takes the descriptor into the table without closing it. The
-      # probe closes it, so the table must not be closed after it.
+      # Inserting takes the handle into the table without closing it.
       assert open?(fd)
+      InboundCalls.close_all(calls)
     end
 
     test "records whether the caller asked for no reply" do
@@ -119,7 +117,7 @@ defmodule Rebus.Connection.InboundCallsTest do
   describe "pop_export/2" do
     test "removes and releases every call made on the export, in serial order" do
       export = make_ref()
-      fd = TestFD.dup!()
+      fd = handle!()
       {second, calls} = insert(InboundCalls.new(), export: export, serial: 9, unix_fds: [fd])
       {other, calls} = insert(calls, serial: 8)
       {first, calls} = insert(calls, export: export, serial: 3)
@@ -146,7 +144,7 @@ defmodule Rebus.Connection.InboundCallsTest do
 
   describe "complete/2" do
     test "removes the call, cancels its timer and closes its descriptors" do
-      fd = TestFD.dup!()
+      fd = handle!()
       {entry, calls} = insert(InboundCalls.new(), unix_fds: [fd])
 
       assert {^entry, calls} = InboundCalls.complete(calls, entry.ref)
@@ -176,7 +174,7 @@ defmodule Rebus.Connection.InboundCallsTest do
     end
 
     test "completes a call that never expires" do
-      fd = TestFD.dup!()
+      fd = handle!()
       {entry, calls} = insert(InboundCalls.new(), call_timeout: :infinity, unix_fds: [fd])
 
       assert {^entry, calls} = InboundCalls.complete(calls, entry.ref)
@@ -187,7 +185,7 @@ defmodule Rebus.Connection.InboundCallsTest do
 
   describe "take_fds/2" do
     test "moves the descriptors out and leaves the call pending" do
-      fd = TestFD.dup!()
+      fd = handle!()
       {entry, calls} = insert(InboundCalls.new(), unix_fds: [fd])
 
       assert {:ok, ^entry, calls} = InboundCalls.take_fds(calls, entry.ref)
@@ -197,20 +195,21 @@ defmodule Rebus.Connection.InboundCallsTest do
 
       assert taken.timer_ref == entry.timer_ref
 
-      # Completing the call no longer closes what was taken. The probe closes
-      # it instead.
+      # Completing the call no longer closes what was taken.
       assert {%Entry{}, _calls} = InboundCalls.complete(calls, entry.ref)
       assert open?(fd)
+      UnixFD.close(fd)
     end
 
     test "takes descriptors only once" do
-      fd = TestFD.dup!()
+      fd = handle!()
       {entry, calls} = insert(InboundCalls.new(), unix_fds: [fd])
       {:ok, ^entry, calls} = InboundCalls.take_fds(calls, entry.ref)
 
       assert :error = InboundCalls.take_fds(calls, entry.ref)
       assert open?(fd)
       InboundCalls.close_all(calls)
+      UnixFD.close(fd)
     end
 
     test "finds nothing for a call that is gone" do
@@ -233,7 +232,7 @@ defmodule Rebus.Connection.InboundCallsTest do
     end
 
     test "removes the expired call and closes its descriptors" do
-      fd = TestFD.dup!()
+      fd = handle!()
       {entry, calls} = insert(InboundCalls.new(), call_timeout: 10, unix_fds: [fd])
       ref = entry.ref
       assert_receive {:inbound_call_timeout, ^ref}, 1_000
@@ -244,7 +243,7 @@ defmodule Rebus.Connection.InboundCallsTest do
     end
 
     test "finds nothing when the timer fires after the call completed" do
-      fd = TestFD.dup!()
+      fd = handle!()
       {entry, calls} = insert(InboundCalls.new(), call_timeout: 10, unix_fds: [fd])
       ref = entry.ref
 
@@ -258,10 +257,36 @@ defmodule Rebus.Connection.InboundCallsTest do
     end
   end
 
+  describe "releasing a call" do
+    test "closes only the handles this process still owns" do
+      owned = handle!()
+      moved = handle!()
+      owner = spawn(fn -> Process.sleep(:infinity) end)
+      :ok = UnixFD.controlling_process(moved, owner)
+      {entry, calls} = insert(InboundCalls.new(), unix_fds: [owned, moved])
+
+      assert {^entry, _calls} = InboundCalls.complete(calls, entry.ref)
+
+      assert closed?(owned)
+      assert {:ok, ^owner} = UnixFD.owner(moved)
+      Process.exit(owner, :kill)
+    end
+
+    test "leaves a handle its handler already closed closed once" do
+      fd = handle!()
+      {entry, calls} = insert(InboundCalls.new(), unix_fds: [fd])
+      handler = Task.async(fn -> UnixFD.close(fd) end)
+      assert :ok = Task.await(handler)
+
+      assert {^entry, _calls} = InboundCalls.complete(calls, entry.ref)
+      assert closed?(fd)
+    end
+  end
+
   describe "close_all/1" do
     test "cancels every timer and closes every descriptor" do
-      first_fd = TestFD.dup!()
-      second_fd = TestFD.dup!()
+      first_fd = handle!()
+      second_fd = handle!()
       {first, calls} = insert(InboundCalls.new(), unix_fds: [first_fd])
       {second, calls} = insert(calls, call_timeout: :infinity, unix_fds: [second_fd])
 
@@ -276,8 +301,8 @@ defmodule Rebus.Connection.InboundCallsTest do
 
   describe "fail_all/1" do
     test "closes everything and leaves an empty table" do
-      first_fd = TestFD.dup!()
-      second_fd = TestFD.dup!()
+      first_fd = handle!()
+      second_fd = handle!()
       {first, calls} = insert(InboundCalls.new(), unix_fds: [first_fd])
       {second, calls} = insert(calls, unix_fds: [second_fd])
 
@@ -305,7 +330,18 @@ defmodule Rebus.Connection.InboundCallsTest do
     InboundCalls.insert(calls, call, Keyword.get(opts, :call_timeout, 60_000))
   end
 
-  defp open?(fd), do: Raw.close(fd) == :ok
+  # One end of a new pipe, owned by the test process as the connection would
+  # own a received descriptor.
+  defp handle! do
+    {:ok, read, write} = UnixFD.__pipe__()
+    :ok = UnixFD.close(write)
+    read
+  end
 
-  defp closed?(fd), do: Raw.close(fd) == {:error, :ebadf}
+  defp open?(handle), do: UnixFD.open?(handle)
+
+  # The close is synchronous in the process that made it, so close(2) has
+  # run exactly once by the time it returns.
+  defp closed?(handle),
+    do: not UnixFD.open?(handle) and UnixFD.__close_count__(handle) == {:ok, 1}
 end

@@ -7,7 +7,6 @@ defmodule Rebus.Connection.DispatchTest do
 
   alias Rebus.Connection
   alias Rebus.Connection.Dispatch
-  alias Rebus.Connection.FDClaims
   alias Rebus.Connection.Inbound
   alias Rebus.Connection.InboundCalls
   alias Rebus.Connection.Objects
@@ -21,6 +20,7 @@ defmodule Rebus.Connection.DispatchTest do
   alias Rebus.ScriptedTransport
   alias Rebus.Service.Call
   alias Rebus.TestFD
+  alias Rebus.UnixFD
 
   # xmerl only checks the documents Introspect answers with; it is not a
   # runtime dependency of Rebus.
@@ -75,7 +75,16 @@ defmodule Rebus.Connection.DispatchTest do
       assert state.pending == Pending.new()
       refute Map.has_key?(state.pending.request_index, request_ref)
       refute Map.has_key?(state.pending.monitor_index, monitor_ref)
-      assert_received {^tag, %Message{type: :method_return, body: ["ok"]}}
+      assert_received {^tag, {:ok, %Message{type: :method_return, body: ["ok"]}}}
+    end
+
+    test "answers a D-Bus error reply as a dbus_error" do
+      %{tag: tag} = entry = caller()
+      state = pending(connection(), 11, entry)
+      reply = Message.new!(:error, reply_serial: 11, error_name: "org.example.Error.No")
+
+      assert {:continue, :recv, %Connection{}} = dispatch(reply, state)
+      assert_received {^tag, {:error, {:dbus_error, %Message{type: :error}}}}
     end
 
     test "logs and drops a reply that correlates to nothing" do
@@ -91,33 +100,56 @@ defmodule Rebus.Connection.DispatchTest do
     end
 
     @tag skip: TestFD.skip_reason()
-    test "opens a file-descriptor claim for a reply that carries descriptors" do
+    test "makes the caller the owner of a reply's handles before answering it" do
       fd = descriptor()
+      test = self()
+
+      caller_pid =
+        spawn_link(fn ->
+          receive(do: (answer -> send(test, {:caller, answer})))
+          Process.sleep(:infinity)
+        end)
+
       %{tag: tag, request_ref: request_ref} = entry = caller()
+      entry = %{entry | from: {caller_pid, tag}}
 
-      state =
-        %{
-          pending(connection(), 11, entry)
-          | unix_fd_negotiated?: true,
-            inbound_fds: Rights.retain(Rights.new(), [fd])
-        }
+      state = %{
+        pending(connection(), 11, entry)
+        | unix_fd_negotiated?: true,
+          inbound_fds: Rights.retain(Rights.new(), [fd])
+      }
 
-      reply =
-        Message.new!(:method_return,
-          reply_serial: 11,
-          signature: "h",
-          body: [0],
-          fds: [fd]
-        )
-
-      assert {:continue, :recv, %Connection{} = state} = dispatch(reply, state)
+      assert {:continue, :recv, %Connection{} = state} = dispatch(fd_reply(11), state)
       assert state.pending == Pending.new()
-      assert_received {^tag, {:fd_claim, claim_ref}}
-      assert {:ok, ^claim_ref} = FDClaims.fetch_by_request(state.fd_claims, request_ref)
+      assert_receive {:caller, {^tag, {:ok, %Message{unix_fds: [^fd]}}}}, 1_000
+      assert {:ok, ^caller_pid} = UnixFD.owner(fd)
+      assert Rights.fds(state.inbound_fds) == []
 
-      # The claim still owns the descriptor, so this test closes it rather than
-      # leaving it open for the life of the run.
-      FDClaims.close_all(state.fd_claims)
+      # Remembered, so that the caller's cancel can close them should it
+      # have stopped waiting.
+      assert %{^request_ref => {[^fd], _timer_ref}} = state.handed_over.entries
+
+      Process.unlink(caller_pid)
+      Process.exit(caller_pid, :kill)
+    end
+
+    @tag skip: TestFD.skip_reason()
+    test "closes a reply's handles instead of answering a caller that died" do
+      fd = descriptor()
+      dead = spawn(fn -> :ok end)
+      ref = Process.monitor(dead)
+      assert_receive {:DOWN, ^ref, :process, ^dead, _reason}
+      %{tag: tag} = entry = caller()
+
+      state = %{
+        pending(connection(), 11, %{entry | from: {dead, tag}})
+        | unix_fd_negotiated?: true,
+          inbound_fds: Rights.retain(Rights.new(), [fd])
+      }
+
+      assert {:continue, :recv, %Connection{}} = dispatch(fd_reply(11), state)
+      refute UnixFD.open?(fd)
+      assert {:ok, 1} = UnixFD.__close_count__(fd)
     end
 
     test "fails a pending call whose reply hit a resource limit" do
@@ -882,7 +914,7 @@ defmodule Rebus.Connection.DispatchTest do
       fd = descriptor()
       {export_ref, state} = exported(fd_connection(fd), interfaces: [@files])
 
-      assert {:continue, :recv, %Connection{} = state} = dispatch(fd_call("Take", fd), state)
+      assert {:continue, :recv, %Connection{} = state} = dispatch(fd_call("Take"), state)
 
       assert_received {^export_ref, %Call{unix_fds: [^fd], message: message} = call}
       assert message.unix_fds == [fd]
@@ -908,7 +940,7 @@ defmodule Rebus.Connection.DispatchTest do
           ] do
         fd = descriptor()
         {export_ref, state} = exported(fd_connection(fd), interfaces: [@files])
-        call = %{fd_call("Take", fd) | flags: [:no_reply_expected]}
+        call = %{fd_call("Take") | flags: [:no_reply_expected]}
 
         {:continue, :recv, state} = dispatch(call, state)
 
@@ -934,7 +966,7 @@ defmodule Rebus.Connection.DispatchTest do
       assert_received {^export_ref, %Call{}}
 
       state = %{state | inbound_fds: Rights.retain(state.inbound_fds, [fd])}
-      call = %{fd_call("Take", fd) | flags: [:no_reply_expected]}
+      call = %{fd_call("Take") | flags: [:no_reply_expected]}
 
       log =
         capture_log(fn ->
@@ -954,7 +986,10 @@ defmodule Rebus.Connection.DispatchTest do
     test "cannot be sent back in the reply that completes the call" do
       fd = descriptor()
       {call, state} = fd_routed(fd, "Echo")
-      reply = Message.new!(:method_return, reply_serial: 5, signature: "h", body: [0], fds: [fd])
+
+      # Outbound descriptors are raw numbers, which a handler can read out of
+      # a borrowed handle.
+      reply = fd_reply(5) |> with_raw_fds([fd])
 
       assert {:error, :unix_fd_borrowed} = Service.complete(state, call.ref, reply)
 
@@ -971,10 +1006,13 @@ defmodule Rebus.Connection.DispatchTest do
       assert {:error, :unix_fd_borrowed} = Service.complete(state, other_ref, reply)
 
       # Nor one received for a frame still being read.
-      buffering = %{state | inbound_fds: Rights.retain(state.inbound_fds, [:buffered])}
+      buffered = descriptor()
+      buffering = %{state | inbound_fds: Rights.retain(state.inbound_fds, [buffered])}
 
       assert {:error, :unix_fd_borrowed} =
-               Service.complete(buffering, call.ref, %{reply | unix_fds: [:buffered]})
+               Service.complete(buffering, call.ref, with_raw_fds(reply, [buffered]))
+
+      UnixFD.close(buffered)
 
       # Any other descriptor is the handler's own to lend.
       assert {:ok, %Message{unix_fds: [:not_a_descriptor]}, state} =
@@ -990,7 +1028,7 @@ defmodule Rebus.Connection.DispatchTest do
       {export_ref, state} = exported(fd_connection(fd), interfaces: [@files])
 
       {:continue, :recv, state} =
-        dispatch(%{fd_call("Take", fd) | flags: [:no_reply_expected]}, state)
+        dispatch(%{fd_call("Take") | flags: [:no_reply_expected]}, state)
 
       assert_received {^export_ref, %Call{ref: ref}}
 
@@ -1007,44 +1045,51 @@ defmodule Rebus.Connection.DispatchTest do
       assert {:ok, _entry} = InboundCalls.fetch(state.inbound_calls, ref)
     end
 
-    test "are handed over once, through an FD claim, leaving the call pending" do
+    test "are handed over once, to the taker, leaving the call pending" do
       fd = descriptor()
       {call, state} = fd_routed(fd, "Take")
-      {from, tag} = local_caller()
-      request_ref = make_ref()
-      deadline = System.monotonic_time(:millisecond) + 60_000
+      taker = spawn_link(fn -> Process.sleep(:infinity) end)
 
-      assert {:ok, state} = Service.take_fds(state, call.ref, from, deadline, request_ref)
-      assert_received {^tag, {:fd_claim, claim_ref}}
-      assert {:ok, ^claim_ref} = FDClaims.fetch_by_request(state.fd_claims, request_ref)
-      assert %{msg: %Message{unix_fds: [^fd]}} = state.fd_claims.claims[claim_ref]
+      assert {:ok, [^fd], state} = Service.take_fds(state, call.ref, taker)
+      assert {:ok, ^taker} = UnixFD.owner(fd)
 
       assert {:ok, %{unix_fds: [], taken?: true}} =
                InboundCalls.fetch(state.inbound_calls, call.ref)
 
-      assert {:error, :unknown_call} =
-               Service.take_fds(state, call.ref, from, deadline, make_ref())
+      assert {:error, :unknown_call} = Service.take_fds(state, call.ref, taker)
 
-      # Until the claim settles the descriptor is still the connection's, so
-      # a reply cannot send it.
-      echo = Message.new!(:method_return, reply_serial: 5, fds: [fd])
-      assert {:error, :unix_fd_borrowed} = Service.complete(state, call.ref, echo)
+      # The taker owns it now, so a reply may send its number.
+      echo = fd_reply(5) |> with_raw_fds([fd])
+      assert {:ok, %Message{}, _state} = Service.complete(state, call.ref, echo)
 
-      # Once it is acknowledged the taker owns it, and may.
-      acked = FDClaims.drop(state.fd_claims, claim_ref, close?: false, outcome: :acknowledged)
-
-      assert {:ok, %Message{unix_fds: [^fd]}, _state} =
-               Service.complete(%{state | fd_claims: acked}, call.ref, echo)
-
-      # The call is still answered as usual, and the claim keeps the descriptor.
+      # The call is still answered as usual, and completing it leaves the
+      # taker's handle open.
       reply = Message.new!(:method_return, reply_serial: 5)
       assert {:ok, _reply, state} = Service.complete(state, call.ref, reply)
-      assert map_size(state.fd_claims.claims) == 1
+      assert UnixFD.open?(fd)
+      assert {:error, :unknown_call} = Service.take_fds(state, call.ref, taker)
 
-      assert {:error, :unknown_call} =
-               Service.take_fds(state, call.ref, from, deadline, make_ref())
+      Process.unlink(taker)
+      Process.exit(taker, :kill)
+    end
 
-      FDClaims.close_all(state.fd_claims)
+    test "close only the handles the connection still owns when the call completes" do
+      fd = descriptor()
+      {call, state} = fd_routed(fd, "Take")
+
+      # Were the handle closed regardless of its owner, the call completing
+      # would close one that is no longer the connection's.
+      elsewhere = spawn_link(fn -> Process.sleep(:infinity) end)
+      :ok = UnixFD.controlling_process(fd, elsewhere)
+
+      reply = Message.new!(:method_return, reply_serial: 5)
+      assert {:ok, _reply, state} = Service.complete(state, call.ref, reply)
+      assert {:ok, ^elsewhere} = UnixFD.owner(fd)
+      assert {:ok, 0} = UnixFD.__close_count__(fd)
+      assert state.inbound_calls == InboundCalls.new()
+
+      Process.unlink(elsewhere)
+      Process.exit(elsewhere, :kill)
     end
   end
 
@@ -1286,18 +1331,33 @@ defmodule Rebus.Connection.DispatchTest do
         inbound_fds: Rights.retain(Rights.new(), [fd])
     }
 
-  defp fd_call(member, fd, opts \\ []),
+  # The frame only declares its descriptor: the connection attributes the
+  # handle it is holding, so the number given here is never used.
+  defp fd_call(member),
     do:
       app_call(
         member,
-        opts ++ [interface: "org.example.Files", signature: "h", body: [0], fds: [fd]]
+        interface: "org.example.Files",
+        signature: "h",
+        body: [0],
+        fds: [0]
       )
+
+  # `msg` sending the raw numbers behind `handles`, as a handler would after
+  # reading them out with `Rebus.UnixFD.with_fd/2`.
+  defp with_raw_fds(%Message{} = msg, handles) do
+    %{msg | unix_fds: Enum.map(handles, &elem(UnixFD.with_fd(&1, fn fd -> fd end), 1))}
+  end
+
+  # A method return for `serial` declaring one descriptor, as `fd_call/1`.
+  defp fd_reply(serial),
+    do: Message.new!(:method_return, reply_serial: serial, signature: "h", body: [0], fds: [0])
 
   # A call to `member` of `@files` carrying `fd`, routed to this process and
   # recorded.
   defp fd_routed(fd, member) do
     {export_ref, state} = exported(fd_connection(fd), interfaces: [@files])
-    {:continue, :recv, state} = dispatch(fd_call(member, fd), state)
+    {:continue, :recv, state} = dispatch(fd_call(member), state)
     assert_received {^export_ref, %Call{} = call}
     {call, state}
   end
@@ -1402,10 +1462,13 @@ defmodule Rebus.Connection.DispatchTest do
   defp handler(rule),
     do: %{pid: self(), monitor_ref: Process.monitor(self()), rule: rule}
 
-  # A descriptor this test owns outright, so the close-or-deliver path under
-  # test never closes a number another socket still holds. `{:otp, :fd}` on a
-  # socket the test keeps would do exactly that; see `Rebus.TestFD`.
-  defp descriptor, do: TestFD.dup!()
+  # A handle this process owns, as the connection owns every descriptor it
+  # receives: one end of a new pipe.
+  defp descriptor do
+    {:ok, read, write} = UnixFD.__pipe__()
+    :ok = UnixFD.close(write)
+    read
+  end
 
   # A well-formed `method_return` frame whose body exceeds a local scalar cap,
   # so parsing yields the reply envelope and `{:error, :resource_limit, ...}`.

@@ -8,27 +8,15 @@ defmodule Rebus.SafeCall do
   # other exit means the server is gone.
 
   @typedoc """
-  How a call answers when it does not complete.
-
-  `:cancel` is cast to the server before a timed-out call answers,
-  `:on_timeout` replaces the `{:error, :timeout}` it would otherwise return,
-  and `:then` post-processes a successful reply inside the same `try`, so an
-  exit raised while doing so is caught here too.
+  How a call answers when it does not complete: `:cancel` is cast to the
+  server before a timed-out call returns `{:error, :timeout}`.
   """
-  @type option ::
-          {:cancel, term()}
-          | {:on_timeout, (-> term())}
-          | {:then, (term() -> term())}
+  @type option :: {:cancel, term()}
 
   @doc false
   @spec call(GenServer.server(), term(), timeout(), [option()]) :: term()
   def call(server, request, timeout, opts \\ []) do
-    reply = GenServer.call(server, request, timeout)
-
-    case Keyword.get(opts, :then) do
-      nil -> reply
-      then_fun -> then_fun.(reply)
-    end
+    GenServer.call(server, request, timeout)
   catch
     :exit, {:timeout, _call} -> timed_out(server, opts)
     :exit, _reason -> {:error, :disconnected}
@@ -40,9 +28,6 @@ defmodule Rebus.SafeCall do
       cancellation -> GenServer.cast(server, cancellation)
     end
 
-    case Keyword.get(opts, :on_timeout) do
-      nil -> {:error, :timeout}
-      on_timeout -> on_timeout.()
-    end
+    {:error, :timeout}
   end
 end
