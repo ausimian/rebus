@@ -60,7 +60,7 @@ defmodule Rebus.Connection.Writer do
       field :wait, nil | {:continue, tuple()} | {:select, tuple(), reference()}
       field :timer_ref, reference()
       field :partial?, boolean()
-      field :unix_fds, [Rebus.UnixFD.t()]
+      field :unix_fds, [Rebus.UnixFD.raw()]
       field :uses_sendmsg?, boolean()
       # `:socket.sendmsg/4` retains the original encoded control map in a select
       # continuation. We keep this explicit so that only a no-progress select

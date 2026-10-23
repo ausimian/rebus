@@ -51,7 +51,7 @@ defmodule Rebus.Connection.Rights do
   typedstruct enforce: true do
     # Received descriptors not yet claimed by a frame, in arrival order. The
     # batches partition this list.
-    field :fds, [UnixFD.t()], default: []
+    field :fds, [UnixFD.raw()], default: []
     # Oldest first. A batch outlives its read only while the frame being
     # assembled began inside it, so there is at most one between receives.
     field :batches, [batch()], default: []
@@ -80,19 +80,19 @@ defmodule Rebus.Connection.Rights do
   each names descriptors the connection must close, exactly once.
   """
   @type decision ::
-          {:frame, binary(), [UnixFD.t()]}
-          | {:quarantine, binary(), [UnixFD.t()], atom()}
-          | {:taint, binary(), [UnixFD.t()]}
-          | {:stop, atom(), [UnixFD.t()]}
+          {:frame, binary(), [UnixFD.raw()]}
+          | {:quarantine, binary(), [UnixFD.raw()], atom()}
+          | {:taint, binary(), [UnixFD.raw()]}
+          | {:stop, atom(), [UnixFD.raw()]}
 
   @typedoc false
-  @type fds_result :: {:ok, [UnixFD.t()]} | {:error, atom(), [UnixFD.t()]}
+  @type fds_result :: {:ok, [UnixFD.raw()]} | {:error, atom(), [UnixFD.raw()]}
 
   @spec new() :: t()
   def new, do: %__MODULE__{}
 
   @doc false
-  @spec fds(t()) :: [UnixFD.t()]
+  @spec fds(t()) :: [UnixFD.raw()]
   def fds(%__MODULE__{fds: fds}), do: fds
 
   @doc false
@@ -111,7 +111,7 @@ defmodule Rebus.Connection.Rights do
   # Hold descriptors for the frame at the head of the inbound buffer alone.
   # Received batches are added by `decode/3`, which knows their byte range.
   @doc false
-  @spec retain(t(), [UnixFD.t()]) :: t()
+  @spec retain(t(), [UnixFD.raw()]) :: t()
   def retain(%__MODULE__{} = rights, []), do: rights
 
   def retain(%__MODULE__{offset: offset} = rights, fds),
@@ -122,7 +122,7 @@ defmodule Rebus.Connection.Rights do
   # with any descriptors rejected on receipt, which the caller must close.
   @doc false
   @spec decode(term(), t(), context()) ::
-          {:ok, binary(), t(), [UnixFD.t()]} | {:stop, atom(), [UnixFD.t()]}
+          {:ok, binary(), t(), [UnixFD.raw()]} | {:stop, atom(), [UnixFD.raw()]}
   def decode(message, %__MODULE__{} = rights, context) do
     case decode_message(message, context) do
       {:frame, data, fds} ->
@@ -228,7 +228,7 @@ defmodule Rebus.Connection.Rights do
   # at or before the head frame. Their unclaimed descriptors are named for the
   # caller to close, never carried into a later frame.
   @doc false
-  @spec expire(t()) :: {[UnixFD.t()], t()}
+  @spec expire(t()) :: {[UnixFD.raw()], t()}
   def expire(%__MODULE__{batches: [%{stop: stop} = batch | batches], offset: offset} = rights)
       when stop <= offset do
     {unclaimed, fds} = Enum.split(rights.fds, batch.count)
@@ -245,7 +245,7 @@ defmodule Rebus.Connection.Rights do
   # closed with it, never carried into a later frame.
   @doc false
   @spec attach(t(), Message.t(), pos_integer(), boolean()) ::
-          {:ok, Message.t(), t()} | {:error, atom(), [UnixFD.t()], t()}
+          {:ok, Message.t(), t()} | {:error, atom(), [UnixFD.raw()], t()}
   def attach(%__MODULE__{} = rights, %Message{} = msg, size, negotiated?) do
     {fds, rejected, advanced} = claim(rights, declared_unix_fds(msg), size)
 
@@ -264,7 +264,7 @@ defmodule Rebus.Connection.Rights do
   # attributed safely: those descriptors are named for closing and the batch
   # is poisoned for any later frame in its range.
   @doc false
-  @spec skip(t(), pos_integer()) :: {[UnixFD.t()], t()}
+  @spec skip(t(), pos_integer()) :: {[UnixFD.raw()], t()}
   def skip(%__MODULE__{} = rights, size) do
     case in_scope(rights) do
       {%{reason: nil, count: count} = batch, batches} ->
@@ -402,7 +402,7 @@ defmodule Rebus.Connection.Rights do
   end
 
   @doc false
-  @spec decode_rights_data(binary()) :: {:ok, [UnixFD.t()]} | {:error, [UnixFD.t()]}
+  @spec decode_rights_data(binary()) :: {:ok, [UnixFD.raw()]} | {:error, [UnixFD.raw()]}
   def decode_rights_data(data) do
     complete_size = div(byte_size(data), 4) * 4
     <<complete::binary-size(^complete_size), _tail::binary>> = data

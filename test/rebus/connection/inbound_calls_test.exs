@@ -6,7 +6,7 @@ defmodule Rebus.Connection.InboundCallsTest do
   alias Rebus.Connection.InboundCalls
   alias Rebus.Connection.InboundCalls.Entry
   alias Rebus.TestFD
-  alias Rebus.UnixFD
+  alias Rebus.UnixFD.Raw
 
   @moduletag skip: TestFD.skip_reason()
 
@@ -305,7 +305,7 @@ defmodule Rebus.Connection.InboundCallsTest do
     InboundCalls.insert(calls, call, Keyword.get(opts, :call_timeout, 60_000))
   end
 
-  defp open?(fd), do: UnixFD.close(fd) == :ok
+  defp open?(fd), do: Raw.close(fd) == :ok
 
-  defp closed?(fd), do: UnixFD.close(fd) == {:error, :ebadf}
+  defp closed?(fd), do: Raw.close(fd) == {:error, :ebadf}
 end

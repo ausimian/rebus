@@ -123,7 +123,7 @@ defmodule Rebus.Message do
     field :serial, non_neg_integer()
     field :header_fields, %{optional(header_field()) => term()}
     field :body, [term()]
-    field :unix_fds, [Rebus.UnixFD.t()], default: []
+    field :unix_fds, [Rebus.UnixFD.raw()], default: []
 
     # Internal little-endian encoding cache populated by `new/2`, holding the
     # `{body, signature, binary}` the encoded bytes were produced from. Callers
@@ -753,7 +753,7 @@ defmodule Rebus.Message do
   end
 
   @doc false
-  @spec attach_unix_fds(t(), [Rebus.UnixFD.t()]) ::
+  @spec attach_unix_fds(t(), [Rebus.UnixFD.raw()]) ::
           {:ok, t()} | {:error, :invalid_unix_fds | :unix_fd_limit}
   def attach_unix_fds(%__MODULE__{} = message, fds) when is_list(fds) do
     message = %{message | unix_fds: fds}

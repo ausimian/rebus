@@ -33,19 +33,33 @@
 # owner-death monitor, which an explicit close has removed.  So on
 # `{:error, _}` this adapter must not retry, and neither can the caller.
 #
-# Migration: if OTP gains a public way to close a raw descriptor, change
-# `close/1` below to use it and delete the compatibility test.  Otherwise the
-# fallback is a minimal NIF built with `elixir_make`; that adds a C toolchain
-# to the build and to the hex package, so it is a build-system decision to be
-# taken on its own, not a change to be made in passing here.
+# Migration: this module closes the raw descriptors the connection still
+# carries.  Once the connection carries `Rebus.UnixFD` handles instead, whose
+# NIF closes descriptors itself (c_src/rebus_unix_fd.cpp), this module and its
+# compatibility test are deleted (#261).
 defmodule Rebus.UnixFD.Raw do
   @moduledoc false
 
   @doc """
-  Adopts a raw descriptor and closes it, reporting the outcome.
+  Closes an owned raw descriptor, reporting the outcome.
+
+  This consumes the descriptor whether it returns `:ok` or a POSIX error:
+  never retry. `:invalid_descriptor` rejects a value that is not a
+  non-negative integer, `:close_failed` reports an unexpected close failure,
+  and after `:unsupported` the caller still owns the descriptor.
   """
-  @spec close(non_neg_integer()) :: :ok | {:error, term()}
+  @spec close(term()) ::
+          :ok | {:error, :close_failed | :invalid_descriptor | :unsupported | term()}
   def close(fd) when is_integer(fd) and fd >= 0 do
+    case :os.type() do
+      {:unix, _} -> adopt_and_close(fd)
+      _ -> {:error, :unsupported}
+    end
+  end
+
+  def close(_fd), do: {:error, :invalid_descriptor}
+
+  defp adopt_and_close(fd) do
     case :prim_file.file_desc_to_ref(fd, [:raw]) do
       {:ok, file} -> :file.close(file)
       {:error, reason} -> {:error, reason}

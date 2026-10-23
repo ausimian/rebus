@@ -73,9 +73,9 @@ defmodule Rebus.UnixFDTest do
   end
 
   test "reports invalid raw descriptors without closing an unrelated descriptor" do
-    assert {:error, :invalid_descriptor} = UnixFD.close(-1)
-    assert {:error, :invalid_descriptor} = UnixFD.close(:not_a_descriptor)
-    assert {:error, :ebadf} = UnixFD.close(1_000_000)
+    assert {:error, :invalid_descriptor} = Raw.close(-1)
+    assert {:error, :invalid_descriptor} = Raw.close(:not_a_descriptor)
+    assert {:error, :ebadf} = Raw.close(1_000_000)
     assert :ok = UnixFD.close_all([1_000_000, -1])
     assert {:error, :ebadf} = Raw.close(1_000_000)
   end
@@ -128,7 +128,7 @@ defmodule Rebus.UnixFDTest do
     assert first != fd
     assert second != fd
     assert first != second
-    assert :ok = UnixFD.close(first)
+    assert :ok = Raw.close(first)
     assert :ok = Raw.close(second)
 
     # Read-only: /dev/fd is /proc/self/fd on Linux and the fdesc filesystem on
@@ -166,7 +166,7 @@ defmodule Rebus.UnixFDTest do
                    1_000
 
     assert received != fd
-    assert :ok = UnixFD.close(received)
+    assert :ok = Raw.close(received)
   end
 
   test "sends rights once and switches a partial sendmsg tail to send", %{connection: connection} do
@@ -332,7 +332,7 @@ defmodule Rebus.UnixFDTest do
     :ok = TestServer.push_with_fds(server, reply, [fd])
     assert {:ok, %Message{type: :method_return, unix_fds: [received]}} = Task.await(task, 1_000)
     assert received != fd
-    assert :ok = UnixFD.close(received)
+    assert :ok = Raw.close(received)
   end
 
   test "delivers a received descriptor with an FD-bearing D-Bus error reply", %{
@@ -374,7 +374,7 @@ defmodule Rebus.UnixFDTest do
              }}} = Task.await(task, 1_000)
 
     assert received != fd
-    assert :ok = UnixFD.close(received)
+    assert :ok = Raw.close(received)
   end
 
   test "closes an FD reply whose public call alias timed out while its PID lived", %{
@@ -655,7 +655,7 @@ defmodule Rebus.UnixFDTest do
     # Check the exact received descriptor before any other operation can cause
     # the OS to reuse its integer value. This is stronger than a process-wide
     # table comparison, which changes by one OTP fixture descriptor on close.
-    assert {:error, :ebadf} = UnixFD.close(received)
+    assert {:error, :ebadf} = Raw.close(received)
     assert Process.whereis(connection_name) == nil
 
     refute Enum.any?(DynamicSupervisor.which_children(Rebus.ConnectionSupervisor), fn
@@ -673,7 +673,7 @@ defmodule Rebus.UnixFDTest do
     ref = Process.monitor(connection)
     assert :ok = Rebus.close(connection)
     assert_receive {:DOWN, ^ref, :process, ^connection, :shutdown}, 1_000
-    assert {:error, :ebadf} = UnixFD.close(fd)
+    assert {:error, :ebadf} = Raw.close(fd)
   end
 
   test "a transport stop closes descriptors held by unanswered inbound calls", %{
@@ -685,7 +685,7 @@ defmodule Rebus.UnixFDTest do
     ref = Process.monitor(connection)
     :ok = :socket.shutdown(:sys.get_state(server).cli_sock, :write)
     assert_receive {:DOWN, ^ref, :process, ^connection, {:shutdown, :closed}}, 1_000
-    assert {:error, :ebadf} = UnixFD.close(fd)
+    assert {:error, :ebadf} = Raw.close(fd)
   end
 
   test "Rebus.close resolves an unacknowledged claim as disconnected", %{
@@ -745,7 +745,7 @@ defmodule Rebus.UnixFDTest do
     assert :ok = Task.await(close_task, 1_000)
     assert_receive {:DOWN, ^ref, :process, ^connection, :shutdown}, 1_000
     assert {:error, :disconnected} = Task.await(call_task, 1_000)
-    assert {:error, :ebadf} = UnixFD.close(received)
+    assert {:error, :ebadf} = Raw.close(received)
     assert Process.whereis(connection_name) == nil
 
     refute Enum.any?(DynamicSupervisor.which_children(Rebus.ConnectionSupervisor), fn
@@ -993,7 +993,7 @@ defmodule Rebus.UnixFDTest do
         :ok = TestServer.push_with_fds(server, reply, [fd])
         assert {:ok, %Message{unix_fds: [received]}} = Task.await(task, 1_000)
         assert received != fd
-        assert :ok = UnixFD.close(received)
+        assert :ok = Raw.close(received)
       end
     end
   end
@@ -1100,7 +1100,7 @@ defmodule Rebus.UnixFDTest do
     assert log =~ "D-Bus connection protocol stopped: :message_too_large"
     # Check the exact received descriptor before anything else can reuse its
     # integer value.
-    assert {:error, :ebadf} = UnixFD.close(received)
+    assert {:error, :ebadf} = Raw.close(received)
   end
 
   test "reads coalesced frames in one recvmsg once descriptors are negotiated", %{
@@ -1211,7 +1211,7 @@ defmodule Rebus.UnixFDTest do
     assert_receive {^handler_ref, %Message{header_fields: %{member: "BeforeFDReply"}}}, 1_000
     assert {:ok, %Message{type: :method_return, unix_fds: [received]}} = Task.await(task, 1_000)
     assert received != fd
-    assert :ok = UnixFD.close(received)
+    assert :ok = Raw.close(received)
   end
 
   test "delivers descriptors with consecutive replies in separate reads", %{
@@ -1234,7 +1234,7 @@ defmodule Rebus.UnixFDTest do
 
       :ok = TestServer.push_with_fds(server, reply, [fd])
       assert {:ok, %Message{unix_fds: [received]}} = Task.await(task, 1_000)
-      assert :ok = UnixFD.close(received)
+      assert :ok = Raw.close(received)
     end
   end
 
@@ -1488,7 +1488,7 @@ defmodule Rebus.UnixFDTest do
 
     # Completing the call closed nothing: the descriptor is this process's.
     assert open_fd?(borrowed)
-    assert :ok = UnixFD.close(borrowed)
+    assert :ok = Raw.close(borrowed)
     assert no_new_fds?(before_fds)
   end
 
@@ -1518,7 +1518,7 @@ defmodule Rebus.UnixFDTest do
 
     # The reply borrowed the descriptor, so it is still the handler's to close,
     # as the server's received duplicate is the server's.
-    assert :ok = UnixFD.close(received)
+    assert :ok = Raw.close(received)
 
     # An error reply carries them the same way.
     {:ok, ref} = Service.export(connection, @files_path <> "/Errors", [@files])
@@ -1541,9 +1541,9 @@ defmodule Rebus.UnixFDTest do
                     }},
                    1_000
 
-    assert :ok = UnixFD.close(received)
-    assert :ok = UnixFD.close(error_taken)
-    assert :ok = UnixFD.close(taken)
+    assert :ok = Raw.close(received)
+    assert :ok = Raw.close(error_taken)
+    assert :ok = Raw.close(taken)
     assert no_new_fds?(before_fds)
   end
 
@@ -2068,7 +2068,7 @@ defmodule Rebus.UnixFDTest do
 
     # The malformed first cmsg must not prevent the later, kernel-created
     # descriptor from being found and closed on the fail-closed path.
-    assert {:error, :ebadf} = UnixFD.close(received)
+    assert {:error, :ebadf} = Raw.close(received)
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
   end
 
@@ -2096,7 +2096,7 @@ defmodule Rebus.UnixFDTest do
                :sys.get_state(connection)
              )
 
-    assert {:error, :ebadf} = UnixFD.close(invalid_iov_fd)
+    assert {:error, :ebadf} = Raw.close(invalid_iov_fd)
 
     assert {:ok,
             %{
@@ -2109,7 +2109,7 @@ defmodule Rebus.UnixFDTest do
                :sys.get_state(connection)
              )
 
-    assert {:error, :ebadf} = UnixFD.close(missing_iov_fd)
+    assert {:error, :ebadf} = Raw.close(missing_iov_fd)
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
   end
 

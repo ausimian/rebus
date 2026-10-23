@@ -10,6 +10,8 @@ defmodule Rebus.MixProject do
       version: System.get_env("VERSION_OVERRIDE", @version),
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
+      compilers: compilers(),
+      make_env: &make_env/0,
       aliases: aliases(),
       deps: deps(),
       description: description(),
@@ -47,6 +49,19 @@ defmodule Rebus.MixProject do
   defp elixirc_paths(:test), do: ["lib", "test/lib"]
   defp elixirc_paths(_), do: ["lib"]
 
+  # The Rebus.UnixFD NIF is Unix-only; elsewhere it is not built and
+  # Rebus.UnixFD returns {:error, :unsupported}.
+  defp compilers do
+    case :os.type() do
+      {:unix, _} -> [:elixir_make] ++ Mix.compilers()
+      _ -> Mix.compilers()
+    end
+  end
+
+  defp make_env do
+    %{"FINE_INCLUDE_DIR" => Fine.include_dir()}
+  end
+
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
@@ -60,7 +75,9 @@ defmodule Rebus.MixProject do
     [
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:elixir_make, "~> 0.9", runtime: false},
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false},
+      {:fine, "~> 0.1", runtime: false},
       {:publisho, "~> 1.0", only: :dev, runtime: false},
       {:typedstruct, "~> 0.5.0", runtime: false}
     ]
@@ -139,6 +156,8 @@ defmodule Rebus.MixProject do
     [
       name: "rebus",
       licenses: ["MIT"],
+      # The NIF compiles on install, so its source and Makefile ship.
+      files: ~w(lib c_src Makefile mix.exs .formatter.exs README.md CHANGELOG.md LICENSE.md),
       links: %{
         "GitHub" => @source_url
       },

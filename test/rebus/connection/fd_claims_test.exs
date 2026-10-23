@@ -7,7 +7,7 @@ defmodule Rebus.Connection.FDClaimsTest do
   alias Rebus.Connection.Hooks
   alias Rebus.Message
   alias Rebus.TestFD
-  alias Rebus.UnixFD
+  alias Rebus.UnixFD.Raw
 
   @moduletag skip: TestFD.skip_reason()
 
@@ -481,13 +481,13 @@ defmodule Rebus.Connection.FDClaimsTest do
     pid
   end
 
-  # `UnixFD.close/1` answers `{:error, :ebadf}` for a descriptor which is
+  # `Raw.close/1` answers `{:error, :ebadf}` for a descriptor which is
   # already closed, so it is both the openness assertion and the cleanup. The
   # `:ebadf` answer only means "closed" while nothing else can reopen the
   # number, which is why this module stays `async: false`.
-  defp open?(fd), do: UnixFD.close(fd) == :ok
+  defp open?(fd), do: Raw.close(fd) == :ok
 
-  defp closed?(fd), do: UnixFD.close(fd) == {:error, :ebadf}
+  defp closed?(fd), do: Raw.close(fd) == {:error, :ebadf}
 
   # A descriptor this test owns outright: a dup received over SCM_RIGHTS, so
   # closing it cannot disturb a socket or file the VM still holds.
