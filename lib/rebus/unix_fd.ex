@@ -16,8 +16,10 @@ defmodule Rebus.UnixFD do
 
   Ownership follows the controlling-process model of ports and sockets. Each
   handle has exactly one owning process. When the owner exits, for any
-  reason including `:kill`, the descriptor is closed at once, even if other
-  processes still hold the handle, which then reads closed for them too.
+  reason including `:kill`, the handle closes at once, even if other
+  processes still hold it, and reads closed for them too. A background
+  thread then closes the descriptor, so a close that blocks cannot stall a
+  scheduler; the same happens when a handle is garbage collected.
 
   Any process holding a handle may use it, send it, duplicate it with
   `dup/1`, or close it, but only the owner can pass ownership on with
@@ -93,6 +95,10 @@ defmodule Rebus.UnixFD do
   `{:error, :closed}` if the handle is already closed, by an earlier call or
   because its owner exited, so calling it again is harmless.
 
+  The descriptor is closed when this returns `:ok`. Closing it runs on a
+  dirty I/O scheduler, so if `close(2)` blocks, for instance on a socket
+  with lingering data, only the caller waits.
+
   If another process is inside `with_fd/2` on the handle, or a connection is
   still sending it, the handle is closed at once but the descriptor stays
   open until that function returns or the send has passed it on.
@@ -110,7 +116,7 @@ defmodule Rebus.UnixFD do
 
   Only the owner can transfer a handle; any other caller gets
   `{:error, :not_owner}`. A closed handle answers `{:error, :closed}`,
-  whoever asks. If `pid` is not alive, the descriptor is closed and the call
+  whoever asks. If `pid` is not alive, the handle is closed and the call
   returns `{:error, :noproc}`. A `pid` on another node gets
   `{:error, :not_local}` and leaves the handle as it was. Making the current
   owner the owner again does nothing.
