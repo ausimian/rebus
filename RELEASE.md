@@ -12,6 +12,14 @@
   manage and inspect ownership, and a handle that has crossed to another node
   answers `{:error, :not_local}`. Inspecting a handle shows its state and
   owner but never the descriptor number.
+- Outbound messages take `Rebus.UnixFD` handles as well as raw descriptor
+  numbers, in any mix, in `Rebus.Message.new/2`'s `:fds`, the replies of
+  `Rebus.Service` and a `Rebus.Object`'s `{:reply, body, state, fds: fds}`.
+  Any process holding a handle may send it, and sending neither closes nor
+  transfers it. The connection keeps each handle's descriptor open until the
+  kernel has taken it, even if the handle is closed or its owner exits
+  meanwhile. A handle that is already closed when the connection accepts the
+  message fails it with `{:error, :unix_fd_closed}`, and nothing is written.
 
 - Services. `Rebus.Service` exports objects on a connection and answers the
   method calls made on them. `Rebus.Service.export/4` binds `Rebus.Interface`
@@ -66,8 +74,7 @@
   still owns, however the call completes. `Rebus.Service.take_fds/2` makes
   the handler their owner instead. `Rebus.Service.reply/3` and
   `Rebus.Service.reply_error/4` take an `:fds` option to send descriptors
-  with a reply; sending the number of one the connection still owns returns
-  `{:error, :unix_fd_borrowed}`.
+  with a reply, which may include the call's own borrowed handles.
 - `Rebus.connect/2` takes `:max_pending_calls`, 1024 by default, which bounds
   how many inbound calls may wait for a handler's answer at once. Calls
   beyond it are answered with `org.freedesktop.DBus.Error.LimitsExceeded`.
@@ -98,8 +105,7 @@
   reply included, in `Rebus.Service.Call.unix_fds` and its message, and from
   `Rebus.Service.take_fds/2`. The process that called `Rebus.call/3` owns
   its reply's handles, so they close when it exits if it has not closed them
-  first. Outbound messages still take raw numbers in `fds:`; use
-  `Rebus.UnixFD.with_fd/2` to send the number behind a handle you own.
+  first. Send a received handle on by passing the handle itself in `fds:`.
 
   ```elixir
   # Before
@@ -108,7 +114,7 @@
 
   # After: the same code works, and `fd` is a handle
   {:ok, %Rebus.Message{unix_fds: [handle]}} = Rebus.call(conn, message)
-  {:ok, stat} = Rebus.UnixFD.with_fd(handle, &File.stat("/dev/fd/#{&1}"))
+  {:ok, {:ok, stat}} = Rebus.UnixFD.with_fd(handle, &File.stat("/dev/fd/#{&1}"))
   :ok = Rebus.UnixFD.close(handle)
   ```
 
@@ -181,6 +187,9 @@
 
 ### Fixed
 
+- A raw descriptor number in `fds:` too large to be a descriptor, above
+  `0x7FFFFFFF`, is refused with `{:error, :invalid_unix_fds}` rather than
+  sent truncated to 32 bits, which could pass a different descriptor.
 - `EXTERNAL` authentication now completes when the peer answers with an
   empty `DATA` challenge, which the specification permits. A peer `ERROR`
   now cancels `EXTERNAL` and moves on to the next mechanism rather than

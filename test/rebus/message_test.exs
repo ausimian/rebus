@@ -832,6 +832,19 @@ defmodule Rebus.MessageTest do
   end
 
   describe "new/2 error handling" do
+    test "rejects a raw descriptor number that does not fit a descriptor" do
+      opts = [path: "/test", interface: "test.interface", member: "FD", signature: "h", body: [0]]
+
+      for fd <- [-1, 0x80000000, 0x100000003] do
+        assert {:error, :invalid_unix_fds} = Message.new(:signal, opts ++ [fds: [fd]])
+      end
+
+      assert {:ok, message} = Message.new(:signal, opts ++ [fds: [0x7FFFFFFF]])
+      oversized = %{message | unix_fds: [0x100000003]}
+      assert {:error, :invalid_unix_fds} = Message.validate(oversized)
+      assert {:error, :invalid_unix_fds} = Message.encode(oversized)
+    end
+
     test "rejects invalid message type" do
       assert {:error, :invalid_type} = Message.new(:invalid_type, path: "/test")
     end

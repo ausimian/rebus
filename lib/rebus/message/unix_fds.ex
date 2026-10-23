@@ -6,18 +6,19 @@ defmodule Rebus.Message.UnixFDs do
   # `:unix_fds` header count and the local descriptor bound before any
   # descriptor is exposed.
   #
-  # A received message carries `Rebus.UnixFD` handles, and one built to be
-  # sent carries raw descriptor numbers. Until outbound messages accept
-  # handles too (#261), only raw numbers can be encoded.
+  # A received message carries `Rebus.UnixFD` handles. One built to be sent
+  # carries handles, raw descriptor numbers, or both. Whether a handle is
+  # still open is not checked here: the connection finds that out when it
+  # pins the handle as it accepts the message.
 
   alias Rebus.Message
   alias Rebus.Signature
 
   @spec extract_unix_fds(keyword()) ::
-          {:ok, [Rebus.UnixFD.raw()]} | {:error, :invalid_unix_fds | :unix_fd_limit}
+          {:ok, [Message.unix_fd()]} | {:error, :invalid_unix_fds | :unix_fd_limit}
   def extract_unix_fds(opts) do
     case Keyword.get(opts, :fds, []) do
-      fds when is_list(fds) -> validate_unix_fd_list(fds, &raw?/1)
+      fds when is_list(fds) -> validate_unix_fd_list(fds)
       _fds -> {:error, :invalid_unix_fds}
     end
   end
@@ -38,17 +39,9 @@ defmodule Rebus.Message.UnixFDs do
   # Validates a message's descriptors, handles or raw numbers, against its
   # header count and body.
   @spec validate_unix_fds(Message.t()) :: :ok | {:error, :invalid_unix_fds | :unix_fd_limit}
-  def validate_unix_fds(message), do: validate_unix_fds(message, &unix_fd?/1)
-
-  # As `validate_unix_fds/1`, for a message about to be encoded and sent,
-  # whose descriptors must be raw numbers.
-  @spec validate_outbound_unix_fds(Message.t()) ::
-          :ok | {:error, :invalid_unix_fds | :unix_fd_limit}
-  def validate_outbound_unix_fds(message), do: validate_unix_fds(message, &raw?/1)
-
-  defp validate_unix_fds(%Message{header_fields: header_fields, unix_fds: fds} = message, valid?)
-       when is_map(header_fields) and is_list(fds) do
-    with {:ok, fds} <- validate_unix_fd_list(fds, valid?),
+  def validate_unix_fds(%Message{header_fields: header_fields, unix_fds: fds} = message)
+      when is_map(header_fields) and is_list(fds) do
+    with {:ok, fds} <- validate_unix_fd_list(fds),
          count <- length(fds),
          ^count <- Map.get(header_fields, :unix_fds, 0),
          :ok <- validate_unix_fd_indices(Message.signature(message), message.body, fds) do
@@ -58,7 +51,7 @@ defmodule Rebus.Message.UnixFDs do
     end
   end
 
-  defp validate_unix_fds(_message, _valid?), do: {:error, :invalid_unix_fds}
+  def validate_unix_fds(_message), do: {:error, :invalid_unix_fds}
 
   @spec validate_unix_fd_indices(term(), term(), [Message.unix_fd()]) ::
           :ok | {:error, :invalid_unix_fds}
@@ -74,16 +67,18 @@ defmodule Rebus.Message.UnixFDs do
 
   def validate_unix_fd_indices(_signature, _body, _fds), do: {:error, :invalid_unix_fds}
 
-  defp validate_unix_fd_list(fds, valid?) when is_list(fds) do
+  defp validate_unix_fd_list(fds) when is_list(fds) do
     cond do
       length(fds) > Message.max_unix_fds() -> {:error, :unix_fd_limit}
-      Enum.all?(fds, valid?) -> {:ok, fds}
+      Enum.all?(fds, &unix_fd?/1) -> {:ok, fds}
       true -> {:error, :invalid_unix_fds}
     end
   end
 
-  defp raw?(fd), do: is_integer(fd) and fd >= 0
-  defp unix_fd?(fd), do: raw?(fd) or is_struct(fd, Rebus.UnixFD)
+  # A raw number must fit the signed 32-bit slot SCM_RIGHTS carries it in, as
+  # every descriptor does, or it would be sent truncated.
+  defp unix_fd?(fd),
+    do: (is_integer(fd) and fd >= 0 and fd <= 0x7FFFFFFF) or is_struct(fd, Rebus.UnixFD)
 
   defp validate_unix_fd_values([], [], _fd_count), do: :ok
 

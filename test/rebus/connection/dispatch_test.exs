@@ -983,43 +983,16 @@ defmodule Rebus.Connection.DispatchTest do
       InboundCalls.close_all(state.inbound_calls)
     end
 
-    test "cannot be sent back in the reply that completes the call" do
+    test "can be sent back in the reply that completes the call" do
       fd = descriptor()
       {call, state} = fd_routed(fd, "Echo")
+      reply = %{fd_reply(5) | unix_fds: [fd]}
 
-      # Outbound descriptors are raw numbers, which a handler can read out of
-      # a borrowed handle.
-      reply = fd_reply(5) |> with_raw_fds([fd])
-
-      assert {:error, :unix_fd_borrowed} = Service.complete(state, call.ref, reply)
-
-      assert {:ok, %{unix_fds: [^fd]}} = InboundCalls.fetch(state.inbound_calls, call.ref)
-
-      # Nor can the reply to another call, which may be written after this
-      # one completes.
-      {export_ref, state} = exported(state, path: "/calc")
-
-      {:continue, :recv, state} =
-        dispatch(app_call("Add", path: "/calc", signature: "ii", body: [2, 3]), state)
-
-      assert_received {^export_ref, %Call{ref: other_ref}}
-      assert {:error, :unix_fd_borrowed} = Service.complete(state, other_ref, reply)
-
-      # Nor one received for a frame still being read.
-      buffered = descriptor()
-      buffering = %{state | inbound_fds: Rights.retain(state.inbound_fds, [buffered])}
-
-      assert {:error, :unix_fd_borrowed} =
-               Service.complete(buffering, call.ref, with_raw_fds(reply, [buffered]))
-
-      UnixFD.close(buffered)
-
-      # Any other descriptor is the handler's own to lend.
-      assert {:ok, %Message{unix_fds: [:not_a_descriptor]}, state} =
-               Service.complete(state, call.ref, %{reply | unix_fds: [:not_a_descriptor]})
-
-      # Once that call completed, its descriptor is no longer the connection's.
-      assert {:ok, _reply, state} = Service.complete(state, other_ref, reply)
+      # The reply carries the call's own handle. Completing the call closes
+      # it; the connection pins it before then, so the frame still passes on
+      # the descriptor.
+      assert {:ok, %Message{unix_fds: [^fd]}, state} = Service.complete(state, call.ref, reply)
+      refute UnixFD.open?(fd)
       assert state.inbound_calls == InboundCalls.new()
     end
 
@@ -1057,10 +1030,6 @@ defmodule Rebus.Connection.DispatchTest do
                InboundCalls.fetch(state.inbound_calls, call.ref)
 
       assert {:error, :unknown_call} = Service.take_fds(state, call.ref, taker)
-
-      # The taker owns it now, so a reply may send its number.
-      echo = fd_reply(5) |> with_raw_fds([fd])
-      assert {:ok, %Message{}, _state} = Service.complete(state, call.ref, echo)
 
       # The call is still answered as usual, and completing it leaves the
       # taker's handle open.
@@ -1342,12 +1311,6 @@ defmodule Rebus.Connection.DispatchTest do
         body: [0],
         fds: [0]
       )
-
-  # `msg` sending the raw numbers behind `handles`, as a handler would after
-  # reading them out with `Rebus.UnixFD.with_fd/2`.
-  defp with_raw_fds(%Message{} = msg, handles) do
-    %{msg | unix_fds: Enum.map(handles, &elem(UnixFD.with_fd(&1, fn fd -> fd end), 1))}
-  end
 
   # A method return for `serial` declaring one descriptor, as `fd_call/1`.
   defp fd_reply(serial),

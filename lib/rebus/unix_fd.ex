@@ -2,27 +2,66 @@ defmodule Rebus.UnixFD do
   @moduledoc """
   Handles for Unix file descriptors.
 
-  A handle owns one open descriptor and closes it exactly once: when any
-  holder calls `close/1`, when its owning process exits, or when the last
-  reference to it is garbage collected, whichever comes first. A handle never
-  exposes its descriptor number except inside `with_fd/2`, and once closed it
-  forgets the number, so a stale handle cannot reach an unrelated descriptor
-  that the operating system has since given the same number.
+  Rebus hands every descriptor it receives to your code as a handle: in the
+  `unix_fds` of a `Rebus.call/3` reply, and in `call.unix_fds` of a
+  `Rebus.Service.Call`. A handle owns one open descriptor and closes it
+  exactly once: when any holder calls `close/1`, when its owning process
+  exits, or when the last reference to it is garbage collected, whichever
+  comes first. A handle never exposes its descriptor number except inside
+  `with_fd/2`, and once closed it forgets the number, so a stale handle
+  cannot reach an unrelated descriptor that the operating system has since
+  given the same number.
+
+  ## Ownership
 
   Ownership follows the controlling-process model of ports and sockets. Each
-  handle has exactly one owning process, at first the one that created it.
-  When the owner exits, for any reason including `:kill`, the descriptor is
-  closed at once, even if other processes still hold the handle. Any holder
-  may use or close a handle, but only the owner can pass ownership on with
-  `controlling_process/2`.
+  handle has exactly one owning process. When the owner exits, for any
+  reason including `:kill`, the descriptor is closed at once, even if other
+  processes still hold the handle, which then reads closed for them too.
 
-  A handle is local to the node that created it. One that has crossed a
-  distribution boundary answers `{:error, :not_local}` to every operation.
+  Any process holding a handle may use it, send it, duplicate it with
+  `dup/1`, or close it, but only the owner can pass ownership on with
+  `controlling_process/2`. `owner/1` and `open?/1` tell who owns a handle and
+  whether it is still open:
+
+      {:ok, %Rebus.Message{unix_fds: [handle]}} = Rebus.call(conn, message)
+      {:ok, pid} = Rebus.UnixFD.owner(handle)   # pid == self()
+      :ok = Rebus.UnixFD.controlling_process(handle, worker)
+      true = Rebus.UnixFD.open?(handle)
+
+  ## Using the descriptor
+
+  `with_fd/2` lends the raw number to a function and keeps the descriptor
+  open until the function returns, even if the handle is closed meanwhile.
+  Hand the number to something that takes its own copy, such as
+  `:socket.open/2`, or open `/dev/fd/N`:
+
+      {:ok, {:ok, sock}} =
+        Rebus.UnixFD.with_fd(handle, fn fd ->
+          :socket.open(fd, %{domain: :local, type: :stream})
+        end)
+
+      :ok = Rebus.UnixFD.close(handle)
+
+  ## Sending
+
+  A handle can be sent in the `fds:` of `Rebus.Message.new/2` and the reply
+  functions of `Rebus.Service`, by its owner or any other holder. Sending
+  neither closes nor transfers it. The connection keeps the descriptor open
+  until the kernel has taken it, even if the handle is closed or its owner
+  exits meanwhile, and refuses one that is already closed with
+  `{:error, :unix_fd_closed}`.
+
+  ## Distribution and platforms
+
+  A handle is local to the node that created it. One that has crossed to
+  another node answers `{:error, :not_local}` to every operation there; back
+  on its own node, it works again.
 
   Handles are available on Unix systems, where Rebus builds the native code
   behind them. Elsewhere every function returns `{:error, :unsupported}`.
 
-  See [Unix file descriptor passing](unix_fds.html).
+  See [Unix file descriptor passing](unix_fds.html) for the full model.
   """
 
   alias Rebus.UnixFD.NIF
@@ -54,8 +93,14 @@ defmodule Rebus.UnixFD do
   `{:error, :closed}` if the handle is already closed, by an earlier call or
   because its owner exited, so calling it again is harmless.
 
-  If another process is inside `with_fd/2` on the handle, the handle is closed
-  at once but the descriptor stays open until that function returns.
+  If another process is inside `with_fd/2` on the handle, or a connection is
+  still sending it, the handle is closed at once but the descriptor stays
+  open until that function returns or the send has passed it on.
+
+  ```elixir
+  :ok = Rebus.UnixFD.close(handle)
+  {:error, :closed} = Rebus.UnixFD.close(handle)
+  ```
   """
   @spec close(t()) :: :ok | {:error, :closed | error()}
   def close(%__MODULE__{ref: ref}), do: native(ref, &NIF.close_handle/1)
@@ -64,9 +109,17 @@ defmodule Rebus.UnixFD do
   Makes `pid` the owner of a handle.
 
   Only the owner can transfer a handle; any other caller gets
-  `{:error, :not_owner}`. If `pid` is not alive, the descriptor is closed and
-  the call returns `{:error, :noproc}`. A `pid` on another node gets
-  `{:error, :not_local}` and leaves the handle as it was.
+  `{:error, :not_owner}`. A closed handle answers `{:error, :closed}`,
+  whoever asks. If `pid` is not alive, the descriptor is closed and the call
+  returns `{:error, :noproc}`. A `pid` on another node gets
+  `{:error, :not_local}` and leaves the handle as it was. Making the current
+  owner the owner again does nothing.
+
+  ```elixir
+  worker = spawn(fn -> receive do {:take, handle} -> use_and_close(handle) end end)
+  :ok = Rebus.UnixFD.controlling_process(handle, worker)
+  send(worker, {:take, handle})
+  ```
   """
   @spec controlling_process(t(), pid()) ::
           :ok | {:error, :closed | :noproc | :not_owner | error()}
@@ -75,7 +128,12 @@ defmodule Rebus.UnixFD do
   end
 
   @doc """
-  Returns the process that owns a handle.
+  Returns the process that owns a handle, or `{:error, :closed}` once it is
+  closed.
+
+  ```elixir
+  {:ok, owner} = Rebus.UnixFD.owner(handle)
+  ```
   """
   @spec owner(t()) :: {:ok, pid()} | {:error, :closed | error()}
   def owner(%__MODULE__{ref: ref}), do: native(ref, &NIF.owner/1)
@@ -97,14 +155,20 @@ defmodule Rebus.UnixFD do
 
   The descriptor stays open until `fun` returns, even if the handle is closed
   or its owner exits meanwhile, and the number is valid only until then. Do
-  not keep it, close it, or hand it to anything that outlives `fun`. If the
-  calling process is killed inside `fun`, the descriptor is released when the
-  process's memory is reclaimed. Exceptions, throws and exits from `fun`
-  propagate after the descriptor is released.
+  not keep it, close it, or hand it to anything that outlives `fun` without
+  taking its own copy, as `:socket.open/2` does. To keep a descriptor of your
+  own, use `dup/1`. If the calling process is killed inside `fun`, the
+  descriptor is released when the process's memory is reclaimed.
+  Exceptions, throws and exits from `fun` propagate after the descriptor is
+  released.
 
   ```elixir
-  {:ok, stat} = Rebus.UnixFD.with_fd(handle, fn fd -> File.stat("/dev/fd/\#{fd}") end)
+  {:ok, {:ok, contents}} = Rebus.UnixFD.with_fd(handle, &File.read("/dev/fd/\#{&1}"))
   ```
+
+  Returning the number from `fun`, as in `{:ok, fd} = with_fd(handle, & &1)`,
+  gives you a number that may already be closed, or reused for something
+  else, by the time you use it.
   """
   @spec with_fd(t(), (raw() -> result)) :: {:ok, result} | {:error, :closed | error()}
         when result: term()
@@ -125,9 +189,14 @@ defmodule Rebus.UnixFD do
   @doc """
   Duplicates a handle's descriptor into a new handle owned by the caller.
 
-  The two handles refer to the same open file but close independently.
-  Returns `{:error, :closed}` if the handle is closed, or `{:error, posix}` if
-  the operating system cannot duplicate the descriptor.
+  The two handles refer to the same open file but close independently. The
+  new handle is owned by the process that calls this, whether or not it owns
+  the original. Returns `{:error, :closed}` if the handle is closed, or
+  `{:error, posix}` if the operating system cannot duplicate the descriptor.
+
+  ```elixir
+  {:ok, mine} = Rebus.UnixFD.dup(borrowed)
+  ```
   """
   @spec dup(t()) :: {:ok, t()} | {:error, :closed | error() | atom()}
   def dup(%__MODULE__{ref: ref}) do
@@ -186,6 +255,40 @@ defmodule Rebus.UnixFD do
   def unpin(token) do
     if is_reference(token) and supported?(), do: NIF.unpin(token), else: :ok
   end
+
+  @doc false
+  # Pins every handle in a list of outbound descriptors, handles and raw
+  # numbers in any mix, and returns the raw number of each in the same order
+  # together with the pins taken. A raw number passes through unpinned. If a
+  # handle cannot be pinned, because it is closed or not local, the pins
+  # already taken are released and nothing stays pinned. The same happens if
+  # the list is not a proper list.
+  @spec pin_all([t() | raw()]) :: {:ok, [raw()], [pin()]} | {:error, :closed | :invalid}
+  def pin_all(fds), do: pin_all(fds, [], [])
+
+  defp pin_all([], raw, pins), do: {:ok, Enum.reverse(raw), pins}
+
+  defp pin_all([%__MODULE__{ref: ref} = handle | rest], raw, pins) when is_reference(ref) do
+    case pin(handle) do
+      {:ok, pin, fd} -> pin_all(rest, [fd | raw], [pin | pins])
+      {:error, _reason} -> release_all(pins, {:error, :closed})
+    end
+  end
+
+  # A struct that is not a real handle has no descriptor to send.
+  defp pin_all([%__MODULE__{} | _rest], _raw, pins), do: release_all(pins, {:error, :closed})
+  defp pin_all([fd | rest], raw, pins), do: pin_all(rest, [fd | raw], pins)
+  defp pin_all(_improper, _raw, pins), do: release_all(pins, {:error, :invalid})
+
+  defp release_all(pins, result) do
+    unpin_all(pins)
+    result
+  end
+
+  @doc false
+  # Releases every pin in a list, as `unpin/1` does each one.
+  @spec unpin_all([pin()]) :: :ok
+  def unpin_all(pins) when is_list(pins), do: Enum.each(pins, &unpin/1)
 
   # Test hooks.
 

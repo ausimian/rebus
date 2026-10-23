@@ -20,6 +20,7 @@ defmodule Rebus.Connection.Writer do
   alias Rebus.Connection.Pending
   alias Rebus.Connection.SocketError
   alias Rebus.Message
+  alias Rebus.UnixFD
 
   require Logger
 
@@ -60,7 +61,11 @@ defmodule Rebus.Connection.Writer do
       field :wait, nil | {:continue, tuple()} | {:select, tuple(), reference()}
       field :timer_ref, reference()
       field :partial?, boolean()
-      field :unix_fds, [Rebus.UnixFD.raw()]
+      # The raw numbers SCM_RIGHTS carries, and the pins that keep the
+      # descriptors of handles among them open until the kernel has accepted
+      # them; see `queue/2`.
+      field :unix_fds, [UnixFD.raw()]
+      field :pins, [UnixFD.pin()]
       field :uses_sendmsg?, boolean()
       # `:socket.sendmsg/4` retains the original encoded control map in a select
       # continuation. We keep this explicit so that only a no-progress select
@@ -91,14 +96,17 @@ defmodule Rebus.Connection.Writer do
   @typedoc """
   A frame handed to `queue/2` for writing. `from` is `nil` for
   connection-originated replies, which have no caller to answer, monitor or
-  cancel.
+  cancel. `unix_fds` and `pins` are what `pin/1` returned for the message's
+  descriptors.
   """
   @type operation :: %{
           required(:kind) => :call | :send | :reply,
           required(:from) => GenServer.from() | nil,
           required(:msg) => Message.t(),
           required(:deadline) => integer(),
-          required(:request_ref) => reference()
+          required(:request_ref) => reference(),
+          required(:unix_fds) => [UnixFD.raw()],
+          required(:pins) => [UnixFD.pin()]
         }
 
   @typedoc """
@@ -111,6 +119,8 @@ defmodule Rebus.Connection.Writer do
           required(:msg) => Message.t(),
           required(:deadline) => integer(),
           required(:request_ref) => reference(),
+          required(:unix_fds) => [UnixFD.raw()],
+          required(:pins) => [UnixFD.pin()],
           required(:monitor_ref) => reference() | nil
         }
 
@@ -164,6 +174,30 @@ defmodule Rebus.Connection.Writer do
   @spec active(t()) :: Active.t() | nil
   def active(%__MODULE__{active: active}), do: active
 
+  # Pins the handles among an outbound message's descriptors, for an
+  # operation that is about to be queued. The connection calls this when it
+  # accepts the message, inside its own process, so the pin tokens live on
+  # its heap and go with it if it dies. From here on the writer owns the
+  # pins: they keep each handle's descriptor open, even if the handle is
+  # closed or its owner exits, until the kernel has accepted the frame's
+  # SCM_RIGHTS data or the write is abandoned. A raw number is the caller's
+  # to keep open. A handle that is already closed, or not local, fails the
+  # whole message with nothing pinned; so does a descriptor list that is not
+  # a proper list, which no frame could be encoded from.
+  @spec pin(Message.t()) ::
+          {:ok, [UnixFD.raw()], [UnixFD.pin()]} | {:error, :unix_fd_closed | :encode_failed}
+  def pin(%Message{unix_fds: fds}) do
+    case UnixFD.pin_all(fds) do
+      {:ok, raw, pins} -> {:ok, raw, pins}
+      {:error, :closed} -> {:error, :unix_fd_closed}
+      {:error, :invalid} -> {:error, :encode_failed}
+    end
+  end
+
+  # Releases pins that `pin/1` took for an operation that will not be queued.
+  @spec release_pins([UnixFD.pin()]) :: :ok
+  def release_pins(pins), do: UnixFD.unpin_all(pins)
+
   # Connection-originated frames (`kind: :reply`) have no caller: no `from` to
   # reply to, no monitor to release, and no cancellation. They share the FIFO
   # write queue so a reply can never overtake or starve caller traffic.
@@ -214,6 +248,7 @@ defmodule Rebus.Connection.Writer do
         }
 
         if cancelled_or_expired?(operation, writer) do
+          release_pins(operation.pins)
           writer = release_monitor(writer, operation)
 
           advance(
@@ -303,10 +338,16 @@ defmodule Rebus.Connection.Writer do
 
       write ->
         _ = Process.cancel_timer(write.timer_ref)
+        release_pins(write.pins)
         abandon_operation(write)
     end
 
-    writer.queue |> :queue.to_list() |> Enum.each(&abandon_operation/1)
+    writer.queue
+    |> :queue.to_list()
+    |> Enum.each(fn operation ->
+      release_pins(operation.pins)
+      abandon_operation(operation)
+    end)
 
     %{
       writer
@@ -342,9 +383,10 @@ defmodule Rebus.Connection.Writer do
         wait: nil,
         timer_ref: timer_ref,
         partial?: false,
-        unix_fds: operation.msg.unix_fds,
-        uses_sendmsg?: operation.msg.unix_fds != [],
-        fd_control: if(operation.msg.unix_fds == [], do: :none, else: :initial)
+        unix_fds: operation.unix_fds,
+        pins: operation.pins,
+        uses_sendmsg?: operation.unix_fds != [],
+        fd_control: if(operation.unix_fds == [], do: :none, else: :initial)
       }
 
       advance(%{writer | active: write}, ctx)
@@ -358,10 +400,12 @@ defmodule Rebus.Connection.Writer do
   # error, so it is logged and the frame is dropped; the connection continues.
   defp fail_operation(writer, %{kind: :reply} = operation, reason) do
     Logger.warning("D-Bus internal reply dropped: #{inspect(reason)}", reason: reason)
+    release_pins(operation.pins)
     release_monitor(writer, operation)
   end
 
   defp fail_operation(writer, operation, reason) do
+    release_pins(operation.pins)
     writer = release_monitor(writer, operation)
     GenServer.reply(operation.from, {:error, reason})
     writer
@@ -433,11 +477,21 @@ defmodule Rebus.Connection.Writer do
   defp classify_write_result(result, %Active{rest: rest}),
     do: classify_send_result(result, byte_size(rest))
 
+  # Once the kernel has accepted the SCM_RIGHTS data it holds references of
+  # its own to the descriptors, so the pins are released at once rather than
+  # when the rest of the frame is written.
   defp put_active_rest(%__MODULE__{active: write} = writer, rest) do
     partial? = write.partial? or byte_size(rest) < byte_size(write.rest)
-    fd_control = if fd_control_accepted?(write, rest), do: :accepted, else: write.fd_control
 
-    %{writer | active: %{write | rest: rest, partial?: partial?, fd_control: fd_control}}
+    write =
+      if fd_control_accepted?(write, rest) do
+        release_pins(write.pins)
+        %{write | fd_control: :accepted, pins: []}
+      else
+        write
+      end
+
+    %{writer | active: %{write | rest: rest, partial?: partial?}}
   end
 
   defp fd_control_accepted?(
@@ -502,10 +556,14 @@ defmodule Rebus.Connection.Writer do
     end
   end
 
+  # Every write ends here, written or abandoned, so this releases whatever
+  # pins it still holds, after any select continuation that could still pass
+  # their descriptors has been cancelled.
   defp drop_active(%__MODULE__{active: write} = writer, ctx, opts) do
     _ = Process.cancel_timer(write.timer_ref)
 
     if Keyword.get(opts, :cancel?, false), do: cancel_socket_write(ctx, write.wait)
+    release_pins(write.pins)
 
     writer = %{
       writer
@@ -518,8 +576,27 @@ defmodule Rebus.Connection.Writer do
       else: release_monitor(writer, write)
   end
 
-  defp mark_cancelled(%__MODULE__{} = writer, request_ref),
-    do: %{writer | cancelled_refs: MapSet.put(writer.cancelled_refs, request_ref)}
+  # A cancelled frame still waiting in the queue stays there until it reaches
+  # the head, but its pins are released now: it will never be written, and
+  # the write ahead of it may hold the queue for up to the write timeout.
+  # An active frame is cancelled here only once bytes have entered the
+  # stream, by when its pins are already gone.
+  defp mark_cancelled(%__MODULE__{} = writer, request_ref) do
+    queue =
+      :queue.filtermap(
+        fn
+          %{request_ref: ^request_ref, pins: [_ | _] = pins} = operation ->
+            release_pins(pins)
+            {true, %{operation | pins: []}}
+
+          _operation ->
+            true
+        end,
+        writer.queue
+      )
+
+    %{writer | queue: queue, cancelled_refs: MapSet.put(writer.cancelled_refs, request_ref)}
+  end
 
   defp monitor_operation(%{from: nil}), do: nil
   defp monitor_operation(%{from: from}), do: Process.monitor(elem(from, 0))

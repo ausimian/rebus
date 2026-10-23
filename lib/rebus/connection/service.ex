@@ -49,7 +49,6 @@ defmodule Rebus.Connection.Service do
   alias Rebus.Connection.Objects
   alias Rebus.Connection.Objects.Export
   alias Rebus.Connection.Peer
-  alias Rebus.Connection.Rights
   alias Rebus.Connection.Writer
   alias Rebus.Interface
   alias Rebus.Interface.Method
@@ -209,19 +208,14 @@ defmodule Rebus.Connection.Service do
   # `:answered` says so. Descriptors cannot be handed to a local caller, so a
   # reply that carries any is refused and the call stays open.
   #
-  # A reply is written after the call completes, so it cannot carry a
-  # descriptor the connection still owns: one lent to a pending call, this
-  # one or another, or received for a frame not yet complete. Outbound
-  # descriptors are still raw numbers, which a handler can read out of a
-  # borrowed handle with `Rebus.UnixFD.with_fd/2`. Completing a call closes
-  # its handles before the frame is written, and the reply would carry a
-  # closed descriptor or whatever reused its number. Such a reply is refused,
-  # and the call stays open for the handler to take them first.
+  # Completing the call closes the handles it borrowed, so the connection
+  # pins a reply's handles before it calls this: a reply may carry the
+  # call's own handles, whose descriptors then stay open until it is written.
   @doc false
   @spec complete(Connection.t(), reference(), Message.t()) ::
           {:ok, Message.t(), Connection.t()}
           | {:answered, Connection.t()}
-          | {:error, :unknown_call | :unix_fd_unsupported | :unix_fd_borrowed}
+          | {:error, :unknown_call | :unix_fd_unsupported}
   def complete(%Connection{} = state, ref, %Message{} = msg) do
     case InboundCalls.fetch(state.inbound_calls, ref) do
       :error ->
@@ -234,26 +228,8 @@ defmodule Rebus.Connection.Service do
         {:error, :unix_fd_unsupported}
 
       {:ok, %Entry{}} ->
-        if lent?(state, msg.unix_fds),
-          do: {:error, :unix_fd_borrowed},
-          else: complete_entry(state, ref, msg)
+        complete_entry(state, ref, msg)
     end
-  end
-
-  # The scan is bounded by `max_pending_calls`, each call's descriptor limit
-  # and the receive buffer's own bound, and only a reply that carries
-  # descriptors pays it. A taken call holds no handles, so those the handler
-  # now owns may be sent. A handle already closed has no number to match.
-  defp lent?(%Connection{}, []), do: false
-
-  defp lent?(%Connection{} = state, fds) do
-    owned =
-      for handle <- InboundCalls.fds(state.inbound_calls) ++ Rights.fds(state.inbound_fds),
-          {:ok, fd} <- [UnixFD.with_fd(handle, & &1)],
-          into: MapSet.new(),
-          do: fd
-
-    Enum.any?(fds, &MapSet.member?(owned, &1))
   end
 
   defp complete_entry(%Connection{} = state, ref, %Message{} = msg) do
@@ -599,7 +575,9 @@ defmodule Rebus.Connection.Service do
             from: nil,
             msg: reply,
             deadline: System.monotonic_time(:millisecond) + state.write_timeout,
-            request_ref: make_ref()
+            request_ref: make_ref(),
+            unix_fds: [],
+            pins: []
           })
 
         kick_writes(%{state | writer: writer})
