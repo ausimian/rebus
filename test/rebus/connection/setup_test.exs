@@ -295,6 +295,7 @@ defmodule Rebus.Connection.SetupTest do
                Setup.hello_reply_buffer(state)
 
       refute UnixFD.open?(fd)
+      :ok = UnixFD.__drain__()
       assert {:ok, 1} = UnixFD.__close_count__(fd)
     end
   end

@@ -12,6 +12,12 @@
 // pinning process, so a pin is released even if that process is killed: its
 // heap, and with it the last reference to the token, goes away.
 //
+// close(2) can block, for instance on a socket with lingering data or a file
+// on a stalled network filesystem, so it never runs on a normal scheduler.
+// close/1 runs it on a dirty IO scheduler and returns once it is done; every
+// other path, including the resource callbacks, hands the descriptor to a
+// closer thread of our own.
+//
 // Fine (0.1) registers resource types without a down callback, so the handle
 // type is registered by hand in the load callback; everything else goes
 // through Fine.
@@ -22,7 +28,9 @@
 #include <atomic>
 #include <cerrno>
 #include <climits>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <new>
 #include <stdexcept>
@@ -70,6 +78,9 @@ fine::Atom errno_atom(int error) {
 // Handles currently allocated, for the test hooks.
 std::atomic<std::int64_t> live_handles{0};
 
+// Times close(2) ran on a normal scheduler, for the test hooks; always 0.
+std::atomic<std::uint64_t> scheduler_closes{0};
+
 ErlNifResourceType *handle_type = nullptr;
 
 struct Handle {
@@ -92,9 +103,10 @@ struct Handle {
   std::atomic<std::uint64_t> closes{0};
 };
 
-// Marks a handle closed and returns the descriptor the caller must pass to
-// release_fd/2 once the mutex is dropped, or -1 if close(2) is not due yet
-// (the handle is pinned) or has already run. The caller holds the mutex.
+// Marks a handle closed and returns the descriptor the caller must close, by
+// close_now/2 or defer_close/2, once the mutex is dropped, or -1 if close(2)
+// is not due yet (the handle is pinned) or has already run. The caller holds
+// the mutex.
 int retire_locked(Handle &handle) {
   handle.open = false;
 
@@ -107,15 +119,141 @@ int retire_locked(Handle &handle) {
   return fd;
 }
 
-// Closes a descriptor taken by retire_locked/1 or the last unpin. close(2)
-// releases the number even when it reports an error (including EINTR on
-// Linux and macOS), so it is never retried.
-void release_fd(Handle &handle, int fd) {
+// Runs close(2). It releases the number even when it reports an error
+// (including EINTR on Linux and macOS), so it is never retried.
+void close_fd(int fd) {
+  if (enif_thread_type() == ERL_NIF_THR_NORMAL_SCHEDULER) {
+    ++scheduler_closes;
+  }
+
+  ::close(fd);
+}
+
+// A descriptor waiting for the closer, and the handle it came from, which
+// the entry keeps alive so that its close count can be updated. Entries
+// from the handle's destructor have no handle.
+struct PendingClose {
+  int fd;
+  Handle *handle;
+};
+
+// The closer thread runs close(2) for every path but close/1, one
+// descriptor at a time, as OTP's prim_file does for owner exits. A close
+// that blocks holds up the ones queued behind it, so their descriptors stay
+// allocated a while longer, but it never holds up a scheduler or the process
+// that queued it.
+struct Closer {
+  std::mutex mutex;
+  // Signalled when an entry is queued or the closer is told to stop.
+  std::condition_variable wake;
+  // Signalled when the queue is empty and no close is running.
+  std::condition_variable idle;
+  std::deque<PendingClose> queue;
+  bool busy = false;
+  // Set once the library is unloading. Later closes run where they are
+  // asked for, as a destructor can still run after the closer has gone.
+  bool stopped = true;
+  ErlNifTid thread{};
+};
+
+// Never destroyed: a static Closer would be destroyed at exit while the
+// thread still waits on its condition variable, and glibc's
+// pthread_cond_destroy then blocks the exit for good.
+Closer &closer = *new Closer();
+
+void finish_close(const PendingClose &pending) {
+  close_fd(pending.fd);
+
+  if (pending.handle != nullptr) {
+    ++pending.handle->closes;
+    enif_release_resource(pending.handle);
+  }
+}
+
+void *closer_main(void *) {
+  for (;;) {
+    PendingClose pending{-1, nullptr};
+
+    {
+      std::unique_lock<std::mutex> lock(closer.mutex);
+      closer.wake.wait(lock,
+                       [] { return closer.stopped || !closer.queue.empty(); });
+
+      // Stopping drains the queue first.
+      if (closer.queue.empty()) {
+        return nullptr;
+      }
+
+      pending = closer.queue.front();
+      closer.queue.pop_front();
+      closer.busy = true;
+    }
+
+    // Releasing the handle can run its destructor here, which is allowed on
+    // any thread and finds nothing left to close.
+    finish_close(pending);
+
+    {
+      std::lock_guard<std::mutex> lock(closer.mutex);
+      closer.busy = false;
+
+      if (closer.queue.empty()) {
+        closer.idle.notify_all();
+      }
+    }
+  }
+}
+
+// Hands a descriptor taken by retire_locked/1 or the last unpin, or one
+// that never reached a handle, to the closer. Any thread may call this,
+// including the resource callbacks: it never blocks for longer than it takes
+// to queue the descriptor.
+void defer_close(Handle *handle, int fd) {
   if (fd < 0) {
     return;
   }
 
-  ::close(fd);
+  PendingClose pending{fd, handle};
+
+  {
+    std::lock_guard<std::mutex> lock(closer.mutex);
+
+    if (!closer.stopped) {
+      bool queued = true;
+
+      try {
+        closer.queue.push_back(pending);
+      } catch (const std::bad_alloc &) {
+        // Close it here rather than leak it.
+        queued = false;
+      }
+
+      if (queued) {
+        if (handle != nullptr) {
+          enif_keep_resource(handle);
+        }
+
+        closer.wake.notify_one();
+        return;
+      }
+    }
+  }
+
+  close_fd(fd);
+
+  if (handle != nullptr) {
+    ++handle->closes;
+  }
+}
+
+// Closes a descriptor taken by retire_locked/1 at once. Only close/1, which
+// runs on a dirty IO scheduler, calls this.
+void close_now(Handle &handle, int fd) {
+  if (fd < 0) {
+    return;
+  }
+
+  close_fd(fd);
   ++handle.closes;
 }
 
@@ -132,10 +270,10 @@ void demonitor_locked(ErlNifEnv *env, Handle &handle) {
 void handle_dtor(ErlNifEnv *, void *object) {
   auto *handle = static_cast<Handle *>(object);
 
-  // Nothing else can reach the handle now, and pins hold a reference, so the
-  // descriptor is still set only if no other path closed it.
+  // Nothing else can reach the handle now, and pins and queued closes hold a
+  // reference, so the descriptor is still set only if no other path took it.
   if (handle->fd >= 0) {
-    ::close(handle->fd);
+    defer_close(nullptr, handle->fd);
     handle->fd = -1;
   }
 
@@ -160,7 +298,7 @@ void handle_down(ErlNifEnv *, void *object, ErlNifPid *, ErlNifMonitor *mon) {
     fd = retire_locked(*handle);
   }
 
-  release_fd(*handle, fd);
+  defer_close(handle, fd);
 }
 
 Handle *get_handle(ErlNifEnv *env, fine::Term term) {
@@ -182,7 +320,7 @@ using HandleResult = std::variant<fine::Ok<fine::Term>, fine::Error<fine::Atom>>
 HandleResult make_handle(ErlNifEnv *env, int fd, const ErlNifPid &owner) {
   void *memory = enif_alloc_resource(handle_type, sizeof(Handle));
   if (memory == nullptr) {
-    ::close(fd);
+    defer_close(nullptr, fd);
     return fine::Error(atoms::enomem);
   }
 
@@ -204,7 +342,7 @@ HandleResult make_handle(ErlNifEnv *env, int fd, const ErlNifPid &owner) {
     }
   }
 
-  release_fd(*handle, dead_fd);
+  defer_close(handle, dead_fd);
 
   if (!alive) {
     enif_release_resource(memory);
@@ -248,7 +386,7 @@ struct PinToken {
       }
     }
 
-    release_fd(*handle, fd);
+    defer_close(handle, fd);
   }
 
   Handle *handle;
@@ -271,6 +409,28 @@ auto load_registration = fine::Registration::register_load(
       if (handle_type == nullptr) {
         throw std::runtime_error("cannot open the Rebus.UnixFD.Handle type");
       }
+
+      closer.stopped = false;
+
+      if (enif_thread_create(const_cast<char *>("rebus_fd_closer"),
+                             &closer.thread, closer_main, nullptr,
+                             nullptr) != 0) {
+        closer.stopped = true;
+        throw std::runtime_error("cannot start the descriptor closer thread");
+      }
+    });
+
+// Stops the closer once it has closed everything queued. A handle that
+// outlives the module closes its descriptor in its destructor from then on.
+auto unload_registration =
+    fine::Registration::register_unload([](ErlNifEnv *, void *) {
+      {
+        std::lock_guard<std::mutex> lock(closer.mutex);
+        closer.stopped = true;
+      }
+
+      closer.wake.notify_one();
+      enif_thread_join(closer.thread, nullptr);
     });
 
 } // namespace
@@ -291,7 +451,7 @@ HandleResult wrap(ErlNifEnv *env, std::int64_t fd, fine::Term owner_term) {
     int error = errno;
 
     if (error != EBADF) {
-      ::close(descriptor);
+      defer_close(nullptr, descriptor);
     }
 
     return fine::Error(errno_atom(error));
@@ -299,7 +459,7 @@ HandleResult wrap(ErlNifEnv *env, std::int64_t fd, fine::Term owner_term) {
 
   ErlNifPid owner;
   if (!enif_get_local_pid(env, owner_term, &owner)) {
-    ::close(descriptor);
+    defer_close(nullptr, descriptor);
     return fine::Error(atoms::not_local);
   }
 
@@ -308,31 +468,62 @@ HandleResult wrap(ErlNifEnv *env, std::int64_t fd, fine::Term owner_term) {
 
 FINE_NIF(wrap, 0);
 
-std::variant<fine::Ok<>, fine::Error<fine::Atom>>
-close_handle(ErlNifEnv *env, fine::Term term) {
+using CloseResult = std::variant<fine::Ok<>, fine::Error<fine::Atom>>;
+
+// Closes the handle `term` refers to and sets `fd` to the descriptor to
+// close, or -1, as retire_locked/1 returns it. close(2) is left to the
+// caller, after the mutex is dropped, so a slow close holds up no one else
+// using the handle.
+std::variant<Handle *, fine::Error<fine::Atom>>
+retire(ErlNifEnv *env, fine::Term term, int &fd) {
   Handle *handle = get_handle(env, term);
   if (handle == nullptr) {
     return fine::Error(atoms::not_local);
   }
 
-  int fd;
+  std::lock_guard<std::mutex> lock(handle->mutex);
 
-  {
-    std::lock_guard<std::mutex> lock(handle->mutex);
-
-    if (!handle->open) {
-      return fine::Error(atoms::closed);
-    }
-
-    demonitor_locked(env, *handle);
-    fd = retire_locked(*handle);
+  if (!handle->open) {
+    return fine::Error(atoms::closed);
   }
 
-  release_fd(*handle, fd);
+  demonitor_locked(env, *handle);
+  fd = retire_locked(*handle);
+  return handle;
+}
+
+// Closes a handle and runs close(2) before returning, unless a pin defers
+// it. This runs on a dirty IO scheduler, so a close that blocks holds up
+// only the caller.
+CloseResult close_handle(ErlNifEnv *env, fine::Term term) {
+  int fd = -1;
+  auto retired = retire(env, term, fd);
+
+  if (auto *error = std::get_if<fine::Error<fine::Atom>>(&retired)) {
+    return *error;
+  }
+
+  close_now(*std::get<Handle *>(retired), fd);
   return fine::Ok();
 }
 
-FINE_NIF(close_handle, 0);
+FINE_NIF(close_handle, ERL_NIF_DIRTY_JOB_IO_BOUND);
+
+// Closes a handle but leaves close(2) to the closer, for a caller that must
+// not wait for it, such as a connection cleaning up.
+CloseResult close_handle_async(ErlNifEnv *env, fine::Term term) {
+  int fd = -1;
+  auto retired = retire(env, term, fd);
+
+  if (auto *error = std::get_if<fine::Error<fine::Atom>>(&retired)) {
+    return *error;
+  }
+
+  defer_close(std::get<Handle *>(retired), fd);
+  return fine::Ok();
+}
+
+FINE_NIF(close_handle_async, 0);
 
 std::variant<fine::Ok<>, fine::Error<fine::Atom>>
 controlling_process(ErlNifEnv *env, fine::Term term, fine::Term pid_term) {
@@ -381,7 +572,7 @@ controlling_process(ErlNifEnv *env, fine::Term term, fine::Term pid_term) {
     fd = retire_locked(*handle);
   }
 
-  release_fd(*handle, fd);
+  defer_close(handle, fd);
   return fine::Error(atoms::noproc);
 }
 
@@ -485,6 +676,22 @@ FINE_NIF(dup_handle, 0);
 std::int64_t live_count(ErlNifEnv *) { return live_handles.load(); }
 
 FINE_NIF(live_count, 0);
+
+// Test hook: waits until the closer has closed everything queued so far.
+fine::Atom drain(ErlNifEnv *) {
+  std::unique_lock<std::mutex> lock(closer.mutex);
+  closer.idle.wait(lock, [] { return closer.queue.empty() && !closer.busy; });
+  return atoms::ok;
+}
+
+FINE_NIF(drain, ERL_NIF_DIRTY_JOB_IO_BOUND);
+
+// Test hook: how many times close(2) ran on a normal scheduler.
+std::uint64_t scheduler_close_count(ErlNifEnv *) {
+  return scheduler_closes.load();
+}
+
+FINE_NIF(scheduler_close_count, 0);
 
 // Test hook: how many times close(2) ran for this handle.
 std::variant<fine::Ok<std::uint64_t>, fine::Error<fine::Atom>>

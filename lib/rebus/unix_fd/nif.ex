@@ -24,6 +24,9 @@ defmodule Rebus.UnixFD.NIF do
   @spec close_handle(reference()) :: :ok | {:error, :closed | :not_local}
   def close_handle(_ref), do: :erlang.nif_error(:not_loaded)
 
+  @spec close_handle_async(reference()) :: :ok | {:error, :closed | :not_local}
+  def close_handle_async(_ref), do: :erlang.nif_error(:not_loaded)
+
   @spec controlling_process(reference(), pid()) ::
           :ok | {:error, :closed | :noproc | :not_local | :not_owner}
   def controlling_process(_ref, _pid), do: :erlang.nif_error(:not_loaded)
@@ -43,6 +46,12 @@ defmodule Rebus.UnixFD.NIF do
 
   @spec live_count() :: non_neg_integer()
   def live_count, do: :erlang.nif_error(:not_loaded)
+
+  @spec drain() :: :ok
+  def drain, do: :erlang.nif_error(:not_loaded)
+
+  @spec scheduler_close_count() :: non_neg_integer()
+  def scheduler_close_count, do: :erlang.nif_error(:not_loaded)
 
   @spec close_count(reference()) :: {:ok, non_neg_integer()} | {:error, :not_local}
   def close_count(_ref), do: :erlang.nif_error(:not_loaded)

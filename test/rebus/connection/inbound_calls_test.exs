@@ -342,6 +342,10 @@ defmodule Rebus.Connection.InboundCallsTest do
 
   # The close is synchronous in the process that made it, so close(2) has
   # run exactly once by the time it returns.
-  defp closed?(handle),
-    do: not UnixFD.open?(handle) and UnixFD.__close_count__(handle) == {:ok, 1}
+  # The calls table closes handles without waiting for close(2), so wait
+  # for the closer before counting.
+  defp closed?(handle) do
+    :ok = UnixFD.__drain__()
+    not UnixFD.open?(handle) and UnixFD.__close_count__(handle) == {:ok, 1}
+  end
 end

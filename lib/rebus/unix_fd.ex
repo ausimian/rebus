@@ -208,9 +208,16 @@ defmodule Rebus.UnixFD do
   # Internal API for the connection.
 
   @doc false
-  # Closes each handle the calling process owns, and leaves the rest alone:
-  # one whose ownership has moved on is no longer the caller's to close, and
-  # one already closed needs nothing.
+  # Closes a handle as `close/1` does, but returns without waiting for
+  # close(2), which a background thread runs, so a close that blocks cannot
+  # hold up the caller.
+  @spec close_async(t()) :: :ok | {:error, :closed | error()}
+  def close_async(%__MODULE__{ref: ref}), do: native(ref, &NIF.close_handle_async/1)
+
+  @doc false
+  # Closes each handle the calling process owns, as `close_async/1` does, and
+  # leaves the rest alone: one whose ownership has moved on is no longer the
+  # caller's to close, and one already closed needs nothing.
   @spec close_owned([t()]) :: :ok
   def close_owned(handles) when is_list(handles) do
     me = self()
@@ -219,7 +226,7 @@ defmodule Rebus.UnixFD do
       # Only the owner can transfer a handle, so one the caller owns stays
       # its own between these two calls; a concurrent close by another
       # holder makes the second answer `{:error, :closed}`.
-      with {:ok, ^me} <- owner(handle), do: close(handle)
+      with {:ok, ^me} <- owner(handle), do: close_async(handle)
     end)
   end
 
@@ -295,6 +302,17 @@ defmodule Rebus.UnixFD do
   @doc false
   @spec __live_count__() :: non_neg_integer()
   def __live_count__, do: NIF.live_count()
+
+  @doc false
+  # Waits until the background thread has run every close(2) queued so far.
+  @spec __drain__() :: :ok
+  def __drain__, do: NIF.drain()
+
+  @doc false
+  # How many times close(2) ran on a normal scheduler thread, which it never
+  # should.
+  @spec __scheduler_closes__() :: non_neg_integer()
+  def __scheduler_closes__, do: NIF.scheduler_close_count()
 
   @doc false
   # How many times close(2) ran for this handle.
