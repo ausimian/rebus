@@ -25,7 +25,7 @@ defmodule Rebus.UnixFD do
   See [Unix file descriptor passing](unix_fds.html).
   """
 
-  alias Rebus.UnixFD.{NIF, Raw}
+  alias Rebus.UnixFD.NIF
 
   @enforce_keys [:ref]
   defstruct [:ref]
@@ -155,27 +155,11 @@ defmodule Rebus.UnixFD do
   end
 
   @doc false
-  # Closes a received raw descriptor that `wrap/2` refused, when it is still
-  # open and the caller's. `wrap/2` has already closed it after `:noproc`,
-  # `:not_local` and `:enomem`, and after `:ebadf` or `:invalid_descriptor`
-  # there is nothing open under the number: closing it then could only close
-  # a descriptor another thread has just been given.
-  @spec close_unwrapped(raw(), atom()) :: :ok
-  def close_unwrapped(_fd, reason)
-      when reason in [:noproc, :not_local, :enomem, :ebadf, :invalid_descriptor],
-      do: :ok
-
-  def close_unwrapped(fd, _reason) do
-    _ = Raw.close(fd)
-    :ok
-  end
-
-  @doc false
   # Wraps a raw descriptor in a handle owned by `owner`, a local process.
-  # The handle takes over the descriptor: it is closed if `owner` is not
-  # alive (`:noproc`) or not local (`:not_local`). It stays the caller's
-  # after `:invalid_descriptor`, `:unsupported`, or a POSIX error, which
-  # means the number was not open.
+  # The handle takes over the descriptor, which is closed on any refusal
+  # except three: after `:ebadf` nothing is open under the number, after
+  # `:invalid_descriptor` it is no descriptor number at all, and after
+  # `:unsupported` it stays the caller's.
   @spec wrap(raw(), pid()) ::
           {:ok, t()} | {:error, :invalid_descriptor | :noproc | error() | atom()}
   def wrap(fd, owner) when is_raw(fd) and is_pid(owner) do

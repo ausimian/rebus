@@ -5,7 +5,6 @@ defmodule Rebus.UnixFDTest do
   alias Rebus.Connection.Rights
   alias Rebus.{Message, Service, TestImpl, TestServer, UnixFD}
   alias Rebus.Service.Call
-  alias Rebus.UnixFD.Raw
 
   @connection_name :rebus_unix_fd_test_connection
   @files_path "/org/example/Files"
@@ -69,21 +68,6 @@ defmodule Rebus.UnixFDTest do
     assert message.header_fields.unix_fds == 1
     assert message.unix_fds == [0]
     assert {:error, :invalid_unix_fds} = Message.attach_unix_fds(message, [])
-  end
-
-  test "reports invalid raw descriptors without closing an unrelated descriptor" do
-    assert {:error, :invalid_descriptor} = Raw.close(-1)
-    assert {:error, :invalid_descriptor} = Raw.close(:not_a_descriptor)
-    assert {:error, :ebadf} = Raw.close(1_000_000)
-  end
-
-  test "the private OTP close primitive is still exported" do
-    Code.ensure_loaded(:prim_file)
-
-    assert function_exported?(:prim_file, :file_desc_to_ref, 2),
-           "Rebus.UnixFD.Raw closes owned descriptors with the private OTP function " <>
-             ":prim_file.file_desc_to_ref/2, and this OTP release no longer exports it. " <>
-             "The migration plan in lib/rebus/unix_fd/raw.ex now applies."
   end
 
   test "closes a received socket descriptor without disturbing the original", %{
@@ -166,8 +150,8 @@ defmodule Rebus.UnixFDTest do
     assert_receive {^server, %Message{header_fields: %{member: "FD"}, unix_fds: [received]}},
                    1_000
 
-    assert received != fd
-    assert :ok = Raw.close(received)
+    assert raw!(received) != fd
+    assert :ok = UnixFD.close(received)
   end
 
   test "sends rights once and switches a partial sendmsg tail to send", %{connection: connection} do
@@ -1277,8 +1261,8 @@ defmodule Rebus.UnixFDTest do
                    1_000
 
     # The reply borrowed the descriptor, so it is still the handler's to close,
-    # as the server's received duplicate is the server's.
-    assert :ok = Raw.close(received)
+    # as the server's received handle is the server's.
+    assert :ok = UnixFD.close(received)
 
     # An error reply carries them the same way.
     {:ok, ref} = Service.export(connection, @files_path <> "/Errors", [@files])
@@ -1304,7 +1288,7 @@ defmodule Rebus.UnixFDTest do
                     }},
                    1_000
 
-    assert :ok = Raw.close(received)
+    assert :ok = UnixFD.close(received)
     assert :ok = UnixFD.close(error_taken)
     assert :ok = UnixFD.close(taken)
     assert no_new_fds?(before_fds)
@@ -1784,7 +1768,7 @@ defmodule Rebus.UnixFDTest do
 
     # The malformed first cmsg must not prevent the later, kernel-created
     # descriptor from being found and closed on the fail-closed path.
-    assert {:error, :ebadf} = Raw.close(received)
+    assert {:error, :ebadf} = UnixFD.__fd_identity__(received)
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
   end
 
@@ -1812,7 +1796,7 @@ defmodule Rebus.UnixFDTest do
                :sys.get_state(connection)
              )
 
-    assert {:error, :ebadf} = Raw.close(invalid_iov_fd)
+    assert {:error, :ebadf} = UnixFD.__fd_identity__(invalid_iov_fd)
 
     assert {:ok,
             %{
@@ -1825,7 +1809,7 @@ defmodule Rebus.UnixFDTest do
                :sys.get_state(connection)
              )
 
-    assert {:error, :ebadf} = Raw.close(missing_iov_fd)
+    assert {:error, :ebadf} = UnixFD.__fd_identity__(missing_iov_fd)
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
   end
 

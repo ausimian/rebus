@@ -284,9 +284,17 @@ HandleResult wrap(ErlNifEnv *env, std::int64_t fd, fine::Term owner_term) {
   int descriptor = static_cast<int>(fd);
 
   // A number that is not open now would be closed later, after the operating
-  // system may have reused it, so refuse it rather than adopt it.
+  // system may have reused it, so refuse it rather than adopt it. F_GETFD
+  // fails only with EBADF; should it fail otherwise, the descriptor is open
+  // and the caller has handed it over, so it is closed rather than leaked.
   if (fcntl(descriptor, F_GETFD) < 0) {
-    return fine::Error(errno_atom(errno));
+    int error = errno;
+
+    if (error != EBADF) {
+      ::close(descriptor);
+    }
+
+    return fine::Error(errno_atom(error));
   }
 
   ErlNifPid owner;
