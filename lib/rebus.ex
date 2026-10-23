@@ -23,49 +23,45 @@ defmodule Rebus do
 
       :ok = Rebus.close(conn)
 
+  ## Services
+
+  `Rebus.Service` exports objects and answers the method calls made on them,
+  `Rebus.Object` runs an exported object as a GenServer, and `Rebus.Bus`
+  requests the well-known names clients find them by. Every connection
+  answers `org.freedesktop.DBus.Peer` (`Ping` and `GetMachineId`) on every
+  path. A call to a path with nothing exported gets
+  `org.freedesktop.DBus.Error.UnknownObject`, unless it asked for no reply.
+
   ## Supported platforms
 
-  Rebus supports Linux and macOS, which are the platforms exercised in CI.
-  Other Unix variants are untested; Unix file descriptor passing in particular
-  is limited to Linux and macOS. Windows is not supported.
+  Rebus supports Linux and macOS, the platforms exercised in CI. Other Unix
+  variants are untested, and Unix file descriptor passing in particular is
+  limited to Linux and macOS. Windows is not supported.
 
-  ## Configuration and guides
+  ## Configuration
 
-  You can configure the system bus address in your application's config:
+  The system bus address can be set in application config. The
+  `DBUS_SYSTEM_BUS_ADDRESS` environment variable, when set and non-empty,
+  overrides it:
 
       config :rebus, :system_bus_address, "unix:path=/run/dbus/system_bus_socket"
 
-  The `DBUS_SYSTEM_BUS_ADDRESS` environment variable, when set and non-empty,
-  overrides this config key.
-
-  `:match_recovery_max_rules` bounds the match rules on a single connection
-  whose bus-side state is unresolved. The default is 64. At most that many are
-  cleaned up at once, and a rule that needs cleanup beyond it is left
-  uncertain. While that many rules are unresolved, `add_match/3` refuses a rule
-  the connection does not already hold. See
+  Two settings bound the cleanup Rebus does when a match-rule operation on
+  the bus is left in doubt. `:match_recovery_max_rules`, 64 by default, is
+  how many rules on one connection may be unresolved at once, and
+  `:match_recovery_max_attempts`, 30 by default, is how many cleanup attempts
+  a rule gets before it is left uncertain. See
   [Signal subscriptions and match rules](match_rules.html).
 
       config :rebus, :match_recovery_max_rules, 64
-
-  `:match_recovery_max_attempts` caps how many times the cleanup of one such
-  rule is retried before the rule is left uncertain. The default is 30, about
-  26 seconds of backoff. See
-  [Signal subscriptions and match rules](match_rules.html).
-
       config :rebus, :match_recovery_max_attempts, 30
 
-  Connections implement
-  `org.freedesktop.DBus.Peer` (`Ping` and `GetMachineId`) on every path.
-  `Rebus.Service` exports objects and answers the method calls made on them,
-  `Rebus.Object` runs an exported object as a GenServer, and `Rebus.Bus`
-  requests the well-known names clients find them by.
-  A call to a path with nothing exported gets an
-  `org.freedesktop.DBus.Error.UnknownObject` error, unless the call is marked
-  `:no_reply_expected`.
+  ## Guides
 
-  See [Exporting objects](services.html), [Authentication](authentication.html),
-  [Signal subscriptions and match rules](match_rules.html), and
-  [Unix file descriptor passing](unix_fds.html) for practical guidance.
+  - [Exporting objects](services.html)
+  - [Authentication and bus addresses](authentication.html)
+  - [Signal subscriptions and match rules](match_rules.html)
+  - [Unix file descriptor passing](unix_fds.html)
   """
 
   @type address ::
@@ -181,40 +177,45 @@ defmodule Rebus do
   | `:max_message_size` | `134217728` | Largest complete inbound message, in bytes, from `4096` up to the protocol limit, `Rebus.Message.max_message_size/0`. Outbound messages are not affected. |
   | `:max_pending_calls` | `1024` | Positive number of inbound method calls handed to `Rebus.Service` handlers that may wait for their answers at once. Calls beyond it are answered with `org.freedesktop.DBus.Error.LimitsExceeded`. A call that asks for no reply counts only if it carries descriptors, and beyond the limit is dropped with them closed. |
 
-  ## Notes
+  ## Lifetime
 
-  - A PID found by name before its `connect/2` returns is still being
-    established. Operations sent to it may time out, and are safe to retry
-    once `connect/2` succeeds.
-  - An `:owner` is monitored, not linked, and need not be the process calling
-    `connect/2`. The connection stops with `{:shutdown, :owner_down}` when the
-    owner exits for any reason, including `:normal`. The stop is an ordinary
-    one, so the connection's socket and any retained descriptors are closed
-    and the bus releases the state that connection held. Inflight callers
-    receive `{:error, :disconnected}`. Only a PID on the local node is
-    accepted; a remote PID is `:invalid_owner`.
-  - The supervisor owns the connection until `close/1` or, with `:owner`, until
-    that process exits.
-  - A write timeout that accepted no bytes fails only that caller. After a
-    partial frame the connection terminates and inflight callers receive
-    `{:error, :disconnected}`.
-  - Setup is one budget, not one per step: a slow identity lookup or socket
-    connect leaves less time for authentication. For an address list the
-    budget is shared across every candidate too, so a slow candidate leaves
-    less time for the entries after it.
-  - Failed address-list attempts are logged at debug level, without any
-    address, host, path or GUID.
-  - `:max_message_size` bounds the memory a peer can make one connection
-    hold for inbound traffic. Rebus buffers one partial message at a time
-    and reads at most 64 KiB at once, so a connection retains about the cap
-    plus one read. The default protocol limit allows a peer to make a
-    connection buffer 128 MiB; lower it for untrusted peer-to-peer or TCP
-    endpoints. A message declared larger than the cap stops the connection
-    with `{:shutdown, :message_too_large}`, as one over the protocol limit
-    does, once its fixed header arrives and before the rest of it is
-    buffered. Any descriptors received with it are closed. The cap also
-    applies to the `Hello` reply, and the `4096` floor leaves room for that
-    reply and the `NameAcquired` signal that follows it.
+  The supervisor owns the connection until `close/1` is called or, with
+  `:owner`, until that process exits. An `:owner` is monitored, not linked,
+  and need not be the process calling `connect/2`. When it exits for any
+  reason, including `:normal`, the connection stops with
+  `{:shutdown, :owner_down}`: its socket and any retained descriptors are
+  closed, the bus releases the state it held, and inflight callers receive
+  `{:error, :disconnected}`. Only a local PID is accepted; a remote one is
+  `:invalid_owner`.
+
+  A PID found by `:name` before its `connect/2` returns is still being
+  established. Operations sent to it may time out, and are safe to retry
+  once `connect/2` succeeds.
+
+  ## Timeouts
+
+  Setup is one budget, not one per step. A slow identity lookup or socket
+  connect leaves less time for authentication, and for an address list the
+  budget is shared across every candidate, so a slow candidate leaves less
+  time for the entries after it. Failed address-list attempts are logged at
+  debug level, without any address, host, path or GUID.
+
+  A write timeout that accepted no bytes fails only that caller. After a
+  partial frame the connection terminates and inflight callers receive
+  `{:error, :disconnected}`.
+
+  ## Message size
+
+  `:max_message_size` bounds the memory a peer can make one connection hold
+  for inbound traffic. Rebus buffers one partial message at a time and reads
+  at most 64 KiB at once, so a connection retains about the cap plus one
+  read. The default is the protocol limit, which lets a peer make a
+  connection buffer 128 MiB, so lower it for untrusted peer-to-peer or TCP
+  endpoints. A message declared larger than the cap stops the connection
+  with `{:shutdown, :message_too_large}` once its fixed header arrives,
+  before the rest is buffered, and any descriptors received with it are
+  closed. The cap also applies to the `Hello` reply; the `4096` floor leaves
+  room for that reply and the `NameAcquired` signal that follows it.
 
   ## Return values
 
@@ -341,14 +342,10 @@ defmodule Rebus do
   Stops a local connection process created by `connect/2`.
 
   Connections are supervised and, unless `connect/2` was given an `:owner`,
-  remain alive after the connecting process exits. Use this function to release
-  a named or otherwise no-longer-needed connection. It accepts only local
-  connection PIDs; remote PIDs are not supported.
-
-  An owned connection is stopped the same way. Once an owner's exit has stopped
-  its connection there is nothing left to close, and this function answers
-  `{:error, :not_found}` as it does for any other PID that is no longer a
-  connection.
+  stay alive after the connecting process exits, so this is how a connection
+  is released. An owned connection can be closed the same way. Once a
+  connection has already stopped, for example because its owner exited,
+  there is nothing left to close and this returns `{:error, :not_found}`.
 
   A connection can be closed before its `connect/2` returns, for example
   through its registered `:name`. One still connecting its socket or
@@ -422,39 +419,43 @@ defmodule Rebus do
   def unique_name(conn) when is_pid(conn), do: Rebus.Connection.unique_name(conn)
 
   @doc """
-  Sends a method call and waits for its correlated reply.
+  Sends a method call and waits for its reply.
 
   Only a method call that expects a reply is accepted, and `timeout` is in
-  milliseconds. Each result carries the complete message, including any received
-  descriptors in `:unix_fds`. A D-Bus error reply from the peer is returned as
-  `{:error, {:dbus_error, %Rebus.Message{type: :error}}}`, so it never shares a
-  shape with a local or transport failure.
+  milliseconds. Each result carries the complete message, including any
+  received descriptors in `:unix_fds`. A D-Bus error reply from the peer is
+  returned as `{:error, {:dbus_error, %Rebus.Message{type: :error}}}`, so it
+  never shares a shape with a local or transport failure.
 
   ## Return values
 
-  - `{:ok, %Rebus.Message{type: :method_return}}` - the peer replied successfully.
-  - `{:error, {:dbus_error, %Rebus.Message{type: :error}}}` - the peer returned
-    a D-Bus error reply. Its error name is in `header_fields.error_name`, and any
-    descriptors it carried are in `:unix_fds` and owned by the caller.
-  - `{:error, :timeout}` - no reply arrived in time, and the request may already
-    have reached the peer. A request sent to a named PID whose `connect/2` has
-    not yet returned was never written and is safe to retry. A reply that
-    exhausted a local decoding cap inside its own header fields also lands here:
-    Rebus recovered no trusted `reply_serial`, so the frame is dropped and the
-    connection stays up, but the call cannot be matched to it.
+  - `{:ok, %Rebus.Message{type: :method_return}}` - the peer replied.
+  - `{:error, {:dbus_error, %Rebus.Message{type: :error}}}` - the peer
+    returned a D-Bus error. Its name is in `header_fields.error_name`, and
+    any descriptors it carried are in `:unix_fds` and owned by the caller.
+  - `{:error, :timeout}` - no reply arrived in time. The request may already
+    have reached the peer, except when it was sent to a named PID whose
+    `connect/2` has not yet returned: that request was never written and is
+    safe to retry.
   - `{:error, {:reply_dropped, :method_return}}` or
-    `{:error, {:reply_dropped, {:error, error_name}}}` - the peer definitely
-    replied, but the reply exhausted a local decoding cap and was discarded.
-    Neither is delivery-ambiguous, so decide whether to retry from what the
-    operation does. A cap exhausted inside the reply's own header fields cannot
-    produce these shapes; it returns `{:error, :timeout}` instead.
-  - `{:error, :fd_claim_expired}` - Rebus closed the reply's descriptors instead of handing them over.
+    `{:error, {:reply_dropped, {:error, error_name}}}` - the peer replied,
+    but the reply exceeded a local decoding cap and was discarded. Delivery
+    is not in doubt, so decide whether to retry from what the operation does.
+  - `{:error, :fd_claim_expired}` - Rebus closed the reply's descriptors
+    instead of handing them over.
   - `{:error, :disconnected}` - the connection stopped before the reply, or
-    before its descriptors transferred. A call carrying descriptors can return
-    after `timeout`; see [Unix file descriptor passing](unix_fds.html).
-  - Nothing was written for `:encode_failed`, `:no_reply_expected`, `:not_connected`,
-    `:serial_exhausted`, `:unix_fd_unsupported`, `:unix_fd_not_negotiated`,
-    `:unix_fd_send_failed`, `{:invalid_message_type, type}` and `:remote_connection_unsupported`.
+    before its descriptors transferred. A call carrying descriptors can
+    return after `timeout`; see
+    [Unix file descriptor passing](unix_fds.html).
+  - Nothing was written for `:encode_failed`, `:no_reply_expected`,
+    `:not_connected`, `:serial_exhausted`, `:unix_fd_unsupported`,
+    `:unix_fd_not_negotiated`, `:unix_fd_send_failed`,
+    `{:invalid_message_type, type}` and `:remote_connection_unsupported`.
+
+  A reply that exceeds a decoding cap inside its own header fields is a
+  special case: Rebus recovers no trusted `reply_serial`, so the frame is
+  dropped, the connection stays up, and the call reports `{:error, :timeout}`
+  rather than `:reply_dropped`, because it cannot be matched to the reply.
 
   ## Examples
 
@@ -520,41 +521,31 @@ defmodule Rebus do
   @doc """
   Subscribes the calling process to signals selected by a match rule.
 
-  Signals matching the rule arrive as `{ref, %Rebus.Message{}}`. Build the rule
-  with `Rebus.MatchRule.new/1`; raw strings are not accepted. Equivalent rules
-  share one bus registration, and each call gets its own reference.
+  Signals matching the rule arrive as `{ref, %Rebus.Message{}}`. Build the
+  rule with `Rebus.MatchRule.new/1`; raw strings are not accepted. Equivalent
+  rules share one bus registration, and each call gets its own reference.
 
   `{:error, :timeout}` is ambiguous: you get no reference, but the bus may
-  already hold the rule. A reply whose header fields exceed a local decoding
-  limit has the same result because its reply serial cannot be trusted; see
-  `call/3` for the fuller contract. `{:error, :sender_routing_ambiguous}` means the rule
-  overlaps an existing one with a different sender. `{:error, :not_a_bus}`
-  means the connection was opened with `bus: false`, and nothing was sent.
-
-  When Rebus cannot prove what the bus holds for a rule, it leaves the rule
-  uncertain and keeps the connection up. That happens when the rule's cleanup
-  exhausts its retry budget, when too many cleanups are already running, or
-  when an operation's task is lost. Rebus then sends a
-  `t:match_uncertain_notice/0` to each holder of a reference on the rule and to
-  the connection's `:owner`. It is a four-element tuple tagged
-  `:rebus_match_uncertain`, so it never matches a `{ref, %Rebus.Message{}}`
-  pattern. Close the connection if you need the bus to forget the rule. The
-  [match rules guide](match_rules.html) explains what else an uncertain rule
-  changes.
-
-  Rebus manages a connection's match rules in a process linked to the
-  connection. If that process fails, which would be a bug in Rebus, the
-  connection stops with `{:shutdown, {:match_subscription_exited, reason}}`,
-  and the bus discards its rules.
+  already hold the rule. Rebus cleans up in the background. When it cannot
+  establish what the bus holds for a rule, it leaves the rule uncertain,
+  keeps the connection up, and sends a `t:match_uncertain_notice/0` to each
+  holder of a reference on the rule and to the connection's `:owner`. The
+  notice is a four-element tuple tagged `:rebus_match_uncertain`, so it never
+  matches a `{ref, %Rebus.Message{}}` pattern. Closing the connection is the
+  only way to make the bus forget such a rule. See
+  [Signal subscriptions and match rules](match_rules.html) for what else an
+  uncertain rule changes.
 
   ## Return values
 
-  Success is `{:ok, reference}`. Every failure is `{:error, reason}`: `:timeout`, `:not_a_bus`,
-  `:sender_routing_ambiguous`, `:match_rule_cleanup_pending`, `:match_rule_uncertain`,
-  `:match_recovery_capacity_exhausted`, `{:bus_error, error_name}`, `:invalid_bus_reply`,
-  `:not_connected`, `:disconnected`, `:encode_failed`, `:serial_exhausted`, `:fd_claim_expired`, `:not_started`,
-  `{:reply_dropped, outcome}` and `:remote_connection_unsupported`. The
-  [match rules guide](match_rules.html) lists what each one means.
+  Success is `{:ok, reference}`. Every failure is `{:error, reason}`, where
+  `reason` is one of `:timeout`, `:not_a_bus`, `:sender_routing_ambiguous`,
+  `:match_rule_cleanup_pending`, `:match_rule_uncertain`,
+  `:match_recovery_capacity_exhausted`, `{:bus_error, error_name}`,
+  `:invalid_bus_reply`, `:not_connected`, `:disconnected`, `:encode_failed`,
+  `:serial_exhausted`, `:fd_claim_expired`, `:not_started`,
+  `{:reply_dropped, outcome}` or `:remote_connection_unsupported`. The guide
+  lists what each one means.
 
   ## Example
 
@@ -574,11 +565,12 @@ defmodule Rebus do
   @doc """
   Removes a match-rule subscription reference.
 
-  Removing a reference is idempotent and scoped to its own connection. A removed
-  reference receives no further signals, and the last reference for a rule also removes
-  the rule from the bus, unless Rebus has left the rule uncertain. A removal that times out or fails keeps the reference for a
-  retry, while Rebus clears the rule in the background. Rebus removes the reference and
-  the bus rule when the owning process exits. Closing the connection discards both.
+  Removing a reference is idempotent. The reference receives no further
+  signals, and removing the last reference for a rule also removes the rule
+  from the bus, unless Rebus has left the rule uncertain. A removal that
+  times out or fails keeps the reference for a retry while Rebus clears the
+  rule in the background. The reference and the bus rule are also removed
+  when the owning process exits, and closing the connection discards both.
 
   ## Return values
 

@@ -2,20 +2,20 @@ defmodule Rebus.MatchRule do
   @moduledoc """
   A validated, canonical D-Bus signal match rule.
 
-  Construct rules with `new/1`, then pass them to `Rebus.add_match/3`.
-  Rebus deliberately accepts structured criteria instead of raw rule strings,
-  so every outbound rule is bounded, correctly quoted, and safe to use for
-  client-side filtering when several subscriptions share a connection.
+  Build rules with `new/1` and pass them to `Rebus.add_match/3`. Rebus takes
+  structured criteria rather than raw rule strings, so every rule it sends is
+  bounded and correctly quoted, and can also be evaluated locally when
+  several subscriptions share a connection.
 
-  The generated rule always contains `type='signal'`. Supported criteria are
+  The generated rule always contains `type='signal'`. The criteria are
   `:sender`, `:interface`, `:member`, `:path`, `:path_namespace`,
-  `:destination`, `:args`, `:arg_paths`, and `:arg0namespace`. `:path` and
-  `:path_namespace` are mutually exclusive. `:args` and `:arg_paths` are maps
-  or keyword lists keyed by indexes 0 through 63.
+  `:destination`, `:args`, `:arg_paths` and `:arg0namespace`. `:path` and
+  `:path_namespace` cannot be combined. `:args` and `:arg_paths` are maps or
+  keyword lists keyed by argument index, 0 through 63.
 
-  `eavesdrop` is not accepted, and sender matching is split between the bus
-  and Rebus; see
-  [Signal subscriptions and match rules](match_rules.html).
+  `eavesdrop` is not accepted. Sender matching is split between the bus and
+  Rebus, as [Signal subscriptions and match rules](match_rules.html)
+  describes.
   """
 
   alias Rebus.Message
@@ -43,11 +43,11 @@ defmodule Rebus.MatchRule do
   @type t :: %__MODULE__{criteria: criteria(), string: binary()}
 
   @doc """
-  Builds a safe signal match rule.
+  Builds a signal match rule from the criteria in `opts`.
 
-  The rule is limited to #{@max_length} bytes, matching the reference D-Bus
-  implementation's match-rule limit. Invalid input returns a stable atom and
-  never includes caller-provided rule text.
+  The encoded rule is limited to #{@max_length} bytes, the reference D-Bus
+  implementation's limit. Invalid input returns a fixed atom that never
+  includes the caller's text.
 
   ## Examples
 
@@ -82,23 +82,21 @@ defmodule Rebus.MatchRule do
   end
 
   @doc """
-  Returns the canonical D-Bus representation used for both AddMatch and
-  RemoveMatch.
+  Returns the rule as the string sent to the bus in `AddMatch` and
+  `RemoveMatch`.
   """
   @spec to_string(t()) :: binary()
   def to_string(%__MODULE__{string: string}), do: string
 
   @doc """
-  Returns whether an inbound signal matches the criteria that Rebus can safely
-  evaluate after the bus has routed it.
+  Returns whether a signal matches the parts of the rule that can be checked
+  locally, after the bus has routed it.
 
-  Rebus compares unique-name `:sender` values, `:interface`, `:member`,
-  `:path`, `:path_namespace`, `:destination`, `:args`, `:arg_paths`, and
-  `:arg0namespace`. A well-known `:sender` is left to the bus for broadcast
-  signals. A directed signal is accepted for a well-known `:sender` when the
-  sender header is that exact name. Ownership-aware matching for subscribed
-  signals is handled by the connection. This function does not emulate bus
-  access policy or eavesdropping.
+  Every criterion is compared except a well-known `:sender`, which is left to
+  the bus for broadcast signals; a directed signal matches such a sender
+  only when its sender header is that exact name. The connection adds
+  ownership tracking for subscribed signals on top of this. Bus access
+  policy and eavesdropping are not emulated.
   """
   @spec matches?(t(), Message.t()) :: boolean()
   def matches?(%__MODULE__{} = rule, %Message{} = message), do: matches?(rule, message, %{})

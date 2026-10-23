@@ -2,9 +2,9 @@ defmodule Rebus.ResourceLimitError do
   @moduledoc """
   Raised when encoding or decoding exceeds a local Rebus resource limit.
 
-  These limits protect the VM while handling otherwise wire-valid D-Bus data.
-  They are distinct from malformed D-Bus grammar and from the protocol's own
-  wire-size limits, which raise `Rebus.ProtocolLimitError`.
+  These limits protect the VM from wire-valid D-Bus data that is too large
+  or too deeply nested to handle. Malformed data is reported separately, and
+  the protocol's own wire-size limits raise `Rebus.ProtocolLimitError`.
   """
 
   defexception limit: :unknown, message: "D-Bus local resource limit exceeded"

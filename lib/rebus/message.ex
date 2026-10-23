@@ -1,21 +1,23 @@
 defmodule Rebus.Message do
   @moduledoc """
-  Constructs, validates, encodes, and decodes D-Bus messages.
+  Constructs, validates, encodes and decodes D-Bus messages.
 
-  A message has a fixed header, typed header fields, and a body described by a
-  D-Bus signature. See the
+  A message has a fixed header, typed header fields, and a body described by
+  a D-Bus signature. The
   [D-Bus message protocol](https://dbus.freedesktop.org/doc/dbus-specification.html#message-protocol-messages)
-  for the wire layout and required header fields. Use `new/2` for outbound
-  messages and `signature/1` to read the body signature.
+  gives the wire layout and the header fields each message type requires.
+  Build outbound messages with `new/2` and read a body's signature with
+  `signature/1`.
 
   ## Unix file descriptors
 
-  The `unix_fds` struct field is separate from the `:unix_fds` header count.
-  Construct outbound messages with `fds: [fd, ...]`; `h` body values are their
-  zero-based wire indexes. Inbound descriptors appear in `message.unix_fds` on
-  a `Rebus.call/3` reply, and the calling process then owns them, and on the
-  message of an inbound call delivered to a `Rebus.Service` handler, which
-  only borrows them until the call completes. See
+  The `unix_fds` struct field holds the descriptors themselves and is
+  separate from the `:unix_fds` header field, which is only their count.
+  Build an outbound message with `fds: [fd, ...]`; each `h` value in the body
+  is a zero-based index into that list. On a `Rebus.call/3` reply, the
+  descriptors in `message.unix_fds` belong to the calling process. On the
+  message of an inbound call delivered to a `Rebus.Service` handler, they are
+  borrowed from the connection until the call completes. See
   [Unix file descriptor passing](unix_fds.html).
 
   ## Examples
@@ -210,18 +212,19 @@ defmodule Rebus.Message do
   @doc """
   The largest D-Bus array payload accepted or emitted, in bytes.
 
-  This is the D-Bus protocol limit of 2^26 bytes. It is distinct from the
-  local scalar materialization cap exposed by `max_scalar_elements/0`.
+  This is the D-Bus protocol limit of 2^26 bytes. `max_scalar_elements/0` is
+  a separate, local limit on element counts.
   """
   @spec max_array_size() :: pos_integer()
   def max_array_size, do: @max_array_size
 
   @doc """
-  The maximum number of fixed-width scalar array elements per encode or decode.
+  The most fixed-width scalar array elements one encode or decode may
+  produce.
 
-  This local safety cap is 1,000,000 elements. Encoding shares it cumulatively
-  across every fixed-width scalar array in one encode operation; it is not a
-  D-Bus wire-format limit.
+  This is a local safety cap of 1,000,000 elements, not a D-Bus limit. One
+  encode operation shares it across every fixed-width scalar array in the
+  message.
   """
   @spec max_scalar_elements() :: pos_integer()
   def max_scalar_elements, do: @max_scalar_elements
@@ -250,33 +253,31 @@ defmodule Rebus.Message do
   def validate_encoded_size(_header_fields_size, _body_length), do: {:error, :message_too_large}
 
   @doc """
-  Creates a new D-Bus message.
+  Builds a D-Bus message of `type`, validating it.
 
-  ## Parameters
+  `type` is `:method_call`, `:method_return`, `:error` or `:signal`. The
+  message's serial is set to 1; the connection assigns the real serial as it
+  writes the frame.
 
-  - `type` - The message type (`:method_call`, `:method_return`, `:error`, `:signal`)
-  - `opts` - Keyword list of options:
-    - `:flags` - A list of flags (default: `[]`): `:no_reply_expected` suppresses
-      a reply, `:no_auto_start` prevents service activation, and
-      `:allow_interactive_authorization` permits interactive authorization
-    - `:version` - Protocol version (default: `1`)
-    - `:body` - Message body as list of values (default: `[]`)
-    - `:signature` - Message body signature (default: auto-generated from body;
-      `:infinity`, `:negative_infinity`, and `:nan` infer `d`)
-    - `:fds` - Borrowed Unix file descriptors. Each `h` value in the body is
-      an index into this list. Rebus never closes outbound descriptors.
-    - `:path` - Object path; required for method calls and signals
-    - `:interface` - Interface name; required for signals
-    - `:member` - Method or signal name; required for method calls and signals
-    - `:error_name` - D-Bus error name; required for error replies
-    - `:reply_serial` - Request serial; required for method returns and errors
-    - `:destination` - Optional target connection name
-    - `:sender` - Optional sending connection name, normally supplied by a bus
+  ## Options
 
-  ## Note
-
-  The serial number is initialized to 1. The transport layer that dispatches
-  the message assigns its own serial number before writing the frame.
+  - `:path` - the object path. Required for method calls and signals.
+  - `:interface` - the interface name. Required for signals.
+  - `:member` - the method or signal name. Required for method calls and
+    signals.
+  - `:error_name` - the D-Bus error name. Required for errors.
+  - `:reply_serial` - the serial of the call being answered. Required for
+    method returns and errors.
+  - `:destination` - the connection to send the message to.
+  - `:sender` - the sending connection's name, normally set by the bus.
+  - `:body` - the body, as a list of values. Defaults to `[]`.
+  - `:signature` - the body's signature. Defaults to one inferred from the
+    body, where `:infinity`, `:negative_infinity` and `:nan` infer `d`.
+  - `:fds` - borrowed Unix file descriptors, which `h` values in the body
+    index. Rebus never closes outbound descriptors.
+  - `:flags` - a list of `:no_reply_expected`, `:no_auto_start` and
+    `:allow_interactive_authorization`. Defaults to `[]`.
+  - `:version` - the protocol version. Defaults to `1`.
 
   ## Examples
 
@@ -289,24 +290,23 @@ defmodule Rebus.Message do
 
   ## Errors
 
-  Returns `{:error, reason}` where `reason` is one of:
-  - `:invalid_type` - the message type is not a D-Bus message type
-  - `:invalid_flags` - the flags are not a list, or include an unknown flag
-  - `:invalid_version` - the protocol version is unsupported
+  - `:invalid_type` - `type` is not a D-Bus message type.
+  - `:invalid_flags` - the flags are not a list, or include an unknown flag.
+  - `:invalid_version` - the protocol version is unsupported.
   - `:invalid_body` - the body is not a list, or its values cannot be encoded
-    by the signature
-  - `:invalid_signature` - the signature is not a binary, or is not a valid
-    D-Bus type expression
+    with the signature.
+  - `:invalid_signature` - the signature is not a binary, or not a valid
+    D-Bus type expression.
   - `{:invalid_header_field, field}` - the value given for that header field
-    is not valid
-  - `{:missing_header_field, field}` - a header field required for the message
-    type was not given
-  - `:invalid_unix_fds` - the descriptors do not match the body
-  - `:unix_fd_limit` - the message exceeds the Unix file descriptor limit
-  - `:message_too_large` - the encoded message, or an array within it, exceeds
-    the D-Bus size limit
-  - `:resource_limit` - a local structural, nesting, or scalar materialization
-    cap is exceeded
+    is not valid.
+  - `{:missing_header_field, field}` - a header field the message type
+    requires was not given.
+  - `:invalid_unix_fds` - the descriptors do not match the body.
+  - `:unix_fd_limit` - the message exceeds the Unix file descriptor limit.
+  - `:message_too_large` - the encoded message, or an array within it,
+    exceeds the D-Bus size limit.
+  - `:resource_limit` - a local structural, nesting or scalar cap was
+    exceeded.
   """
   @spec new(message_type(), keyword()) :: {:ok, t()} | {:error, construction_error()}
   def new(type, opts \\ []) do
@@ -391,15 +391,9 @@ defmodule Rebus.Message do
     do: "unknown header field #{inspect(field)}"
 
   @doc """
-  Encodes a message to iodata format.
+  Encodes a message in the D-Bus wire format, as iodata.
 
-  Returns the message encoded according to the D-Bus wire format specification.
-  The endianness can be specified as `:little` or `:big` (default: `:little`).
-
-  ## Parameters
-
-  - `message` - The message to encode
-  - `endianness` - Byte order (`:little` or `:big`, default: `:little`)
+  `endianness` is `:little` by default, or `:big`.
 
   ## Examples
 
@@ -408,15 +402,17 @@ defmodule Rebus.Message do
       iex> is_binary(IO.iodata_to_binary(iodata))
       true
 
-  ## Returns
+  ## Return values
 
-  `{:ok, iodata}` on success. Returns `{:error, :invalid_body}` when the
-  message body does not match its signature, `{:error, :invalid_header_fields}`
-  for invalid header values, or `{:error, :invalid_message}` for an invalid
-  fixed header or missing required fields. Returns `{:error, :message_too_large}`
-  when the encoded frame exceeds the D-Bus message or header-fields limits, or
-  an encoded array exceeds `max_array_size/0`, or `{:error, :resource_limit}`
-  when a local structural, nesting, or scalar cap is exhausted.
+  - `{:ok, iodata}` - the encoded frame.
+  - `{:error, :invalid_body}` - the body does not match its signature.
+  - `{:error, :invalid_header_fields}` - a header field value is invalid.
+  - `{:error, :invalid_message}` - the fixed header is invalid, or a required
+    header field is missing.
+  - `{:error, :message_too_large}` - the frame exceeds the D-Bus message or
+    header-fields limit, or an array in it exceeds `max_array_size/0`.
+  - `{:error, :resource_limit}` - a local structural, nesting or scalar cap
+    was exceeded.
   """
   @spec encode(t(), :little | :big) :: {:ok, iodata()} | {:error, encoding_error()}
   def encode(message, endianness \\ :little) when endianness in [:little, :big] do
@@ -455,13 +451,11 @@ defmodule Rebus.Message do
   end
 
   @doc """
-  Decodes a binary message.
+  Decodes one complete message from a binary.
 
-  Parses a D-Bus message from binary format according to the wire format specification.
-
-  ## Parameters
-
-  - `binary` - The binary data to decode
+  Returns `{:ok, message}`, or `{:error, reason}` when the binary is not a
+  well-formed D-Bus message. Use `parse/1` for a binary that may hold part of
+  a message, or more than one.
 
   ## Examples
 
@@ -470,10 +464,6 @@ defmodule Rebus.Message do
       iex> {:ok, decoded} = Rebus.Message.decode(IO.iodata_to_binary(encoded))
       iex> decoded.type
       :signal
-
-  ## Returns
-
-  `{:ok, message}` on success, `{:error, reason}` on failure.
   """
   @spec decode(binary()) :: {:ok, t()} | {:error, any()}
   def decode(binary) when is_binary(binary) do
@@ -633,29 +623,22 @@ defmodule Rebus.Message do
   end
 
   @doc """
-  Parses a complete D-Bus message from a binary if sufficient data is available.
+  Parses one message from the front of a binary that may hold part of a
+  message, or more than one.
 
-  This function checks if the provided binary contains enough data to parse a complete
-  D-Bus message (both header and body). If it does, it extracts exactly the right
-  amount of data and passes it to `decode/1`. If the binary is too small, returns `nil`.
+  This is the function to use on a stream. It decodes the first message once
+  the binary holds all of it, and returns `nil` until then.
 
-  This is useful for streaming scenarios where you receive partial data and need to
-  determine when you have a complete message.
+  ## Return values
 
-  ## Parameters
-
-  - `binary` - The binary data that may contain a D-Bus message
-
-  ## Returns
-
-  - `{:ok, message, remaining_data}` - If a complete message was successfully parsed
-  - `{:error, reason}` - If the binary contains sufficient data but parsing failed.
-    Invalid endianness, message type, and protocol version are rejected as soon
-    as the 12-byte fixed header is available. `:message_too_large` is returned
-    as soon as the header-fields length is available and the declared complete
-    message would exceed `max_message_size/0`, and for a body array whose
-    declared length exceeds `max_array_size/0`.
-  - `nil` - If the binary does not contain sufficient data for a complete message
+  - `{:ok, message, rest}` - a complete message, and the bytes after it.
+  - `nil` - the binary does not yet hold a complete message.
+  - `{:error, reason}` - the data is malformed. An invalid endianness,
+    message type or protocol version is rejected as soon as the 12-byte
+    fixed header is available. `:message_too_large` is returned as soon as
+    the header-fields length shows that the complete message would exceed
+    `max_message_size/0`, and for a body array whose declared length exceeds
+    `max_array_size/0`.
 
   ## Examples
 
@@ -696,13 +679,12 @@ defmodule Rebus.Message do
   def expected_size(_binary, _max_message_size), do: nil
 
   @doc """
-  Validates that a message is well-formed according to D-Bus rules.
+  Checks that a message is well formed.
 
-  Checks that:
-  - Message type is valid
-  - Required header fields are present for the message type
-  - Header field types are correct
-  - Message signature is valid
+  The message type must be valid, the header fields the type requires must
+  be present, every header field must have the right type, and the body
+  signature must be valid. `new/2` runs these checks already; this is for a
+  message built or changed by hand.
 
   ## Examples
 

@@ -2,19 +2,18 @@ defmodule Rebus.BusAddress do
   @moduledoc """
   Parses D-Bus address lists without opening a connection.
 
-  `parse/1` accepts a bounded, semicolon-separated list of
-  `transport:key=value` entries. It percent-decodes values, but never converts
-  input into atoms or returns input in an error. The supported transports are
-  `unix` (`path` and `abstract`) and `tcp` (`host`, `port`, and optional
-  `family`). A valid `guid` is retained as the expected server identity while
-  being ignored for socket selection. Other syntactically valid, unrecognised
-  parameters are deliberately discarded: they may be meaningful to a newer
-  implementation, but do not change a socket address Rebus supports.
+  `parse/1` takes a semicolon-separated list of `transport:key=value`
+  entries. The supported transports are `unix`, with `path` or `abstract`,
+  and `tcp`, with `host`, `port` and an optional `family`. A `guid` is kept
+  as the server identity to expect, and plays no part in choosing the
+  socket. Other well-formed parameters are ignored: a newer implementation
+  may give them meaning, but they do not change a socket address Rebus
+  supports.
 
-  A syntactically valid unsupported transport is represented by `:unsupported`.
-  Malformed input returns
-  `{:error, {:invalid_bus_address, reason}}`, where `reason` is a fixed atom;
-  no supplied address data is retained in that result.
+  Values are percent-decoded, but input is never turned into atoms, and no
+  input appears in an error. A well-formed entry for an unsupported
+  transport parses as `:unsupported`. Malformed input returns
+  `{:error, {:invalid_bus_address, reason}}`, where `reason` is a fixed atom.
   """
 
   @type socket_family :: :inet | :inet6 | :unspec
