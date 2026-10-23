@@ -16,6 +16,7 @@ defmodule Rebus.Connection.HandedOverTest do
     assert {:ok, handed_over} = HandedOver.cancel(handed_over, request_ref)
     assert handed_over == HandedOver.new()
     refute UnixFD.open?(handle)
+    :ok = UnixFD.__drain__()
     assert {:ok, 1} = UnixFD.__close_count__(handle)
 
     # A second cancel finds nothing, so nothing closes twice.

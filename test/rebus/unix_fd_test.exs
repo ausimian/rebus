@@ -19,6 +19,18 @@ defmodule Rebus.UnixFDTest do
                  else: "SCM_RIGHTS coverage is supported on Linux and macOS"
                )
 
+  # No connection path may run close(2) on a normal scheduler, as it can
+  # block. This callback is registered first, so it runs after the one below
+  # has closed the connection and everything it still owned.
+  setup do
+    before = UnixFD.__scheduler_closes__()
+
+    on_exit(fn ->
+      :ok = UnixFD.__drain__()
+      assert UnixFD.__scheduler_closes__() == before
+    end)
+  end
+
   setup do
     path = Rebus.TestTmp.path("ufd")
 
@@ -2091,6 +2103,7 @@ defmodule Rebus.UnixFDTest do
 
     # The malformed first cmsg must not prevent the later, kernel-created
     # descriptor from being found and closed on the fail-closed path.
+    :ok = UnixFD.__drain__()
     assert {:error, :ebadf} = UnixFD.__fd_identity__(received)
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
   end
@@ -2119,6 +2132,7 @@ defmodule Rebus.UnixFDTest do
                :sys.get_state(connection)
              )
 
+    :ok = UnixFD.__drain__()
     assert {:error, :ebadf} = UnixFD.__fd_identity__(invalid_iov_fd)
 
     assert {:ok,
@@ -2132,6 +2146,7 @@ defmodule Rebus.UnixFDTest do
                :sys.get_state(connection)
              )
 
+    :ok = UnixFD.__drain__()
     assert {:error, :ebadf} = UnixFD.__fd_identity__(missing_iov_fd)
     assert eventually(fn -> MapSet.difference(fd_set!(), before_fds) == MapSet.new() end)
   end

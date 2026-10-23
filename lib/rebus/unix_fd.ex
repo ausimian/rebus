@@ -16,8 +16,10 @@ defmodule Rebus.UnixFD do
 
   Ownership follows the controlling-process model of ports and sockets. Each
   handle has exactly one owning process. When the owner exits, for any
-  reason including `:kill`, the descriptor is closed at once, even if other
-  processes still hold the handle, which then reads closed for them too.
+  reason including `:kill`, the handle closes at once, even if other
+  processes still hold it, and reads closed for them too. A background
+  thread then closes the descriptor, so a close that blocks cannot stall a
+  scheduler; the same happens when a handle is garbage collected.
 
   Any process holding a handle may use it, send it, duplicate it with
   `dup/1`, or close it, but only the owner can pass ownership on with
@@ -93,6 +95,10 @@ defmodule Rebus.UnixFD do
   `{:error, :closed}` if the handle is already closed, by an earlier call or
   because its owner exited, so calling it again is harmless.
 
+  The descriptor is closed when this returns `:ok`. Closing it runs on a
+  dirty I/O scheduler, so if `close(2)` blocks, for instance on a socket
+  with lingering data, only the caller waits.
+
   If another process is inside `with_fd/2` on the handle, or a connection is
   still sending it, the handle is closed at once but the descriptor stays
   open until that function returns or the send has passed it on.
@@ -110,7 +116,7 @@ defmodule Rebus.UnixFD do
 
   Only the owner can transfer a handle; any other caller gets
   `{:error, :not_owner}`. A closed handle answers `{:error, :closed}`,
-  whoever asks. If `pid` is not alive, the descriptor is closed and the call
+  whoever asks. If `pid` is not alive, the handle is closed and the call
   returns `{:error, :noproc}`. A `pid` on another node gets
   `{:error, :not_local}` and leaves the handle as it was. Making the current
   owner the owner again does nothing.
@@ -208,9 +214,16 @@ defmodule Rebus.UnixFD do
   # Internal API for the connection.
 
   @doc false
-  # Closes each handle the calling process owns, and leaves the rest alone:
-  # one whose ownership has moved on is no longer the caller's to close, and
-  # one already closed needs nothing.
+  # Closes a handle as `close/1` does, but returns without waiting for
+  # close(2), which a background thread runs, so a close that blocks cannot
+  # hold up the caller.
+  @spec close_async(t()) :: :ok | {:error, :closed | error()}
+  def close_async(%__MODULE__{ref: ref}), do: native(ref, &NIF.close_handle_async/1)
+
+  @doc false
+  # Closes each handle the calling process owns, as `close_async/1` does, and
+  # leaves the rest alone: one whose ownership has moved on is no longer the
+  # caller's to close, and one already closed needs nothing.
   @spec close_owned([t()]) :: :ok
   def close_owned(handles) when is_list(handles) do
     me = self()
@@ -219,7 +232,7 @@ defmodule Rebus.UnixFD do
       # Only the owner can transfer a handle, so one the caller owns stays
       # its own between these two calls; a concurrent close by another
       # holder makes the second answer `{:error, :closed}`.
-      with {:ok, ^me} <- owner(handle), do: close(handle)
+      with {:ok, ^me} <- owner(handle), do: close_async(handle)
     end)
   end
 
@@ -295,6 +308,17 @@ defmodule Rebus.UnixFD do
   @doc false
   @spec __live_count__() :: non_neg_integer()
   def __live_count__, do: NIF.live_count()
+
+  @doc false
+  # Waits until the background thread has run every close(2) queued so far.
+  @spec __drain__() :: :ok
+  def __drain__, do: NIF.drain()
+
+  @doc false
+  # How many times close(2) ran on a normal scheduler thread, which it never
+  # should.
+  @spec __scheduler_closes__() :: non_neg_integer()
+  def __scheduler_closes__, do: NIF.scheduler_close_count()
 
   @doc false
   # How many times close(2) ran for this handle.

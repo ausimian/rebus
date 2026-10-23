@@ -58,8 +58,9 @@ defmodule Rebus.Connection.HandedOver do
   end
 
   # The caller of `request_ref` timed out, so it never received the reply:
-  # its handles are closed. Any holder may close a handle, and closing one
-  # the caller has somehow closed already is harmless.
+  # its handles are closed, without waiting for close(2). Any holder may
+  # close a handle, and closing one the caller has somehow closed already is
+  # harmless.
   @spec cancel(t(), reference()) :: {:ok, t()} | :error
   def cancel(%__MODULE__{} = handed_over, request_ref) do
     case Map.pop(handed_over.entries, request_ref) do
@@ -68,7 +69,7 @@ defmodule Rebus.Connection.HandedOver do
 
       {{handles, timer_ref}, entries} ->
         _ = Process.cancel_timer(timer_ref)
-        Enum.each(handles, &UnixFD.close/1)
+        Enum.each(handles, &UnixFD.close_async/1)
         {:ok, %{handed_over | entries: entries}}
     end
   end

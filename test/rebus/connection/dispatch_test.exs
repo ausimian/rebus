@@ -149,6 +149,7 @@ defmodule Rebus.Connection.DispatchTest do
 
       assert {:continue, :recv, %Connection{}} = dispatch(fd_reply(11), state)
       refute UnixFD.open?(fd)
+      :ok = UnixFD.__drain__()
       assert {:ok, 1} = UnixFD.__close_count__(fd)
     end
 

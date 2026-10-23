@@ -16,9 +16,12 @@ native library, which needs `make` and a C++17 compiler.
   owning process exits, even by `:kill`, or when the last reference to it is
   garbage collected. A closed handle forgets its descriptor number, so it can
   never close an unrelated descriptor that the operating system has given the
-  same number. `Rebus.UnixFD.with_fd/2` lends the number to a function and
-  keeps the descriptor open until the function returns, even if the handle is
-  closed meanwhile. `Rebus.UnixFD.controlling_process/2`,
+  same number. `Rebus.UnixFD.close/1` returns once the descriptor is closed
+  and runs on a dirty I/O scheduler; every other close happens on a
+  background thread, so a close that blocks never stalls a scheduler.
+  `Rebus.UnixFD.with_fd/2` lends the number to a function and keeps the
+  descriptor open until the function returns, even if the handle is closed
+  meanwhile. `Rebus.UnixFD.controlling_process/2`,
   `Rebus.UnixFD.owner/1`, `Rebus.UnixFD.open?/1` and `Rebus.UnixFD.dup/1`
   manage and inspect ownership, and a handle that has crossed to another node
   answers `{:error, :not_local}`. Inspecting a handle shows its state and

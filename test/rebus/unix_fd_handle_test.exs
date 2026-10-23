@@ -7,6 +7,18 @@ defmodule Rebus.UnixFDHandleTest do
 
   @moduletag skip: TestFD.skip_reason()
 
+  # close(2) can block, so no path may run it on a normal scheduler; the
+  # tests below between them take every path that closes a descriptor. The
+  # count is compared per test so that a failure names the path at fault.
+  setup do
+    before = UnixFD.__scheduler_closes__()
+
+    on_exit(fn ->
+      :ok = UnixFD.__drain__()
+      assert UnixFD.__scheduler_closes__() == before
+    end)
+  end
+
   describe "close/1" do
     test "closes once and answers :closed after that" do
       {:ok, read, write} = UnixFD.__pipe__()
@@ -30,6 +42,49 @@ defmodule Rebus.UnixFDHandleTest do
       refute UnixFD.open?(read)
       assert {:ok, 1} = UnixFD.__close_count__(read)
       assert :ok = UnixFD.close(write)
+    end
+  end
+
+  describe "internal close_async/1" do
+    test "closes the handle at once and leaves close(2) to the closer" do
+      {:ok, read, write} = UnixFD.__pipe__()
+
+      assert :ok = UnixFD.close_async(read)
+      refute UnixFD.open?(read)
+      assert {:error, :closed} = UnixFD.close_async(read)
+      assert {:error, :closed} = UnixFD.close(read)
+
+      :ok = UnixFD.__drain__()
+      assert {:ok, 1} = UnixFD.__close_count__(read)
+      assert :ok = UnixFD.close(write)
+    end
+
+    test "defers close(2) to the last unpin" do
+      {:ok, read, write} = UnixFD.__pipe__()
+      {:ok, token, _fd} = UnixFD.pin(read)
+
+      assert :ok = UnixFD.close_async(read)
+      :ok = UnixFD.__drain__()
+      assert {:ok, 0} = UnixFD.__close_count__(read)
+
+      :ok = UnixFD.unpin(token)
+      :ok = UnixFD.__drain__()
+      assert {:ok, 1} = UnixFD.__close_count__(read)
+      assert :ok = UnixFD.close(write)
+    end
+
+    test "close_owned/1 closes only the caller's handles" do
+      {:ok, mine, theirs} = UnixFD.__pipe__()
+      holder = spawn_holder(theirs)
+      :ok = UnixFD.controlling_process(theirs, holder)
+
+      assert :ok = UnixFD.close_owned([mine, theirs])
+      :ok = UnixFD.__drain__()
+      assert {:ok, 1} = UnixFD.__close_count__(mine)
+      assert UnixFD.open?(theirs)
+
+      Process.exit(holder, :kill)
+      assert_closed_once(theirs, [holder])
     end
   end
 
@@ -215,6 +270,7 @@ defmodule Rebus.UnixFDHandleTest do
                  UnixFD.__fd_identity__(fd)
                end)
 
+      :ok = UnixFD.__drain__()
       assert {:ok, 1} = UnixFD.__close_count__(read)
       assert :ok = UnixFD.close(write)
     end
@@ -312,6 +368,7 @@ defmodule Rebus.UnixFDHandleTest do
 
       assert {:error, :noproc} = UnixFD.controlling_process(read, dead)
       refute UnixFD.open?(read)
+      :ok = UnixFD.__drain__()
       assert {:ok, 1} = UnixFD.__close_count__(read)
       assert :ok = UnixFD.close(write)
     end
@@ -404,6 +461,7 @@ defmodule Rebus.UnixFDHandleTest do
 
         assert {:error, reason} = UnixFD.wrap(fd, owner)
         assert reason in [:noproc, :not_local]
+        :ok = UnixFD.__drain__()
         refute UnixFD.__fd_identity__(fd) == {:ok, identity}
       end
     end
@@ -431,6 +489,7 @@ defmodule Rebus.UnixFDHandleTest do
       assert {:ok, 0} = UnixFD.__close_count__(read)
 
       assert :ok = UnixFD.unpin(second)
+      :ok = UnixFD.__drain__()
       assert {:ok, 1} = UnixFD.__close_count__(read)
       assert :ok = UnixFD.close(write)
     end
@@ -472,6 +531,7 @@ defmodule Rebus.UnixFDHandleTest do
       Enum.each([read, write], &UnixFD.close/1)
       assert {:ok, 0} = UnixFD.__close_count__(read)
       assert :ok = UnixFD.unpin_all(pins)
+      :ok = UnixFD.__drain__()
       assert {:ok, 1} = UnixFD.__close_count__(read)
       assert {:ok, 1} = UnixFD.__close_count__(write)
       assert {:ok, [], []} = UnixFD.pin_all([])
@@ -577,8 +637,8 @@ defmodule Rebus.UnixFDHandleTest do
   end
 
   # Waits for close(2), then for every process whose exit could still close
-  # the handle, and checks that close(2) ran exactly once, so that a late
-  # second close would not go unseen.
+  # the handle and for anything they queued, and checks that close(2) ran
+  # exactly once, so that a late second close would not go unseen.
   defp assert_closed_once(handle, pids) do
     assert eventually(fn -> UnixFD.__close_count__(handle) == {:ok, 1} end)
 
@@ -587,6 +647,7 @@ defmodule Rebus.UnixFDHandleTest do
       assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
     end
 
+    :ok = UnixFD.__drain__()
     assert {:ok, 1} = UnixFD.__close_count__(handle)
   end
 

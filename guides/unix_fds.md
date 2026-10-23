@@ -43,9 +43,9 @@ duplicates of the descriptor. The rules are:
   `Rebus.UnixFD.controlling_process/2`. Anyone else gets
   `{:error, :not_owner}`, and a closed handle answers `{:error, :closed}`
   before ownership is even checked.
-- When the owner exits, the descriptor is closed at once, and every alias
-  reads closed from then on. Transferring a handle to a process that is not
-  alive closes it and returns `{:error, :noproc}`.
+- When the owner exits, the handle closes at once, and every alias reads
+  closed from then on. Transferring a handle to a process that is not alive
+  closes it and returns `{:error, :noproc}`.
 - `Rebus.UnixFD.dup/1` makes a new handle, owned by the process that calls
   it, for the same open file. The two close independently, so `dup/1` is how
   a process that does not own a handle gets a descriptor of its own.
@@ -93,6 +93,15 @@ Closing a handle you no longer need releases the descriptor at once. A
 handle you leave open is closed when your process exits or when nothing
 refers to it any more, so it never leaks for good, but it holds the
 descriptor until then.
+
+`Rebus.UnixFD.close/1` returns once the descriptor itself is closed.
+Closing a descriptor can block, for instance on a socket with unsent data
+and `SO_LINGER` set, so `Rebus.UnixFD.close/1` runs on a dirty I/O
+scheduler, where only the caller waits. When a
+handle closes any other way, because its owner exits, because it is garbage
+collected, or because the connection closes it, it reads closed at once,
+and a background thread closes the descriptor a moment later, so a slow
+close never holds up the VM or the process that let the handle go.
 
 ## Using a descriptor with `with_fd/2`
 
