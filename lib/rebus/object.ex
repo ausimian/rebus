@@ -150,7 +150,7 @@ defmodule Rebus.Object do
   @typedoc "What `c:handle_method/3` returns."
   @type method_result ::
           {:reply, body :: [term()], state()}
-          | {:reply, body :: [term()], state(), [fds: [Rebus.UnixFD.t()]]}
+          | {:reply, body :: [term()], state(), [fds: [Rebus.UnixFD.raw()]]}
           | {:error, name :: binary(), message :: binary(), state()}
           | {:noreply, state()}
           | {:stop, reason :: term(), state()}

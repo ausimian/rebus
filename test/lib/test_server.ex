@@ -4,6 +4,7 @@ defmodule Rebus.TestServer do
   use TypedStruct
 
   alias Rebus.Message
+  alias Rebus.UnixFD.Raw
 
   def get_listen_addr(svr) when is_pid(svr) do
     GenServer.call(svr, :get_listen_addr)
@@ -438,7 +439,7 @@ defmodule Rebus.TestServer do
             deliver_frame(msg, rest, %{state | received_fds: []})
 
           {:error, _reason} ->
-            Enum.each(state.received_fds, &Rebus.UnixFD.close/1)
+            Enum.each(state.received_fds, &Raw.close/1)
             {:stop, :parse_error, state}
         end
 

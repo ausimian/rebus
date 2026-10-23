@@ -13,6 +13,7 @@ defmodule Rebus.Integration.SessionBusTest do
   alias Rebus.Message
   alias Rebus.Service
   alias Rebus.Service.Call
+  alias Rebus.UnixFD.Raw
 
   @moduletag :integration
 
@@ -456,7 +457,7 @@ defmodule Rebus.Integration.SessionBusTest do
       assert {:ok, [^borrowed]} = Service.take_fds(call)
       assert :ok = Service.reply(call, [])
       assert {:ok, %Message{type: :method_return}} = Task.await(task, @window)
-      assert :ok = Rebus.UnixFD.close(borrowed)
+      assert :ok = Raw.close(borrowed)
 
       # /proc is Linux-only; elsewhere the transfer above is all this asserts.
       if before do

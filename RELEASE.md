@@ -1,5 +1,18 @@
 ### Added
 
+- `Rebus.UnixFD` handles. A handle owns one Unix file descriptor and closes
+  it exactly once: when any holder calls `Rebus.UnixFD.close/1`, when its
+  owning process exits, even by `:kill`, or when the last reference to it is
+  garbage collected. A closed handle forgets its descriptor number, so it can
+  never close an unrelated descriptor that the operating system has given the
+  same number. `Rebus.UnixFD.with_fd/2` lends the number to a function and
+  keeps the descriptor open until the function returns, even if the handle is
+  closed meanwhile. `Rebus.UnixFD.controlling_process/2`,
+  `Rebus.UnixFD.owner/1`, `Rebus.UnixFD.open?/1` and `Rebus.UnixFD.dup/1`
+  manage and inspect ownership, and a handle that has crossed to another node
+  answers `{:error, :not_local}`. Inspecting a handle shows its state and
+  owner but never the descriptor number.
+
 - Services. `Rebus.Service` exports objects on a connection and answers the
   method calls made on them. `Rebus.Service.export/4` binds `Rebus.Interface`
   declarations at an object path, or a whole subtree, to a handler process,
@@ -73,6 +86,15 @@
   [Signal subscriptions and match rules](match_rules.html).
 
 ### Changed
+
+- **Breaking:** `Rebus.UnixFD.t()` is now an opaque handle, and
+  `Rebus.UnixFD.close/1` closes a handle rather than a raw descriptor number,
+  returning `{:error, :closed}` for a handle that is already closed. A raw
+  number is typed `Rebus.UnixFD.raw()`.
+
+- On Unix, Rebus now compiles a small native library when it is built, so
+  building it needs `make` and a C++17 compiler. Nothing is compiled on other
+  platforms, where `Rebus.UnixFD` returns `{:error, :unsupported}`.
 
 - Clarified the guides and public API documentation, including descriptor
   ownership and the experimental status of Unix file descriptor support.

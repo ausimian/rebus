@@ -10,7 +10,7 @@ defmodule Rebus.Message.UnixFDs do
   alias Rebus.Signature
 
   @spec extract_unix_fds(keyword()) ::
-          {:ok, [Rebus.UnixFD.t()]} | {:error, :invalid_unix_fds | :unix_fd_limit}
+          {:ok, [Rebus.UnixFD.raw()]} | {:error, :invalid_unix_fds | :unix_fd_limit}
   def extract_unix_fds(opts) do
     case Keyword.get(opts, :fds, []) do
       fds when is_list(fds) -> validate_unix_fd_list(fds)
@@ -18,7 +18,8 @@ defmodule Rebus.Message.UnixFDs do
     end
   end
 
-  @spec put_unix_fd_count(map(), [Rebus.UnixFD.t()]) :: {:ok, map()} | {:error, :invalid_unix_fds}
+  @spec put_unix_fd_count(map(), [Rebus.UnixFD.raw()]) ::
+          {:ok, map()} | {:error, :invalid_unix_fds}
   def put_unix_fd_count(header_fields, fds) do
     count = length(fds)
 
@@ -45,7 +46,7 @@ defmodule Rebus.Message.UnixFDs do
 
   def validate_unix_fds(_message), do: {:error, :invalid_unix_fds}
 
-  @spec validate_unix_fd_indices(term(), term(), [Rebus.UnixFD.t()]) ::
+  @spec validate_unix_fd_indices(term(), term(), [Rebus.UnixFD.raw()]) ::
           :ok | {:error, :invalid_unix_fds}
   def validate_unix_fd_indices(signature, body, fds)
       when is_binary(signature) and is_list(body) do

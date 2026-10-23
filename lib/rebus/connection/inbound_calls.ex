@@ -44,7 +44,7 @@ defmodule Rebus.Connection.InboundCalls do
       field :sender, binary() | nil
       field :export, reference()
       field :handler, pid()
-      field :unix_fds, [UnixFD.t()]
+      field :unix_fds, [UnixFD.raw()]
       field :timer_ref, reference() | nil
       field :deadline, integer() | nil
       field :from, GenServer.from() | nil, default: nil
@@ -60,7 +60,7 @@ defmodule Rebus.Connection.InboundCalls do
           required(:sender) => binary() | nil,
           required(:export) => reference(),
           required(:handler) => pid(),
-          required(:unix_fds) => [UnixFD.t()],
+          required(:unix_fds) => [UnixFD.raw()],
           optional(:from) => GenServer.from(),
           optional(:no_reply?) => boolean()
         }
@@ -102,7 +102,7 @@ defmodule Rebus.Connection.InboundCalls do
   def fetch(%__MODULE__{entries: entries}, ref), do: Map.fetch(entries, ref)
 
   # Every descriptor the table still holds for its calls.
-  @spec fds(t()) :: [UnixFD.t()]
+  @spec fds(t()) :: [UnixFD.raw()]
   def fds(%__MODULE__{entries: entries}),
     do: Enum.flat_map(entries, fn {_ref, %Entry{unix_fds: fds}} -> fds end)
 

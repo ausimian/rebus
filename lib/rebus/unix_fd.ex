@@ -1,64 +1,243 @@
 defmodule Rebus.UnixFD do
   @moduledoc """
-  Closes Unix file descriptors received from a peer.
+  Handles for Unix file descriptors.
 
-  A descriptor is the non-negative integer the operating system returned for
-  it. Rebus borrows the descriptors given to it for an outbound message and
-  never closes or duplicates them. A descriptor received in a reply to
-  `Rebus.call/3` belongs to the process that received the message, which
-  must close it exactly once, with `close/1` or an OS or OTP API of its own.
+  A handle owns one open descriptor and closes it exactly once: when any
+  holder calls `close/1`, when its owning process exits, or when the last
+  reference to it is garbage collected, whichever comes first. A handle never
+  exposes its descriptor number except inside `with_fd/2`, and once closed it
+  forgets the number, so a stale handle cannot reach an unrelated descriptor
+  that the operating system has since given the same number.
 
-  Descriptors on an inbound method call are the exception. The handler of a
-  `Rebus.Service.Call` borrows them from the connection, which closes them
-  when the call completes. Close one only after taking it with
-  `Rebus.Service.take_fds/2`.
+  Ownership follows the controlling-process model of ports and sockets. Each
+  handle has exactly one owning process, at first the one that created it.
+  When the owner exits, for any reason including `:kill`, the descriptor is
+  closed at once, even if other processes still hold the handle. Any holder
+  may use or close a handle, but only the owner can pass ownership on with
+  `controlling_process/2`.
 
-  Never close a descriptor twice. Operating systems reuse descriptor
-  numbers, so a second close can close an unrelated resource. `close/1` is
-  safe in an `after` block and does not log descriptor values.
+  A handle is local to the node that created it. One that has crossed a
+  distribution boundary answers `{:error, :not_local}` to every operation.
 
-  These functions need a Unix system with OTP's raw-file support, and return
-  `{:error, :unsupported}` elsewhere. See
-  [Unix file descriptor passing](unix_fds.html).
+  Handles are available on Unix systems, where Rebus builds the native code
+  behind them. Elsewhere every function returns `{:error, :unsupported}`.
+
+  See [Unix file descriptor passing](unix_fds.html).
   """
 
-  alias Rebus.UnixFD.Raw
+  alias Rebus.UnixFD.{NIF, Raw}
 
-  @typedoc "A raw Unix file descriptor, owned by a process or borrowed from one."
-  @type t :: non_neg_integer()
+  @enforce_keys [:ref]
+  defstruct [:ref]
+
+  @typedoc "A handle that owns one Unix file descriptor."
+  @opaque t :: %__MODULE__{ref: reference()}
+
+  @typedoc """
+  A raw descriptor number. Rebus borrows a raw descriptor that it sends: it
+  never duplicates or closes it.
+  """
+  @type raw :: non_neg_integer()
+
+  @typedoc false
+  @opaque pin :: reference()
+
+  @type error :: :not_local | :unsupported
+
+  # A number that fits a C int, as every descriptor does.
+  defguardp is_raw(fd) when is_integer(fd) and fd >= 0 and fd <= 0x7FFFFFFF
 
   @doc """
-  Closes an owned raw Unix file descriptor.
+  Closes a handle's descriptor.
 
-  The descriptor is spent whether this returns `:ok` or a POSIX error, so
-  treat the number as unusable afterwards and never retry: the operating
-  system may already have given it to another resource.
+  Any process holding the handle may close it, not only its owner. Returns
+  `{:error, :closed}` if the handle is already closed, by an earlier call or
+  because its owner exited, so calling it again is harmless.
 
-  ## Return values
-
-  - `:ok` - the descriptor was closed.
-  - `{:error, :invalid_descriptor}` - `fd` is not a non-negative integer.
-  - `{:error, :close_failed}` - the close failed unexpectedly. The descriptor
-    is still spent.
-  - `{:error, :unsupported}` - the platform cannot do this. The caller still
-    owns the descriptor and must close it with another API.
-  - `{:error, reason}` - a POSIX error from the close. The descriptor is
-    spent.
+  If another process is inside `with_fd/2` on the handle, the handle is closed
+  at once but the descriptor stays open until that function returns.
   """
-  @spec close(t()) :: :ok | {:error, :close_failed | :invalid_descriptor | :unsupported | term()}
-  def close(fd) when is_integer(fd) and fd >= 0 do
-    case :os.type() do
-      {:unix, _} -> Raw.close(fd)
-      _ -> {:error, :unsupported}
+  @spec close(t()) :: :ok | {:error, :closed | error()}
+  def close(%__MODULE__{ref: ref}), do: native(ref, &NIF.close_handle/1)
+
+  @doc """
+  Makes `pid` the owner of a handle.
+
+  Only the owner can transfer a handle; any other caller gets
+  `{:error, :not_owner}`. If `pid` is not alive, the descriptor is closed and
+  the call returns `{:error, :noproc}`. A `pid` on another node gets
+  `{:error, :not_local}` and leaves the handle as it was.
+  """
+  @spec controlling_process(t(), pid()) ::
+          :ok | {:error, :closed | :noproc | :not_owner | error()}
+  def controlling_process(%__MODULE__{ref: ref}, pid) when is_pid(pid) do
+    native(ref, &NIF.controlling_process(&1, pid))
+  end
+
+  @doc """
+  Returns the process that owns a handle.
+  """
+  @spec owner(t()) :: {:ok, pid()} | {:error, :closed | error()}
+  def owner(%__MODULE__{ref: ref}), do: native(ref, &NIF.owner/1)
+
+  @doc """
+  Returns whether a handle is open.
+
+  A handle that is not local to this node, or on a platform without handle
+  support, is reported as not open.
+  """
+  @spec open?(t()) :: boolean()
+  def open?(%__MODULE__{} = handle), do: match?({:ok, _}, owner(handle))
+
+  @doc """
+  Calls `fun` with the handle's raw descriptor number.
+
+  Returns `{:ok, result}` with what `fun` returned, or `{:error, :closed}`
+  without calling `fun` if the handle is closed.
+
+  The descriptor stays open until `fun` returns, even if the handle is closed
+  or its owner exits meanwhile, and the number is valid only until then. Do
+  not keep it, close it, or hand it to anything that outlives `fun`. If the
+  calling process is killed inside `fun`, the descriptor is released when the
+  process's memory is reclaimed. Exceptions, throws and exits from `fun`
+  propagate after the descriptor is released.
+
+  ```elixir
+  {:ok, stat} = Rebus.UnixFD.with_fd(handle, fn fd -> File.stat("/dev/fd/\#{fd}") end)
+  ```
+  """
+  @spec with_fd(t(), (raw() -> result)) :: {:ok, result} | {:error, :closed | error()}
+        when result: term()
+  def with_fd(%__MODULE__{} = handle, fun) when is_function(fun, 1) do
+    case pin(handle) do
+      {:ok, token, fd} ->
+        try do
+          {:ok, fun.(fd)}
+        after
+          unpin(token)
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
-  def close(_fd), do: {:error, :invalid_descriptor}
+  @doc """
+  Duplicates a handle's descriptor into a new handle owned by the caller.
+
+  The two handles refer to the same open file but close independently.
+  Returns `{:error, :closed}` if the handle is closed, or `{:error, posix}` if
+  the operating system cannot duplicate the descriptor.
+  """
+  @spec dup(t()) :: {:ok, t()} | {:error, :closed | error() | atom()}
+  def dup(%__MODULE__{ref: ref}) do
+    with {:ok, new_ref} <- native(ref, &NIF.dup_handle/1) do
+      {:ok, %__MODULE__{ref: new_ref}}
+    end
+  end
+
+  # The connection uses these until it carries handles itself.
 
   @doc false
-  @spec close_all([t()]) :: :ok
+  @spec close_all([raw()]) :: :ok
   def close_all(fds) when is_list(fds) do
-    Enum.each(fds, &close/1)
+    Enum.each(fds, &Raw.close/1)
     :ok
+  end
+
+  # Internal API for the connection.
+
+  @doc false
+  # Wraps a raw descriptor in a handle owned by `owner`, a local process.
+  # The handle takes over the descriptor: it is closed if `owner` is not
+  # alive (`:noproc`) or not local (`:not_local`). It stays the caller's
+  # after `:invalid_descriptor`, `:unsupported`, or a POSIX error, which
+  # means the number was not open.
+  @spec wrap(raw(), pid()) ::
+          {:ok, t()} | {:error, :invalid_descriptor | :noproc | error() | atom()}
+  def wrap(fd, owner) when is_raw(fd) and is_pid(owner) do
+    if supported?() do
+      with {:ok, ref} <- NIF.wrap(fd, owner), do: {:ok, %__MODULE__{ref: ref}}
+    else
+      {:error, :unsupported}
+    end
+  end
+
+  def wrap(_fd, owner) when is_pid(owner), do: {:error, :invalid_descriptor}
+
+  @doc false
+  # Keeps a handle's descriptor open until `unpin/1`, or until the returned
+  # token is garbage collected, so the raw number can be used meanwhile. The
+  # handle can still be closed; close(2) waits for the last pin.
+  @spec pin(t()) :: {:ok, pin(), raw()} | {:error, :closed | error()}
+  def pin(%__MODULE__{ref: ref}), do: native(ref, &NIF.pin/1)
+
+  @doc false
+  # Releases a pin. It never raises: releasing a pin again, or passing
+  # anything that is not a pin token, does nothing.
+  @spec unpin(pin()) :: :ok
+  def unpin(token) do
+    if is_reference(token) and supported?(), do: NIF.unpin(token), else: :ok
+  end
+
+  # Test hooks.
+
+  @doc false
+  @spec __live_count__() :: non_neg_integer()
+  def __live_count__, do: NIF.live_count()
+
+  @doc false
+  # How many times close(2) ran for this handle.
+  @spec __close_count__(t()) :: {:ok, non_neg_integer()} | {:error, error()}
+  def __close_count__(%__MODULE__{ref: ref}), do: native(ref, &NIF.close_count/1)
+
+  @doc false
+  # The two ends of a new pipe, owned by the caller.
+  @spec __pipe__() :: {:ok, t(), t()} | {:error, atom()}
+  def __pipe__ do
+    if supported?() do
+      with {:ok, read_ref, write_ref} <- NIF.pipe_pair() do
+        {:ok, %__MODULE__{ref: read_ref}, %__MODULE__{ref: write_ref}}
+      end
+    else
+      {:error, :unsupported}
+    end
+  end
+
+  @doc false
+  # The {device, inode} that fstat(2) reports for a raw descriptor number.
+  @spec __fd_identity__(raw()) :: {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, atom()}
+  def __fd_identity__(fd) when is_raw(fd), do: NIF.fd_identity(fd)
+  def __fd_identity__(_fd), do: {:error, :invalid_descriptor}
+
+  @doc false
+  # The state Inspect shows.
+  @spec __state__(t()) :: {:open, pid()} | :closed | error()
+  def __state__(%__MODULE__{} = handle) do
+    case owner(handle) do
+      {:ok, pid} -> {:open, pid}
+      {:error, reason} -> reason
+    end
+  end
+
+  defp native(ref, fun) when is_reference(ref) do
+    cond do
+      not supported?() -> {:error, :unsupported}
+      node(ref) != node() -> {:error, :not_local}
+      true -> fun.(ref)
+    end
+  end
+
+  defp supported?, do: match?({:unix, _}, :os.type())
+
+  defimpl Inspect do
+    import Inspect.Algebra
+
+    def inspect(handle, opts) do
+      case Rebus.UnixFD.__state__(handle) do
+        {:open, owner} -> concat(["#Rebus.UnixFD<open, owner: ", to_doc(owner, opts), ">"])
+        state -> "#Rebus.UnixFD<#{state}>"
+      end
+    end
   end
 end

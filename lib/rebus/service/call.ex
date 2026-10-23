@@ -67,7 +67,7 @@ defmodule Rebus.Service.Call do
     field :body, [term()]
     field :flags, [Rebus.Message.flag()]
     field :no_reply?, boolean()
-    field :unix_fds, [Rebus.UnixFD.t()]
+    field :unix_fds, [Rebus.UnixFD.raw()]
     field :deadline, integer() | nil
     field :message, Rebus.Message.t()
   end

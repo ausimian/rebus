@@ -445,7 +445,7 @@ defmodule Rebus.Service do
   - `{:error, :disconnected}` - the connection stopped, closing them.
   """
   @spec take_fds(Call.t(), non_neg_integer()) ::
-          {:ok, [Rebus.UnixFD.t()]} | {:error, take_fds_error()}
+          {:ok, [Rebus.UnixFD.raw()]} | {:error, take_fds_error()}
   def take_fds(call, timeout \\ @default_timeout)
 
   def take_fds(%Call{unix_fds: []}, timeout) when is_integer(timeout) and timeout >= 0,
