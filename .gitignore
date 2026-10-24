@@ -24,3 +24,10 @@ rebus-*.tar
 
 # Erlang/Elixir shell history file.
 /.erl.history/
+
+# Precompiled NIF checksums, written by `mix elixir_make.precompile` and
+# `mix elixir_make.checksum`. CI generates the file for each Hex release.
+/checksum.exs
+
+# Precompiled libraries from bin/precompile-linux and bin/precompile-macos.
+/precompiled/

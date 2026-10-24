@@ -8,9 +8,10 @@ numbers must treat them as handles: close them with `Rebus.UnixFD.close/1`,
 and use the number inside `Rebus.UnixFD.with_fd/2`. Outbound `fds:` take
 handles and raw numbers alike. Handles need a small native library, so
 descriptor passing is now opt-in: an application that passes descriptors
-must add `config :rebus, unix_fds: true` to its `config/config.exs`, and its
-build then needs `make` and a C++17 compiler. Without it Rebus stays pure
-Elixir.
+must add `config :rebus, unix_fds: true` to its `config/config.exs`. Rebus
+then installs the library precompiled on x86_64 and aarch64 Linux and macOS,
+and builds it from source, with `make` and a C++17 compiler, anywhere else.
+Without the setting Rebus stays pure Elixir.
 
 ### Added
 
@@ -109,6 +110,16 @@ Elixir.
   such a rule, and `{:error, :match_recovery_capacity_exhausted}` for a new
   rule while `:match_recovery_max_rules` rules are unresolved. See
   [Signal subscriptions and match rules](match_rules.html).
+- Precompiled `Rebus.UnixFD` libraries for `x86_64` and `aarch64` Linux,
+  with glibc 2.31 or later or musl (Alpine 3.21 or later), and for macOS 11
+  or later on Intel and Apple silicon, for Erlang/OTP 27 and later. An
+  application that enables descriptor passing on one of these needs no
+  compiler: the library comes from the GitHub Release for its version,
+  verified against checksums in the Hex package. Every other target, and
+  every cross-compiled build such as Nerves, builds it from source.
+  `config :elixir_make, :force_build, rebus: true` builds from source
+  everywhere. See
+  [Enabling descriptor passing](unix_fds.html#enabling-descriptor-passing).
 
 ### Changed
 
@@ -146,15 +157,14 @@ Elixir.
   handlers of pending calls. A `:kill` used to leave them open.
 
 - **Breaking:** Unix file descriptor passing is opt-in. Handles are built on
-  a small native library, which Rebus compiles only when the application
-  sets `config :rebus, unix_fds: true` in its `config/config.exs`; the build
-  then needs `make` and a C++17 compiler. Without the setting, Rebus is pure
-  Elixir: connections never offer descriptor passing, messages with
-  descriptors are refused with `{:error, :unix_fd_unsupported}`, and
-  `Rebus.UnixFD` functions return `{:error, :unsupported}`. Changing the
-  setting recompiles Rebus on the next `mix compile`. A library built on
-  Rebus cannot enable it for its users, but can check the new
-  `Rebus.UnixFD.supported?/0`. See
+  a small native library, which Rebus installs only when the application
+  sets `config :rebus, unix_fds: true` in its `config/config.exs`. Without
+  the setting, Rebus is pure Elixir: connections never offer descriptor
+  passing, messages with descriptors are refused with
+  `{:error, :unix_fd_unsupported}`, and `Rebus.UnixFD` functions return
+  `{:error, :unsupported}`. Changing the setting recompiles Rebus on the next
+  `mix compile`. A library built on Rebus cannot enable it for its users,
+  but can check the new `Rebus.UnixFD.supported?/0`. See
   [Enabling descriptor passing](unix_fds.html#enabling-descriptor-passing).
 
   ```elixir

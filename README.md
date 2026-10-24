@@ -22,8 +22,10 @@ end
 
 Rebus is pure Elixir by default. Passing Unix file descriptors is opt-in,
 because it needs a small native library: enable it in your application's
-`config/config.exs`, and the build then needs `make` and a C++17 compiler
-such as GCC or Clang.
+`config/config.exs`. Rebus installs the library precompiled on x86_64 and
+aarch64 Linux, with glibc or musl, and on macOS; anywhere else the build
+needs `make` and a C++17 compiler such as GCC or Clang. See
+[Enabling descriptor passing](https://hexdocs.pm/rebus/unix_fds.html#enabling-descriptor-passing).
 
 ```elixir
 config :rebus, unix_fds: true

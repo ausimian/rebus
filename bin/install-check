@@ -1,0 +1,64 @@
+#!/bin/sh
+#
+# Installs Rebus the way an application does, with Unix fd support enabled,
+# in a Docker image with no C or C++ toolchain, and checks that the
+# precompiled library loaded.
+#
+# Usage: bin/install-check <image>
+#
+# The package is built from the repository, which must hold the checksum.exs
+# of a published release, so the install downloads that release's library.
+# Setting ELIXIR_MAKE_CACHE_DIR to a directory holding the archive installs
+# from there instead, without a download.
+set -eu
+
+image=${1:?usage: bin/install-check <image>}
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+if [ ! -f "$root/checksum.exs" ]; then
+    echo "error: no checksum.exs in $root" >&2
+    exit 1
+fi
+
+cache=
+if [ -n "${ELIXIR_MAKE_CACHE_DIR:-}" ]; then
+    cache="-v $ELIXIR_MAKE_CACHE_DIR:/cache:ro -e ELIXIR_MAKE_CACHE_DIR=/cache"
+fi
+
+# shellcheck disable=SC2086
+docker run --rm -v "$root":/src:ro $cache -e VERSION_OVERRIDE -e MIX_ENV=prod "$image" sh -euc '
+    for tool in make cc c++ gcc g++ clang; do
+        if command -v "$tool" >/dev/null; then
+            echo "error: the image has $tool, so a source build could pass" >&2
+            exit 1
+        fi
+    done
+
+    mix local.hex --force >/dev/null
+
+    mkdir /rebus
+    cp -R /src/lib /src/c_src /src/Makefile /src/mix.exs /src/mix.lock /src/checksum.exs \
+        /src/.formatter.exs /src/README.md /src/CHANGELOG.md /src/LICENSE.md /rebus
+    cd /rebus
+    mix deps.get >/dev/null
+    mix hex.build --unpack -o /package
+
+    mkdir -p /consumer/config
+    cd /consumer
+    cat > mix.exs <<EOF
+defmodule Consumer.MixProject do
+  use Mix.Project
+
+  def project, do: [app: :consumer, version: "0.1.0", deps: [{:rebus, path: "/package"}]]
+end
+EOF
+    cat > config/config.exs <<EOF
+import Config
+
+config :rebus, unix_fds: true
+EOF
+    mix deps.get
+    mix compile
+    mix run -e "Rebus.UnixFD.supported?() || raise ~s{the precompiled library did not load}"
+    echo "Installed and loaded the precompiled library."
+'

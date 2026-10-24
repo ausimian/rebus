@@ -32,6 +32,24 @@ build, in `_build/no_unix_fds` so that it never mixes with the other:
 REBUS_UNIX_FDS=0 mix test
 ```
 
+## Precompiled libraries
+
+Releases publish the library precompiled for six targets; see
+`.github/workflows/precompile.yml`, which CI runs on every change. Each
+target can be built, checked and tested locally. On Linux, with Docker,
+`bin/precompile-linux <target>` builds one Linux target in the image that
+sets its oldest supported C library, checks what the library needs from the
+system, and runs the unit suite against it on Erlang/OTP 27 and 29. On an
+Apple silicon Mac, `bin/precompile-macos build` builds both macOS targets
+and `bin/precompile-macos test aarch64-apple-darwin` tests one on the
+installed Erlang/OTP. The archives land in `precompiled/`.
+
+These scripts build in a copy of the sources. Running
+`mix elixir_make.precompile` or `mix elixir_make.checksum` directly in the
+repository writes `checksum.exs`, and while that file exists Rebus's own
+builds install the precompiled library instead of building `c_src/`; delete
+it afterwards.
+
 ## Integration tests
 
 The integration suite uses a real `dbus-daemon` and is excluded from the

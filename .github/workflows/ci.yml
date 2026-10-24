@@ -28,6 +28,12 @@ jobs:
       - name: Run cppcheck
         run: make cppcheck
 
+  precompile:
+    name: Precompile
+    # The libraries a release would publish, built, checked and tested
+    # without uploading them anywhere.
+    uses: ./.github/workflows/precompile.yml
+
   precommit:
     name: Precommit (Elixir 1.19.5 / OTP 28.3)
     runs-on: ubuntu-24.04

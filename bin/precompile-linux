@@ -1,0 +1,146 @@
+#!/bin/sh
+#
+# Builds the precompiled Rebus.UnixFD library for one Linux target in Docker,
+# checks what it needs from the system that loads it, and runs the unit suite
+# against it on the oldest and newest supported Erlang/OTP.
+#
+# Usage: bin/precompile-linux <target> [out-dir]
+#
+# <target> is x86_64-linux-gnu, aarch64-linux-gnu, x86_64-linux-musl or
+# aarch64-linux-musl. Docker runs that architecture's images, under emulation
+# on a host of another. The archive and its .sha256 land in out-dir
+# (default: precompiled/), with checksum-<target>.exs to verify the archive.
+#
+# The repository is bind-mounted read-only and each container builds in its
+# own copy, so neither _build nor checksum.exs on the host is touched.
+set -eu
+
+target=${1:?usage: bin/precompile-linux <target> [out-dir]}
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+out=${2:-$root/precompiled}
+mkdir -p "$out"
+out=$(CDPATH= cd -- "$out" && pwd)
+
+version=${VERSION_OVERRIDE:-$(sed -n 's/^  @version "\(.*\)"$/\1/p' "$root/mix.exs")}
+archive="rebus-nif-2.17-$target-$version.tar.gz"
+
+case $target in
+    x86_64-linux-*) platform=linux/amd64 ;;
+    aarch64-linux-*) platform=linux/arm64 ;;
+    *) echo "unknown target: $target" >&2; exit 2 ;;
+esac
+
+case $target in
+    *-gnu)
+        # Debian 11 sets the glibc floor at 2.31. Its mirrors no longer carry
+        # bullseye, so the build installs from the snapshot the image names.
+        build_image=hexpm/elixir:1.19.5-erlang-28.3-debian-bullseye-20260610
+        install='sed -i -e "s|^deb |# deb |" -e "s|^# deb http://snapshot|deb [check-valid-until=no] http://snapshot|" /etc/apt/sources.list && apt-get update -qq && apt-get install -y -qq --no-install-recommends gcc g++ make >/dev/null'
+        test_images="hexpm/elixir:1.18.4-erlang-27.3.4-debian-bullseye-20260610 hexpm/elixir:1.20.4-erlang-29.1.2-debian-bookworm-20261020"
+        glibc_floor=2.31
+        ;;
+    *-musl)
+        build_image=hexpm/elixir:1.19.5-erlang-28.3-alpine-3.21.7
+        install='apk add --no-cache g++ make >/dev/null'
+        test_images="hexpm/elixir:1.18.4-erlang-27.3.4-alpine-3.21.7 hexpm/elixir:1.20.4-erlang-29.1.2-alpine-3.24.3"
+        glibc_floor=
+        ;;
+    *) echo "unknown target: $target" >&2; exit 2 ;;
+esac
+
+# Copies the sources a build needs from the read-only mount to /work.
+copy='mkdir /work && cp -R /src/lib /src/c_src /src/config /src/test /src/Makefile /src/mix.exs /src/mix.lock /src/.formatter.exs /work && cd /work && mix local.hex --force >/dev/null'
+
+echo "==> Building $target in $build_image"
+docker run --rm --platform "$platform" \
+    -v "$root":/src:ro -v "$out":/out \
+    -e MIX_ENV=prod -e ELIXIR_MAKE_CACHE_DIR=/out \
+    -e REBUS_NIF_WERROR -e VERSION_OVERRIDE \
+    "$build_image" sh -euc "
+        $install
+        $copy
+        mix deps.get
+        mix elixir_make.precompile
+        cp checksum.exs /out/checksum-$target.exs
+        chown $(id -u):$(id -g) /out/$archive /out/$archive.sha256 /out/checksum-$target.exs
+    "
+
+# Precompile builds every target it finds a compiler for. Each Linux target
+# names a compiler only its own image has, so exactly one archive comes out.
+built=$(sed -n 's/^ *"\(rebus-nif-[^"]*\)".*/\1/p' "$out/checksum-$target.exs")
+if [ "$built" != "$archive" ]; then
+    echo "expected only $archive, built: $built" >&2
+    exit 1
+fi
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+tar -xzf "$out/$archive" -C "$tmp"
+so="$tmp/rebus_unix_fd.so"
+
+echo "==> Checking $archive"
+fail=0
+
+needed=$(readelf -dW "$so" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
+echo "needs: $(echo $needed)"
+case " $(echo $needed) " in
+    *libstdc++*|*libgcc_s*)
+        echo "error: links the C++ runtime dynamically" >&2
+        fail=1
+        ;;
+esac
+
+versions=$(readelf -W --dyn-syms "$so" | grep -o '@[A-Z]*_[0-9.]*' | sort -u)
+if echo "$versions" | grep -qE '@(GLIBCXX|CXXABI|GCC)_'; then
+    echo "error: imports C++ runtime symbols:" $(echo "$versions" | grep -E '@(GLIBCXX|CXXABI|GCC)_') >&2
+    fail=1
+fi
+
+if [ -n "$glibc_floor" ]; then
+    glibc=$(echo "$versions" | sed -n 's/^@GLIBC_//p' | sort -V | tail -1)
+    echo "highest glibc symbol version: $glibc (floor $glibc_floor)"
+    if [ "$(printf '%s\n%s\n' "$glibc" "$glibc_floor" | sort -V | tail -1)" != "$glibc_floor" ]; then
+        echo "error: needs glibc $glibc, newer than $glibc_floor" >&2
+        fail=1
+    fi
+fi
+
+# The library exports nif_init alone, besides the _init and _fini that musl
+# adds; the C++ runtime it carries stays hidden, so it cannot interpose on
+# another library's.
+exported=$(readelf -W --dyn-syms "$so" |
+    awk '$5 == "GLOBAL" && $7 != "UND" && $8 != "_init" && $8 != "_fini" { print $8 }' | sort -u)
+if [ "$(echo $exported)" != "nif_init" ]; then
+    echo "error: exports more than nif_init:" $exported >&2
+    fail=1
+fi
+
+[ "$fail" = 0 ] || exit 1
+
+so_size=$(wc -c < "$so" | tr -d ' ')
+archive_size=$(wc -c < "$out/$archive" | tr -d ' ')
+echo "size: library $so_size bytes, archive $archive_size bytes"
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    echo "| \`$target\` | $so_size | $archive_size |" >> "$GITHUB_STEP_SUMMARY"
+fi
+
+# The unit suite installs the library the way a release does, from the
+# archive in ELIXIR_MAKE_CACHE_DIR verified against checksum.exs, and on
+# Erlang/OTP 29 (NIF 2.18) that is the 2.17 archive. The library it ran
+# against must be the archive's: a source build would differ. Standard input
+# is a pipe because the suite passes the test runner's own pipe descriptors.
+for image in $test_images; do
+    echo "==> Testing $archive in $image"
+    : | docker run -i --rm --platform "$platform" \
+        -v "$root":/src:ro -v "$out":/out:ro \
+        -e ELIXIR_MAKE_CACHE_DIR=/out -e VERSION_OVERRIDE \
+        "$image" sh -euc "
+            $copy
+            cp /out/checksum-$target.exs checksum.exs
+            mix deps.get
+            mix test
+            mkdir /tmp/archive && tar -xzf /out/$archive -C /tmp/archive
+            cmp _build/test/lib/rebus/priv/rebus_unix_fd.so /tmp/archive/rebus_unix_fd.so
+            echo 'Ran against the precompiled library.'
+        "
+done
