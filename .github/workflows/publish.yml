@@ -63,9 +63,10 @@ jobs:
             found && /^## / { exit }
             found { print }
           ' CHANGELOG.md > release-notes.md
-          if [ ! -s release-notes.md ]; then
-            echo "::error::CHANGELOG.md has no section for $GITHUB_REF_NAME"
-            exit 1
+          # `mix publisho` allows a pre-release without notes, which leaves
+          # its CHANGELOG section empty.
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "Rebus $GITHUB_REF_NAME. See [CHANGELOG.md](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/CHANGELOG.md)." > release-notes.md
           fi
 
       # Published, not a draft: installs download from the Release, and so
