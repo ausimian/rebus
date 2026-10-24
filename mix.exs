@@ -36,7 +36,7 @@ defmodule Rebus.MixProject do
           {:no_warn,
            "_build/plts/dialyzer-#{System.otp_release()}-#{System.version()}-#{Mix.env()}.plt"}
       ]
-    ]
+    ] ++ build_path()
   end
 
   def cli do
@@ -49,14 +49,36 @@ defmodule Rebus.MixProject do
   defp elixirc_paths(:test), do: ["lib", "test/lib"]
   defp elixirc_paths(_), do: ["lib"]
 
-  # The Rebus.UnixFD NIF is Unix-only; elsewhere it is not built and
-  # Rebus.UnixFD returns {:error, :unsupported}.
+  # The Rebus.UnixFD NIF is built only on Linux and macOS, the platforms where
+  # Rebus passes descriptors, and only when Unix fd support is enabled;
+  # otherwise Rebus.UnixFD returns {:error, :unsupported}.
   defp compilers do
-    case :os.type() do
-      {:unix, _} -> [:elixir_make] ++ Mix.compilers()
-      _ -> Mix.compilers()
-    end
+    if unix_fds?() and :os.type() in [{:unix, :linux}, {:unix, :darwin}],
+      do: [:elixir_make] ++ Mix.compilers(),
+      else: Mix.compilers()
   end
+
+  # An application enables Unix fd support with `config :rebus, unix_fds: true`
+  # in its config/config.exs, which Mix loads before it evaluates this file
+  # for a dependency. Rebus.UnixFD.NIF reads the same key with compile_env/3,
+  # so changing it recompiles the dependency and re-evaluates this file.
+  # Rebus's own config/config.exs is loaded only after this file, so for
+  # Rebus's own builds the default repeats what that file sets.
+  defp unix_fds? do
+    Application.get_env(:rebus, :unix_fds, own_build?() and not no_unix_fds?())
+  end
+
+  # Mix decides whether to recompile Rebus itself from its source and config
+  # files, so it would not notice REBUS_UNIX_FDS changing and would reuse a
+  # build made with the other setting. A build without fd support gets its
+  # own directory instead.
+  defp build_path do
+    if own_build?() and no_unix_fds?(), do: [build_path: "_build/no_unix_fds"], else: []
+  end
+
+  # A dependency is built in :prod, so these apply only to Rebus's own builds.
+  defp own_build?, do: Mix.env() in [:dev, :test]
+  defp no_unix_fds?, do: System.get_env("REBUS_UNIX_FDS") == "0"
 
   defp make_env do
     %{"FINE_INCLUDE_DIR" => Fine.include_dir()}
@@ -156,7 +178,8 @@ defmodule Rebus.MixProject do
     [
       name: "rebus",
       licenses: ["MIT"],
-      # The NIF compiles on install, so its source and Makefile ship.
+      # The NIF compiles on install when Unix fd support is enabled, so its
+      # source and Makefile ship.
       files: ~w(lib c_src Makefile mix.exs .formatter.exs README.md CHANGELOG.md LICENSE.md),
       links: %{
         "GitHub" => @source_url

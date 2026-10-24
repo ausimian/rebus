@@ -234,6 +234,9 @@ defmodule Rebus do
   - Expired setup budget: `:read_timeout`, or `{:read_timeout, reason}` once an
     address-list attempt has already failed.
   - Refused or unusable `Hello` reply: `{:hello_failed, reason}`.
+  - Descriptors sent by a peer that was never offered descriptor passing,
+    before the connection was established, on macOS: `:unix_fd_not_negotiated`.
+    See [Unix file descriptor passing](unix_fds.html).
   - Taken `:name`: `{:name_taken, pid}` for another Rebus connection, or
     `{:name_registered, pid}` for any other process.
   - Any other socket or setup failure: the failure's own atom.

@@ -416,12 +416,15 @@ defmodule Rebus.TestServer do
     end
   end
 
+  # A connection that cannot pass descriptors sends BEGIN without asking for
+  # them, and may send Hello straight after it, so the eight bytes of BEGIN
+  # are read first and nothing beyond them is consumed.
   defp receive_begin(cli, %__MODULE__{family: :local, unix_fd_response: response}) do
-    case :socket.recv(cli, 0) do
-      {:ok, "NEGOTIATE_UNIX_FD\r\n"} ->
-        case :socket.send(cli, response) do
-          :ok -> :socket.recv(cli, 8)
-          {:error, _reason} = error -> error
+    case :socket.recv(cli, 8) do
+      {:ok, "NEGOTIAT"} ->
+        with {:ok, "E_UNIX_FD\r\n"} <- :socket.recv(cli, 11),
+             :ok <- :socket.send(cli, response) do
+          :socket.recv(cli, 8)
         end
 
       result ->

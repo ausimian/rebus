@@ -22,6 +22,7 @@ defmodule Rebus.Connection.Setup do
   alias Rebus.Connection.SocketError
   alias Rebus.Connection.Writer
   alias Rebus.Message
+  alias Rebus.UnixFD
   alias Rebus.WireValue
 
   require Logger
@@ -144,7 +145,7 @@ defmodule Rebus.Connection.Setup do
   end
 
   defp receive_hello_reply(%Connection{} = state, deadline, timeout) do
-    if state.unix_fd_transport? do
+    if state.recvmsg_reads? do
       receive_hello_reply_recvmsg(state, deadline, timeout)
     else
       case transport(state).recv(state.sock, 0, [], timeout) do
@@ -166,10 +167,10 @@ defmodule Rebus.Connection.Setup do
     end
   end
 
-  # After local transport negotiation, every peer read—including the initial
-  # Hello reply—must observe SCM_RIGHTS. A plain recv/4 here could discard
-  # ancillary metadata outside the single close-or-deliver ownership path.
-  # Like every other read it coalesces: frames past the reply are kept.
+  # A connection that reads with recvmsg does so for every peer read,
+  # including the Hello reply. A plain recv/4 here could let descriptors in
+  # outside the single close-or-deliver ownership path. Like every other read
+  # it coalesces: frames past the reply are kept.
   defp receive_hello_reply_recvmsg(%Connection{} = state, deadline, timeout) do
     case transport(state).recvmsg(state.sock, 0, recvmsg_control_size(state), [], timeout) do
       {:ok, message} when is_map(message) ->
@@ -248,6 +249,7 @@ defmodule Rebus.Connection.Setup do
       write_timeout: state.write_timeout,
       allow_anonymous?: state.allow_anonymous?,
       unix_fd_transport?: state.unix_fd_transport?,
+      recvmsg_auth?: recvmsg_auth?(state),
       expected_guid: state.expected_guid
     }
   end
@@ -385,14 +387,40 @@ defmodule Rebus.Connection.Setup do
   end
 
   @doc false
+  # Whether a connection on this socket family can pass descriptors: a local
+  # socket where OTP has SCM_RIGHTS, in a build with Unix fd support. Without
+  # it the connection never negotiates descriptor passing, so a well-behaved
+  # peer never sends any.
   @spec unix_fd_transport_supported?(atom()) :: boolean()
-  def unix_fd_transport_supported?(:local) do
+  def unix_fd_transport_supported?(family), do: UnixFD.supported?() and scm_rights?(family)
+
+  @doc false
+  # Whether reads on this socket family go through recvmsg. A connection that
+  # can pass descriptors needs it to receive them. So does a local socket on
+  # macOS without fd support: XNU installs descriptors a peer pushes anyway
+  # even into a plain recv, without reporting their numbers, and only recvmsg
+  # shows that some arrived. Linux discards them unless the reader supplies a
+  # control buffer, so there a plain recv is the safe read.
+  @spec recvmsg_reads?(atom()) :: boolean()
+  def recvmsg_reads?(family) do
+    unix_fd_transport_supported?(family) or
+      (scm_rights?(family) and :os.type() == {:unix, :darwin})
+  end
+
+  # Authentication reads use recvmsg on a macOS local socket whether or not
+  # the build has fd support, which is exactly where `recvmsg_reads?` holds on
+  # macOS. On Linux they stay plain: there is nothing to dispose of what a
+  # control buffer would let in before BEGIN.
+  defp recvmsg_auth?(%Connection{recvmsg_reads?: recvmsg_reads?}),
+    do: recvmsg_reads? and :os.type() == {:unix, :darwin}
+
+  defp scm_rights?(:local) do
     :os.type() in [{:unix, :linux}, {:unix, :darwin}] and
       function_exported?(:socket, :sendmsg, 4) and
       function_exported?(:socket, :recvmsg, 5)
   end
 
-  def unix_fd_transport_supported?(_family), do: false
+  defp scm_rights?(_family), do: false
 
   @doc false
   @spec configure_receive_buffer(module(), :socket.socket()) :: :tuple | :scalar | :default

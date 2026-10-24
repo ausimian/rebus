@@ -60,8 +60,12 @@ defmodule Rebus.UnixFD do
   another node answers `{:error, :not_local}` to every operation there; back
   on its own node, it works again.
 
-  Handles are available on Unix systems, where Rebus builds the native code
-  behind them. Elsewhere every function returns `{:error, :unsupported}`.
+  Handles need a small native library, which Rebus builds on Linux and macOS
+  only when the application enables Unix fd support with
+  `config :rebus, unix_fds: true` (see
+  [Enabling descriptor passing](unix_fds.html#enabling-descriptor-passing)).
+  Without it every function returns `{:error, :unsupported}`; `supported?/0`
+  tells which applies.
 
   See [Unix file descriptor passing](unix_fds.html) for the full model.
   """
@@ -87,6 +91,24 @@ defmodule Rebus.UnixFD do
 
   # A number that fits a C int, as every descriptor does.
   defguardp is_raw(fd) when is_integer(fd) and fd >= 0 and fd <= 0x7FFFFFFF
+
+  @doc """
+  Returns whether this build of Rebus supports handles, and so can pass
+  descriptors.
+
+  It is true on Linux and macOS when the application enabled Unix fd support
+  with `config :rebus, unix_fds: true` in its `config/config.exs`. A library
+  built on Rebus cannot enable it for its users, so one that needs descriptor
+  passing can check this at startup and tell them to.
+
+  ```elixir
+  unless Rebus.UnixFD.supported?() do
+    raise "add `config :rebus, unix_fds: true` to config/config.exs"
+  end
+  ```
+  """
+  @spec supported?() :: boolean()
+  def supported?, do: NIF.enabled?()
 
   @doc """
   Closes a handle's descriptor.
@@ -241,7 +263,8 @@ defmodule Rebus.UnixFD do
   # The handle takes over the descriptor, which is closed on any refusal
   # except three: after `:ebadf` nothing is open under the number, after
   # `:invalid_descriptor` it is no descriptor number at all, and after
-  # `:unsupported` it stays the caller's.
+  # `:unsupported` it stays the caller's, since without the native library
+  # nothing here can close it.
   @spec wrap(raw(), pid()) ::
           {:ok, t()} | {:error, :invalid_descriptor | :noproc | error() | atom()}
   def wrap(fd, owner) when is_raw(fd) and is_pid(owner) do
@@ -307,18 +330,18 @@ defmodule Rebus.UnixFD do
 
   @doc false
   @spec __live_count__() :: non_neg_integer()
-  def __live_count__, do: NIF.live_count()
+  def __live_count__, do: if(supported?(), do: NIF.live_count(), else: 0)
 
   @doc false
   # Waits until the background thread has run every close(2) queued so far.
   @spec __drain__() :: :ok
-  def __drain__, do: NIF.drain()
+  def __drain__, do: if(supported?(), do: NIF.drain(), else: :ok)
 
   @doc false
   # How many times close(2) ran on a normal scheduler thread, which it never
   # should.
   @spec __scheduler_closes__() :: non_neg_integer()
-  def __scheduler_closes__, do: NIF.scheduler_close_count()
+  def __scheduler_closes__, do: if(supported?(), do: NIF.scheduler_close_count(), else: 0)
 
   @doc false
   # How many times close(2) ran for this handle.
@@ -341,7 +364,9 @@ defmodule Rebus.UnixFD do
   @doc false
   # The {device, inode} that fstat(2) reports for a raw descriptor number.
   @spec __fd_identity__(raw()) :: {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, atom()}
-  def __fd_identity__(fd) when is_raw(fd), do: NIF.fd_identity(fd)
+  def __fd_identity__(fd) when is_raw(fd),
+    do: if(supported?(), do: NIF.fd_identity(fd), else: {:error, :unsupported})
+
   def __fd_identity__(_fd), do: {:error, :invalid_descriptor}
 
   @doc false
@@ -361,8 +386,6 @@ defmodule Rebus.UnixFD do
       true -> fun.(ref)
     end
   end
-
-  defp supported?, do: match?({:unix, _}, :os.type())
 
   defimpl Inspect do
     import Inspect.Algebra

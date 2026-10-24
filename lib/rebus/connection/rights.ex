@@ -359,6 +359,17 @@ defmodule Rebus.Connection.Rights do
     ArgumentError -> {:error, :invalid_unix_fds}
   end
 
+  # Whether a `recvmsg` result shows that descriptors arrived: an SCM_RIGHTS
+  # item of any shape, or truncated control data, which may have hidden one.
+  @doc false
+  @spec carries_rights?(term()) :: boolean()
+  def carries_rights?(%{} = message) do
+    Enum.any?(List.wrap(Map.get(message, :ctrl)), &match?(%{level: :socket, type: :rights}, &1)) or
+      :ctrunc in List.wrap(Map.get(message, :flags))
+  end
+
+  def carries_rights?(_message), do: false
+
   @doc false
   @spec recvmsg_fds([map()], [atom()]) :: fds_result(UnixFD.raw())
   def recvmsg_fds(ctrl, flags) do

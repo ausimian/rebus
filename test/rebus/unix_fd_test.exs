@@ -12,12 +12,7 @@ defmodule Rebus.UnixFDTest do
            methods: [{"Take", in: [fd: "h"]}, {"Echo", in: [fd: "h"], out: [fd: "h"]}]
          )
 
-  @moduletag skip:
-               if(
-                 :os.type() in [{:unix, :linux}, {:unix, :darwin}],
-                 do: false,
-                 else: "SCM_RIGHTS coverage is supported on Linux and macOS"
-               )
+  @moduletag skip: Rebus.TestFD.skip_reason()
 
   # No connection path may run close(2) on a normal scheduler, as it can
   # block. This callback is registered first, so it runs after the one below

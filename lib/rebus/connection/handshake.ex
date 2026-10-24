@@ -13,7 +13,10 @@ defmodule Rebus.Connection.Handshake do
 
   alias Rebus.Auth
   alias Rebus.Auth.{Anonymous, CookieSha1, External}
+  alias Rebus.Connection.Dispatch
+  alias Rebus.Connection.Rights
   alias Rebus.Connection.SocketError
+  alias Rebus.UnixFD
 
   @max_auth_line_size 1_024
   @max_auth_id_output 64
@@ -35,6 +38,11 @@ defmodule Rebus.Connection.Handshake do
       field :clock, module(), default: Rebus.Clock.System
       field :allow_anonymous?, boolean(), default: false
       field :unix_fd_transport?, boolean(), default: false
+      # Read authentication data with recvmsg, to see descriptors a peer
+      # pushes before BEGIN, which are never legitimate. Set only on a macOS
+      # local socket, where the kernel installs descriptors even into a plain
+      # recv; Linux discards them unless the reader supplies a control buffer.
+      field :recvmsg_auth?, boolean(), default: false
       field :expected_guid, binary() | nil, default: nil
     end
   end
@@ -317,7 +325,7 @@ defmodule Rebus.Connection.Handshake do
         {:error, :read_timeout}
 
       {:ok, receive_timeout} ->
-        case options.transport.recv(sock, 0, [], receive_timeout) do
+        case receive_auth_data(options, sock, receive_timeout) do
           {:ok, data} ->
             consume_auth_data(options, sock, buffer, data, deadline, timeout)
 
@@ -335,6 +343,59 @@ defmodule Rebus.Connection.Handshake do
         end
     end
   end
+
+  defp receive_auth_data(%Options{recvmsg_auth?: true} = options, sock, timeout) do
+    case options.transport.recvmsg(sock, 0, Dispatch.max_unix_fd_control_size(), [], timeout) do
+      {:ok, message} ->
+        recvmsg_auth_data(message)
+
+      {:error, {:timeout, message}} when is_map(message) ->
+        with {:ok, data} <- recvmsg_auth_data(message), do: {:error, {:timeout, data}}
+
+      {:error, _reason} = error ->
+        error
+
+      _unexpected ->
+        {:error, :receive_failed}
+    end
+  end
+
+  defp receive_auth_data(%Options{} = options, sock, timeout),
+    do: options.transport.recv(sock, 0, [], timeout)
+
+  # Descriptors before BEGIN fail the handshake rather than let it read on
+  # from a peer that sends them.
+  defp recvmsg_auth_data(message) do
+    cond do
+      Rights.carries_rights?(message) ->
+        close_received(message)
+        {:error, :unix_fd_not_negotiated}
+
+      is_map(message) and is_list(Map.get(message, :iov)) ->
+        {:ok, IO.iodata_to_binary(message.iov)}
+
+      true ->
+        {:error, :receive_failed}
+    end
+  end
+
+  # Closes each descriptor whose number the kernel reported, in a build that
+  # can: `UnixFD.wrap/2` takes it over and closes it, and leaves it alone
+  # without fd support, where nothing can. Any the kernel installed without
+  # reporting, as XNU does past a full control buffer, stay open either way.
+  defp close_received(%{ctrl: ctrl}) when is_list(ctrl) do
+    fds =
+      case Rights.extract_rights_fds(ctrl) do
+        {:ok, fds} -> fds
+        {:error, _reason, fds} -> fds
+      end
+
+    Enum.each(fds, fn fd ->
+      with {:ok, handle} <- UnixFD.wrap(fd, self()), do: UnixFD.close_async(handle)
+    end)
+  end
+
+  defp close_received(_message), do: :ok
 
   defp consume_auth_data(options, sock, buffer, data, deadline, timeout) do
     case consume_auth_buffer(buffer <> data) do
