@@ -20,10 +20,28 @@ Elixir. To enable it, set this in your application's `config/config.exs`:
 config :rebus, unix_fds: true
 ```
 
-Rebus then builds a small native library from C++17 source shipped in the
-package, which needs `make` and a C++17 compiler, such as GCC or Clang. Most
-Linux distributions provide them, as do the Xcode command line tools on
-macOS. Nothing is built on other platforms, whatever the setting.
+Rebus then installs a small native library. Releases on Hex carry it
+precompiled, for Erlang/OTP 27 and later, for these targets, which need
+nothing but the C library:
+
+| Target | Runs on |
+|---|---|
+| `x86_64-linux-gnu`, `aarch64-linux-gnu` | glibc 2.31 or later: Debian 11, Ubuntu 20.04, RHEL 9 |
+| `x86_64-linux-musl`, `aarch64-linux-musl` | Alpine 3.21 or later |
+| `x86_64-apple-darwin`, `aarch64-apple-darwin` | macOS 11 or later |
+
+Anywhere else on Linux or macOS, and in every cross-compiled build, such as
+a Nerves firmware build, Rebus builds the library from the C++17 source
+shipped in the package instead. That needs `make` and a C++17 compiler, such
+as GCC or Clang. Most Linux distributions provide them, as do the Xcode
+command line tools on macOS. Nothing is built on other platforms, whatever
+the setting. To build from source on a precompiled target too, add:
+
+```elixir
+config :elixir_make, :force_build, rebus: true
+```
+
+A Rebus fetched from git or a local path always builds from source.
 
 - The setting must be in `config/config.exs` (or a file it imports), not in
   `config/runtime.exs`, because it decides how Rebus is compiled. A release
@@ -38,7 +56,8 @@ macOS. Nothing is built on other platforms, whatever the setting.
   setting.
 - If the setting is on but the native library fails to load, Rebus fails to
   load with it, rather than running without the descriptor passing the
-  application asked for.
+  application asked for. A precompiled library fails to load on a system
+  older than the table above allows.
 
 Without it, a connection never offers descriptor passing to its peer, every
 `Rebus.UnixFD` function returns `{:error, :unsupported}`, and a message with
