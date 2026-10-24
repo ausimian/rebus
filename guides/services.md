@@ -127,7 +127,7 @@ A handler is monitored and automatically unexported when it exits.
 `Rebus.Service.unexport/3` removes an export explicitly.
 
 An export with `subtree: true` also serves every path below its own, and
-`call.path` is the path actually called. This suits objects that come and go
+the call's `:path` is the path actually called. This suits objects that come and go
 too quickly to export one by one, such as one per database row. An exact
 export takes precedence over a subtree that covers the same path.
 
@@ -147,8 +147,8 @@ What happens when a call is not answered cleanly:
 
 - **It times out.** A call not answered within the export's `:call_timeout`,
   60 seconds by default, is answered by the connection with
-  `org.freedesktop.DBus.Error.NoReply`. `call.deadline` is the monotonic time
-  at which that happens. Pass `call_timeout: :infinity` to
+  `org.freedesktop.DBus.Error.NoReply`. The call's `:deadline` is the
+  monotonic time at which that happens. Pass `call_timeout: :infinity` to
   `Rebus.Service.export/4` or `Rebus.Object.start_link/3` to wait forever.
 - **The handler dies.** When a handler exits, or its object is unexported,
   every call still waiting on it is answered with
@@ -160,7 +160,7 @@ What happens when a call is not answered cleanly:
   open. `Rebus.Object` treats this as a bug and stops the object.
 
 A caller can set the `NO_REPLY_EXPECTED` flag on any call, and the handler
-sees `call.no_reply?` set to `true`. Answer it anyway. The answer sends
+sees the call's `:no_reply?` set to `true`. Answer it anyway. The answer sends
 nothing and returns `:ok`, so a handler need not tell such calls apart, and
 answering is what releases any descriptors the call carried. Declaring a
 method with `no_reply: true` only adds the introspection annotation telling
@@ -315,7 +315,7 @@ subscribe as described in
 
 ## Unix file descriptors
 
-Descriptors sent with a call arrive in `call.unix_fds`, indexed by the call's
+Descriptors sent with a call arrive in the call's `:unix_fds`, indexed by its
 `h` arguments. The handler borrows them until the call completes, and the
 connection closes them then, however the call completes. A handler that
 ignores them leaks nothing, and must never close one itself.
@@ -401,13 +401,13 @@ requests it with `:replace_existing` when this one allowed replacement.
 ## Untrusted callers
 
 On a message bus, the bus authenticates every connection and sets each
-call's sender, so `call.sender` is the caller's unique name and cannot be
+call's `:sender`, which is therefore the caller's unique name and cannot be
 forged. Bus policy may also restrict who can call you.
 
 On a peer-to-peer connection, made with `bus: false`, there is no bus in
 between. Nothing has filtered the calls, and the peer can send whatever it
-likes, including any `sender` header it chooses. `call.sender` is then
-unauthenticated, usually `nil` but possibly a forged name, so never use it to
+likes, including any `sender` header it chooses. The call's `:sender` is
+then unauthenticated, usually `nil` but possibly a forged name, so never use it to
 decide what a caller may do. Treat such a peer as untrusted by default.
 
 Rebus bounds what a caller can do to you:

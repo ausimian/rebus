@@ -269,7 +269,7 @@ the function:
 ## Inbound method calls
 
 A method call to an object exported with `Rebus.Service.export/4` arrives
-with a handle for each of its descriptors in `call.unix_fds`. The handler
+with a handle for each of its descriptors in the call's `:unix_fds`. The handler
 borrows them: it may use them while the call is pending, or close them
 early, but the connection owns them and closes each one it still owns when
 the call completes. A call completes when it is answered, including an
@@ -294,7 +294,7 @@ end
 ```
 
 `take_fds/2` makes the calling process the owner of the handles, the same
-ones as in `call.unix_fds`, so they outlive the call. On
+ones as in the call's `:unix_fds`, so they outlive the call. On
 `{:error, :timeout}` the connection may still make you their owner a moment
 later, or may not, and the same holds for `{:error, :disconnected}` from a
 connection killed in the middle of the hand-over. Either way each handle

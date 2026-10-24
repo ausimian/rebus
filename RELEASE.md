@@ -86,7 +86,7 @@ Without the setting Rebus stays pure Elixir.
   path above them, so `busctl tree`, `gdbus introspect` and `d-feet` can
   find and describe a Rebus service. `Rebus.Introspection.to_xml/1` renders a
   `Rebus.Introspection.Node` without an XML library.
-- Descriptors sent with a method call arrive in `call.unix_fds` as
+- Descriptors sent with a method call arrive in the call's `:unix_fds` as
   `Rebus.UnixFD` handles. The connection owns them and the handler borrows
   them until the call completes, when the connection closes each one it
   still owns, however the call completes. `Rebus.Service.take_fds/2` makes

@@ -3,7 +3,7 @@ defmodule Rebus.UnixFD do
   Handles for Unix file descriptors.
 
   Rebus hands every descriptor it receives to your code as a handle: in the
-  `unix_fds` of a `Rebus.call/3` reply, and in `call.unix_fds` of a
+  `unix_fds` of a `Rebus.call/3` reply, and in the `unix_fds` of a
   `Rebus.Service.Call`. A handle owns one open descriptor and closes it
   exactly once: when any holder calls `close/1`, when its owning process
   exits, or when the last reference to it is garbage collected, whichever
