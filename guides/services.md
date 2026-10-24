@@ -91,13 +91,14 @@ children = [{Calculator, {nil, conn: conn, path: "/org/example/Calculator"}}]
 {:ok, :primary_owner} = Rebus.Bus.request_name(conn, "org.example.Calculator")
 ```
 
-The child spec is `:transient`, so under the supervisor's usual rules an
-object that crashes is restarted, and the new process exports itself again,
-while one that stopped normally is left alone. Stopping because the
-connection stopped counts as normal, since the export went with the
-connection and a restart could not recreate it. Pass `restart:` or any other
-child spec key to `use Rebus.Object` to change this, as with `use GenServer`.
-`Rebus.Object` documents the rest of the lifecycle.
+The child spec has the same defaults as one from `use GenServer`, so the
+object is `:permanent`: however it exits, the supervisor restarts it and the
+new process exports itself again. That includes an object that stopped
+because its connection stopped. The restart then fails, since there is no
+connection to export on, and the supervisor gives up after its restart
+limit, as it would for any child whose dependency has gone. Pass `restart:`
+or any other child spec key to `use Rebus.Object` to change this, as with
+`use GenServer`. `Rebus.Object` documents the rest of the lifecycle.
 
 ## The raw protocol
 

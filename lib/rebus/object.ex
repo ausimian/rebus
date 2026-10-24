@@ -47,11 +47,14 @@ defmodule Rebus.Object do
 
       children = [{Calculator, {2, conn: conn, path: "/org/example/Calculator"}}]
 
-  The child is `:transient`, so a supervisor restarts an object that
-  crashed, but not one that stopped with its connection, which a restart
-  could not export again. `use Rebus.Object` takes the keys of
-  `t:Supervisor.child_spec/0`, such as `:restart` or `:id`, to change that,
-  as `use GenServer` does.
+  The child spec has the same defaults as one from `use GenServer`, so the
+  object is `:permanent` and a supervisor restarts it however it exits,
+  including when it stopped because its connection stopped. The restarted
+  object exports itself on the connection it is given; if that connection is
+  gone, the restart fails and the supervisor gives up after its restart
+  limit, as it would for any child whose dependency has gone. `use
+  Rebus.Object` takes the keys of `t:Supervisor.child_spec/0`, such as
+  `:restart` or `:id`, to change that, as `use GenServer` does.
 
   ## Lifetime
 
@@ -234,8 +237,7 @@ defmodule Rebus.Object do
         Supervisor.child_spec(
           %{
             id: __MODULE__,
-            start: {Rebus.Object, :start_link, [__MODULE__, arg, start_opts]},
-            restart: :transient
+            start: {Rebus.Object, :start_link, [__MODULE__, arg, start_opts]}
           },
           @rebus_object_child_spec
         )

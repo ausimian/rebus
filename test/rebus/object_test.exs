@@ -109,7 +109,7 @@ defmodule Rebus.ObjectTest do
 
   # An object with properties but neither property callback.
   defmodule Bare do
-    use Rebus.Object, restart: :permanent, id: :bare
+    use Rebus.Object, restart: :transient, id: :bare
 
     @impl true
     def interfaces do
@@ -233,11 +233,13 @@ defmodule Rebus.ObjectTest do
       assert {:ok, _ref} = Service.export(cli, @path, [Calc.calculator()])
     end
 
-    test "child specs are transient unless use says otherwise" do
-      assert %{id: Calc, restart: :transient, start: {Rebus.Object, :start_link, [Calc, 2, []]}} =
-               Calc.child_spec({2, []})
+    test "child specs are permanent, as for GenServer, unless use says otherwise" do
+      spec = Calc.child_spec({2, []})
+      assert %{id: Calc, start: {Rebus.Object, :start_link, [Calc, 2, []]}} = spec
+      # No :restart key, so the supervisor applies its :permanent default.
+      refute Map.has_key?(spec, :restart)
 
-      assert %{id: :bare, restart: :permanent} = Bare.child_spec({nil, []})
+      assert %{id: :bare, restart: :transient} = Bare.child_spec({nil, []})
     end
 
     test "registers a name and refuses unknown or missing options", %{cli: cli} do
