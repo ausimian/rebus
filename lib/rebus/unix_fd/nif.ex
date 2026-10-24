@@ -34,7 +34,14 @@ defmodule Rebus.UnixFD.NIF do
 
   @doc false
   @spec enabled?() :: boolean()
-  def enabled?, do: @enabled and :os.type() in [{:unix, :linux}, {:unix, :darwin}]
+  def enabled?, do: enabled?(@enabled, :os.type())
+
+  @doc false
+  # The compiled setting arrives as an argument rather than inline, where
+  # Dialyzer and the Elixir type checker would each see a constant and flag
+  # the branches built on it as dead code in one build or the other.
+  @spec enabled?(boolean(), {atom(), atom()}) :: boolean()
+  def enabled?(enabled, os_type), do: enabled and os_type in [{:unix, :linux}, {:unix, :darwin}]
 
   @spec wrap(integer(), pid()) :: {:ok, reference()} | {:error, atom()}
   def wrap(_fd, _owner), do: :erlang.nif_error(:not_loaded)
