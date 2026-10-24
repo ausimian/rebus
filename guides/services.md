@@ -123,8 +123,8 @@ It answers each call with `Rebus.Service.reply/3`,
 `Rebus.Service.reply_message/3`. Calls to one handler arrive in the order the
 connection received them.
 
-The handler is monitored, and everything it exported is unexported when it
-exits. `Rebus.Service.unexport/3` removes an export explicitly.
+A handler is monitored and automatically unexported when it exits.
+`Rebus.Service.unexport/3` removes an export explicitly.
 
 An export with `subtree: true` also serves every path below its own, and
 `call.path` is the path actually called. This suits objects that come and go
