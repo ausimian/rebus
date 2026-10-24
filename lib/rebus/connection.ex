@@ -60,6 +60,7 @@ defmodule Rebus.Connection do
     :invalid_message_type,
     :invalid_unix_fds,
     :unix_fd_truncated,
+    :unix_fd_not_negotiated,
     :message_too_large,
     :read_timeout,
     :resource_limit,
@@ -441,6 +442,10 @@ defmodule Rebus.Connection do
     field :partial_frame_timer, {reference(), reference()} | nil, default: nil
     field :unix_fd_transport?, boolean(), default: false
     field :unix_fd_negotiated?, boolean(), default: false
+    # Whether reads go through recvmsg. True wherever `unix_fd_transport?` is,
+    # and also on a macOS local socket without it, so that descriptors a peer
+    # pushes there are seen. See `Rebus.Connection.Setup.recvmsg_reads?/1`.
+    field :recvmsg_reads?, boolean(), default: false
     # `nil` until org.freedesktop.DBus.Peer.GetMachineId is first served;
     # `:unavailable` caches a definitive negative lookup.
     field :machine_id, binary() | :unavailable | nil, default: nil
@@ -601,7 +606,8 @@ defmodule Rebus.Connection do
               inbound: Inbound.new(<<>>, settings.max_message_size),
               connect_waiter_monitor: Setup.monitor_connect_waiter(settings.connect_waiter),
               owner_monitor: monitor_owner(settings.owner),
-              unix_fd_transport?: Setup.unix_fd_transport_supported?(family)
+              unix_fd_transport?: Setup.unix_fd_transport_supported?(family),
+              recvmsg_reads?: Setup.recvmsg_reads?(family)
             },
             Map.take(settings, @setting_fields)
           )

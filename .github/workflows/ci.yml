@@ -172,6 +172,47 @@ jobs:
         if: ${{ matrix.cover }}
         run: mix test --cover
 
+  no-unix-fds:
+    name: Test without Unix fd support (Linux, Elixir 1.20 / OTP 29)
+    # Applications get no native code unless they enable Unix fd support, so
+    # one leg builds Rebus that way. REBUS_UNIX_FDS=0 builds into
+    # _build/no_unix_fds; the cache key keeps it apart from the other legs.
+    runs-on: ubuntu-24.04
+    env:
+      REBUS_UNIX_FDS: '0'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: '1.20'
+          otp-version: '29'
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
+
+      - name: Restore dependencies and build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-${{ runner.arch }}-mix-no-unix-fds-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-mix-no-unix-fds-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Compile
+        run: mix compile --warnings-as-errors
+
+      - name: Run tests
+        run: mix test
+
   unix-fd-macos:
     name: Unix FD lifecycle (macOS, Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }})
     # Unix FD passing is intentionally supported only on Linux and macOS.

@@ -11,7 +11,9 @@ defmodule Rebus.ScriptedTransport do
   # of `:recv`, `:send` and `:sendmsg` scripts. A script step is either a
   # function, applied to the payload of the call it answers, or a plain term.
   # A plain `recv/4` step that is a binary is delivered as `{:ok, binary}`; any
-  # other term is returned unchanged.
+  # other term is returned unchanged. `recvmsg/5` replays the same script,
+  # delivering a binary step as a `recvmsg` result with no control data and a
+  # map step, a whole `recvmsg` result, as `{:ok, map}`.
   #
   # An exhausted `recv/4` script reports `{:error, :closed}`, exactly as a peer
   # that hung up would; an exhausted `send/4` or `sendmsg/4` script accepts the
@@ -111,7 +113,16 @@ defmodule Rebus.ScriptedTransport do
   def connect(_sock, _address, _timeout), do: {:error, :not_scripted}
 
   @impl Rebus.Transport
-  def recvmsg(_sock, _length, _control_size, _flags, _timeout), do: {:error, :not_scripted}
+  def recvmsg(sock, _length, _control_size, _flags, _timeout) do
+    Agent.get_and_update(sock, fn
+      %{recv: [step | script]} = state -> {recvmsg_step(step), %{state | recv: script}}
+      %{recv: []} = state -> {{:error, :closed}, state}
+    end)
+  end
+
+  defp recvmsg_step(data) when is_binary(data), do: {:ok, %{iov: [data], ctrl: [], flags: []}}
+  defp recvmsg_step(message) when is_map(message), do: {:ok, message}
+  defp recvmsg_step(result), do: result
 
   @impl Rebus.Transport
   def setopt(_sock, _option, _value), do: {:error, :not_scripted}

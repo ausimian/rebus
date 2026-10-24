@@ -1208,6 +1208,38 @@ defmodule Rebus.Connection.DispatchTest do
     end
   end
 
+  # A macOS local socket in a build without fd support reads with recvmsg
+  # only to see descriptors a peer pushes anyway; plain integers stand in for
+  # them, since nothing here may touch one.
+  describe "recvmsg results without fd support" do
+    setup do
+      %{state: %{connection() | recvmsg_reads?: true, unix_fd_transport?: false}}
+    end
+
+    test "stops the connection when descriptors arrive", %{state: state} do
+      message = %{iov: [signal_bytes()], ctrl: [rights_cmsg([3])], flags: []}
+
+      assert {:protocol_error, :unix_fd_not_negotiated, %Connection{}} =
+               Dispatch.receive_result({:ok, message}, state)
+    end
+
+    test "stops the connection when control data was truncated", %{state: state} do
+      message = %{iov: [signal_bytes()], ctrl: [], flags: [:ctrunc]}
+
+      assert {:protocol_error, :unix_fd_not_negotiated, %Connection{}} =
+               Dispatch.receive_result({:ok, message}, state)
+    end
+
+    test "reads bytes that arrive without descriptors", %{state: state} do
+      message = %{iov: [signal_bytes()], ctrl: [], flags: []}
+
+      assert {:continue, :recv, %Connection{} = state} =
+               Dispatch.receive_result({:ok, message}, state)
+
+      assert state.inbound.size == 0
+    end
+  end
+
   # An established connection whose socket is a `ScriptedTransport` agent. No
   # test here writes to it: queued replies are asserted on the writer's queue.
   defp connection do
@@ -1226,6 +1258,20 @@ defmodule Rebus.Connection.DispatchTest do
       %{state | inbound: Inbound.new(IO.iodata_to_binary(encoded))},
       :recv
     )
+  end
+
+  defp signal_bytes do
+    signal = Message.new!(:signal, path: "/test", interface: "test.interface", member: "Ping")
+    {:ok, encoded} = Message.encode(serialised(signal))
+    IO.iodata_to_binary(encoded)
+  end
+
+  defp rights_cmsg(fds) do
+    %{
+      level: :socket,
+      type: :rights,
+      data: for(fd <- fds, into: <<>>, do: <<fd::native-signed-32>>)
+    }
   end
 
   defp serialised(%Message{serial: serial} = msg) when is_integer(serial) and serial > 0, do: msg

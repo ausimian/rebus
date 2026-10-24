@@ -98,6 +98,27 @@ defmodule Rebus.Connection.RightsTest do
     end
   end
 
+  describe "carries_rights?/1" do
+    test "is false for a result with no descriptors" do
+      refute Rights.carries_rights?(%{iov: ["x"], ctrl: [], flags: []})
+      refute Rights.carries_rights?(%{iov: ["x"], ctrl: [%{level: :socket, type: :timestamp}]})
+    end
+
+    test "is true for an SCM_RIGHTS item, well-formed or not" do
+      assert Rights.carries_rights?(%{iov: ["x"], ctrl: [rights_cmsg([3])], flags: []})
+      assert Rights.carries_rights?(%{ctrl: [%{level: :socket, type: :rights, data: :bad}]})
+    end
+
+    test "is true for truncated control data, which may have hidden descriptors" do
+      assert Rights.carries_rights?(%{iov: ["x"], ctrl: [], flags: [:ctrunc]})
+    end
+
+    test "is false for anything that is not a recvmsg result" do
+      refute Rights.carries_rights?(:invalid)
+      refute Rights.carries_rights?(%{iov: ["x"]})
+    end
+  end
+
   describe "decide/3" do
     test "holds descriptors for the frames beginning in their bytes" do
       assert {:frame, "abc", [3]} = Rights.decide({:ok, [3]}, "abc", context())

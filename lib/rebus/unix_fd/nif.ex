@@ -1,22 +1,40 @@
 defmodule Rebus.UnixFD.NIF do
   # Native functions behind Rebus.UnixFD, from c_src/rebus_unix_fd.cpp. The
-  # library is built only on Unix, so elsewhere nothing is loaded and
-  # Rebus.UnixFD answers {:error, :unsupported} before calling in here.
+  # library is built only on Linux and macOS, the platforms where Rebus passes
+  # descriptors, and only when Unix fd support is enabled,
+  # so otherwise nothing is loaded and Rebus.UnixFD answers
+  # {:error, :unsupported} before calling in here.
   @moduledoc false
 
   @on_load :load
 
-  @doc false
-  def load do
-    case :os.type() do
-      {:unix, _} ->
-        path = :filename.join(:code.priv_dir(:rebus), ~c"rebus_unix_fd")
-        :erlang.load_nif(path, 0)
+  # Set by the application with `config :rebus, unix_fds: true`. mix.exs reads
+  # the same key to decide whether to build the library, and compile_env/3
+  # makes Mix recompile Rebus when it changes.
+  @enabled Application.compile_env(:rebus, :unix_fds, false)
 
-      _ ->
-        :ok
+  unless is_boolean(@enabled) do
+    raise ArgumentError,
+          "expected config :rebus, :unix_fds to be a boolean, got: #{inspect(@enabled)}"
+  end
+
+  @doc false
+  # Loading only when enabled keeps a build without the library loadable,
+  # which matters to a release that loads every module at boot. When enabled,
+  # a library that fails to load fails this module, and the boot with it,
+  # rather than leaving an application that asked for fd passing without it.
+  def load do
+    if enabled?() do
+      path = :filename.join(:code.priv_dir(:rebus), ~c"rebus_unix_fd")
+      :erlang.load_nif(path, 0)
+    else
+      :ok
     end
   end
+
+  @doc false
+  @spec enabled?() :: boolean()
+  def enabled?, do: @enabled and :os.type() in [{:unix, :linux}, {:unix, :darwin}]
 
   @spec wrap(integer(), pid()) :: {:ok, reference()} | {:error, atom()}
   def wrap(_fd, _owner), do: :erlang.nif_error(:not_loaded)

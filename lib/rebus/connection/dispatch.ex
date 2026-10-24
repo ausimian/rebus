@@ -61,12 +61,15 @@ defmodule Rebus.Connection.Dispatch do
   @doc false
   @spec recv(Connection.t()) :: result()
   def recv(%Connection{} = state) do
-    # Every read on a local socket goes through recvmsg, negotiated or not:
-    # OTP documents CtrlSz=0 as its default control-buffer size, not as a
-    # request to discard ancillary data. Reads coalesce exactly as plain recv
-    # does; `Rebus.Connection.Rights` attributes any descriptors to the frames
-    # that begin in the bytes they arrived with.
-    if state.unix_fd_transport? do
+    # A connection that can pass descriptors reads with recvmsg, negotiated or
+    # not, and so does a macOS local socket without fd support (see
+    # `Setup.recvmsg_reads?/1`). OTP documents CtrlSz=0 as its default
+    # control-buffer size, not as a request to discard ancillary data. Reads
+    # coalesce exactly as plain recv does; `Rebus.Connection.Rights`
+    # attributes any descriptors to the frames that begin in the bytes they
+    # arrived with. Every other connection reads with plain recv, after which
+    # Linux discards any descriptors a peer pushes.
+    if state.recvmsg_reads? do
       transport(state).recvmsg(state.sock, 0, @max_unix_fd_control_size, [], :nowait)
       |> receive_result(state)
     else
@@ -127,7 +130,23 @@ defmodule Rebus.Connection.Dispatch do
 
   @doc false
   @spec append_recvmsg(map(), Connection.t(), term()) :: result()
-  def append_recvmsg(message, %Connection{} = state, continuation) do
+  def append_recvmsg(message, %Connection{unix_fd_transport?: false} = state, continuation) do
+    # Only a macOS local socket without fd support gets here. It never
+    # negotiated descriptor passing, and the kernel has already installed any
+    # descriptors that arrived anyway, which nothing in this build can close,
+    # so the connection stops rather than keep reading from a peer that sends
+    # them.
+    if Rights.carries_rights?(message) do
+      {:protocol_error, :unix_fd_not_negotiated, state}
+    else
+      decode_recvmsg(message, state, continuation)
+    end
+  end
+
+  def append_recvmsg(message, %Connection{} = state, continuation),
+    do: decode_recvmsg(message, state, continuation)
+
+  defp decode_recvmsg(message, %Connection{} = state, continuation) do
     # The single close-or-deliver ownership path for every received
     # descriptor: those held for frames stay with the rights, and anything
     # rejected on receipt is closed here, exactly once.
@@ -203,8 +222,9 @@ defmodule Rebus.Connection.Dispatch do
   # refused number needs no closing here. `wrap/2` closes it on every
   # refusal but three: after `:ebadf` and `:invalid_descriptor` nothing is
   # open under it, so closing it could only close a descriptor another
-  # thread has just been given, and `:unsupported` comes only from a
-  # platform that never receives descriptors.
+  # thread has just been given, and `:unsupported` never reaches here,
+  # because a build without fd support never decodes descriptors:
+  # `append_recvmsg/3` stops the connection first.
   defp wrap_received(fd) do
     case UnixFD.wrap(fd, self()) do
       {:ok, handle} -> {:ok, handle}

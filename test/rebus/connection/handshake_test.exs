@@ -199,6 +199,42 @@ defmodule Rebus.Connection.HandshakeTest do
     end
   end
 
+  # As on a macOS local socket, where authentication data is read with recvmsg.
+  describe "authentication read with recvmsg" do
+    test "authenticates as with a plain recv when no descriptors arrive" do
+      sock = ScriptedTransport.start(["OK #{@guid}\r\n", "AGREE_UNIX_FD\r\nrest"])
+
+      assert {:ok, %{guid: @guid, unix_fd_negotiated?: true, rest: "rest"}} =
+               run(sock, recvmsg_auth?: true, unix_fd_transport?: true)
+    end
+
+    test "fails when the peer sends descriptors before BEGIN" do
+      # -1 is no descriptor, so closing what arrived touches nothing here.
+      rights = %{level: :socket, type: :rights, data: <<-1::native-signed-32>>}
+      sock = ScriptedTransport.start([%{iov: ["OK #{@guid}\r\n"], ctrl: [rights], flags: []}])
+
+      assert {:error, :unix_fd_not_negotiated} = run(sock, recvmsg_auth?: true)
+      refute ScriptedTransport.sent(sock) =~ "BEGIN"
+    end
+
+    @tag skip: Rebus.TestFD.skip_reason()
+    test "closes the descriptors it was told of before failing" do
+      fd = Rebus.TestFD.dup!()
+      rights = %{level: :socket, type: :rights, data: <<fd::native-signed-32>>}
+      sock = ScriptedTransport.start([%{iov: ["OK #{@guid}\r\n"], ctrl: [rights], flags: []}])
+
+      assert {:error, :unix_fd_not_negotiated} = run(sock, recvmsg_auth?: true)
+      :ok = Rebus.UnixFD.__drain__()
+      assert {:error, :ebadf} = Rebus.UnixFD.__fd_identity__(fd)
+    end
+
+    test "fails when control data was truncated" do
+      sock = ScriptedTransport.start([%{iov: ["OK #{@guid}\r\n"], ctrl: [], flags: [:ctrunc]}])
+
+      assert {:error, :unix_fd_not_negotiated} = run(sock, recvmsg_auth?: true)
+    end
+  end
+
   describe "REJECTED" do
     test "returns the advertised mechanisms when none can be attempted" do
       sock = ScriptedTransport.start(["REJECTED EXTERNAL KERBEROS_V4\r\n"])

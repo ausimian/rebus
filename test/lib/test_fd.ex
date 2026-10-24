@@ -63,15 +63,42 @@ defmodule Rebus.TestFD do
   end
 
   @doc """
-  The `skip` tag value for tests which need `dup!/0`.
+  The `skip` tag value for tests which need descriptor passing.
 
-  Answers `false` where SCM_RIGHTS is supported, and the reason to skip
-  otherwise.
+  Answers `false` on Linux and macOS in a build with Unix fd support, and the
+  reason to skip otherwise.
   """
   @spec skip_reason() :: false | String.t()
   def skip_reason do
-    if :os.type() in [{:unix, :linux}, {:unix, :darwin}],
-      do: false,
-      else: "SCM_RIGHTS coverage is supported on Linux and macOS"
+    cond do
+      :os.type() not in [{:unix, :linux}, {:unix, :darwin}] ->
+        "SCM_RIGHTS coverage is supported on Linux and macOS"
+
+      not Rebus.UnixFD.supported?() ->
+        "this build has no Unix fd support (REBUS_UNIX_FDS=0)"
+
+      true ->
+        false
+    end
+  end
+
+  @doc """
+  The `skip` tag value for tests of a build without Unix fd support.
+
+  Answers `false` on Linux and macOS in such a build, and the reason to skip
+  otherwise.
+  """
+  @spec disabled_skip_reason() :: false | String.t()
+  def disabled_skip_reason do
+    cond do
+      :os.type() not in [{:unix, :linux}, {:unix, :darwin}] ->
+        "SCM_RIGHTS coverage is supported on Linux and macOS"
+
+      Rebus.UnixFD.supported?() ->
+        "this build has Unix fd support; run with REBUS_UNIX_FDS=0"
+
+      true ->
+        false
+    end
   end
 end
