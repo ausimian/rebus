@@ -7,11 +7,17 @@ defmodule Rebus.MixProject do
   def project do
     [
       app: :rebus,
-      version: System.get_env("VERSION_OVERRIDE", @version),
+      version: version(),
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       compilers: compilers(),
       make_env: &make_env/0,
+      make_precompiler: {:nif, CCPrecompiler},
+      make_precompiler_url: "#{@source_url}/releases/download/#{version()}/@{artefact_filename}",
+      make_precompiler_filename: "rebus_unix_fd",
+      make_precompiler_nif_versions: [versions: ["2.17"]],
+      make_force_build: force_build?(),
+      cc_precompiler: [compilers: precompiled_targets()],
       aliases: aliases(),
       deps: deps(),
       description: description(),
@@ -39,6 +45,8 @@ defmodule Rebus.MixProject do
     ] ++ build_path()
   end
 
+  defp version, do: System.get_env("VERSION_OVERRIDE", @version)
+
   def cli do
     [
       preferred_envs: [precommit: :test]
@@ -49,9 +57,10 @@ defmodule Rebus.MixProject do
   defp elixirc_paths(:test), do: ["lib", "test/lib"]
   defp elixirc_paths(_), do: ["lib"]
 
-  # The Rebus.UnixFD NIF is built only on Linux and macOS, the platforms where
-  # Rebus passes descriptors, and only when Unix fd support is enabled;
-  # otherwise Rebus.UnixFD returns {:error, :unsupported}.
+  # The Rebus.UnixFD NIF is installed, precompiled or built from source, only
+  # on Linux and macOS, the platforms where Rebus passes descriptors, and only
+  # when Unix fd support is enabled; otherwise Rebus.UnixFD returns
+  # {:error, :unsupported}.
   defp compilers do
     if unix_fds?() and :os.type() in [{:unix, :linux}, {:unix, :darwin}],
       do: [:elixir_make] ++ Mix.compilers(),
@@ -80,6 +89,37 @@ defmodule Rebus.MixProject do
   defp own_build?, do: Mix.env() in [:dev, :test]
   defp no_unix_fds?, do: System.get_env("REBUS_UNIX_FDS") == "0"
 
+  # A Hex release carries checksum.exs for the precompiled libraries that CI
+  # publishes with it. Without it, as in Rebus's own builds and git or path
+  # dependencies, nothing can be verified, so the library builds from source.
+  # A cross-compile, such as a Nerves build, always builds from source with
+  # its own toolchain rather than installing a library built for a desktop
+  # distribution.
+  defp force_build? do
+    not File.exists?(Path.join(__DIR__, "checksum.exs")) or System.get_env("CROSSCOMPILE") != nil
+  end
+
+  # The targets with precompiled libraries. Any other target builds from
+  # source. Each Linux target names the compiler prefix of the distribution
+  # that builds it, so a CI job building on one target never finds a
+  # compiler for another; macOS builds both of its targets on one host.
+  defp precompiled_targets do
+    %{
+      {:unix, :linux} => %{
+        "x86_64-linux-gnu" => "x86_64-linux-gnu-",
+        "aarch64-linux-gnu" => "aarch64-linux-gnu-",
+        "x86_64-linux-musl" => "x86_64-alpine-linux-musl-",
+        "aarch64-linux-musl" => "aarch64-alpine-linux-musl-"
+      },
+      {:unix, :darwin} => %{
+        "x86_64-apple-darwin" =>
+          {"gcc", "g++", "<%= cc %> -arch x86_64", "<%= cxx %> -arch x86_64"},
+        "aarch64-apple-darwin" =>
+          {"gcc", "g++", "<%= cc %> -arch arm64", "<%= cxx %> -arch arm64"}
+      }
+    }
+  end
+
   defp make_env do
     %{"FINE_INCLUDE_DIR" => Fine.include_dir()}
   end
@@ -96,6 +136,7 @@ defmodule Rebus.MixProject do
   defp deps do
     [
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:cc_precompiler, "~> 0.1", runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:elixir_make, "~> 0.9", runtime: false},
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false},
@@ -178,9 +219,11 @@ defmodule Rebus.MixProject do
     [
       name: "rebus",
       licenses: ["MIT"],
-      # The NIF compiles on install when Unix fd support is enabled, so its
-      # source and Makefile ship.
-      files: ~w(lib c_src Makefile mix.exs .formatter.exs README.md CHANGELOG.md LICENSE.md),
+      # With Unix fd support enabled, an install downloads the precompiled
+      # library that checksum.exs verifies, or builds it from source on any
+      # other target, so the source and Makefile ship too.
+      files:
+        ~w(lib c_src Makefile mix.exs checksum.exs .formatter.exs README.md CHANGELOG.md LICENSE.md),
       links: %{
         "GitHub" => @source_url
       },
