@@ -83,6 +83,9 @@ jobs:
                 gh release upload "$GITHUB_REF_NAME" "$file"
               fi
             done
+            # gh release create publishes only after its uploads, so a run
+            # that stopped during them left a draft that installs cannot read.
+            gh release edit "$GITHUB_REF_NAME" --draft=false
           else
             prerelease=
             case "$GITHUB_REF_NAME" in *-*) prerelease=--prerelease ;; esac
