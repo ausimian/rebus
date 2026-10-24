@@ -6,8 +6,11 @@ when nothing refers to it any more, and a stale handle can never touch a
 descriptor number the operating system has reused. Code that received raw
 numbers must treat them as handles: close them with `Rebus.UnixFD.close/1`,
 and use the number inside `Rebus.UnixFD.with_fd/2`. Outbound `fds:` take
-handles and raw numbers alike. On Unix, building Rebus now compiles a small
-native library, which needs `make` and a C++17 compiler.
+handles and raw numbers alike. Handles need a small native library, so
+descriptor passing is now opt-in: an application that passes descriptors
+must add `config :rebus, unix_fds: true` to its `config/config.exs`, and its
+build then needs `make` and a C++17 compiler. Without it Rebus stays pure
+Elixir.
 
 ### Added
 
@@ -142,9 +145,28 @@ native library, which needs `make` and a C++17 compiler.
   descriptor it received and still owns, including those lent to the
   handlers of pending calls. A `:kill` used to leave them open.
 
-- On Unix, Rebus now compiles a small native library when it is built, so
-  building it needs `make` and a C++17 compiler. Nothing is compiled on other
-  platforms, where `Rebus.UnixFD` returns `{:error, :unsupported}`.
+- **Breaking:** Unix file descriptor passing is opt-in. Handles are built on
+  a small native library, which Rebus compiles only when the application
+  sets `config :rebus, unix_fds: true` in its `config/config.exs`; the build
+  then needs `make` and a C++17 compiler. Without the setting, Rebus is pure
+  Elixir: connections never offer descriptor passing, messages with
+  descriptors are refused with `{:error, :unix_fd_unsupported}`, and
+  `Rebus.UnixFD` functions return `{:error, :unsupported}`. Changing the
+  setting recompiles Rebus on the next `mix compile`. A library built on
+  Rebus cannot enable it for its users, but can check the new
+  `Rebus.UnixFD.supported?/0`. See
+  [Enabling descriptor passing](unix_fds.html#enabling-descriptor-passing).
+
+  ```elixir
+  # config/config.exs
+  config :rebus, unix_fds: true
+  ```
+
+- In a build without descriptor passing, a macOS connection whose peer sends
+  descriptors anyway stops with `:unix_fd_not_negotiated`, because macOS
+  hands them to the process with nothing there able to close them. On Linux
+  the kernel discards them and only the message that declared them is
+  dropped.
 
 - Rewrote the [Unix file descriptor passing](unix_fds.html) guide for
   handles, with recipes for adopting a received descriptor into an OTP
@@ -202,6 +224,11 @@ native library, which needs `make` and a C++17 compiler.
   report.
 
 ### Fixed
+
+- On macOS, `Rebus.connect/2` fails with `{:error, :unix_fd_not_negotiated}`
+  when the peer sends descriptors during authentication, before descriptor
+  passing can have been agreed. macOS installs such descriptors in the
+  process without reporting their numbers, so they used to leak unnoticed.
 
 - A raw descriptor number in `fds:` too large to be a descriptor, above
   `0x7FFFFFFF`, is refused with `{:error, :invalid_unix_fds}` rather than

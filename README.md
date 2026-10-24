@@ -20,9 +20,14 @@ def deps do
 end
 ```
 
-On Linux and macOS, Rebus compiles a small native library when it is built,
-for Unix file descriptor passing, so the build needs `make` and a C++17
-compiler such as GCC or Clang.
+Rebus is pure Elixir by default. Passing Unix file descriptors is opt-in,
+because it needs a small native library: enable it in your application's
+`config/config.exs`, and the build then needs `make` and a C++17 compiler
+such as GCC or Clang.
+
+```elixir
+config :rebus, unix_fds: true
+```
 
 ## Examples
 

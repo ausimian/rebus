@@ -6,10 +6,50 @@
 > subsequent release.
 
 D-Bus can carry Unix file descriptors alongside a message body. Rebus
-supports this on Linux and macOS, over local Unix sockets, when the peer
-agrees to it during authentication. If the transport cannot carry descriptors
-or the peer did not agree to receive them, Rebus rejects the message without
-sending any bytes.
+supports this on Linux and macOS, over local Unix sockets, when the
+application has enabled it and the peer agrees to it during authentication.
+If the transport cannot carry descriptors or the peer did not agree to
+receive them, Rebus rejects the message without sending any bytes.
+
+## Enabling descriptor passing
+
+Descriptor passing is off by default, so a default build of Rebus is pure
+Elixir. To enable it, set this in your application's `config/config.exs`:
+
+```elixir
+config :rebus, unix_fds: true
+```
+
+Rebus then builds a small native library from C++17 source shipped in the
+package, which needs `make` and a C++17 compiler, such as GCC or Clang. Most
+Linux distributions provide them, as do the Xcode command line tools on
+macOS. Nothing is built on other platforms, whatever the setting.
+
+- The setting must be in `config/config.exs` (or a file it imports), not in
+  `config/runtime.exs`, because it decides how Rebus is compiled. A release
+  whose runtime configuration disagrees with the compiled value refuses to
+  boot.
+- Changing it makes Mix recompile Rebus on the next `mix compile`, adding or
+  dropping the native library; no `--force` or `mix deps.clean` is needed.
+- Only the end application can enable it. Mix never loads a dependency's
+  configuration, so a library built on Rebus cannot enable descriptor
+  passing for its users. A library that needs it can check
+  `Rebus.UnixFD.supported?/0` at startup and tell its users to add the
+  setting.
+- If the setting is on but the native library fails to load, Rebus fails to
+  load with it, rather than running without the descriptor passing the
+  application asked for.
+
+Without it, a connection never offers descriptor passing to its peer, every
+`Rebus.UnixFD` function returns `{:error, :unsupported}`, and a message with
+descriptors is refused with `{:error, :unix_fd_unsupported}`. A peer should
+then never send any. If one does anyway on Linux, the kernel discards the
+descriptors and Rebus drops the message that declared them, as it does for
+any peer that sends descriptors it was not offered. On macOS the kernel hands
+them to Rebus even so, with nothing in such a build able to close them, so
+the connection stops with `:unix_fd_not_negotiated` at the first one, and
+`Rebus.connect/2` returns that error if they arrive while it is still
+authenticating.
 
 Every descriptor Rebus receives reaches your code as a `Rebus.UnixFD`
 handle, never as a raw number. A handle owns one open descriptor and closes
@@ -309,22 +349,13 @@ descriptor closed when the connection stops.
   by recompiling Rebus from `iex` after changing it, fails; restart the node
   instead. This only affects development.
 
-## Building
-
-On Unix, Rebus compiles that native library when it is built, from C++17
-source shipped in the package. Building it needs `make` and a C++17
-compiler, such as GCC or Clang, which most Linux distributions and the
-Xcode command line tools on macOS provide. Nothing is compiled on other
-platforms, where every `Rebus.UnixFD` function returns
-`{:error, :unsupported}` and no connection can pass descriptors.
-
 ## Errors
 
 These are returned when sending or answering:
 
 | Reason | Meaning |
 | --- | --- |
-| `:unix_fd_unsupported` | This connection cannot pass descriptors at all. It is a TCP connection, or the platform lacks support. |
+| `:unix_fd_unsupported` | This connection cannot pass descriptors at all. It is a TCP connection, the platform lacks support, or the application has not [enabled descriptor passing](#enabling-descriptor-passing). |
 | `:unix_fd_not_negotiated` | The peer did not agree to descriptor passing. |
 | `:unix_fd_closed` | A handle in the message was already closed, or belongs to another node, when the connection accepted it. Nothing was written. |
 | `:unix_fd_send_failed` | The kernel refused an outbound descriptor. No byte of the frame was written and the connection remains usable. A handle you sent is as it was, but a reply has still completed its call, closing the call's borrowed handles, and the caller gets no answer. |
@@ -338,4 +369,4 @@ These are returned when sending or answering:
 | `:not_owner` | Only the owner can transfer the handle. |
 | `:noproc` | The process it was transferred to is not alive, so the descriptor was closed. |
 | `:not_local` | The handle, or the process given, belongs to another node. |
-| `:unsupported` | This platform has no handle support. |
+| `:unsupported` | This build has no handle support: the platform lacks it, or the application has not [enabled descriptor passing](#enabling-descriptor-passing). |
