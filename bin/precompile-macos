@@ -1,0 +1,107 @@
+#!/bin/sh
+#
+# Builds and tests the precompiled Rebus.UnixFD libraries for macOS.
+#
+# Usage: bin/precompile-macos build [out-dir]
+#        bin/precompile-macos test <target> [out-dir]
+#
+# `build` builds both aarch64-apple-darwin and x86_64-apple-darwin, which an
+# Apple silicon host can do, and checks that each targets macOS 11 and
+# exports nif_init alone. The archives and their .sha256 land in out-dir
+# (default: precompiled/), with checksum-macos.exs to verify them.
+#
+# `test` runs the unit suite against one archive, installed the way a
+# release installs it, on this host's Erlang/OTP. The host must run
+# <target>'s architecture.
+#
+# Each mode works in a temporary copy of the sources, so neither _build nor
+# checksum.exs in the repository is touched.
+set -eu
+
+mode=${1:?usage: bin/precompile-macos build|test ...}
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+version=${VERSION_OVERRIDE:-$(sed -n 's/^  @version "\(.*\)"$/\1/p' "$root/mix.exs")}
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cp -R "$root/lib" "$root/c_src" "$root/config" "$root/test" \
+    "$root/Makefile" "$root/mix.exs" "$root/mix.lock" "$root/.formatter.exs" "$work"
+
+case $mode in
+    build)
+        out=${2:-$root/precompiled}
+        mkdir -p "$out"
+        out=$(CDPATH= cd -- "$out" && pwd)
+
+        (cd "$work" &&
+            MIX_ENV=prod mix deps.get &&
+            MIX_ENV=prod ELIXIR_MAKE_CACHE_DIR="$out" mix elixir_make.precompile)
+        cp "$work/checksum.exs" "$out/checksum-macos.exs"
+
+        fail=0
+        for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            archive="rebus-nif-2.17-$target-$version.tar.gz"
+            echo "==> Checking $archive"
+            mkdir "$work/$target"
+            tar -xzf "$out/$archive" -C "$work/$target"
+            so="$work/$target/rebus_unix_fd.so"
+
+            arch=$(lipo -archs "$so")
+            case $target in
+                aarch64-*) want=arm64 ;;
+                x86_64-*) want=x86_64 ;;
+            esac
+            echo "architecture: $arch"
+            if [ "$arch" != "$want" ]; then
+                echo "error: built for $arch, not $want" >&2
+                fail=1
+            fi
+
+            minos=$(vtool -show-build "$so" | awk '$1 == "minos" { print $2 }')
+            echo "minimum macOS: $minos"
+            if [ "$minos" != 11.0 ]; then
+                echo "error: targets macOS $minos, not 11.0" >&2
+                fail=1
+            fi
+
+            exported=$(nm -gU "$so" | awk '{ print $3 }')
+            if [ "$(echo $exported)" != _nif_init ]; then
+                echo "error: exports more than nif_init:" $exported >&2
+                fail=1
+            fi
+
+            so_size=$(wc -c < "$so" | tr -d ' ')
+            archive_size=$(wc -c < "$out/$archive" | tr -d ' ')
+            echo "size: library $so_size bytes, archive $archive_size bytes"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                echo "| \`$target\` | $so_size | $archive_size |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+        done
+        exit "$fail"
+        ;;
+
+    test)
+        target=${2:?usage: bin/precompile-macos test <target> [out-dir]}
+        out=${3:-$root/precompiled}
+        out=$(CDPATH= cd -- "$out" && pwd)
+        archive="rebus-nif-2.17-$target-$version.tar.gz"
+
+        # With checksum.exs present, the build installs the archive from
+        # ELIXIR_MAKE_CACHE_DIR, verified, instead of building from source,
+        # and on Erlang/OTP 29 (NIF 2.18) that is the 2.17 archive. The
+        # library the suite ran against must be the archive's.
+        cp "$out/checksum-macos.exs" "$work/checksum.exs"
+        mkdir "$work/archive"
+        tar -xzf "$out/$archive" -C "$work/archive"
+        cd "$work"
+        mix deps.get
+        ELIXIR_MAKE_CACHE_DIR="$out" mix test
+        cmp _build/test/lib/rebus/priv/rebus_unix_fd.so archive/rebus_unix_fd.so
+        echo 'Ran against the precompiled library.'
+        ;;
+
+    *)
+        echo "unknown mode: $mode" >&2
+        exit 2
+        ;;
+esac
