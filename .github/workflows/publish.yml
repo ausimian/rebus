@@ -1,5 +1,10 @@
 name: Publish
 
+# A release publishes the precompiled Rebus.UnixFD libraries to a GitHub
+# Release for its tag, then publishes to Hex a package whose checksum.exs
+# verifies them. Hex publishing runs only once every library has passed its
+# tests and an application has installed the package from the Release.
+
 on:
   push:
     tags:
@@ -10,8 +15,157 @@ permissions:
   contents: read
 
 jobs:
+  version:
+    name: Verify tag matches project version
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      # The precompiled libraries are named, and downloaded, by this version.
+      - name: Verify tag matches project version
+        run: |
+          version=$(grep -m1 -oE '@version "[^"]+"' mix.exs | cut -d'"' -f2)
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' does not match mix.exs @version '$version'"
+            exit 1
+          fi
+          echo "Publishing version $version"
+
+  precompile:
+    name: Precompile
+    needs: version
+    uses: ./.github/workflows/precompile.yml
+
+  release:
+    name: GitHub Release
+    needs: precompile
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: precompiled-*
+          path: precompiled
+          merge-multiple: true
+
+      - name: Extract release notes
+        run: |
+          awk -v version="$GITHUB_REF_NAME" '
+            index($0, "## " version " ") == 1 || $0 == "## " version { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+      # Published, not a draft: installs download from the Release, and so
+      # does the checksum job below. A rerun adds only the archives the
+      # Release lacks. It never replaces one: a rebuilt archive differs, and
+      # a checksum.exs already on Hex would then reject it.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            published=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')
+            for file in precompiled/*.tar.gz precompiled/*.sha256; do
+              if ! echo "$published" | grep -qxF "$(basename "$file")"; then
+                gh release upload "$GITHUB_REF_NAME" "$file"
+              fi
+            done
+          else
+            prerelease=
+            case "$GITHUB_REF_NAME" in *-*) prerelease=--prerelease ;; esac
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
+              --notes-file release-notes.md $prerelease \
+              precompiled/*.tar.gz precompiled/*.sha256
+          fi
+
+  checksum:
+    name: Checksums
+    needs: release
+    runs-on: ubuntu-24.04
+    env:
+      MIX_ENV: prod
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: '1.19.5'
+          otp-version: '28.3'
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      # Reads every published target's checksum from the Release. A target
+      # whose download fails is only logged and left out, so check that all
+      # of those in precompiled_targets/0 in mix.exs made it.
+      - name: Generate checksum.exs
+        run: |
+          mix elixir_make.checksum --all --print
+          for target in x86_64-linux-gnu aarch64-linux-gnu x86_64-linux-musl aarch64-linux-musl \
+                        x86_64-apple-darwin aarch64-apple-darwin; do
+            archive="rebus-nif-2.17-$target-$GITHUB_REF_NAME.tar.gz"
+            if ! grep -qF "\"$archive\"" checksum.exs; then
+              echo "::error::checksum.exs has no entry for $archive"
+              exit 1
+            fi
+          done
+
+      - name: Upload checksum.exs
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksum
+          path: checksum.exs
+          if-no-files-found: error
+
+  install:
+    name: Install check (${{ matrix.target }})
+    # An application installs the package from the Release, with no
+    # toolchain to fall back on.
+    needs: checksum
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux-gnu
+            image: hexpm/elixir:1.19.5-erlang-28.3-debian-bookworm-20260610
+          - target: x86_64-linux-musl
+            image: hexpm/elixir:1.19.5-erlang-28.3-alpine-3.23.4
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Download checksum.exs
+        uses: actions/download-artifact@v4
+        with:
+          name: checksum
+
+      - name: Install and load
+        run: bin/install-check ${{ matrix.image }}
+
   publish:
     name: Publish to Hex
+    needs: install
     runs-on: ubuntu-24.04
 
     steps:
@@ -30,19 +184,18 @@ jobs:
       - name: Install dependencies
         run: mix deps.get
 
-      - name: Verify tag matches project version
-        run: |
-          version=$(grep -m1 -oE '@version "[^"]+"' mix.exs | cut -d'"' -f2)
-          if [ "$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::Tag '$GITHUB_REF_NAME' does not match mix.exs @version '$version'"
-            exit 1
-          fi
-          echo "Publishing version $version"
-
+      # Before checksum.exs arrives, so this builds the library from source.
       - name: Run tests
         run: mix test
 
+      - name: Download checksum.exs
+        uses: actions/download-artifact@v4
+        with:
+          name: checksum
+
       - name: Publish to Hex
-        run: mix hex.publish --yes
+        run: |
+          test -f checksum.exs
+          mix hex.publish --yes
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
