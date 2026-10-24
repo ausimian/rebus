@@ -78,9 +78,13 @@ jobs:
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             published=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')
-            for file in precompiled/*.tar.gz precompiled/*.sha256; do
-              if ! echo "$published" | grep -qxF "$(basename "$file")"; then
-                gh release upload "$GITHUB_REF_NAME" "$file"
+            # An archive goes up with the .sha256 of the same build or not at
+            # all. Where the Release keeps an archive without its .sha256,
+            # the checksum job reads the archive itself.
+            for archive in precompiled/*.tar.gz; do
+              if ! echo "$published" | grep -qxF "$(basename "$archive")"; then
+                gh release upload "$GITHUB_REF_NAME" "$archive"
+                gh release upload "$GITHUB_REF_NAME" --clobber "$archive.sha256"
               fi
             done
             # gh release create publishes only after its uploads, so a run
