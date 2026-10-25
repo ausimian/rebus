@@ -91,9 +91,21 @@ children = [{Calculator, {nil, conn: conn, path: "/org/example/Calculator"}}]
 {:ok, :primary_owner} = Rebus.Bus.request_name(conn, "org.example.Calculator")
 ```
 
-An object that crashes is restarted and exports itself again. An object that
-stopped because its connection stopped is not restarted, since its export
-went with the connection. `Rebus.Object` documents the rest of the lifecycle.
+The child spec is `:transient`, which suits an exported object:
+
+- An object that crashes is restarted, and the new process exports itself
+  again.
+- An object whose connection stops exits with `{:shutdown, :disconnected}`.
+  Supervisors treat that as a normal exit, so it is not restarted. A restart
+  could not export on a stopped connection.
+
+`:temporary` is the only other sensible value, for objects that should never
+be restarted, such as ones started on demand under a `DynamicSupervisor`.
+Avoid `:permanent`: after a disconnect it restarts the object onto the
+stopped connection, every restart fails, and the supervisor exits once it
+reaches its restart limit, taking its other children with it. Pass
+`restart:` or any other child spec key to `use Rebus.Object` to choose, as
+with `use GenServer`. `Rebus.Object` documents the rest of the lifecycle.
 
 ## The raw protocol
 

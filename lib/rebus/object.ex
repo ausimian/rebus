@@ -47,11 +47,20 @@ defmodule Rebus.Object do
 
       children = [{Calculator, {2, conn: conn, path: "/org/example/Calculator"}}]
 
-  The child is `:transient`, so a supervisor restarts an object that
-  crashed, but not one that stopped with its connection, which a restart
-  could not export again. `use Rebus.Object` takes the keys of
-  `t:Supervisor.child_spec/0`, such as `:restart` or `:id`, to change that,
-  as `use GenServer` does.
+  The child is `:transient`. An object that crashes is restarted and exports
+  itself again. An object whose connection stops exits with
+  `{:shutdown, :disconnected}`, which a supervisor treats as a normal exit,
+  so it is not restarted: a restart would try to export on the same stopped
+  connection and fail.
+
+  `:temporary` is the only other sensible value, for an object that should
+  never be restarted, such as one started on demand under a
+  `DynamicSupervisor`. Avoid `:permanent`. It restarts an object after its
+  connection stops, every restart fails, and the supervisor gives up after
+  its restart limit and exits, taking its other children with it.
+
+  `use Rebus.Object` takes the keys of `t:Supervisor.child_spec/0`, such as
+  `:restart` or `:id`, as `use GenServer` does.
 
   ## Lifetime
 
