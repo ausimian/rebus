@@ -102,14 +102,21 @@ jobs:
       - name: Install dependencies
         run: mix deps.get
 
-      # ubuntu-24.04 already ships dbus; install it only if the runner image
-      # ever drops it.
-      - name: Ensure dbus-run-session is available
+      # dbus provides the daemon, systemd provides busctl and libglib2.0-bin
+      # provides gdbus. ubuntu-24.04 may already ship them, so only what is
+      # missing is installed. The suite skips the busctl and gdbus tests on a
+      # host without them, so the final check fails the job instead.
+      - name: Ensure dbus-run-session, busctl and gdbus are available
         run: |
-          if ! command -v dbus-run-session >/dev/null 2>&1; then
+          missing=
+          command -v dbus-run-session >/dev/null 2>&1 || missing="$missing dbus"
+          command -v busctl >/dev/null 2>&1 || missing="$missing systemd"
+          command -v gdbus >/dev/null 2>&1 || missing="$missing libglib2.0-bin"
+          if [ -n "$missing" ]; then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends dbus
+            sudo apt-get install -y --no-install-recommends $missing
           fi
+          command -v dbus-run-session && command -v busctl && command -v gdbus
 
       # A private session bus, so nothing touches a bus the runner already has.
       - name: Run the integration suite

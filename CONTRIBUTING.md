@@ -63,6 +63,10 @@ On other hosts, `mix test.integration` runs the same suite in the container
 defined by `docker/Dockerfile` and requires Docker. The suite skips when no
 session-bus address is available.
 
+Some tests call Rebus from `busctl`, provided by `systemd`, and `gdbus`,
+provided by `libglib2.0-bin` on Debian and Ubuntu. Each of those tests skips
+when its client is not installed. CI and the Docker image install both.
+
 ## Documentation
 
 Build the documentation with warnings treated as errors:

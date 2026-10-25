@@ -6,7 +6,8 @@ defmodule Rebus.Integration.SessionBusTest do
   # a loaded runner.
   #
   # Run with `dbus-run-session -- mix test --only integration` on a host that
-  # has D-Bus, or `mix test.integration` to do that inside Docker.
+  # has D-Bus, or `mix test.integration` to do that inside Docker. The
+  # `busctl` and `gdbus` tests also need those clients, and skip without them.
   use ExUnit.Case, async: false
 
   alias Rebus.MatchRule
@@ -51,6 +52,14 @@ defmodule Rebus.Integration.SessionBusTest do
   @properties "org.freedesktop.DBus.Properties"
   @abacus "org.example.RebusIntegration.Abacus"
 
+  # The `busctl` and `gdbus` tests skip on a host without the client, naming
+  # the package that provides it. CI installs both and checks they are on
+  # PATH, so the tests cannot skip there.
+  @busctl_skip System.find_executable("busctl") == nil &&
+                 "busctl is not on PATH: install systemd to run it"
+  @gdbus_skip System.find_executable("gdbus") == nil &&
+                "gdbus is not on PATH: install libglib2.0-bin to run it"
+
   # A `Rebus.Object` served through the daemon, where the tests above export
   # raw `Rebus.Service` objects and answer each call by hand.
   defmodule Abacus do
@@ -60,7 +69,8 @@ defmodule Rebus.Integration.SessionBusTest do
                  methods: [
                    {"Add", in: [a: "i", b: "i"], out: [sum: "i"]},
                    {"SlowAdd", in: [a: "i", b: "i"], out: [sum: "i"]},
-                   {"Divide", in: [a: "i", b: "i"], out: [quotient: "i"]}
+                   {"Divide", in: [a: "i", b: "i"], out: [quotient: "i"]},
+                   {"Shift", in: [bits: "y", value: "t"], out: [shifted: "t"]}
                  ],
                  properties: [
                    {"Precision", "u", :readwrite},
@@ -90,6 +100,9 @@ defmodule Rebus.Integration.SessionBusTest do
       do: {:error, "org.example.RebusIntegration.Error.DivideByZero", "Division by zero", state}
 
     def handle_method(%Call{member: "Divide"}, [a, b], state), do: {:reply, [div(a, b)], state}
+
+    def handle_method(%Call{member: "Shift"}, [bits, value], state),
+      do: {:reply, [Bitwise.bsl(value, bits)], state}
 
     @impl true
     def handle_get_property(_interface, "Precision", state), do: {:ok, state.precision, state}
@@ -786,6 +799,157 @@ defmodule Rebus.Integration.SessionBusTest do
     end
   end
 
+  # `busctl` is built on systemd's sd-bus and `gdbus` on GLib's GDBus. Each
+  # frames its own messages and parses the object's introspection XML with
+  # its own reader, where `dbus-send` above shares the daemon's libdbus.
+  describe "busctl" do
+    @describetag skip: @busctl_skip
+
+    test "answers busctl calls, including one refused with a D-Bus error" do
+      serve_abacus!()
+
+      assert {"i 5\n", 0} = busctl(["call" | abacus_method("Add")] ++ ["ii", "2", "3"])
+
+      # A byte then a uint64, which the sender pads to an 8-byte boundary.
+      assert {"t 4096\n", 0} = busctl(["call" | abacus_method("Shift")] ++ ["yt", "12", "1"])
+
+      assert {output, 1} = busctl(["call" | abacus_method("Divide")] ++ ["ii", "7", "0"])
+      assert output =~ "Division by zero"
+    end
+
+    test "describes the object to busctl introspect and busctl tree" do
+      serve_abacus!()
+
+      assert {output, 0} = busctl(["introspect", @well_known_name, @object_path])
+
+      # busctl reads each property's value with GetAll and its flags from
+      # the XML annotations.
+      for row <- [
+            ~r/^\.Shift\s+method\s+yt\s+t\s+-$/m,
+            ~r/^\.Cache\s+property\s+as\s+0\s+emits-invalidation writable$/m,
+            ~r/^\.Precision\s+property\s+u\s+2\s+emits-change writable$/m,
+            ~r/^\.Version\s+property\s+s\s+"1\.0"\s+const$/m,
+            ~r/^\.PropertiesChanged\s+signal\s+sa\{sv\}as\s+-\s+-$/m
+          ] do
+        assert output =~ row
+      end
+
+      assert {output, 0} = busctl(["tree", @well_known_name])
+
+      for path <- ["/org", "/org/example", @object_path] do
+        assert output =~ ~r/─ #{Regex.escape(path)}$/m
+      end
+    end
+
+    test "serves busctl get-property and set-property through the object's callbacks" do
+      serve_abacus!()
+
+      property = fn verb, args ->
+        busctl([verb, @well_known_name, @object_path, @abacus | args])
+      end
+
+      assert {~s(u 2\nas 0\ns "1.0"\n), 0} =
+               property.("get-property", ["Precision", "Cache", "Version"])
+
+      assert {"", 0} = property.("set-property", ["Precision", "u", "9"])
+      assert {"", 0} = property.("set-property", ["Cache", "as", "2", "a", "b"])
+      assert {~s(u 9\nas 2 "a" "b"\n), 0} = property.("get-property", ["Precision", "Cache"])
+
+      # Refused by the callback, then by the connection before any callback.
+      assert {output, 1} = property.("set-property", ["Precision", "u", "17"])
+      assert output =~ "Precision above 16"
+      assert {output, 1} = property.("set-property", ["Version", "s", "2.0"])
+      assert output =~ "read-only"
+    end
+
+    test "delivers a signal busctl emits to a matched subscriber" do
+      match_ref = subscribe_pinged!()
+
+      assert {"", 0} =
+               busctl(["emit", @object_path, @signal_interface, "Pinged", "su", "busctl", "7"])
+
+      assert_receive {^match_ref, %Message{type: :signal, body: ["busctl", 7]}}, @window
+    end
+  end
+
+  describe "gdbus" do
+    @describetag skip: @gdbus_skip
+
+    test "answers gdbus calls typed from the object's introspection data" do
+      serve_abacus!()
+
+      assert {"(5,)\n", 0} = gdbus_call(@abacus <> ".Add", ["2", "3"])
+
+      # gdbus learns the `yt` signature by introspecting the object first.
+      # Without it, 12 and 1 would be sent as two int32s and refused.
+      assert {"(uint64 4096,)\n", 0} = gdbus_call(@abacus <> ".Shift", ["12", "1"])
+
+      assert {output, 1} = gdbus_call(@abacus <> ".Divide", ["7", "0"])
+
+      assert output =~
+               "GDBus.Error:org.example.RebusIntegration.Error.DivideByZero: Division by zero"
+    end
+
+    test "serves Properties Get, Set and GetAll to gdbus" do
+      serve_abacus!()
+
+      assert {"(<uint32 2>,)\n", 0} = gdbus_call(@properties <> ".Get", [@abacus, "Precision"])
+
+      assert {"()\n", 0} =
+               gdbus_call(@properties <> ".Set", [@abacus, "Precision", "<uint32 5>"])
+
+      assert {"()\n", 0} = gdbus_call(@properties <> ".Set", [@abacus, "Cache", "<['a', 'b']>"])
+
+      assert {"({'Cache': <['a', 'b']>, 'Precision': <uint32 5>, 'Version': <'1.0'>},)\n", 0} =
+               gdbus_call(@properties <> ".GetAll", [@abacus])
+
+      assert {output, 1} = gdbus_call(@properties <> ".Set", [@abacus, "Version", "<'2.0'>"])
+      assert output =~ "GDBus.Error:org.freedesktop.DBus.Error.PropertyReadOnly"
+    end
+
+    test "describes every node to gdbus introspect --recurse" do
+      serve_abacus!()
+
+      assert {output, 0} =
+               gdbus([
+                 "introspect",
+                 "--session",
+                 "--dest",
+                 @well_known_name,
+                 "--object-path",
+                 "/",
+                 "--recurse"
+               ])
+
+      for path <- ["/", "/org", "/org/example", @object_path] do
+        assert output =~ ~r/^\s*node #{Regex.escape(path)} \{$/m
+      end
+
+      assert output =~ ~r/^\s*Shift\(in  y bits,$/m
+      assert output =~ ~s[@org.freedesktop.DBus.Property.EmitsChangedSignal("invalidates")]
+      assert output =~ "readwrite u Precision = 2;"
+      assert output =~ "readonly s Version = '1.0';"
+    end
+
+    test "delivers a signal gdbus emits to a matched subscriber" do
+      match_ref = subscribe_pinged!()
+
+      assert {"", 0} =
+               gdbus([
+                 "emit",
+                 "--session",
+                 "--object-path",
+                 @object_path,
+                 "--signal",
+                 @signal_interface <> ".Pinged",
+                 "'gdbus'",
+                 "uint32 8"
+               ])
+
+      assert_receive {^match_ref, %Message{type: :signal, body: ["gdbus", 8]}}, @window
+    end
+  end
+
   defp connect! do
     {:ok, conn} = Rebus.connect(:session)
     on_exit(fn -> Rebus.close(conn) end)
@@ -822,6 +986,37 @@ defmodule Rebus.Integration.SessionBusTest do
       )
 
     Rebus.call(caller, message, @call_timeout)
+  end
+
+  # An Abacus at the well-known name, which the third-party clients call by.
+  defp serve_abacus! do
+    exporter = connect!()
+    start_supervised!({Abacus, {self(), conn: exporter, path: @object_path}})
+
+    assert {:ok, :primary_owner} =
+             Rebus.Bus.request_name(exporter, @well_known_name, [], timeout: @call_timeout)
+  end
+
+  defp abacus_method(member), do: [@well_known_name, @object_path, @abacus, member]
+
+  # `busctl --user` and `gdbus --session` both find the private bus through
+  # DBUS_SESSION_BUS_ADDRESS, as `dbus-send --session` does.
+  defp busctl(args), do: System.cmd("busctl", ["--user" | args], stderr_to_stdout: true)
+
+  defp gdbus(args), do: System.cmd("gdbus", args, stderr_to_stdout: true)
+
+  defp gdbus_call(method, args) do
+    gdbus(
+      ["call", "--session", "--dest", @well_known_name, "--object-path", @object_path] ++
+        ["--method", method | args]
+    )
+  end
+
+  defp subscribe_pinged! do
+    subscriber = connect!()
+    rule = MatchRule.new!(interface: @signal_interface, member: "Pinged")
+    assert {:ok, match_ref} = Rebus.add_match(subscriber, rule, @call_timeout)
+    match_ref
   end
 
   defp peer_call(destination, member) do
