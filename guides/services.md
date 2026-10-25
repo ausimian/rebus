@@ -130,11 +130,11 @@ It answers each call with `Rebus.Service.reply/3`,
 `Rebus.Service.reply_message/3`. Calls to one handler arrive in the order the
 connection received them.
 
-The handler is monitored, and everything it exported is unexported when it
-exits. `Rebus.Service.unexport/3` removes an export explicitly.
+A handler is monitored and automatically unexported when it exits.
+`Rebus.Service.unexport/3` removes an export explicitly.
 
 An export with `subtree: true` also serves every path below its own, and
-`call.path` is the path actually called. This suits objects that come and go
+the call's `:path` is the path actually called. This suits objects that come and go
 too quickly to export one by one, such as one per database row. An exact
 export takes precedence over a subtree that covers the same path.
 
@@ -154,8 +154,8 @@ What happens when a call is not answered cleanly:
 
 - **It times out.** A call not answered within the export's `:call_timeout`,
   60 seconds by default, is answered by the connection with
-  `org.freedesktop.DBus.Error.NoReply`. `call.deadline` is the monotonic time
-  at which that happens. Pass `call_timeout: :infinity` to
+  `org.freedesktop.DBus.Error.NoReply`. The call's `:deadline` is the
+  monotonic time at which that happens. Pass `call_timeout: :infinity` to
   `Rebus.Service.export/4` or `Rebus.Object.start_link/3` to wait forever.
 - **The handler dies.** When a handler exits, or its object is unexported,
   every call still waiting on it is answered with
@@ -166,12 +166,15 @@ What happens when a call is not answered cleanly:
   out-signature returns `{:error, :signature_mismatch}` and leaves the call
   open. `Rebus.Object` treats this as a bug and stops the object.
 
-A caller can set the `NO_REPLY_EXPECTED` flag on any call, and the handler
-sees `call.no_reply?` set to `true`. Answer it anyway. The answer sends
-nothing and returns `:ok`, so a handler need not tell such calls apart, and
-answering is what releases any descriptors the call carried. Declaring a
-method with `no_reply: true` only adds the introspection annotation telling
-callers they need not wait. It does not change what the handler receives.
+A call whose caller wants no answer has `:no_reply?` set to `true`. Answer it
+like any other call; Rebus sends nothing. Handlers rarely need to treat these
+calls differently. If preparing the reply is expensive and could be skipped,
+check `:no_reply?` and skip it, but still return a reply of the declared
+shape, because Rebus checks it either way.
+
+Declaring a method with `no_reply: true` only adds the introspection
+annotation telling callers they need not wait. It does not change what the
+handler receives.
 
 At most `:max_pending_calls` calls, 1024 by default, may wait for answers on
 one connection at a time. The connection answers the rest with
@@ -186,10 +189,9 @@ connection sends for calls that never reach the handler.
 
 ### Replying later
 
-A handler does not have to answer a call before taking the next one. The
-`Rebus.Service.Call` struct is all that is needed to answer, and any process
-holding it can do so. A `Rebus.Object` callback returns `{:noreply, state}`
-to leave the call open:
+A handler does not have to answer a call immediately. It can return
+`{:noreply, state}` and answer later with `Rebus.Service.reply/3` or
+`Rebus.Service.reply_error/4`, from any process that holds the call:
 
 ```elixir
 @impl true
@@ -206,8 +208,7 @@ The call stays bound to its export. If the object exits before the task
 answers, the caller has already received `Failed`, and the task's
 `Rebus.Service.reply/3` returns `{:error, :unknown_call}`. If the task
 crashes without answering, the call stays open until it expires and the
-caller gets `NoReply`, so have the task answer with an error while it still
-can.
+caller gets `NoReply`.
 
 ## Properties
 
@@ -260,8 +261,7 @@ all when it is `false` or `:const`. Return `{:ok, state, emit: false}` from
 stores a value other than the one it was given.
 
 A property that changes for any other reason is announced with
-`Rebus.Service.properties_changed/6`. It types each value by its declaration
-and refuses a property whose `emits_changed` does not allow it:
+`Rebus.Service.properties_changed/6`:
 
 ```elixir
 :ok =
@@ -393,7 +393,7 @@ Clients find a service by its well-known name, which
 `Rebus.Bus.request_name/4` asks the bus for. Export the service's objects
 first. The bus announces the new owner as soon as it grants the name, and a
 client waiting for that announcement, or one whose call activated the
-service, may call at once. A call to a path with nothing exported yet is
+service, may call immediately. A call to a path with nothing exported yet is
 answered with `org.freedesktop.DBus.Error.UnknownObject`.
 
 ```elixir
@@ -415,13 +415,13 @@ requests it with `:replace_existing` when this one allowed replacement.
 ## Untrusted callers
 
 On a message bus, the bus authenticates every connection and sets each
-call's sender, so `call.sender` is the caller's unique name and cannot be
+call's `:sender`, which is therefore the caller's unique name and cannot be
 forged. Bus policy may also restrict who can call you.
 
 On a peer-to-peer connection, made with `bus: false`, there is no bus in
 between. Nothing has filtered the calls, and the peer can send whatever it
-likes, including any `sender` header it chooses. `call.sender` is then
-unauthenticated, usually `nil` but possibly a forged name, so never use it to
+likes, including any `sender` header it chooses. The call's `:sender` is
+then unauthenticated, usually `nil` but possibly a forged name, so never use it to
 decide what a caller may do. Treat such a peer as untrusted by default.
 
 Rebus bounds what a caller can do to you:

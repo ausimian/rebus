@@ -593,8 +593,7 @@ defmodule Rebus do
   @doc """
   Registers the calling process to receive every signal on the connection.
 
-  This asks the bus for nothing; use `add_match/3` to have the bus route more
-  signals here. A connection can carry several handlers, each receiving every
+  A connection can carry several handlers, each receiving every
   signal that arrives on it. Rebus removes a handler when its process exits or
   the connection closes. Call `delete_signal_handler/2` as soon as you stop
   wanting signals, so a busy bus does not fill the process mailbox.

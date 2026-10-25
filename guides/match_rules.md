@@ -13,9 +13,8 @@ one connection: a handler never sees signals from another connection.
 :ok = Rebus.delete_signal_handler(conn, ref)
 ```
 
-`Rebus.add_signal_handler/1` asks the bus for nothing. It hands you the
-signals the connection already receives, such as signals directed at your
-unique name.
+`Rebus.add_signal_handler/1` will result in all signals to that connection
+being passed to your process.
 
 ## Subscribing with a match rule
 
@@ -61,15 +60,11 @@ A connection opened with `bus: false` has no bus driver to ask, so
 The bus routes broadcast signals, but Rebus checks the `:sender` of each
 delivered signal itself.
 
-For a unique-name sender that is a plain comparison. A well-known name needs
-more care. The bus forwards broadcast signals under the sender's current
-unique name, and a directed signal, one with a destination, bypasses bus
-routing altogether. Rebus therefore tracks who owns the well-known name,
-using `GetNameOwner` and the bus driver's `NameOwnerChanged` signal, and
-accepts a directed signal only from that owner, or from the well-known name
-itself, which only the bus driver can send. Both facts come from the bus
-driver, whose sender header a peer cannot forge. A directed signal from
-anyone else is dropped.
+A unique-name sender is a direct comparison. A well-known name is harder,
+because a directed signal, one sent to a specific destination, bypasses the
+bus's routing. Rebus tracks the name's current owner with `GetNameOwner` and
+`NameOwnerChanged`, and accepts a directed signal only from that owner or
+from the bus driver. Any other directed signal is dropped.
 
 Ownership tracking is best effort. If a lookup fails, Rebus logs a warning
 and retries with backoff. Directed delivery for that name stays off until
@@ -77,11 +72,6 @@ ownership is known; broadcast delivery is unaffected. If the retries run
 out, Rebus logs an error and keeps rejecting directed signals from that
 service for the life of the connection. A directed signal can also be missed
 briefly while a new subscription obtains its first ownership answer.
-
-D-Bus does not say which rule admitted a signal. Rather than risk delivering
-a signal to the wrong subscription, Rebus rejects a rule that overlaps an
-existing one with a different sender, returning
-`{:error, :sender_routing_ambiguous}`.
 
 ## When a subscription fails
 

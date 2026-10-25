@@ -3,12 +3,12 @@ defmodule Rebus.UnixFD do
   Handles for Unix file descriptors.
 
   Rebus hands every descriptor it receives to your code as a handle: in the
-  `unix_fds` of a `Rebus.call/3` reply, and in `call.unix_fds` of a
+  `unix_fds` of a `Rebus.call/3` reply, and in the `unix_fds` of a
   `Rebus.Service.Call`. A handle owns one open descriptor and closes it
   exactly once: when its owner calls `close/1`, when its owning process
   exits, or when the last reference to it is garbage collected, whichever
   comes first. A handle never exposes its descriptor number except inside
-  `with_fd/2`, and once closed it forgets the number, so a stale handle
+  `with_fd/2`, and once closed it invalidates the number, so a stale handle
   cannot reach an unrelated descriptor that the operating system has since
   given the same number.
 
@@ -21,12 +21,13 @@ defmodule Rebus.UnixFD do
   thread then closes the descriptor, so a close that blocks cannot stall a
   scheduler; the same happens when a handle is garbage collected.
 
-  Any process holding a handle may use it, send it, or duplicate it with
-  `dup/1`, but only the owner can close it or pass ownership on with
-  `controlling_process/2`. Any holder can take a copy of the open file that
-  outlives the owner, so share a handle only with processes you trust with
-  the file. `owner/1` and `open?/1` tell who owns a handle and whether it is
-  still open:
+  Any process holding a handle may reach the descriptor with `with_fd/2`,
+  pass the handle in a message's `fds:`, or duplicate it with `dup/1`. Only
+  the owner can close it with `close/1` or pass ownership on with
+  `controlling_process/2`. Each of the first three gives the holder, or the
+  peer it sends to, a copy of the open file that outlives the handle's owner,
+  so share a handle only with processes you trust with the file. `owner/1`
+  and `open?/1` tell who owns a handle and whether it is still open:
 
       {:ok, %Rebus.Message{unix_fds: [handle]}} = Rebus.call(conn, message)
       {:ok, pid} = Rebus.UnixFD.owner(handle)   # pid == self()

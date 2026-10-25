@@ -84,8 +84,6 @@ options, results, errors, and wire-format modules. The practical guides cover
 [signal subscriptions](https://hexdocs.pm/rebus/match_rules.html), and
 [Unix file descriptors](https://hexdocs.pm/rebus/unix_fds.html).
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development and testing instructions.
-
 ## License
 
 Rebus is licensed under the MIT License.

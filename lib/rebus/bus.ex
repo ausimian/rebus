@@ -23,8 +23,8 @@ defmodule Rebus.Bus do
 
   Export a service's objects before requesting its name. The bus announces a
   new owner with `NameOwnerChanged` as soon as the name is granted, and a
-  client waiting for that, or one the bus activated, may call at once. A
-  connection that exports nothing at the path answers the call with
+  client waiting for that, or one the bus activated, may call immediately.
+  The connection replies to calls on unknown paths with
   `org.freedesktop.DBus.Error.UnknownObject`.
 
   ## Ownership notices
