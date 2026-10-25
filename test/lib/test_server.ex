@@ -462,6 +462,10 @@ defmodule Rebus.TestServer do
   # it gets the frame and the server then stops normally underneath it.
   defp deliver_frame(%Message{} = msg, rest, %__MODULE__{} = state) do
     result = maybe_reply_hello(msg, state)
+    # Only a handle's owner can close it, so the tap that receives the frame
+    # becomes the owner of its descriptors. A tap that has already exited
+    # closes them through the transfer.
+    Enum.each(msg.unix_fds, &UnixFD.controlling_process(&1, state.tap))
     send(state.tap, {self(), msg})
 
     case result do

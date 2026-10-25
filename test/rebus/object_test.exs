@@ -109,7 +109,7 @@ defmodule Rebus.ObjectTest do
 
   # An object with properties but neither property callback.
   defmodule Bare do
-    use Rebus.Object, restart: :permanent, id: :bare
+    use Rebus.Object, restart: :temporary, id: :bare
 
     @impl true
     def interfaces do
@@ -237,7 +237,7 @@ defmodule Rebus.ObjectTest do
       assert %{id: Calc, restart: :transient, start: {Rebus.Object, :start_link, [Calc, 2, []]}} =
                Calc.child_spec({2, []})
 
-      assert %{id: :bare, restart: :permanent} = Bare.child_spec({nil, []})
+      assert %{id: :bare, restart: :temporary} = Bare.child_spec({nil, []})
     end
 
     test "registers a name and refuses unknown or missing options", %{cli: cli} do
@@ -245,6 +245,25 @@ defmodule Rebus.ObjectTest do
         Rebus.Object.start_link(Calc, self(), conn: cli, path: @path, name: :rebus_test_calc)
 
       assert Process.whereis(:rebus_test_calc) == pid
+
+      {:ok, tuned} =
+        Rebus.Object.start_link(Calc, self(),
+          conn: cli,
+          path: "/tuned",
+          spawn_opt: [priority: :high],
+          debug: [:statistics],
+          hibernate_after: 50
+        )
+
+      assert Process.info(tuned, :priority) == {:priority, :high}
+      assert {:ok, _stats} = :sys.statistics(tuned, :get)
+
+      # hibernate_after reached the GenServer: the idle object hibernates. OTP 28
+      # reports this as gen_server's own loop, earlier releases as erlang:hibernate/3.
+      assert Enum.any?(1..40, fn _ ->
+               Process.sleep(25)
+               hibernating?(tuned)
+             end)
 
       assert_raise ArgumentError, fn ->
         Rebus.Object.start_link(Calc, self(), conn: cli, path: "/other", bogus: true)
@@ -423,6 +442,43 @@ defmodule Rebus.ObjectTest do
       assert_receive {:object_terminated, {:shutdown, :disconnected}}, 1_000
       assert_receive {:EXIT, ^pid, {:shutdown, :disconnected}}, 1_000
     end
+
+    test "under a supervisor, restarts after a crash but not after a disconnect",
+         %{cli: cli, svr: svr} do
+      children = [{Calc, {self(), conn: cli, path: @path}}]
+
+      sup =
+        start_supervised!(%{
+          id: :object_sup,
+          start: {Supervisor, :start_link, [children, [strategy: :one_for_one]]},
+          type: :supervisor
+        })
+
+      [{Calc, first, :worker, _}] = Supervisor.which_children(sup)
+      ref = Process.monitor(first)
+
+      capture_log(fn ->
+        {:ok, _serial} = TestServer.push_call(svr, calc_call("Crash", []))
+        assert_receive {:DOWN, ^ref, :process, ^first, {%RuntimeError{message: "boom"}, _}}, 1_000
+      end)
+
+      assert Enum.any?(1..40, fn _ ->
+               Process.sleep(25)
+
+               match?(
+                 [{Calc, pid, :worker, _}] when is_pid(pid) and pid != first,
+                 Supervisor.which_children(sup)
+               )
+             end)
+
+      [{Calc, second, :worker, _}] = Supervisor.which_children(sup)
+      ref = Process.monitor(second)
+      :ok = Rebus.close(cli)
+      assert_receive {:DOWN, ^ref, :process, ^second, {:shutdown, :disconnected}}, 1_000
+
+      assert [{Calc, :undefined, :worker, _}] = Supervisor.which_children(sup)
+      assert Process.alive?(sup)
+    end
   end
 
   describe "dispatch/4" do
@@ -530,5 +586,13 @@ defmodule Rebus.ObjectTest do
     assert fields.path == @path
     assert fields.interface == "org.freedesktop.DBus.Properties"
     assert signal.body == ["org.example.Calculator", changed, invalidated]
+  end
+
+  defp hibernating?(pid) do
+    case Process.info(pid, :current_function) do
+      {:current_function, {:erlang, :hibernate, 3}} -> true
+      {:current_function, {:gen_server, :loop_hibernate, _}} -> true
+      _ -> false
+    end
   end
 end

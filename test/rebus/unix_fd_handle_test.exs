@@ -33,14 +33,20 @@ defmodule Rebus.UnixFDHandleTest do
       assert :ok = UnixFD.close(write)
     end
 
-    test "any holder may close a handle" do
+    test "only the owner may close a handle" do
       {:ok, read, write} = UnixFD.__pipe__()
 
       task = Task.async(fn -> UnixFD.close(read) end)
 
-      assert :ok = Task.await(task)
-      refute UnixFD.open?(read)
+      assert {:error, :not_owner} = Task.await(task)
+      assert UnixFD.open?(read)
+      assert {:ok, 0} = UnixFD.__close_count__(read)
+
+      assert :ok = UnixFD.close(read)
       assert {:ok, 1} = UnixFD.__close_count__(read)
+
+      # A closed handle answers :closed whoever asks.
+      assert {:error, :closed} = Task.await(Task.async(fn -> UnixFD.close(read) end))
       assert :ok = UnixFD.close(write)
     end
   end
@@ -560,14 +566,13 @@ defmodule Rebus.UnixFDHandleTest do
       for _ <- 1..50 do
         {:ok, read, write} = UnixFD.__pipe__()
 
-        results =
-          1..8
-          |> Enum.map(fn _ -> Task.async(fn -> UnixFD.close(read) end) end)
-          |> Task.await_many()
+        racers = Enum.map(1..7, fn _ -> Task.async(fn -> UnixFD.close_async(read) end) end)
+        results = [UnixFD.close(read) | Task.await_many(racers)]
 
         assert Enum.count(results, &(&1 == :ok)) == 1
         assert Enum.count(results, &(&1 == {:error, :closed})) == 7
-        assert {:ok, 1} = UnixFD.__close_count__(read)
+        # If a close_async/1 won, a background thread runs close(2) a moment later.
+        assert_closed_once(read, [])
         :ok = UnixFD.close(write)
       end
     end
@@ -583,14 +588,19 @@ defmodule Rebus.UnixFDHandleTest do
             end)
           end
 
-        closer = Task.async(fn -> UnixFD.close(handle) end)
+        send(owner, {:close, self()})
         Process.exit(owner, :kill)
 
         for result <- Task.await_many(users) do
           assert match?({:ok, {:ok, _}}, result) or result == {:error, :closed}
         end
 
-        assert Task.await(closer) in [:ok, {:error, :closed}]
+        receive do
+          {:closed, result} -> assert result in [:ok, {:error, :closed}]
+        after
+          0 -> :ok
+        end
+
         assert_closed_once(handle, [owner])
         refute UnixFD.open?(handle)
       end
@@ -621,16 +631,30 @@ defmodule Rebus.UnixFDHandleTest do
     test "a transfer racing a close closes(2) exactly once" do
       for _ <- 1..50 do
         {:ok, read, write} = UnixFD.__pipe__()
-        target = spawn_holder(read)
+        parent = self()
 
-        closer = Task.async(fn -> UnixFD.close(read) end)
-        transfer = UnixFD.controlling_process(read, target)
+        target =
+          spawn(fn ->
+            receive do
+              :go -> send(parent, {:target_close, UnixFD.close(read)})
+            end
 
-        assert transfer in [:ok, {:error, :closed}]
-        assert Task.await(closer) == :ok
-        assert {:ok, 1} = UnixFD.__close_count__(read)
+            receive do
+              :exit -> :ok
+            end
+          end)
 
+        send(target, :go)
+        assert :ok = UnixFD.controlling_process(read, target)
+
+        # Before the transfer the target is refused; after it, it closes.
+        assert_receive {:target_close, result}, 1_000
+        assert result in [:ok, {:error, :not_owner}]
+
+        # Whichever won, the target's exit closes anything left open.
         Process.exit(target, :kill)
+        assert eventually(fn -> not UnixFD.open?(read) end)
+        assert_closed_once(read, [target])
         :ok = UnixFD.close(write)
       end
     end
@@ -684,6 +708,10 @@ defmodule Rebus.UnixFDHandleTest do
 
       {:transfer, pid, reply_to} ->
         send(reply_to, {:transferred, UnixFD.controlling_process(handle, pid)})
+        owner_loop(handle)
+
+      {:close, reply_to} ->
+        send(reply_to, {:closed, UnixFD.close(handle)})
         owner_loop(handle)
     end
   end

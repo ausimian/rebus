@@ -47,11 +47,20 @@ defmodule Rebus.Object do
 
       children = [{Calculator, {2, conn: conn, path: "/org/example/Calculator"}}]
 
-  The child is `:transient`, so a supervisor restarts an object that
-  crashed, but not one that stopped with its connection, which a restart
-  could not export again. `use Rebus.Object` takes the keys of
-  `t:Supervisor.child_spec/0`, such as `:restart` or `:id`, to change that,
-  as `use GenServer` does.
+  The child is `:transient`. An object that crashes is restarted and exports
+  itself again. An object whose connection stops exits with
+  `{:shutdown, :disconnected}`, which a supervisor treats as a normal exit,
+  so it is not restarted: a restart would try to export on the same stopped
+  connection and fail.
+
+  `:temporary` is the only other sensible value, for an object that should
+  never be restarted, such as one started on demand under a
+  `DynamicSupervisor`. Avoid `:permanent`. It restarts an object after its
+  connection stops, every restart fails, and the supervisor gives up after
+  its restart limit and exits, taking its other children with it.
+
+  `use Rebus.Object` takes the keys of `t:Supervisor.child_spec/0`, such as
+  `:restart` or `:id`, as `use GenServer` does.
 
   ## Lifetime
 
@@ -142,7 +151,9 @@ defmodule Rebus.Object do
   # the object has nothing left to do for it.
   @settled_reply_errors [:unknown_call, :timeout, :disconnected]
 
-  @start_options [:conn, :path, :subtree, :interfaces, :call_timeout, :timeout, :name]
+  @export_options [:subtree, :call_timeout, :timeout]
+  @gen_server_options [:name, :debug, :spawn_opt, :hibernate_after]
+  @start_options [:conn, :path, :interfaces] ++ @export_options ++ @gen_server_options
 
   @typedoc "The object's own state, as its callbacks return it."
   @type state :: term()
@@ -255,8 +266,17 @@ defmodule Rebus.Object do
   - `:interfaces` - the interfaces to export. Defaults to
     `module.interfaces()`.
   - `:subtree`, `:call_timeout` and `:timeout` - as for
-    `Rebus.Service.export/4`.
-  - `:name` - registers the process, as for `GenServer.start_link/3`.
+    `Rebus.Service.export/4`. `:timeout` bounds the export, not the
+    GenServer's `init/1`.
+  - `:name` - a name for the process in the VM, as for
+    `GenServer.start_link/3`: an atom, `{:global, term}` or
+    `{:via, module, term}`. It is not a bus name; clients find the object by
+    its `:path`, under a well-known name the connection requests with
+    `Rebus.Bus.request_name/4`.
+  - `:debug`, `:spawn_opt` and `:hibernate_after` - passed to
+    `GenServer.start_link/3`.
+
+  Any other option raises `ArgumentError`.
 
   ## Return values
 
@@ -270,12 +290,12 @@ defmodule Rebus.Object do
     conn = Keyword.fetch!(opts, :conn)
     path = Keyword.fetch!(opts, :path)
 
-    export_opts = Keyword.take(opts, [:subtree, :call_timeout, :timeout])
+    export_opts = Keyword.take(opts, @export_options)
 
     GenServer.start_link(
       Rebus.Object.Server,
       {module, arg, conn, path, Keyword.get(opts, :interfaces), export_opts},
-      Keyword.take(opts, [:name])
+      Keyword.take(opts, @gen_server_options)
     )
   end
 

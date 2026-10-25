@@ -102,7 +102,7 @@ defmodule Rebus.Service do
           Rebus.Service.reply(call, [values])
       end
 
-  `call.out_signature` is `"v"` for `Get`, so the value is a
+  The call's `:out_signature` is `"v"` for `Get`, so the value is a
   `{signature, value}` variant; `""` for `Set`; and `"a{sv}"` for `GetAll`,
   which `Rebus.Interface.wrap_properties/2` builds from the declaration. A
   `GetAll` for an interface that declares no readable property is answered
@@ -136,13 +136,13 @@ defmodule Rebus.Service do
 
   ## Unix file descriptors
 
-  Descriptors sent with a call arrive in `call.unix_fds` as `Rebus.UnixFD`
-  handles, indexed by the call's `h` arguments. The connection owns them and
-  the handler borrows them while the call is pending: it may use them, with
-  `Rebus.UnixFD.with_fd/2`, or close them early. When the call completes,
-  however it completes, the connection closes each one it still owns, so a
-  handler that ignores them leaks nothing. To keep them, take ownership with
-  `take_fds/2` before the call completes:
+  Descriptors sent with a call arrive in the call's `:unix_fds` as
+  `Rebus.UnixFD` handles, indexed by its `h` arguments. The connection owns
+  them and the handler borrows them while the call is pending: it may use
+  them, with `Rebus.UnixFD.with_fd/2`, but only the connection can close them.
+  When the call completes, however it completes, the connection closes each
+  one it still owns, so a handler that ignores them leaks nothing. To keep
+  them, take ownership with `take_fds/2` before the call completes:
 
       receive do
         {^ref, %Rebus.Service.Call{member: "TakeLog"} = call} ->
@@ -230,7 +230,7 @@ defmodule Rebus.Service do
   - `:handler` - the local process that receives the calls. Defaults to the
     caller.
   - `:subtree` - when `true`, the export also serves every path below `path`,
-    and `call.path` is the path actually called. An exact export of a path
+    and the call's `:path` is the path actually called. An exact export of a path
     takes precedence over a subtree that covers it, and the longest
     covering subtree takes precedence over shorter ones. Defaults to `false`.
   - `:call_timeout` - positive milliseconds a call may wait for its answer
@@ -300,8 +300,8 @@ defmodule Rebus.Service do
   @doc """
   Answers a call with a method return carrying `body`.
 
-  The reply is encoded with the method's declared out-signature,
-  `call.out_signature`, in the calling process, so a body that does not fit
+  The reply is encoded with the method's declared out-signature, the call's
+  `:out_signature`, in the calling process, so a body that does not fit
   it is reported here as `{:error, :signature_mismatch}` and the call stays
   open for another answer.
 
@@ -325,7 +325,8 @@ defmodule Rebus.Service do
 
   - `:ok` - the reply was handed to the socket, or the caller asked for no
     reply and nothing was sent.
-  - `{:error, :signature_mismatch}` - `body` does not fit `call.out_signature`.
+  - `{:error, :signature_mismatch}` - `body` does not fit the call's
+    `:out_signature`.
   - `{:error, :unknown_call}` - the call was already answered, expired, or
     its export is gone.
   - `{:error, :unix_fd_closed}` - a handle in `:fds` was already closed,
@@ -387,7 +388,7 @@ defmodule Rebus.Service do
 
   `message` must be a `:method_return` or an `:error`; any other type
   returns `{:error, {:invalid_message_type, type}}`. A method return must
-  have the declared out-signature, `call.out_signature`, or this returns
+  have the declared out-signature, the call's `:out_signature`, or this returns
   `{:error, :signature_mismatch}`. An error can carry any body. The message's
   `reply_serial` and `destination` are replaced with the call's own.
 
@@ -444,22 +445,21 @@ defmodule Rebus.Service do
 
   ## Return values
 
-  - `{:ok, handles}` - the handles, the same ones as `call.unix_fds` and in
+  - `{:ok, handles}` - the handles, the same ones as the call's `:unix_fds` and in
     the same order, now owned by the calling process. A call that carried
-    none returns `{:ok, []}` without reaching the connection. A handle the
-    handler had already closed stays closed.
+    none returns `{:ok, []}` without reaching the connection.
   - `{:error, :unknown_call}` - the handles were already taken, or the call
     was answered, expired, or its export is gone.
   - `{:error, :timeout}` - the connection did not answer within `timeout`.
     It may still make this process their owner afterwards, or it may not:
     either way each handle closes exactly once, when this process or the
-    connection is done with it. `Rebus.UnixFD.owner/1` on `call.unix_fds`
-    tells which once the connection has caught up, and a second `take_fds/2`
+    connection is done with it. `Rebus.UnixFD.owner/1` on the call's
+    `:unix_fds` tells which once the connection has caught up, and a second `take_fds/2`
     answers `{:error, :unknown_call}` if the first one went through.
   - `{:error, :disconnected}` - the connection stopped, closing the handles
     it still owned. Only if it was killed as it handed them over can this
-    process have become their owner, which `Rebus.UnixFD.owner/1` on
-    `call.unix_fds` tells.
+    process have become their owner, which `Rebus.UnixFD.owner/1` on the
+    call's `:unix_fds` tells.
   """
   @spec take_fds(Call.t(), non_neg_integer()) ::
           {:ok, [Rebus.UnixFD.t()]} | {:error, take_fds_error()}
