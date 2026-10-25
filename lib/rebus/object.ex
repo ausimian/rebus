@@ -142,7 +142,9 @@ defmodule Rebus.Object do
   # the object has nothing left to do for it.
   @settled_reply_errors [:unknown_call, :timeout, :disconnected]
 
-  @start_options [:conn, :path, :subtree, :interfaces, :call_timeout, :timeout, :name]
+  @export_options [:subtree, :call_timeout, :timeout]
+  @gen_server_options [:name, :debug, :spawn_opt, :hibernate_after]
+  @start_options [:conn, :path, :interfaces] ++ @export_options ++ @gen_server_options
 
   @typedoc "The object's own state, as its callbacks return it."
   @type state :: term()
@@ -255,8 +257,17 @@ defmodule Rebus.Object do
   - `:interfaces` - the interfaces to export. Defaults to
     `module.interfaces()`.
   - `:subtree`, `:call_timeout` and `:timeout` - as for
-    `Rebus.Service.export/4`.
-  - `:name` - registers the process, as for `GenServer.start_link/3`.
+    `Rebus.Service.export/4`. `:timeout` bounds the export, not the
+    GenServer's `init/1`.
+  - `:name` - a name for the process in the VM, as for
+    `GenServer.start_link/3`: an atom, `{:global, term}` or
+    `{:via, module, term}`. It is not a bus name; clients find the object by
+    its `:path`, under a well-known name the connection requests with
+    `Rebus.Bus.request_name/4`.
+  - `:debug`, `:spawn_opt` and `:hibernate_after` - passed to
+    `GenServer.start_link/3`.
+
+  Any other option raises `ArgumentError`.
 
   ## Return values
 
@@ -270,12 +281,12 @@ defmodule Rebus.Object do
     conn = Keyword.fetch!(opts, :conn)
     path = Keyword.fetch!(opts, :path)
 
-    export_opts = Keyword.take(opts, [:subtree, :call_timeout, :timeout])
+    export_opts = Keyword.take(opts, @export_options)
 
     GenServer.start_link(
       Rebus.Object.Server,
       {module, arg, conn, path, Keyword.get(opts, :interfaces), export_opts},
-      Keyword.take(opts, [:name])
+      Keyword.take(opts, @gen_server_options)
     )
   end
 

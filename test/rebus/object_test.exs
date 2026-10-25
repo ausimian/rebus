@@ -246,6 +246,25 @@ defmodule Rebus.ObjectTest do
 
       assert Process.whereis(:rebus_test_calc) == pid
 
+      {:ok, tuned} =
+        Rebus.Object.start_link(Calc, self(),
+          conn: cli,
+          path: "/tuned",
+          spawn_opt: [priority: :high],
+          debug: [:statistics],
+          hibernate_after: 50
+        )
+
+      assert Process.info(tuned, :priority) == {:priority, :high}
+      assert {:ok, _stats} = :sys.statistics(tuned, :get)
+
+      # hibernate_after reached the GenServer: the idle object hibernates. OTP 28
+      # reports this as gen_server's own loop, earlier releases as erlang:hibernate/3.
+      assert Enum.any?(1..40, fn _ ->
+               Process.sleep(25)
+               hibernating?(tuned)
+             end)
+
       assert_raise ArgumentError, fn ->
         Rebus.Object.start_link(Calc, self(), conn: cli, path: "/other", bogus: true)
       end
@@ -530,5 +549,13 @@ defmodule Rebus.ObjectTest do
     assert fields.path == @path
     assert fields.interface == "org.freedesktop.DBus.Properties"
     assert signal.body == ["org.example.Calculator", changed, invalidated]
+  end
+
+  defp hibernating?(pid) do
+    case Process.info(pid, :current_function) do
+      {:current_function, {:erlang, :hibernate, 3}} -> true
+      {:current_function, {:gen_server, :loop_hibernate, _}} -> true
+      _ -> false
+    end
   end
 end
