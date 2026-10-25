@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- %% CHANGELOG_ENTRIES %% -->
 
-## 0.4.0-rc.1 - 2026-10-25
+## 0.4.0 - 2026-10-25
 
 Rebus can now serve D-Bus as well as call it: applications can export
 objects, answer method calls and own bus names. Unix file descriptors arrive
