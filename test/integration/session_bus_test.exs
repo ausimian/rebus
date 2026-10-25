@@ -48,6 +48,64 @@ defmodule Rebus.Integration.SessionBusTest do
   @call_timeout 5_000
   @window 2_000
 
+  @properties "org.freedesktop.DBus.Properties"
+  @abacus "org.example.RebusIntegration.Abacus"
+
+  # A `Rebus.Object` served through the daemon, where the tests above export
+  # raw `Rebus.Service` objects and answer each call by hand.
+  defmodule Abacus do
+    use Rebus.Object
+
+    @interface Rebus.Interface.new!("org.example.RebusIntegration.Abacus",
+                 methods: [
+                   {"Add", in: [a: "i", b: "i"], out: [sum: "i"]},
+                   {"SlowAdd", in: [a: "i", b: "i"], out: [sum: "i"]},
+                   {"Divide", in: [a: "i", b: "i"], out: [quotient: "i"]}
+                 ],
+                 properties: [
+                   {"Precision", "u", :readwrite},
+                   {"Cache", "as", :readwrite, emits_changed: :invalidates},
+                   {"Version", "s", :read, emits_changed: :const}
+                 ]
+               )
+
+    @impl true
+    def interfaces, do: [@interface]
+
+    @impl true
+    def init(parent) do
+      send(parent, {:object_started, self()})
+      {:ok, %{parent: parent, precision: 2, cache: []}}
+    end
+
+    @impl true
+    def handle_method(%Call{member: "Add"}, [a, b], state), do: {:reply, [a + b], state}
+
+    def handle_method(%Call{member: "SlowAdd"} = call, [a, b], state) do
+      Task.start(fn -> send(state.parent, {:slow_reply, Service.reply(call, [a + b])}) end)
+      {:noreply, state}
+    end
+
+    def handle_method(%Call{member: "Divide"}, [_a, 0], state),
+      do: {:error, "org.example.RebusIntegration.Error.DivideByZero", "Division by zero", state}
+
+    def handle_method(%Call{member: "Divide"}, [a, b], state), do: {:reply, [div(a, b)], state}
+
+    @impl true
+    def handle_get_property(_interface, "Precision", state), do: {:ok, state.precision, state}
+    def handle_get_property(_interface, "Cache", state), do: {:ok, state.cache, state}
+    def handle_get_property(_interface, "Version", state), do: {:ok, "1.0", state}
+
+    @impl true
+    def handle_set_property(_interface, "Precision", precision, state) when precision > 16,
+      do: {:error, "org.freedesktop.DBus.Error.InvalidArgs", "Precision above 16", state}
+
+    def handle_set_property(_interface, "Precision", precision, state),
+      do: {:ok, %{state | precision: precision}}
+
+    def handle_set_property(_interface, "Cache", cache, state), do: {:ok, %{state | cache: cache}}
+  end
+
   describe "session bus" do
     test "connects, is given a unique name, and can list the daemon's names" do
       conn = connect!()
@@ -548,6 +606,186 @@ defmodule Rebus.Integration.SessionBusTest do
     end
   end
 
+  describe "Rebus.Object" do
+    test "answers calls routed by the daemon to its well-known name from its callbacks" do
+      caller = connect!()
+      exporter = connect!()
+      start_supervised!({Abacus, {self(), conn: exporter, path: @object_path}})
+      assert_receive {:object_started, _pid}, @window
+
+      assert {:ok, :primary_owner} =
+               Rebus.Bus.request_name(exporter, @well_known_name, [], timeout: @call_timeout)
+
+      assert {:ok, %Message{type: :method_return, body: [5]}} =
+               object_call(caller, @well_known_name, @abacus, "Add", "ii", [2, 3])
+
+      assert {:ok, %Message{type: :method_return, body: [3]}} =
+               object_call(caller, @well_known_name, @abacus, "Divide", "ii", [7, 2])
+
+      assert {:error,
+              {:dbus_error,
+               %Message{
+                 header_fields: %{
+                   error_name: "org.example.RebusIntegration.Error.DivideByZero"
+                 },
+                 body: ["Division by zero"]
+               }}} = object_call(caller, @well_known_name, @abacus, "Divide", "ii", [7, 0])
+    end
+
+    test "answers a call its callback left open with {:noreply, state} from another process" do
+      caller = connect!()
+      exporter = connect!()
+      start_supervised!({Abacus, {self(), conn: exporter, path: @object_path}})
+
+      assert {:ok, %Message{type: :method_return, body: [5]}} =
+               object_call(caller, unique_name!(exporter), @abacus, "SlowAdd", "ii", [2, 3])
+
+      assert_receive {:slow_reply, :ok}, @window
+    end
+
+    test "serves Get, Set and GetAll through its property callbacks" do
+      caller = connect!()
+      exporter = connect!()
+      start_supervised!({Abacus, {self(), conn: exporter, path: @object_path}})
+      exporter_name = unique_name!(exporter)
+
+      property = fn member, signature, args ->
+        object_call(caller, exporter_name, @properties, member, signature, [@abacus | args])
+      end
+
+      assert {:ok, %Message{body: [{"u", 2}]}} = property.("Get", "ss", ["Precision"])
+
+      assert {:ok, %Message{type: :method_return, body: []}} =
+               property.("Set", "ssv", ["Precision", {"u", 4}])
+
+      assert {:ok, %Message{body: [{"u", 4}]}} = property.("Get", "ss", ["Precision"])
+
+      assert {:ok, %Message{type: :method_return, body: []}} =
+               property.("Set", "ssv", ["Cache", {"as", ["a", "b"]}])
+
+      assert {:ok,
+              %Message{
+                body: [
+                  [
+                    {"Cache", {"as", ["a", "b"]}},
+                    {"Precision", {"u", 4}},
+                    {"Version", {"s", "1.0"}}
+                  ]
+                ]
+              }} = property.("GetAll", "s", [])
+
+      # Refused by the callback, then by the connection before any callback.
+      assert {:error,
+              {:dbus_error,
+               %Message{
+                 header_fields: %{error_name: "org.freedesktop.DBus.Error.InvalidArgs"},
+                 body: ["Precision above 16"]
+               }}} = property.("Set", "ssv", ["Precision", {"u", 17}])
+
+      assert {:error,
+              {:dbus_error,
+               %Message{
+                 header_fields: %{error_name: "org.freedesktop.DBus.Error.PropertyReadOnly"}
+               }}} = property.("Set", "ssv", ["Version", {"s", "2.0"}])
+
+      assert {:ok, %Message{body: [{"u", 4}]}} = property.("Get", "ss", ["Precision"])
+    end
+
+    test "emits PropertiesChanged to a subscriber after each successful Set" do
+      caller = connect!()
+      subscriber = connect!()
+      exporter = connect!()
+      start_supervised!({Abacus, {self(), conn: exporter, path: @object_path}})
+      exporter_name = unique_name!(exporter)
+
+      # A daemon only routes the signal to a connection holding a match rule
+      # for it.
+      rule =
+        MatchRule.new!(
+          sender: exporter_name,
+          path: @object_path,
+          interface: @properties,
+          member: "PropertiesChanged",
+          args: %{0 => @abacus}
+        )
+
+      assert {:ok, match_ref} = Rebus.add_match(subscriber, rule, @call_timeout)
+
+      set = fn name, value ->
+        object_call(caller, exporter_name, @properties, "Set", "ssv", [@abacus, name, value])
+      end
+
+      assert {:ok, %Message{type: :method_return}} = set.("Precision", {"u", 7})
+      assert_receive {^match_ref, %Message{type: :signal} = changed}, @window
+      assert Message.signature(changed) == "sa{sv}as"
+      assert changed.body == [@abacus, [{"Precision", {"u", 7}}], []]
+
+      assert {:ok, %Message{type: :method_return}} = set.("Cache", {"as", ["x"]})
+      assert_receive {^match_ref, %Message{type: :signal} = invalidated}, @window
+      assert invalidated.body == [@abacus, [], ["Cache"]]
+
+      # A refused Set announces nothing. The daemon keeps one sender's
+      # messages in order, so the next signal to arrive is the one for the
+      # Set that follows it.
+      assert {:error, {:dbus_error, _error}} = set.("Precision", {"u", 17})
+      assert {:ok, %Message{type: :method_return}} = set.("Precision", {"u", 8})
+      assert_receive {^match_ref, %Message{type: :signal} = next}, @window
+      assert next.body == [@abacus, [{"Precision", {"u", 8}}], []]
+
+      assert :ok = Rebus.remove_match(subscriber, match_ref, @call_timeout)
+    end
+
+    test "stops with its connection under a supervisor, which does not restart it" do
+      caller = connect!()
+      exporter = connect!()
+      exporter_name = unique_name!(exporter)
+
+      sup =
+        start_supervised!(%{
+          id: :object_sup,
+          start:
+            {Supervisor, :start_link,
+             [[{Abacus, {self(), conn: exporter, path: @object_path}}], [strategy: :one_for_one]]},
+          type: :supervisor
+        })
+
+      [{Abacus, object, :worker, _modules}] = Supervisor.which_children(sup)
+      assert_receive {:object_started, ^object}, @window
+
+      assert {:ok, %Message{body: [5]}} =
+               object_call(caller, exporter_name, @abacus, "Add", "ii", [2, 3])
+
+      # The daemon announces the exporter's disconnection, after which it has
+      # no route to the object at all.
+      rule =
+        MatchRule.new!(
+          sender: @driver,
+          path: @driver_path,
+          interface: @driver,
+          member: "NameOwnerChanged",
+          args: %{0 => exporter_name}
+        )
+
+      assert {:ok, match_ref} = Rebus.add_match(caller, rule, @call_timeout)
+
+      monitor = Process.monitor(object)
+      assert :ok = Rebus.close(exporter)
+      assert_receive {:DOWN, ^monitor, :process, ^object, {:shutdown, :disconnected}}, @window
+
+      # Transient: a restart could not export the object on a closed
+      # connection.
+      assert [{Abacus, :undefined, :worker, _modules}] = Supervisor.which_children(sup)
+      refute_receive {:object_started, _pid}, 300
+
+      assert_receive {^match_ref, %Message{body: [^exporter_name, ^exporter_name, ""]}}, @window
+
+      assert {:error,
+              {:dbus_error,
+               %Message{header_fields: %{error_name: "org.freedesktop.DBus.Error.ServiceUnknown"}}}} =
+               object_call(caller, exporter_name, @abacus, "Add", "ii", [2, 3])
+    end
+  end
+
   defp connect! do
     {:ok, conn} = Rebus.connect(:session)
     on_exit(fn -> Rebus.close(conn) end)
@@ -570,6 +808,20 @@ defmodule Rebus.Integration.SessionBusTest do
       )
 
     Rebus.call(conn, message, @call_timeout)
+  end
+
+  defp object_call(caller, destination, interface, member, signature, body) do
+    message =
+      Message.new!(:method_call,
+        destination: destination,
+        path: @object_path,
+        interface: interface,
+        member: member,
+        signature: signature,
+        body: body
+      )
+
+    Rebus.call(caller, message, @call_timeout)
   end
 
   defp peer_call(destination, member) do
