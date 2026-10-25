@@ -139,10 +139,10 @@ defmodule Rebus.Service do
   Descriptors sent with a call arrive in `call.unix_fds` as `Rebus.UnixFD`
   handles, indexed by the call's `h` arguments. The connection owns them and
   the handler borrows them while the call is pending: it may use them, with
-  `Rebus.UnixFD.with_fd/2`, or close them early. When the call completes,
-  however it completes, the connection closes each one it still owns, so a
-  handler that ignores them leaks nothing. To keep them, take ownership with
-  `take_fds/2` before the call completes:
+  `Rebus.UnixFD.with_fd/2`, but only the connection can close them. When the
+  call completes, however it completes, the connection closes each one it
+  still owns, so a handler that ignores them leaks nothing. To keep them, take
+  ownership with `take_fds/2` before the call completes:
 
       receive do
         {^ref, %Rebus.Service.Call{member: "TakeLog"} = call} ->
@@ -446,8 +446,7 @@ defmodule Rebus.Service do
 
   - `{:ok, handles}` - the handles, the same ones as `call.unix_fds` and in
     the same order, now owned by the calling process. A call that carried
-    none returns `{:ok, []}` without reaching the connection. A handle the
-    handler had already closed stays closed.
+    none returns `{:ok, []}` without reaching the connection.
   - `{:error, :unknown_call}` - the handles were already taken, or the call
     was answered, expired, or its export is gone.
   - `{:error, :timeout}` - the connection did not answer within `timeout`.

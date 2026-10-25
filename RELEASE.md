@@ -16,13 +16,14 @@ Without the setting Rebus stays pure Elixir.
 ### Added
 
 - `Rebus.UnixFD` handles. A handle owns one Unix file descriptor and closes
-  it exactly once: when any holder calls `Rebus.UnixFD.close/1`, when its
+  it exactly once: when its owner calls `Rebus.UnixFD.close/1`, when its
   owning process exits, even by `:kill`, or when the last reference to it is
   garbage collected. A closed handle forgets its descriptor number, so it can
   never close an unrelated descriptor that the operating system has given the
   same number. `Rebus.UnixFD.close/1` returns once the descriptor is closed
   and runs on a dirty I/O scheduler; every other close happens on a
-  background thread, so a close that blocks never stalls a scheduler.
+  background thread, so a close that blocks never stalls a scheduler. Only a
+  handle's owner can close it; any other holder gets `{:error, :not_owner}`.
   `Rebus.UnixFD.with_fd/2` lends the number to a function and keeps the
   descriptor open until the function returns, even if the handle is closed
   meanwhile. `Rebus.UnixFD.controlling_process/2`,

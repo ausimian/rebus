@@ -41,8 +41,7 @@ defmodule Rebus.Service.Call do
     call, which its `h` arguments index. The connection owns them and the
     handler borrows them until the call completes, when the connection
     closes them, unless `Rebus.Service.take_fds/2` has taken them first.
-    Closing one early with `Rebus.UnixFD.close/1` is safe, and a reply may
-    send them back.
+    The handler cannot close them itself, but a reply may send them back.
   - `deadline` - the `System.monotonic_time(:millisecond)` at which the
     connection completes the call itself: it answers the caller with
     `org.freedesktop.DBus.Error.NoReply`, or, for a call that expects no

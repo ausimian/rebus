@@ -5,7 +5,7 @@ defmodule Rebus.UnixFD do
   Rebus hands every descriptor it receives to your code as a handle: in the
   `unix_fds` of a `Rebus.call/3` reply, and in `call.unix_fds` of a
   `Rebus.Service.Call`. A handle owns one open descriptor and closes it
-  exactly once: when any holder calls `close/1`, when its owning process
+  exactly once: when its owner calls `close/1`, when its owning process
   exits, or when the last reference to it is garbage collected, whichever
   comes first. A handle never exposes its descriptor number except inside
   `with_fd/2`, and once closed it forgets the number, so a stale handle
@@ -21,10 +21,12 @@ defmodule Rebus.UnixFD do
   thread then closes the descriptor, so a close that blocks cannot stall a
   scheduler; the same happens when a handle is garbage collected.
 
-  Any process holding a handle may use it, send it, duplicate it with
-  `dup/1`, or close it, but only the owner can pass ownership on with
-  `controlling_process/2`. `owner/1` and `open?/1` tell who owns a handle and
-  whether it is still open:
+  Any process holding a handle may use it, send it, or duplicate it with
+  `dup/1`, but only the owner can close it or pass ownership on with
+  `controlling_process/2`. Any holder can take a copy of the open file that
+  outlives the owner, so share a handle only with processes you trust with
+  the file. `owner/1` and `open?/1` tell who owns a handle and whether it is
+  still open:
 
       {:ok, %Rebus.Message{unix_fds: [handle]}} = Rebus.call(conn, message)
       {:ok, pid} = Rebus.UnixFD.owner(handle)   # pid == self()
@@ -113,9 +115,9 @@ defmodule Rebus.UnixFD do
   @doc """
   Closes a handle's descriptor.
 
-  Any process holding the handle may close it, not only its owner. Returns
-  `{:error, :closed}` if the handle is already closed, by an earlier call or
-  because its owner exited, so calling it again is harmless.
+  Only the owner can close a handle; any other caller gets
+  `{:error, :not_owner}` and the handle stays open. A closed handle answers
+  `{:error, :closed}`, whoever asks, so calling this again is harmless.
 
   The descriptor is closed when this returns `:ok`. Closing it runs on a
   dirty I/O scheduler, so if `close(2)` blocks, for instance on a socket
@@ -130,8 +132,18 @@ defmodule Rebus.UnixFD do
   {:error, :closed} = Rebus.UnixFD.close(handle)
   ```
   """
-  @spec close(t()) :: :ok | {:error, :closed | error()}
-  def close(%__MODULE__{ref: ref}), do: native(ref, &NIF.close_handle/1)
+  @spec close(t()) :: :ok | {:error, :closed | :not_owner | error()}
+  def close(%__MODULE__{ref: ref} = handle) do
+    me = self()
+
+    # Only the owner can transfer a handle, so one the caller owns stays its
+    # own between the check and the close, as in close_owned/1.
+    case owner(handle) do
+      {:ok, ^me} -> native(ref, &NIF.close_handle/1)
+      {:ok, _other} -> {:error, :not_owner}
+      {:error, _reason} = error -> error
+    end
+  end
 
   @doc """
   Makes `pid` the owner of a handle.

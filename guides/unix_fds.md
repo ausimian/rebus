@@ -74,7 +74,7 @@ Every descriptor Rebus receives reaches your code as a `Rebus.UnixFD`
 handle, never as a raw number. A handle owns one open descriptor and closes
 it exactly once, whichever comes first of:
 
-- any holder calling `Rebus.UnixFD.close/1`,
+- its owner calling `Rebus.UnixFD.close/1`,
 - its owning process exiting, for any reason including `:kill`,
 - the last reference to it being garbage collected.
 
@@ -95,13 +95,13 @@ of ports and sockets. A handle is an ordinary term, so any number of
 processes can hold it; those copies are aliases of the same handle, not
 duplicates of the descriptor. The rules are:
 
-- Any holder may use a handle, send it, duplicate it with
-  `Rebus.UnixFD.dup/1`, or close it. Closing is idempotent: a second
-  `Rebus.UnixFD.close/1` returns `{:error, :closed}`.
-- Only the owner can transfer ownership, with
-  `Rebus.UnixFD.controlling_process/2`. Anyone else gets
-  `{:error, :not_owner}`, and a closed handle answers `{:error, :closed}`
-  before ownership is even checked.
+- Any holder may use a handle, send it, or duplicate it with
+  `Rebus.UnixFD.dup/1`.
+- Only the owner can close a handle, with `Rebus.UnixFD.close/1`, or
+  transfer ownership, with `Rebus.UnixFD.controlling_process/2`. Anyone else
+  gets `{:error, :not_owner}`, and a closed handle answers
+  `{:error, :closed}` before ownership is even checked, so closing twice is
+  harmless.
 - When the owner exits, the handle closes at once, and every alias reads
   closed from then on. Transferring a handle to a process that is not alive
   closes it and returns `{:error, :noproc}`.
@@ -110,6 +110,12 @@ duplicates of the descriptor. The rules are:
   a process that does not own a handle gets a descriptor of its own.
 - `Rebus.UnixFD.owner/1` and `Rebus.UnixFD.open?/1` tell who owns a handle
   and whether it is open.
+
+Sharing a handle shares the file. A holder that duplicates it, opens it
+through `with_fd/2`, or sends it to a peer ends up with a copy of the open
+file that outlives the owner. That matters for descriptors whose meaning is
+"held while open", such as a systemd-logind inhibitor lock: give the handle
+only to processes you trust to let it go.
 
 Where handles come from:
 
@@ -214,8 +220,8 @@ Do not take the number out of the function:
 {:ok, fd} = Rebus.UnixFD.with_fd(h, & &1)
 ```
 
-Once `with_fd/2` returns, nothing keeps that descriptor open. Any holder can
-close the handle, or its owner can exit, and the number may then be closed,
+Once `with_fd/2` returns, nothing keeps that descriptor open. The owner can
+close the handle or exit, and the number may then be closed,
 or given to an unrelated file, socket or pipe by the time you use it. To
 keep a descriptor of your own, use `Rebus.UnixFD.dup/1`, or have something
 like `:socket.open/2` take its own copy inside the function.
@@ -270,12 +276,12 @@ the function:
 
 A method call to an object exported with `Rebus.Service.export/4` arrives
 with a handle for each of its descriptors in `call.unix_fds`. The handler
-borrows them: it may use them while the call is pending, or close them
-early, but the connection owns them and closes each one it still owns when
-the call completes. A call completes when it is answered, including an
+borrows them: it may use them while the call is pending, but the connection
+owns them, so only it can close them, and it closes each one it still owns
+when the call completes. A call completes when it is answered, including an
 answer to a call that asked for no reply, when it expires, when its handler
-exits, when its object is unexported, or when the connection closes. A
-handler that ignores the handles leaks nothing.
+exits, when its object is unexported, or when the connection closes. A handler
+that ignores the handles leaks nothing.
 
 To keep the descriptors beyond the call, take ownership before answering:
 
@@ -385,7 +391,7 @@ These are returned when sending or answering:
 | Reason | Meaning |
 | --- | --- |
 | `:closed` | The handle is closed. |
-| `:not_owner` | Only the owner can transfer the handle. |
+| `:not_owner` | Only the owner can close or transfer the handle. |
 | `:noproc` | The process it was transferred to is not alive, so the descriptor was closed. |
 | `:not_local` | The handle, or the process given, belongs to another node. |
 | `:unsupported` | This build has no handle support: the platform lacks it, or the application has not [enabled descriptor passing](#enabling-descriptor-passing). |

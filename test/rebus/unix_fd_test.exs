@@ -1046,7 +1046,7 @@ defmodule Rebus.UnixFDTest do
     end
   end
 
-  test "lets a handler close a borrowed handle without a second close", %{
+  test "refuses a handler's close of a borrowed handle and closes it once the call completes", %{
     server: server,
     connection: connection
   } do
@@ -1055,12 +1055,14 @@ defmodule Rebus.UnixFDTest do
     {_ref, %Call{serial: serial, unix_fds: [borrowed]} = call} =
       fd_call!(server, connection, "Take")
 
-    assert :ok = UnixFD.close(borrowed)
+    assert {:error, :not_owner} = UnixFD.close(borrowed)
+    assert UnixFD.open?(borrowed)
+
     assert :ok = Service.reply(call, [])
     assert_receive {^server, %Message{header_fields: %{reply_serial: ^serial}}}, 1_000
 
+    assert_closed_once(borrowed)
     assert {:error, :closed} = UnixFD.close(borrowed)
-    assert {:ok, 1} = UnixFD.__close_count__(borrowed)
     assert no_new_fds?(before_fds)
   end
 
@@ -1327,11 +1329,12 @@ defmodule Rebus.UnixFDTest do
     server: server,
     connection: connection
   } do
-    {_ref, %Call{serial: serial, unix_fds: [borrowed]} = call} =
-      fd_call!(server, connection, "Echo")
+    {_ref, %Call{serial: serial} = call} = fd_call!(server, connection, "Echo")
 
-    assert :ok = UnixFD.close(borrowed)
-    assert {:error, :unix_fd_closed} = Service.reply(call, [0], fds: [borrowed])
+    {:ok, closed, closed_peer} = UnixFD.__pipe__()
+    assert :ok = UnixFD.close(closed)
+    assert {:error, :unix_fd_closed} = Service.reply(call, [0], fds: [closed])
+    assert :ok = UnixFD.close(closed_peer)
 
     # `reply_message/3` encodes in the handler, while the handle is still
     # open; the connection checks it again when it accepts the reply.
@@ -1468,8 +1471,12 @@ defmodule Rebus.UnixFDTest do
       {task, fd, resume} = park_fd_send!(connection, handle, "InFlight")
 
       case release do
-        :close -> assert :ok = UnixFD.close(handle)
-        :owner_exit -> send(owner, :exit)
+        :close ->
+          send(owner, {:close, self()})
+          assert_receive {:closed, :ok}, 1_000
+
+        :owner_exit ->
+          send(owner, :exit)
       end
 
       # The handle reads closed for everyone at once, but the pin keeps the
@@ -2449,14 +2456,22 @@ defmodule Rebus.UnixFDTest do
         {:ok, read, write} = UnixFD.__pipe__()
         :ok = UnixFD.close(write)
         send(parent, {:pipe_end, self(), read})
-
-        receive do
-          :exit -> :ok
-        end
+        pipe_end_owner_loop(read)
       end)
 
     assert_receive {:pipe_end, ^owner, handle}, 1_000
     {owner, handle}
+  end
+
+  defp pipe_end_owner_loop(handle) do
+    receive do
+      :exit ->
+        :ok
+
+      {:close, reply_to} ->
+        send(reply_to, {:closed, UnixFD.close(handle)})
+        pipe_end_owner_loop(handle)
+    end
   end
 
   # Sends a signal carrying `handle` from a task, through a transport whose

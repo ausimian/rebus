@@ -272,11 +272,12 @@ defmodule Rebus.Connection.InboundCallsTest do
       Process.exit(owner, :kill)
     end
 
-    test "leaves a handle its handler already closed closed once" do
+    test "keeps a borrowed handle its handler cannot close open until completion" do
       fd = handle!()
       {entry, calls} = insert(InboundCalls.new(), unix_fds: [fd])
       handler = Task.async(fn -> UnixFD.close(fd) end)
-      assert :ok = Task.await(handler)
+      assert {:error, :not_owner} = Task.await(handler)
+      refute closed?(fd)
 
       assert {^entry, _calls} = InboundCalls.complete(calls, entry.ref)
       assert closed?(fd)

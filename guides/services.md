@@ -322,21 +322,27 @@ subscribe as described in
 
 ## Unix file descriptors
 
-Descriptors sent with a call arrive in `call.unix_fds`, indexed by the call's
-`h` arguments. The handler borrows them until the call completes, and the
-connection closes them then, however the call completes. A handler that
-ignores them leaks nothing, and must never close one itself.
+Descriptors sent with a call arrive in the call's `:unix_fds` as
+`Rebus.UnixFD` handles, one for each `h` argument. The connection owns these
+handles and lends them to the handler for the life of the call. While the
+call is pending, the handler may reach a descriptor with
+`Rebus.UnixFD.with_fd/2` or send the handle on, but only the connection, as
+owner, can close it. When the call completes, however it completes, the
+connection closes every handle it still owns, so a handler that does nothing
+with them leaks nothing.
 
-To keep a descriptor beyond the call, take ownership with
-`Rebus.Service.take_fds/2` before answering:
+To keep a descriptor after the call, become its owner with
+`Rebus.Service.take_fds/2` before answering. The handles it returns are the
+same ones as in the call's `:unix_fds`, now owned by the handler, so they
+outlive the call:
 
 ```elixir
 receive do
   {^ref, %Call{member: "TakeLog", unix_fds: [_]} = call} ->
     case Rebus.Service.take_fds(call) do
-      {:ok, [fd]} ->
+      {:ok, [handle]} ->
         :ok = Rebus.Service.reply(call, [])
-        keep_and_later_close(fd)
+        keep_and_later_close(handle)
 
       {:error, _reason} ->
         Rebus.Service.reply_error(call, "org.example.Error.Failed", "Not received")
@@ -344,17 +350,18 @@ receive do
 end
 ```
 
-A failed `take_fds/2` transfers nothing, and the call still needs its answer.
-`{:error, :unknown_call}` means the descriptors were already taken and stay
-with whoever took them, or the call has completed and the connection closed
-them. Any other error means the connection has closed them. Either way there
-is nothing new for you to close.
+Whatever `take_fds/2` returns, the call stays pending and still needs its
+answer. `{:error, :unknown_call}` means the handles were already taken or
+the call has completed. After `{:error, :timeout}` or
+`{:error, :disconnected}` the hand-over may or may not have gone through;
+`Rebus.UnixFD.owner/1` tells you which. In every case each handle closes
+exactly once.
 
 To send descriptors with a reply, pass them as the `:fds` option of
 `Rebus.Service.reply/3`, or return `{:reply, body, state, fds: fds}` from a
-`Rebus.Object` callback. Rebus borrows them, as it does every outbound
-descriptor, so the handler still owns them. A reply cannot send back one of
-the call's own borrowed descriptors without taking it first.
+`Rebus.Object` callback. A reply may carry the call's own borrowed handles
+without taking them first. Answering the call closes them, but their
+descriptors stay open until the reply has been written.
 
 [Unix file descriptor passing](unix_fds.html) covers the ownership rules in
 full.
