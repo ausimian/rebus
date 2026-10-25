@@ -24,11 +24,11 @@ defmodule Rebus.Integration.SessionBusTest do
   # taken once when the file is loaded. Without a session bus the whole module
   # is skipped with a message that names the command to use, instead of failing
   # with a connection error or silently reporting success.
-  if System.get_env(@bus_env) in [nil, ""] do
-    @moduletag skip:
-                 "#{@bus_env} is not set: run `dbus-run-session -- mix test --only integration` " <>
-                   "on a host with dbus, or `mix test.integration` to run it under Docker"
-  end
+  @bus_skip System.get_env(@bus_env) in [nil, ""] &&
+              "#{@bus_env} is not set: run `dbus-run-session -- mix test --only integration` " <>
+                "on a host with dbus, or `mix test.integration` to run it under Docker"
+
+  @moduletag skip: @bus_skip
 
   @driver "org.freedesktop.DBus"
   @driver_path "/org/freedesktop/DBus"
@@ -52,13 +52,16 @@ defmodule Rebus.Integration.SessionBusTest do
   @properties "org.freedesktop.DBus.Properties"
   @abacus "org.example.RebusIntegration.Abacus"
 
-  # The `busctl` and `gdbus` tests skip on a host without the client, naming
-  # the package that provides it. CI installs both and checks they are on
-  # PATH, so the tests cannot skip there.
-  @busctl_skip System.find_executable("busctl") == nil &&
-                 "busctl is not on PATH: install systemd to run it"
-  @gdbus_skip System.find_executable("gdbus") == nil &&
-                "gdbus is not on PATH: install libglib2.0-bin to run it"
+  # The `busctl` and `gdbus` tests also skip on a host without the client,
+  # naming the package that provides it. CI installs both and checks they are
+  # on PATH, so the tests cannot skip there. A describe tag replaces the
+  # module's, so each carries the missing-bus skip too.
+  @busctl_skip @bus_skip ||
+                 (System.find_executable("busctl") == nil &&
+                    "busctl is not on PATH: install systemd to run it")
+  @gdbus_skip @bus_skip ||
+                (System.find_executable("gdbus") == nil &&
+                   "gdbus is not on PATH: install libglib2.0-bin to run it")
 
   # A `Rebus.Object` served through the daemon, where the tests above export
   # raw `Rebus.Service` objects and answer each call by hand.
